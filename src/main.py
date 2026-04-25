@@ -1,9 +1,15 @@
 """CLI entry point.
 
+흐름:
+  1) wisereport 자동 로그인 → 기업 검색 → 상위 N개 PDF 다운로드
+  2) OpenRouter (기본: anthropic/claude-sonnet-4.5) 로 개별 + 종합 요약
+  3) 종합 리포트 텍스트 파일 저장
+  4) (선택) 텔레그램으로 PDF + 요약 발송
+
 사용 예시:
-    python -m src.main 삼성전자
-    python -m src.main "SK하이닉스" --top 5 --no-summarize
-    python -m src.main 카카오 --sort popular --headed
+  python -m src.main 삼성전자 --ticker 005930
+  python -m src.main "SK하이닉스" --ticker 000660 --top 5
+  python -m src.main 카카오 --ticker 035720 --no-summarize --no-telegram
 """
 
 from __future__ import annotations
@@ -15,15 +21,16 @@ import re
 import sys
 from pathlib import Path
 
-import anthropic
 from dotenv import load_dotenv
 
 from src.summarizer import (
     IndividualSummary,
+    get_client,
     summarize_combined,
     summarize_pdf,
     write_report,
 )
+from src.telegram_sender import send_all as telegram_send_all
 from src.wisereport import WisereportClient
 
 
@@ -34,8 +41,9 @@ def setup_logging(verbose: bool) -> None:
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         datefmt="%H:%M:%S",
     )
-    # Playwright 자체 로그는 너무 시끄러우니 줄임
     logging.getLogger("playwright").setLevel(logging.WARNING)
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("openai").setLevel(logging.WARNING)
 
 
 def safe_dirname(name: str) -> str:
@@ -45,9 +53,14 @@ def safe_dirname(name: str) -> str:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="wisereport.co.kr 리포트 자동 다운로드 + Claude 요약"
+        description="wisereport.co.kr 리포트 자동 다운로드 + 요약 + 텔레그램 발송"
     )
     p.add_argument("company", help="기업명 (예: 삼성전자)")
+    p.add_argument(
+        "--ticker",
+        default=None,
+        help="ticker code (6자리, 예: 005930). 지정하면 자동 룩업을 건너뜀",
+    )
     p.add_argument(
         "--top",
         type=int,
@@ -58,24 +71,12 @@ def parse_args() -> argparse.Namespace:
         "--sort",
         choices=["latest", "popular"],
         default=os.getenv("SORT_BY", "latest"),
-        help="정렬 기준: latest(최신순) | popular(조회순). 기본 latest",
+        help="정렬 기준 (현재 latest만 지원)",
     )
-    p.add_argument(
-        "--headed",
-        action="store_true",
-        help="브라우저 화면 표시 (디버깅용; 기본은 headless)",
-    )
-    p.add_argument(
-        "--no-summarize",
-        action="store_true",
-        help="다운로드만 하고 Claude 요약은 건너뛰기",
-    )
-    p.add_argument(
-        "--slow-mo",
-        type=int,
-        default=0,
-        help="Playwright 액션 사이 지연(ms). 디버그 시 500-1000 추천",
-    )
+    p.add_argument("--headed", action="store_true", help="브라우저 화면 표시 (디버깅)")
+    p.add_argument("--no-summarize", action="store_true", help="요약 단계 스킵")
+    p.add_argument("--no-telegram", action="store_true", help="텔레그램 발송 스킵")
+    p.add_argument("--slow-mo", type=int, default=0, help="Playwright 액션 지연(ms)")
     p.add_argument("-v", "--verbose", action="store_true", help="DEBUG 로그")
     return p.parse_args()
 
@@ -89,20 +90,20 @@ def main() -> int:
     user_id = os.getenv("WISEREPORT_ID")
     password = os.getenv("WISEREPORT_PW")
     if not user_id or not password:
-        log.error(
-            "WISEREPORT_ID / WISEREPORT_PW 가 설정되지 않았습니다. "
-            ".env 파일을 .env.example을 참고해 만드세요."
-        )
+        log.error("WISEREPORT_ID / WISEREPORT_PW 가 설정되지 않았습니다.")
         return 2
 
     download_root = Path(os.getenv("DOWNLOAD_DIR", "./downloads"))
     summary_root = Path(os.getenv("SUMMARY_DIR", "./summaries"))
     headless = not args.headed and os.getenv("HEADLESS", "true").lower() != "false"
+    ignore_https_errors = os.getenv("IGNORE_HTTPS_ERRORS", "false").lower() == "true"
+    state_file_str = os.getenv("STORAGE_STATE", "./.wisereport_state.json")
+    state_file = Path(state_file_str) if state_file_str else None
 
     company_dir = download_root / safe_dirname(args.company)
 
     # ------------------------------------------------------------------
-    # STEP 1: 로그인 + 검색 + PDF 다운로드
+    # STEP 1: PDF 다운로드
     # ------------------------------------------------------------------
     log.info("=" * 60)
     log.info("STEP 1: %s 리포트 다운로드 (상위 %d개, %s)", args.company, args.top, args.sort)
@@ -116,15 +117,25 @@ def main() -> int:
             download_root=download_root,
             headless=headless,
             slow_mo=args.slow_mo,
+            ignore_https_errors=ignore_https_errors,
+            state_file=state_file,
         ) as client:
-            client.login()
-            reports = client.search_company(
-                args.company, sort_by=args.sort, limit=args.top
-            )
-            if not reports:
-                log.error("검색 결과 없음: %s", args.company)
+            client.ensure_logged_in()
+            ticker = args.ticker
+            if not ticker:
+                ticker = client.lookup_ticker(args.company)
+                if not ticker:
+                    log.error(
+                        "ticker 자동 룩업 실패. --ticker로 직접 지정해주세요."
+                    )
+                    return 1
+            log.info("사용할 ticker: %s", ticker)
+
+            items = client.list_reports(ticker=ticker, sort_by=args.sort, limit=args.top)
+            if not items:
+                log.error("리포트가 없습니다: %s (ticker=%s)", args.company, ticker)
                 return 1
-            saved_paths = client.download_reports(reports[: args.top], company_dir)
+            saved_paths = client.download_reports(items, company_dir)
     except Exception:
         log.exception("다운로드 단계 실패")
         return 1
@@ -132,7 +143,6 @@ def main() -> int:
     if not saved_paths:
         log.error("다운로드된 PDF가 없습니다.")
         return 1
-
     log.info("다운로드 완료: %d개 (저장 위치: %s)", len(saved_paths), company_dir)
 
     if args.no_summarize:
@@ -140,17 +150,17 @@ def main() -> int:
         return 0
 
     # ------------------------------------------------------------------
-    # STEP 2: Claude로 개별 요약 + 종합 요약
+    # STEP 2: OpenRouter로 요약
     # ------------------------------------------------------------------
     log.info("=" * 60)
-    log.info("STEP 2: Claude로 요약 (모델: claude-opus-4-7)")
+    log.info("STEP 2: OpenRouter로 요약")
     log.info("=" * 60)
 
-    if not os.getenv("ANTHROPIC_API_KEY"):
-        log.error("ANTHROPIC_API_KEY가 .env에 없습니다. 요약을 진행할 수 없습니다.")
+    if not os.getenv("OPENROUTER_API_KEY"):
+        log.error("OPENROUTER_API_KEY가 .env에 없습니다.")
         return 2
 
-    api_client = anthropic.Anthropic()
+    api_client = get_client()
 
     individual: list[IndividualSummary] = []
     for i, pdf_path in enumerate(saved_paths, start=1):
@@ -179,6 +189,29 @@ def main() -> int:
         individual,
         combined,
     )
+    log.info("종합 리포트 파일: %s", out_path)
+
+    # ------------------------------------------------------------------
+    # STEP 3: 텔레그램 발송 (선택)
+    # ------------------------------------------------------------------
+    if args.no_telegram or os.getenv("DISABLE_TELEGRAM", "false").lower() == "true":
+        log.info("텔레그램 발송 스킵")
+        return 0
+
+    log.info("=" * 60)
+    log.info("STEP 3: 텔레그램 발송")
+    log.info("=" * 60)
+    sent = telegram_send_all(
+        pdf_paths=saved_paths,
+        summary_text_path=out_path,
+        company_name=args.company,
+        summary_combined_text=combined,
+    )
+    if not sent:
+        log.warning(
+            "텔레그램 발송 실패 또는 미설정. "
+            ".env의 TELEGRAM_BOT_TOKEN, TELEGRAM_USERNAME 또는 TELEGRAM_CHAT_ID 확인."
+        )
     log.info("=" * 60)
     log.info("완료. 결과 파일: %s", out_path)
     log.info("=" * 60)

@@ -1,30 +1,34 @@
-"""다운로드된 PDF 리포트를 Claude로 요약.
+"""다운로드된 PDF 리포트를 OpenRouter (Claude 등) 로 요약.
 
-사용 모델: claude-opus-4-7 (적응형 사고 + 프롬프트 캐싱)
+사용자가 OpenRouter API 키를 제공하므로 OpenAI-compatible 게이트웨이를 사용.
+PDF는 pypdf로 텍스트 추출 후 LLM에 전달 (OpenAI-compat API는 native PDF
+입력을 모델에 따라 다르게 지원하므로 텍스트가 가장 안정적).
+
 - 각 PDF별 개별 요약
 - 10개 요약을 묶은 종합 요약
 """
 
 from __future__ import annotations
 
-import base64
 import logging
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
-import anthropic
+from openai import OpenAI
 from pypdf import PdfReader
 
 log = logging.getLogger(__name__)
 
-MODEL = "claude-opus-4-7"
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+DEFAULT_MODEL = os.getenv("OPENROUTER_MODEL", "anthropic/claude-sonnet-4.5")
 
-# PDF 1개당 최대 크기 (네이티브 PDF 입력은 32MB 제한이 있음)
-MAX_PDF_BYTES_NATIVE = 30 * 1024 * 1024
+# pypdf로 추출한 텍스트의 최대 길이 (모델 컨텍스트 보호)
+MAX_PDF_TEXT_CHARS = 80_000
 
 INDIVIDUAL_SYSTEM_PROMPT = """당신은 한국 기업 분석 리포트를 정밀하게 요약하는 금융 애널리스트입니다.
 
-증권사 또는 기관에서 발행한 PDF 리포트 1건을 분석하여 한국어로 요약합니다.
+증권사 또는 기관에서 발행한 PDF 리포트 1건의 추출 텍스트를 받아 한국어로 요약합니다.
 다음 항목을 빠짐없이 작성하되, 리포트에 없는 항목은 "해당 없음"으로 표기하세요.
 
 # 요약 형식
@@ -59,7 +63,8 @@ INDIVIDUAL_SYSTEM_PROMPT = """당신은 한국 기업 분석 리포트를 정밀
 ## 8. 기타 특이사항
 - 업종 비교, 경쟁사 언급, 기술적 분석 등 위 항목에 안 들어간 중요 내용
 
-원문에 없는 정보를 추측해서 채우지 마세요. 숫자는 원문 그대로 인용하고 단위(억 원, 조 원, %)를 명확히 표기하세요."""
+원문(텍스트 추출이라 표/그림 일부 누락 가능)에 없는 정보를 추측해서 채우지 마세요.
+숫자는 원문 그대로 인용하고 단위(억 원, 조 원, %)를 명확히 표기하세요."""
 
 COMBINED_SYSTEM_PROMPT = """당신은 한국 기업 분석 리포트를 종합하는 시니어 애널리스트입니다.
 
@@ -100,149 +105,103 @@ COMBINED_SYSTEM_PROMPT = """당신은 한국 기업 분석 리포트를 종합�
 class IndividualSummary:
     pdf_path: Path
     summary_text: str
-    used_native_pdf: bool
 
 
-def _encode_pdf_b64(pdf_path: Path) -> str:
-    return base64.standard_b64encode(pdf_path.read_bytes()).decode("ascii")
+def get_client() -> OpenAI:
+    api_key = os.getenv("OPENROUTER_API_KEY")
+    if not api_key:
+        raise RuntimeError(
+            "OPENROUTER_API_KEY 환경변수가 없습니다. .env에 추가하세요."
+        )
+    return OpenAI(
+        api_key=api_key,
+        base_url=OPENROUTER_BASE_URL,
+        default_headers={
+            "HTTP-Referer": "https://github.com/anselmkim111/basketball-rag-agent",
+            "X-Title": "wisereport-auto-downloader",
+        },
+    )
 
 
-def _extract_pdf_text(pdf_path: Path, max_chars: int = 200_000) -> str:
-    """PDF가 너무 클 때 fallback: 텍스트만 추출."""
+def _extract_pdf_text(pdf_path: Path, max_chars: int = MAX_PDF_TEXT_CHARS) -> str:
+    """PDF 텍스트 추출 (페이지 경계 표시 포함)."""
     reader = PdfReader(str(pdf_path))
     parts: list[str] = []
     total = 0
-    for page in reader.pages:
-        text = page.extract_text() or ""
-        if not text.strip():
+    for i, page in enumerate(reader.pages, start=1):
+        text = (page.extract_text() or "").strip()
+        if not text:
             continue
-        parts.append(text)
-        total += len(text)
+        chunk = f"[Page {i}]\n{text}"
+        parts.append(chunk)
+        total += len(chunk)
         if total >= max_chars:
+            parts.append(f"\n... (이후 {len(reader.pages) - i}페이지 생략)")
             break
     return "\n\n".join(parts)
 
 
 def summarize_pdf(
-    client: anthropic.Anthropic,
+    client: OpenAI,
     pdf_path: Path,
+    model: str = DEFAULT_MODEL,
 ) -> IndividualSummary:
-    """단일 PDF를 요약. 큰 파일은 텍스트 추출 fallback."""
-    size = pdf_path.stat().st_size
-    log.info("요약 시작: %s (%.1f MB)", pdf_path.name, size / 1024 / 1024)
+    log.info("요약 시작: %s", pdf_path.name)
+    text = _extract_pdf_text(pdf_path)
+    if not text.strip():
+        log.warning("PDF 텍스트 추출 실패: %s", pdf_path.name)
+        return IndividualSummary(pdf_path=pdf_path, summary_text="(텍스트 추출 실패)")
 
-    use_native = size <= MAX_PDF_BYTES_NATIVE
-    if use_native:
-        user_content = [
-            {
-                "type": "document",
-                "source": {
-                    "type": "base64",
-                    "media_type": "application/pdf",
-                    "data": _encode_pdf_b64(pdf_path),
-                },
-            },
-            {
-                "type": "text",
-                "text": (
-                    "위 PDF 리포트를 시스템 프롬프트에 정의된 형식으로 요약해주세요.\n"
-                    f"파일명: {pdf_path.name}"
-                ),
-            },
-        ]
-    else:
-        log.warning("PDF가 너무 커서 텍스트 추출 fallback 사용: %s", pdf_path.name)
-        text = _extract_pdf_text(pdf_path)
-        user_content = [
-            {
-                "type": "text",
-                "text": (
-                    "다음은 PDF에서 추출한 텍스트입니다 (서식/이미지 누락). "
-                    "시스템 프롬프트의 형식대로 요약해주세요.\n"
-                    f"파일명: {pdf_path.name}\n\n"
-                    "<pdf_text>\n"
-                    f"{text}\n"
-                    "</pdf_text>"
-                ),
-            },
-        ]
-
-    # 시스템 프롬프트는 PDF 10개 호출 사이에 동일 -> 캐싱
-    system_blocks = [
-        {
-            "type": "text",
-            "text": INDIVIDUAL_SYSTEM_PROMPT,
-            "cache_control": {"type": "ephemeral"},
-        }
-    ]
-
-    # PDF 본문은 길 수 있으므로 streaming + final_message
-    with client.messages.stream(
-        model=MODEL,
-        max_tokens=8_000,
-        thinking={"type": "adaptive"},
-        system=system_blocks,
-        messages=[{"role": "user", "content": user_content}],
-    ) as stream:
-        message = stream.get_final_message()
-
-    text_out = "\n".join(
-        b.text for b in message.content if getattr(b, "type", None) == "text"
+    user_msg = (
+        f"다음은 PDF 리포트({pdf_path.name})에서 추출한 텍스트입니다. "
+        "시스템 프롬프트의 형식대로 요약해주세요.\n\n"
+        f"<pdf_text>\n{text}\n</pdf_text>"
     )
+
+    resp = client.chat.completions.create(
+        model=model,
+        max_tokens=4096,
+        messages=[
+            {"role": "system", "content": INDIVIDUAL_SYSTEM_PROMPT},
+            {"role": "user", "content": user_msg},
+        ],
+    )
+    summary = resp.choices[0].message.content or ""
     log.info(
-        "요약 완료: %s (input=%d, output=%d, cache_read=%d)",
+        "요약 완료: %s (in=%s, out=%s)",
         pdf_path.name,
-        message.usage.input_tokens,
-        message.usage.output_tokens,
-        message.usage.cache_read_input_tokens or 0,
+        getattr(resp.usage, "prompt_tokens", "?"),
+        getattr(resp.usage, "completion_tokens", "?"),
     )
-    return IndividualSummary(
-        pdf_path=pdf_path,
-        summary_text=text_out,
-        used_native_pdf=use_native,
-    )
+    return IndividualSummary(pdf_path=pdf_path, summary_text=summary)
 
 
 def summarize_combined(
-    client: anthropic.Anthropic,
+    client: OpenAI,
     company_name: str,
     summaries: list[IndividualSummary],
+    model: str = DEFAULT_MODEL,
 ) -> str:
-    """여러 개별 요약을 종합한 메타 요약 작성."""
-    log.info("종합 요약 시작 (요약 %d건)", len(summaries))
-
+    log.info("종합 요약 (%d건)", len(summaries))
     bundled_text = "\n\n".join(
-        (
-            f"=== 리포트 #{i+1}: {s.pdf_path.name} ===\n{s.summary_text}"
-        )
+        f"=== 리포트 #{i+1}: {s.pdf_path.name} ===\n{s.summary_text}"
         for i, s in enumerate(summaries)
     )
-
-    user_text = (
+    user_msg = (
         f"분석 대상 기업: {company_name}\n"
         f"아래는 {len(summaries)}건의 리포트 개별 요약본입니다. "
         "시스템 프롬프트의 형식대로 종합 분석을 작성해주세요.\n\n"
         f"{bundled_text}"
     )
-
-    with client.messages.stream(
-        model=MODEL,
-        max_tokens=12_000,
-        thinking={"type": "adaptive"},
-        system=COMBINED_SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": user_text}],
-    ) as stream:
-        message = stream.get_final_message()
-
-    text_out = "\n".join(
-        b.text for b in message.content if getattr(b, "type", None) == "text"
+    resp = client.chat.completions.create(
+        model=model,
+        max_tokens=6000,
+        messages=[
+            {"role": "system", "content": COMBINED_SYSTEM_PROMPT},
+            {"role": "user", "content": user_msg},
+        ],
     )
-    log.info(
-        "종합 요약 완료 (input=%d, output=%d)",
-        message.usage.input_tokens,
-        message.usage.output_tokens,
-    )
-    return text_out
+    return resp.choices[0].message.content or ""
 
 
 def write_report(
@@ -251,7 +210,6 @@ def write_report(
     individual: list[IndividualSummary],
     combined: str,
 ) -> Path:
-    """개별 요약 + 종합 요약을 하나의 텍스트 파일로 저장."""
     output_dir.mkdir(parents=True, exist_ok=True)
     out_path = output_dir / f"{company_name}_종합리포트.txt"
 
@@ -261,11 +219,9 @@ def write_report(
     parts.append(f"  분석 리포트: {len(individual)}건")
     parts.append("=" * 80)
     parts.append("")
-    parts.append("")
     parts.append("# [PART 1] 종합 분석")
     parts.append("")
     parts.append(combined)
-    parts.append("")
     parts.append("")
     parts.append("=" * 80)
     parts.append("# [PART 2] 개별 리포트 요약")
