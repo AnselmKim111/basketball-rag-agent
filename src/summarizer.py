@@ -15,7 +15,7 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
-from openai import OpenAI
+from openai import APIStatusError, OpenAI
 from pypdf import PdfReader
 
 log = logging.getLogger(__name__)
@@ -26,79 +26,74 @@ DEFAULT_MODEL = os.getenv("OPENROUTER_MODEL", "anthropic/claude-sonnet-4.5")
 # pypdf로 추출한 텍스트의 최대 길이 (모델 컨텍스트 보호)
 MAX_PDF_TEXT_CHARS = 80_000
 
-INDIVIDUAL_SYSTEM_PROMPT = """당신은 한국 기업 분석 리포트를 정밀하게 요약하는 금융 애널리스트입니다.
+# 요약 결과물 최대 글자수 (한국어 char 기준)
+MAX_SUMMARY_CHARS = 5_000
 
-증권사 또는 기관에서 발행한 PDF 리포트 1건의 추출 텍스트를 받아 한국어로 요약합니다.
-다음 항목을 빠짐없이 작성하되, 리포트에 없는 항목은 "해당 없음"으로 표기하세요.
 
-# 요약 형식
+class OpenRouterCreditExhausted(RuntimeError):
+    """OpenRouter 토큰이 부족하거나 결제 거부된 경우."""
 
+INDIVIDUAL_SYSTEM_PROMPT = """당신은 한국 기업 분석 리포트를 정밀하게 요약하는 시니어 애널리스트입니다.
+
+증권사/기관 PDF 리포트 1건의 추출 텍스트를 받아 한국어로 요약합니다.
+
+# 출력 규칙 (엄수)
+- **전체 5000자 이내** (한국어 글자수 기준, 공백 포함). 절대 초과 금지.
+- 핵심만 정확하게. 부연 설명 금지. 표/번호 매김 활용으로 압축.
+- 원문에 없는 정보 추측 금지. 숫자는 원문 그대로 인용 + 단위 명시.
+
+# 형식
 ## 1. 기본 정보
-- 발행일 / 발행 기관 / 작성자
-- 분석 대상 기업 (종목코드 포함)
+- 발행일 / 기관 / 작성자 / 종목코드
 - 투자의견 / 목표주가 / 현재가 (있는 경우)
 
-## 2. 핵심 결론 (3-5줄)
-리포트가 전달하려는 가장 중요한 메시지를 압축해서 작성.
+## 2. 핵심 결론 (2-3줄)
+가장 중요한 메시지만 압축.
 
-## 3. 실적 및 재무 하이라이트
-- 최근 분기/연간 실적 (매출, 영업이익, 순이익 - 전년 동기 대비 증감 포함)
-- 주요 재무 비율 변화
-- 가이던스/컨센서스 대비 결과
+## 3. 실적 / 재무 하이라이트
+최근 실적, 주요 재무 변화, 컨센서스 대비 결과 — 숫자 위주.
 
-## 4. 사업/시장 분석
-- 주요 사업부문별 동향
-- 시장 환경 / 경쟁 구도 / 산업 사이클
+## 4. 투자 포인트
+긍정 요인 핵심 3개.
 
-## 5. 투자 포인트 (강세 요인)
-- 리포트가 강조하는 긍정 요인 3-5개
+## 5. 리스크
+부정 요인 핵심 2-3개.
 
-## 6. 리스크 요인
-- 리포트가 지적하는 우려 사항 / 하방 요인
+## 6. 밸류에이션
+PER/PBR/EV-EBITDA 등 멀티플과 추정치 (있는 경우).
 
-## 7. 밸류에이션 / 추정치
-- PER, PBR, EV/EBITDA 등 적용 멀티플
-- 향후 1-2년 추정 매출/영업이익
-
-## 8. 기타 특이사항
-- 업종 비교, 경쟁사 언급, 기술적 분석 등 위 항목에 안 들어간 중요 내용
-
-원문(텍스트 추출이라 표/그림 일부 누락 가능)에 없는 정보를 추측해서 채우지 마세요.
-숫자는 원문 그대로 인용하고 단위(억 원, 조 원, %)를 명확히 표기하세요."""
+리포트에 없는 항목은 "해당 없음" 한 줄로 처리하고 추측하지 말 것."""
 
 COMBINED_SYSTEM_PROMPT = """당신은 한국 기업 분석 리포트를 종합하는 시니어 애널리스트입니다.
 
-같은 기업에 대한 여러 증권사/기관의 리포트 요약본을 받아 한국어로 종합 분석을 작성합니다.
+같은 기업에 대한 여러 증권사/기관 리포트 요약본을 받아 한국어로 종합 분석을 작성합니다.
 
-# 종합 분석 형식
+# 출력 규칙 (엄수)
+- **전체 5000자 이내** (한국어 글자수 기준, 공백 포함). 절대 초과 금지.
+- 핵심만. 압축적 표현 권장.
+- 출처 표기 필수: 각 주장 뒤에 [#1, #3] 형태로.
 
-## 1. 컨센서스 요약
-- 분석 대상 기업명 / 분석 리포트 수
-- 분석 기간 (가장 오래된 리포트 ~ 가장 최근 리포트)
-- 발행 기관 리스트
-- 평균/중간 목표주가 (있는 경우 - 단순 산술평균과 범위)
-- 투자의견 분포 (매수/중립/매도 카운트)
+# 형식
+## 1. 컨센서스 요약 (1-2줄)
+기업명, 리포트 수, 기간, 평균 목표주가(범위), 투자의견 분포.
 
-## 2. 합의된 시각 (Bullish Consensus)
-여러 리포트가 공통적으로 강조한 긍정 포인트를 묶어서 정리.
-각 항목 뒤에 [언급한 리포트 번호 #1, #3, #5] 식으로 출처 표기.
+## 2. 합의된 강세 시각
+공통 긍정 포인트 핵심 3-4개 (각 1-2줄 + 출처).
 
-## 3. 공통된 우려 (Common Risks)
-여러 리포트가 공통적으로 지적한 리스크.
-각 항목 뒤에 출처 번호 표기.
+## 3. 공통 우려
+공통 리스크 핵심 2-3개 (각 1-2줄 + 출처).
 
-## 4. 견해 차이가 있는 쟁점
-리포트마다 평가가 다른 이슈를 정리하고, 어떤 리포트가 어떤 입장을 취하는지 명시.
+## 4. 견해 차이
+리포트마다 평가 갈리는 이슈 1-2개와 양측 입장.
 
-## 5. 시간 경과에 따른 변화
-가장 오래된 리포트와 가장 최근 리포트를 비교하여 시각이 어떻게 바뀌었는지 분석.
-(목표주가 상향/하향, 투자의견 변경, 새롭게 부각된 이슈 등)
+## 5. 시간 변화
+초기 리포트 vs 최근 리포트 비교 — 목표가/의견/관점 변화.
 
-## 6. 핵심 모니터링 포인트
-이 기업을 추적할 때 앞으로 주목해야 할 변수 3-5개.
+## 6. 모니터링 포인트
+앞으로 주목할 핵심 변수 3개.
 
-## 7. 종합 결론
-모든 리포트를 통합한 시각에서 이 기업의 현재 상황과 향후 전망을 5-7줄로 요약."""
+## 7. 종합 결론 (3-4줄)
+모든 리포트 통합 시각으로 현재 상황과 전망."""
 
 
 @dataclass
@@ -141,6 +136,24 @@ def _extract_pdf_text(pdf_path: Path, max_chars: int = MAX_PDF_TEXT_CHARS) -> st
     return "\n\n".join(parts)
 
 
+def _is_credit_error(exc: Exception) -> bool:
+    """OpenRouter 결제·잔액 오류 판별."""
+    if isinstance(exc, APIStatusError):
+        if exc.status_code in (402, 429):
+            msg = (str(exc) + " " + str(getattr(exc, "body", ""))).lower()
+            if any(k in msg for k in ("credit", "balance", "payment", "insufficient", "quota")):
+                return True
+    return False
+
+
+def _trim_to_chars(text: str, max_chars: int = MAX_SUMMARY_CHARS) -> str:
+    """모델이 5000자 초과로 응답한 경우 안전 가드 (보통 발생 안 함)."""
+    if len(text) <= max_chars:
+        return text
+    truncated = text[: max_chars - 60]
+    return truncated.rstrip() + "\n\n... (5000자 제한으로 잘림)"
+
+
 def summarize_pdf(
     client: OpenAI,
     pdf_path: Path,
@@ -154,24 +167,32 @@ def summarize_pdf(
 
     user_msg = (
         f"다음은 PDF 리포트({pdf_path.name})에서 추출한 텍스트입니다. "
-        "시스템 프롬프트의 형식대로 요약해주세요.\n\n"
+        "시스템 프롬프트의 형식대로 5000자 이내로 요약해주세요.\n\n"
         f"<pdf_text>\n{text}\n</pdf_text>"
     )
 
-    resp = client.chat.completions.create(
-        model=model,
-        max_tokens=4096,
-        messages=[
-            {"role": "system", "content": INDIVIDUAL_SYSTEM_PROMPT},
-            {"role": "user", "content": user_msg},
-        ],
-    )
-    summary = resp.choices[0].message.content or ""
+    try:
+        # 5000자 ≈ 한국어 기준 ~3500 토큰. 여유 4000.
+        resp = client.chat.completions.create(
+            model=model,
+            max_tokens=4000,
+            messages=[
+                {"role": "system", "content": INDIVIDUAL_SYSTEM_PROMPT},
+                {"role": "user", "content": user_msg},
+            ],
+        )
+    except APIStatusError as e:
+        if _is_credit_error(e):
+            raise OpenRouterCreditExhausted(str(e)) from e
+        raise
+
+    summary = _trim_to_chars(resp.choices[0].message.content or "")
     log.info(
-        "요약 완료: %s (in=%s, out=%s)",
+        "요약 완료: %s (in=%s, out=%s, chars=%d)",
         pdf_path.name,
         getattr(resp.usage, "prompt_tokens", "?"),
         getattr(resp.usage, "completion_tokens", "?"),
+        len(summary),
     )
     return IndividualSummary(pdf_path=pdf_path, summary_text=summary)
 
@@ -190,18 +211,23 @@ def summarize_combined(
     user_msg = (
         f"분석 대상 기업: {company_name}\n"
         f"아래는 {len(summaries)}건의 리포트 개별 요약본입니다. "
-        "시스템 프롬프트의 형식대로 종합 분석을 작성해주세요.\n\n"
+        "시스템 프롬프트의 형식대로 5000자 이내 종합 분석을 작성해주세요.\n\n"
         f"{bundled_text}"
     )
-    resp = client.chat.completions.create(
-        model=model,
-        max_tokens=6000,
-        messages=[
-            {"role": "system", "content": COMBINED_SYSTEM_PROMPT},
-            {"role": "user", "content": user_msg},
-        ],
-    )
-    return resp.choices[0].message.content or ""
+    try:
+        resp = client.chat.completions.create(
+            model=model,
+            max_tokens=4000,
+            messages=[
+                {"role": "system", "content": COMBINED_SYSTEM_PROMPT},
+                {"role": "user", "content": user_msg},
+            ],
+        )
+    except APIStatusError as e:
+        if _is_credit_error(e):
+            raise OpenRouterCreditExhausted(str(e)) from e
+        raise
+    return _trim_to_chars(resp.choices[0].message.content or "")
 
 
 def write_report(

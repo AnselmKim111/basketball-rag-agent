@@ -25,12 +25,14 @@ from dotenv import load_dotenv
 
 from src.summarizer import (
     IndividualSummary,
+    OpenRouterCreditExhausted,
     get_client,
     summarize_combined,
     summarize_pdf,
     write_report,
 )
 from src.telegram_sender import send_all as telegram_send_all
+from src.telegram_sender import send_pdfs_only as telegram_send_pdfs_only
 from src.wisereport import WisereportClient
 
 
@@ -161,6 +163,8 @@ def main() -> int:
         return 2
 
     api_client = get_client()
+    credit_exhausted = False
+    credit_error_msg = ""
 
     individual: list[IndividualSummary] = []
     for i, pdf_path in enumerate(saved_paths, start=1):
@@ -168,9 +172,33 @@ def main() -> int:
         try:
             summary = summarize_pdf(api_client, pdf_path)
             individual.append(summary)
+        except OpenRouterCreditExhausted as e:
+            log.error("OpenRouter 토큰 부족: %s", e)
+            credit_exhausted = True
+            credit_error_msg = str(e)
+            break
         except Exception:
             log.exception("요약 실패: %s", pdf_path.name)
             continue
+
+    # 토큰 부족 시: 요약 건너뛰고 PDF만 텔레그램 발송
+    if credit_exhausted:
+        log.warning(
+            "토큰 부족으로 요약 단계 중단. PDF 원본만 텔레그램으로 발송합니다."
+        )
+        if args.no_telegram or os.getenv("DISABLE_TELEGRAM", "false").lower() == "true":
+            log.info("텔레그램 발송 스킵")
+            return 0
+        telegram_send_pdfs_only(
+            pdf_paths=saved_paths,
+            company_name=args.company,
+            note=(
+                f"⚠️ OpenRouter 토큰 부족으로 요약 생략.\n"
+                f"PDF {len(saved_paths)}건 원본만 발송합니다.\n\n"
+                f"오류: {credit_error_msg[:300]}"
+            ),
+        )
+        return 0
 
     if not individual:
         log.error("개별 요약이 모두 실패했습니다.")
@@ -179,6 +207,12 @@ def main() -> int:
     log.info("종합 요약 생성 중...")
     try:
         combined = summarize_combined(api_client, args.company, individual)
+    except OpenRouterCreditExhausted as e:
+        log.error("종합 요약 중 토큰 부족: %s", e)
+        combined = (
+            f"(종합 요약 생성 중 OpenRouter 토큰 부족 발생.\n"
+            f"개별 요약 {len(individual)}건만 포함됩니다.)"
+        )
     except Exception:
         log.exception("종합 요약 실패. 개별 요약만 저장합니다.")
         combined = "(종합 요약 생성에 실패했습니다.)"

@@ -103,6 +103,32 @@ def send_document(token: str, chat_id: str, path: Path, caption: str = "") -> bo
         return False
 
 
+def send_pdfs_only(
+    pdf_paths: list[Path],
+    company_name: str,
+    note: str = "",
+) -> bool:
+    """요약 없이 PDF만 발송 (OpenRouter 토큰 부족 등 fallback)."""
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    if not token:
+        log.error("TELEGRAM_BOT_TOKEN 미설정")
+        return False
+    chat_id = get_chat_id()
+    if not chat_id:
+        log.error("Telegram chat_id 못 찾음")
+        return False
+
+    log.info("텔레그램 PDF-only 발송 시작 (chat_id=%s)", chat_id)
+    intro = f"📊 {company_name} 리포트 ({len(pdf_paths)}건)\n\n"
+    if note:
+        intro += note
+    send_message(token, chat_id, intro)
+    for i, pdf in enumerate(pdf_paths, start=1):
+        send_document(token, chat_id, pdf, caption=f"[{i}/{len(pdf_paths)}] {pdf.name}")
+    log.info("PDF-only 발송 완료")
+    return True
+
+
 def send_all(
     pdf_paths: list[Path],
     summary_text_path: Path,
