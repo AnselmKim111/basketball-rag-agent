@@ -231,6 +231,30 @@ def main() -> None:
 
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not token:
+        # 진단: 컨테이너에 어떤 환경변수가 inject 되었는지 출력
+        all_keys = sorted(os.environ.keys())
+        relevant = {
+            k: (
+                f"<set, len={len(os.environ[k])}>"
+                if k in (
+                    "TELEGRAM_BOT_TOKEN",
+                    "WISEREPORT_PW",
+                    "OPENROUTER_API_KEY",
+                )
+                else os.environ[k][:50]
+            )
+            for k in all_keys
+            if any(
+                kw in k.upper()
+                for kw in ("TELEGRAM", "WISE", "OPEN", "ALLOWED", "CHAT")
+            )
+        }
+        print("=" * 60, flush=True)
+        print("DIAG: TELEGRAM_BOT_TOKEN 못 찾음", flush=True)
+        print(f"DIAG: 전체 env key 개수 = {len(all_keys)}", flush=True)
+        print(f"DIAG: 관련 env vars = {relevant}", flush=True)
+        print(f"DIAG: 모든 env key 목록 = {all_keys}", flush=True)
+        print("=" * 60, flush=True)
         raise SystemExit("TELEGRAM_BOT_TOKEN 환경변수 필수")
 
     allowed = get_allowed_ids()
