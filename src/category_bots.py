@@ -22,6 +22,7 @@ from telegram import Bot, Update
 from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
+from src.pipeline_lock import PIPELINE_LOCK
 from src.state_store import mark_seen, seen
 from src.summarizer import (
     OpenRouterCreditExhausted,
@@ -91,84 +92,94 @@ async def _process_and_send_category(
     """카테고리 리포트 가져와서 (옵션: dedup) 다운로드 → 짧은 요약 → 텔레그램 발송.
 
     blocking I/O (Playwright + OpenRouter) 는 thread executor에서 실행.
+    PIPELINE_LOCK으로 직렬화 — 다른 작업 진행 중이면 큐 대기.
     반환: 발송한 리포트 개수.
     """
-    loop = asyncio.get_running_loop()
+    # 다른 wisereport 작업이 돌고 있으면 큐 안내
+    if PIPELINE_LOCK.locked():
+        await _send_text(
+            bot,
+            chat_id,
+            f"⏳ *{label}*: 다른 작업 진행 중 — 끝나면 순차 처리합니다",
+        )
 
-    seen_ids: set[str] = set()
-    if dedup_key:
-        seen_ids = await loop.run_in_executor(None, seen, dedup_key)
+    async with PIPELINE_LOCK:
+        loop = asyncio.get_running_loop()
 
-    # blocking 파이프라인을 thread에서 실행
-    def _blocking() -> tuple[list[Path], list[str], list[str]]:
-        from src.summarizer import IndividualSummary  # noqa: F401
-        items: list[ReportItem] = []
-        with WisereportClient(
-            user_id=os.environ["WISEREPORT_ID"],
-            password=os.environ["WISEREPORT_PW"],
-            download_root=download_root,
-            headless=True,
-            ignore_https_errors=os.environ.get("IGNORE_HTTPS_ERRORS", "false").lower() == "true",
-            state_file=Path(os.environ.get("STORAGE_STATE", "./.wisereport_state.json")),
-        ) as cli:
-            cli.ensure_logged_in()
-            items = cli.list_top_reports(
-                category=category,  # type: ignore[arg-type]
-                sort_by=sort_by,    # type: ignore[arg-type]
-                limit=limit + len(seen_ids),  # dedup으로 잘릴 가능성 보정
-                days_back=days_back,
-                industry_gics=industry_gics,
-            )
-            # dedup
-            if dedup_key:
-                items = [it for it in items if it.rpt_id not in seen_ids][:limit]
-            else:
-                items = items[:limit]
+        seen_ids: set[str] = set()
+        if dedup_key:
+            seen_ids = await loop.run_in_executor(None, seen, dedup_key)
 
-            if not items:
-                return [], [], []
-
-            target_dir = download_root / _safe_dirname(label)
-            saved_paths = cli.download_reports(items, target_dir)
-
-        # OpenRouter 요약
-        summaries: list[str] = []
-        sum_client = get_client()
-        for p in saved_paths:
-            try:
-                if short_summary:
-                    s = summarize_pdf_short(sum_client, p)
+        # blocking 파이프라인을 thread에서 실행
+        def _blocking() -> tuple[list[Path], list[str], list[str]]:
+            from src.summarizer import IndividualSummary  # noqa: F401
+            items: list[ReportItem] = []
+            with WisereportClient(
+                user_id=os.environ["WISEREPORT_ID"],
+                password=os.environ["WISEREPORT_PW"],
+                download_root=download_root,
+                headless=True,
+                ignore_https_errors=os.environ.get("IGNORE_HTTPS_ERRORS", "false").lower() == "true",
+                state_file=Path(os.environ.get("STORAGE_STATE", "./.wisereport_state.json")),
+            ) as cli:
+                cli.ensure_logged_in()
+                items = cli.list_top_reports(
+                    category=category,  # type: ignore[arg-type]
+                    sort_by=sort_by,    # type: ignore[arg-type]
+                    limit=limit + len(seen_ids),  # dedup으로 잘릴 가능성 보정
+                    days_back=days_back,
+                    industry_gics=industry_gics,
+                )
+                # dedup
+                if dedup_key:
+                    items = [it for it in items if it.rpt_id not in seen_ids][:limit]
                 else:
-                    s = summarize_pdf(sum_client, p)
-                summaries.append(s.summary_text)
-            except OpenRouterCreditExhausted:
-                summaries.append("(요약 실패: OpenRouter 토큰 부족)")
-            except Exception as e:
-                summaries.append(f"(요약 실패: {e!r})")
+                    items = items[:limit]
 
-        return saved_paths, summaries, [it.rpt_id for it in items[: len(saved_paths)]]
+                if not items:
+                    return [], [], []
 
-    saved_paths, summaries, sent_rpt_ids = await loop.run_in_executor(None, _blocking)
+                target_dir = download_root / _safe_dirname(label)
+                saved_paths = cli.download_reports(items, target_dir)
 
-    if not saved_paths:
-        await _send_text(bot, chat_id, f"📭 {label}: 새 리포트 없음")
-        return 0
+            # OpenRouter 요약
+            summaries: list[str] = []
+            sum_client = get_client()
+            for p in saved_paths:
+                try:
+                    if short_summary:
+                        s = summarize_pdf_short(sum_client, p)
+                    else:
+                        s = summarize_pdf(sum_client, p)
+                    summaries.append(s.summary_text)
+                except OpenRouterCreditExhausted:
+                    summaries.append("(요약 실패: OpenRouter 토큰 부족)")
+                except Exception as e:
+                    summaries.append(f"(요약 실패: {e!r})")
 
-    # 인트로
-    today = datetime.now(KST).strftime("%Y-%m-%d %H:%M")
-    intro = f"📊 *{label}* ({today})\n총 {len(saved_paths)}건 발송"
-    await _send_text(bot, chat_id, intro)
+            return saved_paths, summaries, [it.rpt_id for it in items[: len(saved_paths)]]
 
-    # 각 (요약 + PDF) 한 쌍씩 발송
-    for i, (p, summary) in enumerate(zip(saved_paths, summaries), start=1):
-        header = f"━━━ [{i}/{len(saved_paths)}] {p.stem} ━━━\n\n"
-        await _send_text(bot, chat_id, header + summary)
-        await _send_pdf(bot, chat_id, p, caption=f"[{i}/{len(saved_paths)}] {p.name}")
+        saved_paths, summaries, sent_rpt_ids = await loop.run_in_executor(None, _blocking)
 
-    if dedup_key and sent_rpt_ids:
-        await loop.run_in_executor(None, mark_seen, dedup_key, sent_rpt_ids)
+        if not saved_paths:
+            await _send_text(bot, chat_id, f"📭 {label}: 새 리포트 없음")
+            return 0
 
-    return len(saved_paths)
+        # 인트로
+        today = datetime.now(KST).strftime("%Y-%m-%d %H:%M")
+        intro = f"📊 *{label}* ({today})\n총 {len(saved_paths)}건 발송"
+        await _send_text(bot, chat_id, intro)
+
+        # 각 (요약 + PDF) 한 쌍씩 발송
+        for i, (p, summary) in enumerate(zip(saved_paths, summaries), start=1):
+            header = f"━━━ [{i}/{len(saved_paths)}] {p.stem} ━━━\n\n"
+            await _send_text(bot, chat_id, header + summary)
+            await _send_pdf(bot, chat_id, p, caption=f"[{i}/{len(saved_paths)}] {p.name}")
+
+        if dedup_key and sent_rpt_ids:
+            await loop.run_in_executor(None, mark_seen, dedup_key, sent_rpt_ids)
+
+        return len(saved_paths)
 
 
 # ------------------------------------------------------------------

@@ -34,6 +34,8 @@ from telegram.ext import (
     filters,
 )
 
+from src.pipeline_lock import PIPELINE_LOCK
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 HELP_TEXT = (
     "📊 *wisereport 자동 분석 봇*\n\n"
@@ -65,8 +67,8 @@ def is_authorized(update: Update) -> bool:
 
 # ------------------------------------------------------------------
 # 작업 큐 - 한 번에 하나만 실행 (wisereport 동시 로그인 충돌 방지)
+# orchestrator의 모든 봇이 PIPELINE_LOCK을 공유하므로 카테고리 봇과도 직렬화됨.
 # ------------------------------------------------------------------
-TASK_LOCK = asyncio.Lock()
 CURRENT_TASK: dict | None = None
 
 
@@ -143,11 +145,10 @@ async def _enqueue(
     update: Update, name: str, ticker: str, top: int
 ) -> None:
     """작업 큐에 추가. 다른 작업이 진행중이면 대기 안내."""
-    chat_id = update.effective_chat.id
-    if TASK_LOCK.locked() and CURRENT_TASK is not None:
+    if PIPELINE_LOCK.locked():
+        running = CURRENT_TASK['name'] if CURRENT_TASK else "다른 작업"
         await update.message.reply_text(
-            f"⏳ 다른 작업 진행중: *{CURRENT_TASK['name']}*\n"
-            f"끝나면 곧장 처리: *{name}* ({ticker}, top {top})",
+            f"⏳ 진행중: *{running}*\n끝나면 처리: *{name}* ({ticker}, top {top})",
             parse_mode=ParseMode.MARKDOWN,
         )
 
@@ -157,9 +158,9 @@ async def _enqueue(
 async def _run_pipeline(
     update: Update, name: str, ticker: str, top: int
 ) -> None:
-    """Lock 잡고 파이프라인 subprocess 실행."""
+    """Lock 잡고 파이프라인 subprocess 실행. PIPELINE_LOCK은 카테고리 봇과 공유."""
     global CURRENT_TASK
-    async with TASK_LOCK:
+    async with PIPELINE_LOCK:
         CURRENT_TASK = {"name": name, "ticker": ticker, "top": top}
         try:
             ack = await update.message.reply_text(
