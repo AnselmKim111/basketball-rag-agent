@@ -293,10 +293,20 @@ class WisereportClient:
         log.info("리포트 목록 AJAX: ticker=%s (top %d)", ticker, limit)
         if "ReportList" not in self.page.url:
             self.page.goto(REPORT_LIST_URL, wait_until="networkidle")
-            self.page.wait_for_timeout(1500)
+        # jQuery + #hiddenUserID 가 준비될 때까지 대기 (세션 재사용 경로 보호)
+        try:
+            self.page.wait_for_function(
+                "() => document.getElementById('hiddenUserID') !== null",
+                timeout=10_000,
+            )
+        except PlaywrightTimeoutError:
+            log.warning("#hiddenUserID 대기 타임아웃")
+        self.page.wait_for_timeout(500)
 
         html = self.page.evaluate(
             """async ({ticker, listType}) => {
+                const userIdEl = document.getElementById('hiddenUserID');
+                const userId = userIdEl ? userIdEl.value : '';
                 const r = await fetch('/wiseReport/reports/contentList.aspx', {
                     method: 'POST',
                     credentials: 'include',
@@ -312,7 +322,7 @@ class WisereportClient:
                         hiddenbottomgubun: 'COCODE',
                         Content: '', Start: '', End: '', docDate: '',
                         langTyp: '1', hiddenQuery: '',
-                        userId: $('#hiddenUserID').val() || '',
+                        userId: userId,
                         pageNum: '1', flashYN: '1', isoCd: '', rptTyp: '0',
                     }).toString(),
                 });
