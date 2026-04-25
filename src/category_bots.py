@@ -17,7 +17,6 @@ import re
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
-import anthropic  # noqa: F401  (downstream consistency check)
 import httpx
 from telegram import Bot, Update
 from telegram.constants import ParseMode
