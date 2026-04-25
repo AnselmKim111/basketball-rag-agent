@@ -39,8 +39,18 @@ log = logging.getLogger(__name__)
 
 BASE_URL = "https://www.wisereport.co.kr"
 REPORT_LIST_URL = f"{BASE_URL}/wiseReport/reports/ReportList.aspx"
+TOPHITS_URL = f"{BASE_URL}/wiseReport/reports/TopHits.aspx"
 CONTENT_LIST_AJAX = f"{BASE_URL}/wiseReport/reports/contentList.aspx"
 LOOKUP_URL_TPL = f"{BASE_URL}/comm/New_commdl_LookUp.aspx?type=elmCmp&searchValue={{q}}"
+
+# TopHits AJAX 엔드포인트 (카테고리별)
+# (path, rptTyp, rptSubTyp, default_min_visit)
+TOPHITS_ENDPOINTS = {
+    "company":  ("ajax/topHits_company.aspx",  "1", "0",  "100"),
+    "industry": ("ajax/topHits_Industry.aspx", "2", "0",  "100"),
+    "strategy": ("ajax/topHits_Strategy.aspx", "6", "0",  "10"),
+    "global":   ("ajax/topHits_Global.aspx",   "3", "29", "10"),
+}
 
 # wisereport.co.kr는 UA의 Win64;x64나 AppleWebKit 헤더가 들어가면 일부 JS
 # 코드 경로가 달라져 로그인 form 제출이 무력화된다. 짧은 UA를 그대로 유지하자.
@@ -359,6 +369,189 @@ class WisereportClient:
         items = items[:limit]
         log.info("파싱된 리포트: %d건", len(items))
         return items
+
+    # ------------------------------------------------------------------
+    # 조회수 Top 리포트 (산업/시황/글로벌/기업)
+    # ------------------------------------------------------------------
+    def list_top_reports(
+        self,
+        category: Literal["company", "industry", "strategy", "global"],
+        sort_by: Literal["popular", "latest"] = "popular",
+        limit: int = 10,
+        days_back: int = 7,
+        industry_gics: str | None = None,
+    ) -> list[ReportItem]:
+        """조회수 Top 페이지의 카테고리별 리포트 목록.
+
+        sort_by="popular"은 wisereport 기본 (visit_cnt 내림차순) 그대로.
+        sort_by="latest"는 응답에서 sch_dt 기준 client-side 재정렬.
+        industry_gics를 주면 해당 산업으로 필터링 (산업 카테고리에서 유용).
+        """
+        if category not in TOPHITS_ENDPOINTS:
+            raise ValueError(f"unknown category: {category}")
+        path, rpt_typ, rpt_sub_typ, min_visit = TOPHITS_ENDPOINTS[category]
+
+        # TopHits 페이지로 이동 (세션 쿠키 + JS context 보장)
+        if "TopHits" not in self.page.url:
+            self.page.goto(TOPHITS_URL, wait_until="networkidle")
+        try:
+            self.page.wait_for_function(
+                "() => document.getElementById('hiddenUserID') !== null",
+                timeout=10_000,
+            )
+        except PlaywrightTimeoutError:
+            log.warning("TopHits #hiddenUserID 대기 타임아웃")
+        self.page.wait_for_timeout(500)
+
+        from datetime import datetime, timedelta, timezone
+
+        kst = timezone(timedelta(hours=9))
+        end = datetime.now(kst).strftime("%Y%m%d")
+        start = (datetime.now(kst) - timedelta(days=days_back)).strftime("%Y%m%d")
+
+        search_typ = "gicscode" if industry_gics else "cocode"
+        search_val = industry_gics or ""
+
+        log.info(
+            "TopHits AJAX category=%s sort=%s days=%d industry=%s",
+            category, sort_by, days_back, industry_gics,
+        )
+
+        html = self.page.evaluate(
+            """async ({path, params}) => {
+                const r = await fetch(path, {
+                    method: 'POST',
+                    credentials: 'include',
+                    headers: {
+                        'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+                        'X-Requested-With': 'XMLHttpRequest',
+                    },
+                    body: new URLSearchParams(params).toString(),
+                });
+                return await r.text();
+            }""",
+            {
+                "path": "/wiseReport/reports/" + path,
+                "params": {
+                    "startDT": start,
+                    "endDt": end,
+                    "langTyp": "1",
+                    "rptTyp": rpt_typ,
+                    "rptSubTyp": rpt_sub_typ,
+                    "orderItem": "visit_cnt",
+                    "orderTyp": "d",
+                    "currentPage": "1",
+                    "limit": "",
+                    "minVisitCnt": min_visit,
+                    "searchTyp": search_typ,
+                    "searchVal": search_val,
+                    "flashYN": "1",
+                },
+            },
+        )
+
+        # gotoSearch(rpt_id, sch_db, sch_lang, sch_dt, sch_cont) 5-args
+        # (TopHits 페이지는 gotoSearchContent가 아닌 gotoSearch 사용)
+        items: list[ReportItem] = []
+        pattern = re.compile(
+            r"gotoSearch\((\d+)\s*,\s*'([^']*)'\s*,\s*'([^']*)'\s*,\s*(\d+)\s*,\s*'([^']*)'\)[^>]*>([^<]+)</a>",
+            re.S,
+        )
+        seen = set()
+        for m in pattern.finditer(html):
+            rpt_id = m.group(1)
+            if rpt_id in seen:
+                continue
+            seen.add(rpt_id)
+            items.append(
+                ReportItem(
+                    rpt_id=rpt_id,
+                    sch_db=m.group(2),
+                    sch_lang=m.group(3),
+                    sch_dt=m.group(4),
+                    sch_gubun="",
+                    sch_cont=m.group(5),
+                    title=re.sub(r"\s+", " ", m.group(6)).strip()[:200],
+                )
+            )
+
+        if sort_by == "latest":
+            items.sort(key=lambda it: it.sch_dt, reverse=True)
+        # sort_by="popular"은 응답 순서가 이미 visit_cnt 내림차순
+
+        items = items[:limit]
+        log.info("TopHits 파싱: %d건", len(items))
+        return items
+
+    # ------------------------------------------------------------------
+    # 산업명 → gicscode 룩업
+    # ------------------------------------------------------------------
+    def lookup_industry_code(self, industry_name: str) -> str | None:
+        """산업명으로 gicscode 검색.
+
+        wisereport의 popup 룩업을 이용. 회사명 룩업과 같은 방식.
+        실패해도 None 반환하고 호출자가 처리.
+        """
+        log.info("산업 코드 룩업: %s", industry_name)
+        if "ReportList" not in self.page.url:
+            self.page.goto(REPORT_LIST_URL, wait_until="networkidle")
+            self.page.wait_for_timeout(1500)
+
+        # 검색 텍스트와 gicscode 모드 활성화
+        self.page.evaluate(
+            """(name) => {
+                $('#txtSearch').val(name);
+                const $b = $('#schOpt02 [data-val="gicscode"]');
+                if ($b.length) {
+                    $('#schOpt02 [type="button"]').removeClass('on');
+                    $b.addClass('on');
+                }
+            }""",
+            industry_name,
+        )
+        try:
+            with self.page.expect_popup(timeout=10_000) as popup_info:
+                self.page.evaluate("typeof na_search_lookup === 'function' && na_search_lookup(1)")
+            popup = popup_info.value
+            popup.wait_for_load_state("networkidle", timeout=10_000)
+            popup_html = popup.content()
+            popup.close()
+        except Exception as e:
+            log.warning("산업 룩업 팝업 캡처 실패: %s", e)
+            return None
+
+        # gicscode는 보통 4~10자리 숫자/알파벳 조합. 다양한 형태가 있어 첫 후보 추출.
+        # 일반적인 코드: G2510, G45, etc. 또는 4-10자리 숫자.
+        m = re.search(r"selectInd\('([A-Z0-9]+)'", popup_html)
+        if m:
+            log.info("산업 코드 결정 (selectInd): %s", m.group(1))
+            return m.group(1)
+        # 백업: 단순 추출
+        m = re.search(r"['\"]([A-Z][0-9]{2,8}|[0-9]{4,8})['\"]\s*,\s*['\"][^'\"]+['\"]", popup_html)
+        if m:
+            log.info("산업 코드 결정 (fallback): %s", m.group(1))
+            return m.group(1)
+        log.warning("산업 코드 후보 없음")
+        return None
+
+    # ------------------------------------------------------------------
+    # 산업코드 → 리포트 목록 (인기/최신)
+    # ------------------------------------------------------------------
+    def list_industry_reports(
+        self,
+        industry_gics: str,
+        sort_by: Literal["popular", "latest"] = "popular",
+        limit: int = 5,
+        days_back: int = 30,
+    ) -> list[ReportItem]:
+        """특정 산업의 리포트 — 산업 카테고리 TopHits에서 gicscode 필터."""
+        return self.list_top_reports(
+            category="industry",
+            sort_by=sort_by,
+            limit=limit,
+            days_back=days_back,
+            industry_gics=industry_gics,
+        )
 
     # ------------------------------------------------------------------
     # 개별 PDF 다운로드

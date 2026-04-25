@@ -220,6 +220,17 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
     logging.exception("Unhandled error: %s", context.error)
 
 
+def build_company_app(token: str) -> Application:
+    """orchestrator가 import해 사용. CompanyBot의 Application을 반환."""
+    app = Application.builder().token(token).build()
+    app.add_handler(CommandHandler(["start", "help"], cmd_start))
+    app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("report", cmd_report))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
+    app.add_error_handler(error_handler)
+    return app
+
+
 def main() -> None:
     logging.basicConfig(
         level=logging.INFO,

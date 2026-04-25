@@ -28,6 +28,7 @@ MAX_PDF_TEXT_CHARS = 80_000
 
 # 요약 결과물 최대 글자수 (한국어 char 기준)
 MAX_SUMMARY_CHARS = 5_000
+MAX_SUMMARY_CHARS_SHORT = 1_000  # 카테고리(산업/시황/글로벌) 봇용 짧은 요약
 
 
 class OpenRouterCreditExhausted(RuntimeError):
@@ -63,6 +64,22 @@ INDIVIDUAL_SYSTEM_PROMPT = """당신은 한국 기업 분석 리포트를 정밀
 PER/PBR/EV-EBITDA 등 멀티플과 추정치 (있는 경우).
 
 리포트에 없는 항목은 "해당 없음" 한 줄로 처리하고 추측하지 말 것."""
+
+SHORT_SYSTEM_PROMPT = """당신은 한국 증권사·기관 리서치 리포트를 한국어 한 단락으로 요약하는 시니어 애널리스트입니다.
+
+# 출력 규칙 (엄수)
+- **전체 1000자 이내** (한국어 글자수, 공백 포함). 절대 초과 금지.
+- 최대 5-7문장. bullet 1-2개 정도면 OK.
+- 핵심 메시지 + 가장 중요한 숫자/근거 + 핵심 결론.
+- 원문에 없는 정보 추측 금지. 숫자는 단위 명시 (조원/억원/%).
+
+# 형식 예시
+[발행: 기관 / 작성자 / 날짜]
+**핵심**: 한 줄 요약.
+- 주요 근거 1 (숫자 포함)
+- 주요 근거 2 (숫자 포함)
+**결론**: 투자 시사점 1-2줄."""
+
 
 COMBINED_SYSTEM_PROMPT = """당신은 한국 기업 분석 리포트를 종합하는 시니어 애널리스트입니다.
 
@@ -189,6 +206,47 @@ def summarize_pdf(
     summary = _trim_to_chars(resp.choices[0].message.content or "")
     log.info(
         "요약 완료: %s (in=%s, out=%s, chars=%d)",
+        pdf_path.name,
+        getattr(resp.usage, "prompt_tokens", "?"),
+        getattr(resp.usage, "completion_tokens", "?"),
+        len(summary),
+    )
+    return IndividualSummary(pdf_path=pdf_path, summary_text=summary)
+
+
+def summarize_pdf_short(
+    client: OpenAI,
+    pdf_path: Path,
+    model: str = DEFAULT_MODEL,
+) -> IndividualSummary:
+    """1000자 이내 짧은 요약. 카테고리(산업/시황/글로벌) 봇용."""
+    log.info("짧은 요약 시작: %s", pdf_path.name)
+    text = _extract_pdf_text(pdf_path, max_chars=60_000)
+    if not text.strip():
+        return IndividualSummary(pdf_path=pdf_path, summary_text="(텍스트 추출 실패)")
+
+    user_msg = (
+        f"PDF: {pdf_path.name}\n"
+        "1000자 이내로 시스템 프롬프트 형식대로 요약해주세요.\n\n"
+        f"<pdf_text>\n{text}\n</pdf_text>"
+    )
+    try:
+        # 1000자 ≈ 800 토큰. max_tokens=1200 여유.
+        resp = client.chat.completions.create(
+            model=model,
+            max_tokens=1200,
+            messages=[
+                {"role": "system", "content": SHORT_SYSTEM_PROMPT},
+                {"role": "user", "content": user_msg},
+            ],
+        )
+    except APIStatusError as e:
+        if _is_credit_error(e):
+            raise OpenRouterCreditExhausted(str(e)) from e
+        raise
+    summary = _trim_to_chars(resp.choices[0].message.content or "", MAX_SUMMARY_CHARS_SHORT)
+    log.info(
+        "짧은 요약 완료: %s (in=%s, out=%s, chars=%d)",
         pdf_path.name,
         getattr(resp.usage, "prompt_tokens", "?"),
         getattr(resp.usage, "completion_tokens", "?"),

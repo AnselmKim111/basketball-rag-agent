@@ -14,5 +14,6 @@ COPY src ./src
 # Playwright 브라우저 (이미지에 이미 있지만 버전 매칭 보장)
 RUN playwright install chromium --with-deps
 
-# 봇 워커 실행
-CMD ["python", "-m", "src.bot_worker"]
+# Orchestrator: 4개 봇(company/industry/market/global) + APScheduler 동시 가동
+# 단일 봇만 실행하려면 CMD를 ["python", "-m", "src.bot_worker"] 로 변경
+CMD ["python", "-m", "src.orchestrator"]
