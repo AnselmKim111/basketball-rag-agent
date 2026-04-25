@@ -1,0 +1,18 @@
+[project]
+name = "wisereport-auto-downloader"
+version = "0.1.0"
+description = "wisereport.co.kr 자동 로그인 후 기업 리포트 PDF 다운로드 + Claude 요약"
+requires-python = ">=3.10"
+dependencies = [
+    "playwright>=1.49.0",
+    "anthropic>=0.40.0",
+    "pypdf>=5.1.0",
+    "python-dotenv>=1.0.1",
+]
+
+[project.scripts]
+wisereport = "src.main:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*"]
