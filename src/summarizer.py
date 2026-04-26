@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -192,6 +193,98 @@ def _safe_content(resp, *, context: str) -> str:
     return raw
 
 
+# ------------------------------------------------------------------
+# LLM 호출 재시도 + 폴백 모델
+# ------------------------------------------------------------------
+# 빈 응답 / 일시적 transient 에러 발생 시 application-level retry.
+# OpenAI SDK의 max_retries는 HTTP 오류만 재시도하고 빈 content는 잡지 못함.
+RETRY_BACKOFF_SECONDS = (2, 4)  # attempt 1 → 2, attempt 2 → 4초
+
+
+def chat_with_retry(
+    client: OpenAI,
+    *,
+    messages: list[dict],
+    max_tokens: int,
+    model: str | None = None,
+    temperature: float | None = None,
+    max_attempts: int = 3,
+    fallback_model: str | None = None,
+    context: str = "",
+) -> str:
+    """LLM chat 호출 + 빈 content 자동 재시도 + 폴백 모델.
+
+    동작:
+      - 1차/2차 시도: model로 호출. 빈 content 혹은 transient 에러면 backoff 후 재시도.
+      - 3차 시도(마지막): fallback_model이 있으면 그걸로, 없으면 동일 model 재호출.
+      - 결제 부족(`OpenRouterCreditExhausted`)은 즉시 raise (재시도 의미 없음).
+
+    반환:
+      - 성공 시 strip()된 content.
+      - 모든 시도 실패 시 빈 string "" — 호출자가 placeholder 처리.
+
+    인자:
+      - fallback_model 미지정 시 env `OPENROUTER_FALLBACK_MODEL` 사용.
+      - context: 로그 식별용 문자열 (예: "deepdive 업의 본질").
+    """
+    primary = model or DEFAULT_MODEL
+    fallback = fallback_model or os.getenv("OPENROUTER_FALLBACK_MODEL") or None
+    last_reason = "unknown"
+
+    for attempt in range(1, max_attempts + 1):
+        # 마지막 시도 + fallback 있으면 모델 교체
+        cur_model = fallback if (attempt == max_attempts and fallback) else primary
+        kwargs: dict = {"model": cur_model, "max_tokens": max_tokens, "messages": messages}
+        if temperature is not None:
+            kwargs["temperature"] = temperature
+
+        try:
+            resp = client.chat.completions.create(**kwargs)
+        except APIStatusError as e:
+            if _is_credit_error(e):
+                raise OpenRouterCreditExhausted(str(e)) from e
+            last_reason = f"APIStatus {e.status_code if hasattr(e, 'status_code') else '?'}"
+            log.warning(
+                "LLM call failed [%s] attempt %d/%d (model=%s): %s",
+                context, attempt, max_attempts, cur_model, last_reason,
+            )
+        except Exception as e:
+            last_reason = f"{type(e).__name__}: {str(e)[:160]}"
+            log.warning(
+                "LLM call failed [%s] attempt %d/%d (model=%s): %s",
+                context, attempt, max_attempts, cur_model, last_reason,
+            )
+        else:
+            try:
+                content = (resp.choices[0].message.content or "").strip()
+            except (IndexError, AttributeError):
+                content = ""
+                last_reason = "malformed response"
+            if content:
+                if attempt > 1:
+                    log.info(
+                        "LLM call recovered [%s] attempt %d (model=%s, chars=%d)",
+                        context, attempt, cur_model, len(content),
+                    )
+                return content
+            last_reason = "empty content (stream idle timeout 가능성)"
+            log.warning(
+                "LLM empty content [%s] attempt %d/%d (model=%s)",
+                context, attempt, max_attempts, cur_model,
+            )
+
+        # backoff (마지막 attempt 후엔 안 함)
+        if attempt < max_attempts:
+            sleep_s = RETRY_BACKOFF_SECONDS[min(attempt - 1, len(RETRY_BACKOFF_SECONDS) - 1)]
+            time.sleep(sleep_s)
+
+    log.error(
+        "LLM call all attempts failed [%s] (max=%d, last=%s)",
+        context, max_attempts, last_reason,
+    )
+    return ""
+
+
 def summarize_pdf(
     client: OpenAI,
     pdf_path: Path,
@@ -209,29 +302,24 @@ def summarize_pdf(
         f"<pdf_text>\n{text}\n</pdf_text>"
     )
 
-    try:
-        # 5000자 ≈ 한국어 기준 ~3500 토큰. 여유 4000.
-        resp = client.chat.completions.create(
-            model=model,
-            max_tokens=4000,
-            messages=[
-                {"role": "system", "content": INDIVIDUAL_SYSTEM_PROMPT},
-                {"role": "user", "content": user_msg},
-            ],
-        )
-    except APIStatusError as e:
-        if _is_credit_error(e):
-            raise OpenRouterCreditExhausted(str(e)) from e
-        raise
-
-    summary = _trim_to_chars(_safe_content(resp, context=f"summarize_pdf {pdf_path.name}"))
-    log.info(
-        "요약 완료: %s (in=%s, out=%s, chars=%d)",
-        pdf_path.name,
-        getattr(resp.usage, "prompt_tokens", "?"),
-        getattr(resp.usage, "completion_tokens", "?"),
-        len(summary),
+    # 5000자 ≈ 한국어 기준 ~3500 토큰. 여유 4000.
+    content = chat_with_retry(
+        client,
+        model=model,
+        max_tokens=4000,
+        messages=[
+            {"role": "system", "content": INDIVIDUAL_SYSTEM_PROMPT},
+            {"role": "user", "content": user_msg},
+        ],
+        context=f"summarize_pdf {pdf_path.name}",
     )
+    if not content:
+        return IndividualSummary(
+            pdf_path=pdf_path,
+            summary_text="(LLM 빈 응답이 3회 연속 — 모델/네트워크 일시 장애. 잠시 후 재시도)",
+        )
+    summary = _trim_to_chars(content)
+    log.info("요약 완료: %s (chars=%d)", pdf_path.name, len(summary))
     return IndividualSummary(pdf_path=pdf_path, summary_text=summary)
 
 
@@ -251,31 +339,24 @@ def summarize_pdf_short(
         "1000자 이내로 시스템 프롬프트 형식대로 요약해주세요.\n\n"
         f"<pdf_text>\n{text}\n</pdf_text>"
     )
-    try:
-        # 1000자 ≈ 800 토큰. max_tokens=1200 여유.
-        resp = client.chat.completions.create(
-            model=model,
-            max_tokens=1200,
-            messages=[
-                {"role": "system", "content": SHORT_SYSTEM_PROMPT},
-                {"role": "user", "content": user_msg},
-            ],
+    # 1000자 ≈ 800 토큰. max_tokens=1200 여유.
+    content = chat_with_retry(
+        client,
+        model=model,
+        max_tokens=1200,
+        messages=[
+            {"role": "system", "content": SHORT_SYSTEM_PROMPT},
+            {"role": "user", "content": user_msg},
+        ],
+        context=f"summarize_pdf_short {pdf_path.name}",
+    )
+    if not content:
+        return IndividualSummary(
+            pdf_path=pdf_path,
+            summary_text="(LLM 빈 응답이 3회 연속 — 모델/네트워크 일시 장애. 잠시 후 재시도)",
         )
-    except APIStatusError as e:
-        if _is_credit_error(e):
-            raise OpenRouterCreditExhausted(str(e)) from e
-        raise
-    summary = _trim_to_chars(
-        _safe_content(resp, context=f"summarize_pdf_short {pdf_path.name}"),
-        MAX_SUMMARY_CHARS_SHORT,
-    )
-    log.info(
-        "짧은 요약 완료: %s (in=%s, out=%s, chars=%d)",
-        pdf_path.name,
-        getattr(resp.usage, "prompt_tokens", "?"),
-        getattr(resp.usage, "completion_tokens", "?"),
-        len(summary),
-    )
+    summary = _trim_to_chars(content, MAX_SUMMARY_CHARS_SHORT)
+    log.info("짧은 요약 완료: %s (chars=%d)", pdf_path.name, len(summary))
     return IndividualSummary(pdf_path=pdf_path, summary_text=summary)
 
 
@@ -296,20 +377,19 @@ def summarize_combined(
         "시스템 프롬프트의 형식대로 5000자 이내 종합 분석을 작성해주세요.\n\n"
         f"{bundled_text}"
     )
-    try:
-        resp = client.chat.completions.create(
-            model=model,
-            max_tokens=4000,
-            messages=[
-                {"role": "system", "content": COMBINED_SYSTEM_PROMPT},
-                {"role": "user", "content": user_msg},
-            ],
-        )
-    except APIStatusError as e:
-        if _is_credit_error(e):
-            raise OpenRouterCreditExhausted(str(e)) from e
-        raise
-    return _trim_to_chars(_safe_content(resp, context=f"summarize_combined {company_name}"))
+    content = chat_with_retry(
+        client,
+        model=model,
+        max_tokens=4000,
+        messages=[
+            {"role": "system", "content": COMBINED_SYSTEM_PROMPT},
+            {"role": "user", "content": user_msg},
+        ],
+        context=f"summarize_combined {company_name}",
+    )
+    if not content:
+        return "(종합 요약 LLM 빈 응답이 3회 연속 — 모델/네트워크 일시 장애. 잠시 후 재시도)"
+    return _trim_to_chars(content)
 
 
 def write_report(
