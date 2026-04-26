@@ -22,6 +22,10 @@ from typing import Optional
 
 log = logging.getLogger(__name__)
 
+# 단일 리포트 텍스트를 LLM에 보낼 때 자르는 길이 (앞 60% + 뒤 40%).
+# 한국 증권사 리포트 PDF는 forward 표가 후반부에 있는 경우가 많아 양 끝을 함께 봄.
+FORWARD_TEXT_WINDOW = 40_000
+
 
 _FORWARD_SYS_PROMPT = """당신은 한국 분석가 리포트에서 forward 전망 숫자를 추출하는 데이터 추출기입니다.
 JSON으로만 출력하세요. 자연어 설명·markdown·코드펜스 절대 금지.
@@ -104,7 +108,7 @@ def from_wisereport(wctx) -> dict[str, dict[str, Optional[float]]]:
 def _extract_one(client, model: str, title: str, text: str) -> Optional[dict]:
     """단일 리포트 텍스트에서 forward JSON 추출. 어느 단계 실패해도 None."""
     # forward 신호가 후반부에 있는 경우가 많아 텍스트 끝부분도 함께 보내기
-    snippet = _smart_text_snippet(text, max_chars=40_000)
+    snippet = _smart_text_snippet(text, max_chars=FORWARD_TEXT_WINDOW)
     try:
         resp = client.chat.completions.create(
             model=model,
