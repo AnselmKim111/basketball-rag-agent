@@ -41,6 +41,17 @@ PERIODIC_REPORT_CODES = ("A001", "A002", "A003")  # 사업/반기/분기
 # 보수적으로 보고서명 텍스트 매칭도 함께 사용
 IR_REPORT_CODES = ("I001",)
 
+# IR 자료로 인정할 보고서명 키워드 (substring match, 대소문자 구분).
+# 컨퍼런스콜·어닝콜·실적설명회 같이 PDF 첨부가 더 잘 붙어있는 종류까지 포함.
+IR_KEYWORDS = (
+    "IR자료", "IR공시", "IR ",
+    "실적발표", "실적설명회", "실적 설명회", "실적 발표",
+    "기업설명회", "투자설명회", "사업설명회",
+    "컨퍼런스콜", "컨퍼런스 콜", "어닝콜", "어닝 콜",
+    "Earnings", "Conference Call", "Investor Day", "Analyst Day",
+    "분석가 간담회", "분석가간담회", "애널리스트",
+)
+
 
 @dataclass
 class DartReport:
@@ -242,13 +253,19 @@ def fetch_latest_business_report(corp_code: str) -> DartReport | None:
     return None
 
 
-def fetch_ir_candidates(corp_code: str, days_back: int = 365) -> list[DartReport]:
-    """최근 IR자료/실적발표 후보 리스트 (날짜 내림차순). 빈 리스트 가능."""
+def fetch_ir_candidates(corp_code: str, days_back: int = 365 * 5) -> list[DartReport]:
+    """최근 IR자료/실적발표/컨퍼런스콜 등 후보 리스트 (날짜 내림차순). 빈 리스트 가능.
+
+    PDF 첨부 비율을 높이기 위해 5년치까지 수집. 키워드는 IR_KEYWORDS 참조.
+    """
     today = datetime.now(KST).strftime("%Y%m%d")
     bgn_de = (datetime.now(KST) - timedelta(days=days_back)).strftime("%Y%m%d")
 
     seen_rcept: set[str] = set()
     candidates: list[DartReport] = []
+
+    def _matches(nm: str) -> bool:
+        return any(kw in nm for kw in IR_KEYWORDS)
 
     # 1순위: pblntf_detail_ty=I001 (거래소 공시 - IR자료)
     for code in IR_REPORT_CODES:
@@ -257,13 +274,13 @@ def fetch_ir_candidates(corp_code: str, days_back: int = 365) -> list[DartReport
             "bgn_de": bgn_de,
             "end_de": today,
             "pblntf_detail_ty": code,
-            "page_count": 30,
+            "page_count": 100,
         })
         if not data:
             continue
         for it in data.get("list") or []:
             nm = it.get("report_nm", "")
-            if any(kw in nm for kw in ("IR", "실적발표", "기업설명회", "투자설명회", "컨퍼런스콜", "사업설명회")):
+            if _matches(nm):
                 rcept = it["rcept_no"]
                 if rcept in seen_rcept:
                     continue
@@ -273,17 +290,24 @@ def fetch_ir_candidates(corp_code: str, days_back: int = 365) -> list[DartReport
                     rcept_dt=it["rcept_dt"], flr_nm=it.get("flr_nm", ""),
                 ))
 
-    # 2순위: 전체 공시에서 IR 키워드 매칭
-    data = _get("list.json", {
-        "corp_code": corp_code,
-        "bgn_de": bgn_de,
-        "end_de": today,
-        "page_count": 50,
-    })
-    if data:
-        for it in data.get("list") or []:
+    # 2순위: 전체 공시에서 IR 키워드 매칭 (페이지 여러 장 순회)
+    for page_no in range(1, 4):  # 최대 300건 (page_count=100 * 3 페이지)
+        data = _get("list.json", {
+            "corp_code": corp_code,
+            "bgn_de": bgn_de,
+            "end_de": today,
+            "page_count": 100,
+            "page_no": page_no,
+        })
+        if not data:
+            break
+        items = data.get("list") or []
+        if not items:
+            break
+        any_added = False
+        for it in items:
             nm = it.get("report_nm", "")
-            if any(kw in nm for kw in ("IR자료", "실적발표", "기업설명회", "투자설명회", "사업설명회")):
+            if _matches(nm):
                 rcept = it["rcept_no"]
                 if rcept in seen_rcept:
                     continue
@@ -292,9 +316,17 @@ def fetch_ir_candidates(corp_code: str, days_back: int = 365) -> list[DartReport
                     rcept_no=rcept, report_nm=nm,
                     rcept_dt=it["rcept_dt"], flr_nm=it.get("flr_nm", ""),
                 ))
+                any_added = True
+        # 다음 페이지에 더 오래된 데이터만 있고 마지막 페이지면 종료
+        if data.get("total_page") and page_no >= int(data["total_page"]):
+            break
+        if not any_added and page_no >= 1:
+            # 페이지에 매칭 없으면 더 멀리까지 안 봐도 됨 (보수적으로 page 2까지는 봄)
+            if page_no >= 2:
+                break
 
     candidates.sort(key=lambda x: x.rcept_dt, reverse=True)
-    log.info("IR 후보 수집: %d건 (corp_code=%s)", len(candidates), corp_code)
+    log.info("IR 후보 수집: %d건 (corp_code=%s, days_back=%d)", len(candidates), corp_code, days_back)
     return candidates
 
 
@@ -305,25 +337,29 @@ def fetch_latest_ir_doc(corp_code: str) -> DartReport | None:
 
 
 def fetch_latest_ir_with_pdf(
-    corp_code: str, target_dir: Path, max_attempts: int = 5,
+    corp_code: str, target_dir: Path, max_attempts: int = 15, days_back: int = 365 * 5,
 ) -> tuple[DartReport, Path] | None:
     """가장 최근 IR 공시 중 PDF 첨부가 있는 첫 번째를 다운로드.
 
     후보를 max_attempts개까지 순차 다운받아 PDF가 있는 것 발견 즉시 반환.
-    PDF 있는 후보 없으면 None.
+    PDF 있는 후보 없으면 None. 후보가 없는 경우도 None.
+
+    days_back을 길게 잡는 이유: 최근 IR자료가 텍스트 공시뿐인 케이스를 위해
+    과거의 컨퍼런스콜·실적발표 PDF까지 폴백.
     """
-    candidates = fetch_ir_candidates(corp_code)
+    candidates = fetch_ir_candidates(corp_code, days_back=days_back)
     if not candidates:
         return None
 
     target_dir.mkdir(parents=True, exist_ok=True)
+    n_try = min(max_attempts, len(candidates))
     for i, cand in enumerate(candidates[:max_attempts]):
-        log.info("IR 후보 %d/%d 다운로드 시도: %s (%s)", i + 1, min(max_attempts, len(candidates)), cand.report_nm, cand.rcept_dt)
+        log.info("IR 후보 %d/%d 다운로드 시도: %s (%s)", i + 1, n_try, cand.report_nm, cand.rcept_dt)
         pdf = download_report_archive(cand.rcept_no, target_dir, require_pdf=True)
         if pdf:
-            log.info("IR PDF 발견: %s → %s", cand.report_nm, pdf.name)
+            log.info("IR PDF 발견: %s (%s) → %s", cand.report_nm, cand.rcept_dt, pdf.name)
             return cand, pdf
-    log.info("IR 공시 %d개 시도했으나 PDF 첨부 없음", min(max_attempts, len(candidates)))
+    log.info("IR 공시 %d개 시도했으나 PDF 첨부 없음 (corp_code=%s)", n_try, corp_code)
     return None
 
 

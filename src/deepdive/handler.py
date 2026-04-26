@@ -235,13 +235,12 @@ async def _execute(bot, chat_id: int, ticker: str) -> None:
                 text=f"⚠️ 업의 본질 요약 실패: {type(e).__name__}: {str(e)[:300]}",
             )
 
-    # 4) IR자료: 최근 IR 후보 중 PDF 첨부 있는 첫 번째 자동 선택
+    # 4) IR자료: 최근 5년 IR 후보 중 PDF 첨부 있는 첫 번째 자동 선택.
+    #    PDF 못 찾으면 wisereport 컨텍스트만으로 투자포인트 작성 (graceful fallback).
     ir_pair = await loop.run_in_executor(
         None, dart_client.fetch_latest_ir_with_pdf, corp_code, download_root,
     )
-    if not ir_pair:
-        await bot.send_message(chat_id=chat_id, text="ℹ️ 최근 IR 공시(PDF 첨부) 없음 — 투자포인트 단계 스킵")
-    else:
+    if ir_pair:
         ir_meta, ir_pdf = ir_pair
         try:
             await _summarize_and_send(
@@ -250,6 +249,7 @@ async def _execute(bot, chat_id: int, ticker: str) -> None:
                 prompt_name="deepdive_ir",
                 header=f"💡 *핵심 투자 포인트* ({ir_meta.report_nm})",
                 prefer_section=None,  # IR자료는 전체 본문 사용
+                extra_context=wisereport_ctx_text,  # 보조 컨텍스트로도 같이
             )
         except Exception as e:
             log.exception("IR 요약 실패")
@@ -257,6 +257,31 @@ async def _execute(bot, chat_id: int, ticker: str) -> None:
                 chat_id=chat_id,
                 text=f"⚠️ IR 요약 실패: {type(e).__name__}: {str(e)[:300]}",
             )
+    elif wisereport_ctx_text:
+        await bot.send_message(
+            chat_id=chat_id,
+            text="ℹ️ DART IR PDF 미발견 — wisereport 분석가 리포트로 투자 포인트 작성",
+        )
+        try:
+            await _summarize_and_send(
+                bot, chat_id,
+                pdf_path=None,
+                prompt_name="deepdive_ir_fallback",
+                header="💡 *핵심 투자 포인트* (외부 분석 기반)",
+                prefer_section=None,
+                extra_context=wisereport_ctx_text,
+            )
+        except Exception as e:
+            log.exception("IR 폴백 요약 실패")
+            await bot.send_message(
+                chat_id=chat_id,
+                text=f"⚠️ IR 폴백 요약 실패: {type(e).__name__}: {str(e)[:300]}",
+            )
+    else:
+        await bot.send_message(
+            chat_id=chat_id,
+            text="ℹ️ DART IR PDF 미발견 + wisereport 컨텍스트도 없음 — 투자포인트 스킵",
+        )
 
     # 5) 분기별 재무 + 차트
     try:
@@ -328,12 +353,13 @@ def _format_wisereport_context(wctx) -> Optional[str]:
 
 
 async def _summarize_and_send(
-    bot, chat_id: int, pdf_path: Path, prompt_name: str, header: str,
+    bot, chat_id: int, pdf_path: Optional[Path], prompt_name: str, header: str,
     prefer_section: Optional[str] = None,
     extra_context: Optional[str] = None,
 ) -> None:
     """공통 헬퍼: DART 보고서 (PDF 또는 XML/HTML) → 텍스트 추출 → LLM 요약 → 발송.
 
+    pdf_path=None 이면 PDF 텍스트 단계는 스킵하고 extra_context만으로 요약.
     extra_context: 시스템 프롬프트에 추가로 주입할 보조 자료 (예: wisereport 리포트 텍스트).
     내부에서 모든 예외를 catch해 문자열로 반환 — _summarize_and_send 자체는
     최대한 raise하지 않게 (상위 핸들러의 try/except 의존도 줄임).
@@ -345,18 +371,22 @@ async def _summarize_and_send(
     loop = asyncio.get_running_loop()
 
     def _do_summary() -> str:
-        # 1) 텍스트 추출
-        try:
-            text = dart_client.extract_doc_text(
-                pdf_path, max_chars=80_000,
-                prefer_section=prefer_section or "",
-            )
-        except Exception as e:
-            log.exception("extract_doc_text 호출 자체 예외")
-            return f"(텍스트 추출 예외: {type(e).__name__}: {str(e)[:200]})"
+        # 1) 텍스트 추출 (pdf_path가 있을 때만)
+        text = ""
+        if pdf_path is not None:
+            try:
+                text = dart_client.extract_doc_text(
+                    pdf_path, max_chars=80_000,
+                    prefer_section=prefer_section or "",
+                )
+            except Exception as e:
+                log.exception("extract_doc_text 호출 자체 예외")
+                return f"(텍스트 추출 예외: {type(e).__name__}: {str(e)[:200]})"
+            if not text.strip() and not extra_context:
+                return f"(보고서 텍스트 추출 결과 빈 문자열 - file={pdf_path.name})"
 
-        if not text.strip():
-            return f"(보고서 텍스트 추출 결과 빈 문자열 - file={pdf_path.name})"
+        if not text.strip() and not extra_context:
+            return "(요약할 텍스트와 컨텍스트가 모두 비어있음)"
 
         # 2) 프롬프트 로드 (fallback 포함, 거의 raise 안 함)
         try:
@@ -373,11 +403,17 @@ async def _summarize_and_send(
             return f"(LLM 초기화 실패: {type(e).__name__}: {str(e)[:200]})"
 
         # 4) LLM 호출 - 모든 예외 catch
-        user_msg = (
-            f"파일: {pdf_path.name}\n"
-            "1000자 이내로 시스템 프롬프트 형식대로 요약해주세요.\n\n"
-            f"<doc_text>\n{text}\n</doc_text>"
-        )
+        if pdf_path is not None and text.strip():
+            user_msg = (
+                f"파일: {pdf_path.name}\n"
+                "1000자 이내로 시스템 프롬프트 형식대로 요약해주세요.\n\n"
+                f"<doc_text>\n{text}\n</doc_text>"
+            )
+        else:
+            user_msg = (
+                "회사가 직접 발표한 IR PDF가 없어 외부 분석가/산업 리포트로 작성합니다.\n"
+                "1000자 이내로 시스템 프롬프트 형식대로 작성해주세요."
+            )
         if extra_context:
             user_msg += f"\n\n<wisereport_context>\n{extra_context}\n</wisereport_context>"
         try:
