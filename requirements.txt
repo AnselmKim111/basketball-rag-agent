@@ -9,3 +9,4 @@ tzdata>=2024.1
 # deepdive 기능
 matplotlib>=3.8
 beautifulsoup4>=4.12
+lxml>=5.0

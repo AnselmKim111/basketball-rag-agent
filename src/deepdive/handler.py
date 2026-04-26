@@ -156,6 +156,7 @@ async def _execute(bot, chat_id: int, ticker: str) -> None:
                 pdf_path=report_pdf,
                 prompt_name="deepdive_business",
                 header="🏢 *업의 본질*",
+                prefer_section="사업의 내용",
             )
         except Exception:
             log.exception("업의 본질 요약 실패")
@@ -176,6 +177,7 @@ async def _execute(bot, chat_id: int, ticker: str) -> None:
                     pdf_path=ir_pdf,
                     prompt_name="deepdive_ir",
                     header=f"💡 *핵심 투자 포인트* ({ir_meta.report_nm})",
+                    prefer_section=None,  # IR자료는 전체 본문 사용
                 )
             except Exception:
                 log.exception("IR 요약 실패")
@@ -239,18 +241,24 @@ async def _execute(bot, chat_id: int, ticker: str) -> None:
 
 
 async def _summarize_and_send(
-    bot, chat_id: int, pdf_path: Path, prompt_name: str, header: str
+    bot, chat_id: int, pdf_path: Path, prompt_name: str, header: str,
+    prefer_section: Optional[str] = None,
 ) -> None:
-    """공통 헬퍼: PDF → 텍스트 추출 → LLM 요약 → 텔레그램 발송."""
+    """공통 헬퍼: DART 보고서 (PDF 또는 XML/HTML) → 텍스트 추출 → LLM 요약 → 발송."""
     from src.deepdive import prompts as prompt_loader
+    from src.deepdive import dart_client
     from src import summarizer
 
     loop = asyncio.get_running_loop()
 
     def _do_summary() -> str:
-        text = summarizer._extract_pdf_text(pdf_path, max_chars=80_000)
+        # PDF/XML/HTML 통합 추출 (DART 사업보고서는 보통 XML)
+        text = dart_client.extract_doc_text(
+            pdf_path, max_chars=80_000,
+            prefer_section=prefer_section or "",
+        )
         if not text.strip():
-            return "(PDF 텍스트 추출 실패)"
+            return "(보고서 텍스트 추출 실패)"
         sys_prompt = prompt_loader.load(prompt_name)
         client = summarizer.get_client()
         try:
@@ -260,9 +268,9 @@ async def _summarize_and_send(
                 messages=[
                     {"role": "system", "content": sys_prompt},
                     {"role": "user", "content": (
-                        f"PDF: {pdf_path.name}\n"
+                        f"파일: {pdf_path.name}\n"
                         "1000자 이내로 시스템 프롬프트 형식대로 요약해주세요.\n\n"
-                        f"<pdf_text>\n{text}\n</pdf_text>"
+                        f"<doc_text>\n{text}\n</doc_text>"
                     )},
                 ],
             )

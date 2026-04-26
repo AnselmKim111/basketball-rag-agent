@@ -343,19 +343,37 @@ def fetch_quarterly_financials(corp_code: str, years: int = 3) -> FinancialMetri
 
 
 def _extract_pl_metrics(items: list[dict]) -> tuple[int, int, int] | None:
-    """fnlttSinglAcntAll 결과에서 매출액/영업이익/당기순이익 YTD 추출 (백만원)."""
+    """fnlttSinglAcntAll 결과에서 매출액/영업이익/당기순이익 YTD(누적) 추출 (원 단위).
+
+    DART API의 IS/CIS 항목에는 두 금액 필드가 있다:
+      - thstrm_amount: 당분기 standalone (3개월)
+      - thstrm_add_amount: 당기 누적 (반기 6개월/3분기 9개월/연간 12개월 = YTD)
+
+    우리는 분기 단위 추출을 위해 YTD를 사용 (Q2 = 반기누적 - Q1, ...).
+    1Q/연간 보고서에서는 add_amount가 비어있을 수 있으므로 standalone fallback.
+    """
+    def _parse(s) -> int | None:
+        if not s:
+            return None
+        try:
+            return int(str(s).replace(",", "").strip())
+        except (ValueError, AttributeError):
+            return None
+
     rev = op = net = None
     for it in items:
         sj = it.get("sj_div", "")  # IS=손익계산서, CIS=포괄손익계산서
         if sj not in ("IS", "CIS"):
             continue
         nm = (it.get("account_nm") or "").replace(" ", "")
-        amount_str = (it.get("thstrm_amount") or "0").replace(",", "")
-        try:
-            amount = int(amount_str)
-        except (ValueError, TypeError):
+
+        # 누적(YTD) 우선, 없으면 standalone
+        add_amt = _parse(it.get("thstrm_add_amount"))
+        std_amt = _parse(it.get("thstrm_amount"))
+        amount = add_amt if add_amt is not None else std_amt
+        if amount is None:
             continue
-        # 단위: 원 → 백만원으로 변환은 하지 않음 (DART는 보통 원 단위)
+
         if rev is None and ("매출액" in nm or "수익(매출액)" in nm or nm == "영업수익"):
             rev = amount
         elif op is None and "영업이익" in nm and "영업이익률" not in nm:
@@ -365,3 +383,157 @@ def _extract_pl_metrics(items: list[dict]) -> tuple[int, int, int] | None:
     if rev is None:
         return None
     return rev, op or 0, net or 0
+
+
+# ------------------------------------------------------------------
+# 4) 보고서 본문 텍스트 추출 (PDF / XML / HTML 통합)
+# ------------------------------------------------------------------
+def extract_doc_text(path: Path, max_chars: int = 80_000, prefer_section: str = "사업의 내용") -> str:
+    """DART 보고서 파일에서 텍스트 추출.
+
+    DART는 사업보고서를 자체 XML 포맷으로 제공 (PDF 아님). 파일 확장자에 따라
+    적절한 파서 선택. 가능하면 'prefer_section'에 해당하는 섹션만 추출,
+    못 찾으면 전체 텍스트 + 앞에서부터 max_chars로 잘림.
+
+    실패 시 빈 문자열 반환 (예외 던지지 않음).
+    """
+    if not path or not path.exists():
+        return ""
+
+    ext = path.suffix.lower()
+    try:
+        if ext == ".pdf":
+            return _extract_pdf(path, max_chars)
+        elif ext in (".xml", ".html", ".htm"):
+            return _extract_xml_or_html(path, max_chars, prefer_section)
+        elif ext in (".txt",):
+            return path.read_text(encoding="utf-8", errors="ignore")[:max_chars]
+        else:
+            # 알 수 없는 형식: 일단 텍스트로 시도
+            try:
+                return path.read_text(encoding="utf-8", errors="ignore")[:max_chars]
+            except Exception:
+                return ""
+    except Exception:
+        log.exception("보고서 본문 텍스트 추출 실패: %s", path)
+        return ""
+
+
+def _extract_pdf(path: Path, max_chars: int) -> str:
+    from pypdf import PdfReader
+    reader = PdfReader(str(path))
+    parts: list[str] = []
+    total = 0
+    for i, page in enumerate(reader.pages, start=1):
+        text = (page.extract_text() or "").strip()
+        if not text:
+            continue
+        chunk = f"[Page {i}]\n{text}"
+        parts.append(chunk)
+        total += len(chunk)
+        if total >= max_chars:
+            parts.append(f"\n... (이후 {len(reader.pages) - i}페이지 생략)")
+            break
+    return "\n\n".join(parts)
+
+
+def _extract_xml_or_html(path: Path, max_chars: int, prefer_section: str | None) -> str:
+    """DART XML/HTML 보고서에서 텍스트 추출.
+
+    DART XML 구조 예시:
+      <DOCUMENT>
+        <SECTION-1>
+          <TITLE>I. 회사의 개요</TITLE>
+          ...
+        </SECTION-1>
+        <SECTION-1>
+          <TITLE>II. 사업의 내용</TITLE>  ← prefer_section과 매칭
+          ...
+        </SECTION-1>
+      </DOCUMENT>
+
+    'prefer_section'이 들어 있는 섹션을 우선 추출. 못 찾으면 전체.
+    """
+    from bs4 import BeautifulSoup
+
+    raw = path.read_bytes()
+    # 인코딩 감지
+    text_content: str = ""
+    for enc in ("utf-8", "cp949", "euc-kr"):
+        try:
+            text_content = raw.decode(enc)
+            break
+        except UnicodeDecodeError:
+            continue
+    if not text_content:
+        text_content = raw.decode("utf-8", errors="ignore")
+
+    # XML/HTML 파서로 시도
+    soup = None
+    for parser in ("lxml-xml", "xml", "html.parser"):
+        try:
+            soup = BeautifulSoup(text_content, parser)
+            break
+        except Exception:
+            continue
+    if soup is None:
+        return text_content[:max_chars]
+
+    # prefer_section 검색 - 모든 태그를 순회하며 텍스트가 일치하는 노드 찾기.
+    # prefer_section이 비어있으면 섹션 검색 skip → 전체 본문 사용.
+    target_text: str = ""
+    if not prefer_section:
+        target_text = soup.get_text(separator="\n", strip=True)
+        return target_text[:max_chars]
+
+    def _is_section_tag(t) -> bool:
+        if not getattr(t, "name", None):
+            return False
+        return "section" in t.name.lower()
+
+    # 직접 텍스트(자식 태그 제외)에 prefer_section이 들어있는 leaf-like 태그 찾기.
+    # find_all(True)는 DOCUMENT 루트부터 시작하므로 .get_text()로 검색하면
+    # 루트가 매칭되어 버림. direct text만 봐야 TITLE 노드를 정확히 잡음.
+    title_tag = None
+    for tag in soup.find_all(True):
+        direct = "".join(c for c in tag.contents if isinstance(c, str)).strip()
+        if not direct:
+            continue
+        if prefer_section in direct and len(direct) < 80:
+            title_tag = tag
+            break
+
+    if title_tag is not None:
+        # 가장 가까운 SECTION-* 부모 찾기
+        parent = title_tag.find_parent(_is_section_tag)
+        if parent is not None:
+            target_text = parent.get_text(separator="\n", strip=True)
+        else:
+            # 부모 SECTION 없으면, title_tag의 부모를 기준으로 형제 노드 수집,
+            # 다음 SECTION 만나면 중단
+            container = title_tag.parent or title_tag
+            collected: list[str] = [title_tag.get_text(separator="\n", strip=True)]
+            sibling = title_tag
+            total = sum(len(s) for s in collected)
+            while sibling.next_sibling and total < max_chars:
+                sibling = sibling.next_sibling
+                if _is_section_tag(sibling):
+                    break
+                txt = (
+                    sibling.get_text(separator="\n", strip=True)
+                    if hasattr(sibling, "get_text")
+                    else str(sibling).strip()
+                )
+                if txt:
+                    collected.append(txt)
+                    total += len(txt)
+            target_text = "\n".join(collected)
+
+    if not target_text:
+        # 섹션 못 찾으면 전체 텍스트
+        target_text = soup.get_text(separator="\n", strip=True)
+        log.info("'%s' 섹션을 찾지 못함 → 전체 본문 사용", prefer_section)
+    else:
+        log.info("'%s' 섹션 추출 성공 (%d자)", prefer_section, len(target_text))
+
+    return target_text[:max_chars]
