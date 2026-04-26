@@ -38,8 +38,7 @@ HELP_TEXT = (
     "*분석 항목:*\n"
     "  1️⃣ DART 사업보고서 → 업의 본질 (1000자)\n"
     "  2️⃣ DART IR자료 → 핵심 투자 포인트 (1000자)\n"
-    "  3️⃣ 분기별 매출·영업이익·순이익 차트 (3년 + Forward)\n"
-    "  4️⃣ 사업보고서 PDF 원본\n\n"
+    "  3️⃣ 분기별 매출·영업이익·순이익 차트 (3년 + Forward)\n\n"
     "_⏱️ 약 5-10분 소요_\n"
     "_프롬프트 수정: GitHub `prompts/deepdive_*.txt` 편집 후 push_"
 )
@@ -343,14 +342,6 @@ async def _execute(bot, chat_id: int, ticker: str) -> None:
             await bot.send_message(chat_id=chat_id, text="⚠️ 차트 단계 실패 (계속 진행)")
     else:
         await bot.send_message(chat_id=chat_id, text="ℹ️ 분기별 재무 데이터 없음 — 차트 스킵")
-
-    # 6) 사업보고서 PDF 원본 발송 (50MB 초과는 send_pdf 내부에서 graceful 스킵)
-    if report_pdf and report_pdf.exists():
-        from src.bot_helpers import send_pdf
-        await send_pdf(
-            bot, chat_id, report_pdf,
-            caption=f"📄 {corp_name} {report.report_nm}",
-        )
 
     await bot.send_message(chat_id=chat_id, text=f"✅ *{corp_name}* 심층분석 완료", parse_mode=ParseMode.MARKDOWN)
 
