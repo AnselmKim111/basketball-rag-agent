@@ -242,18 +242,19 @@ def fetch_latest_business_report(corp_code: str) -> DartReport | None:
     return None
 
 
-def fetch_latest_ir_doc(corp_code: str) -> DartReport | None:
-    """가장 최근 IR자료/실적발표/사업설명회 메타데이터."""
+def fetch_ir_candidates(corp_code: str, days_back: int = 365) -> list[DartReport]:
+    """최근 IR자료/실적발표 후보 리스트 (날짜 내림차순). 빈 리스트 가능."""
     today = datetime.now(KST).strftime("%Y%m%d")
-    six_months_ago = (datetime.now(KST) - timedelta(days=200)).strftime("%Y%m%d")
+    bgn_de = (datetime.now(KST) - timedelta(days=days_back)).strftime("%Y%m%d")
 
+    seen_rcept: set[str] = set()
     candidates: list[DartReport] = []
 
     # 1순위: pblntf_detail_ty=I001 (거래소 공시 - IR자료)
     for code in IR_REPORT_CODES:
         data = _get("list.json", {
             "corp_code": corp_code,
-            "bgn_de": six_months_ago,
+            "bgn_de": bgn_de,
             "end_de": today,
             "pblntf_detail_ty": code,
             "page_count": 30,
@@ -263,43 +264,77 @@ def fetch_latest_ir_doc(corp_code: str) -> DartReport | None:
         for it in data.get("list") or []:
             nm = it.get("report_nm", "")
             if any(kw in nm for kw in ("IR", "실적발표", "기업설명회", "투자설명회", "컨퍼런스콜", "사업설명회")):
+                rcept = it["rcept_no"]
+                if rcept in seen_rcept:
+                    continue
+                seen_rcept.add(rcept)
                 candidates.append(DartReport(
-                    rcept_no=it["rcept_no"], report_nm=nm,
+                    rcept_no=rcept, report_nm=nm,
                     rcept_dt=it["rcept_dt"], flr_nm=it.get("flr_nm", ""),
                 ))
 
-    # 2순위: 전체 공시 검색에서 IR 키워드 포함 보고서
-    if not candidates:
-        data = _get("list.json", {
-            "corp_code": corp_code,
-            "bgn_de": six_months_ago,
-            "end_de": today,
-            "page_count": 30,
-        })
-        if data:
-            for it in data.get("list") or []:
-                nm = it.get("report_nm", "")
-                if any(kw in nm for kw in ("IR자료", "실적발표", "기업설명회", "투자설명회", "사업설명회")):
-                    candidates.append(DartReport(
-                        rcept_no=it["rcept_no"], report_nm=nm,
-                        rcept_dt=it["rcept_dt"], flr_nm=it.get("flr_nm", ""),
-                    ))
-
-    if not candidates:
-        log.info("IR 자료 없음: corp_code=%s", corp_code)
-        return None
+    # 2순위: 전체 공시에서 IR 키워드 매칭
+    data = _get("list.json", {
+        "corp_code": corp_code,
+        "bgn_de": bgn_de,
+        "end_de": today,
+        "page_count": 50,
+    })
+    if data:
+        for it in data.get("list") or []:
+            nm = it.get("report_nm", "")
+            if any(kw in nm for kw in ("IR자료", "실적발표", "기업설명회", "투자설명회", "사업설명회")):
+                rcept = it["rcept_no"]
+                if rcept in seen_rcept:
+                    continue
+                seen_rcept.add(rcept)
+                candidates.append(DartReport(
+                    rcept_no=rcept, report_nm=nm,
+                    rcept_dt=it["rcept_dt"], flr_nm=it.get("flr_nm", ""),
+                ))
 
     candidates.sort(key=lambda x: x.rcept_dt, reverse=True)
-    top = candidates[0]
-    log.info("IR자료 발견: %s (%s)", top.report_nm, top.rcept_dt)
-    return top
+    log.info("IR 후보 수집: %d건 (corp_code=%s)", len(candidates), corp_code)
+    return candidates
 
 
-def download_report_archive(rcept_no: str, target_dir: Path) -> Path | None:
-    """rcept_no → 보고서 첨부서류(zip) 다운로드 후 가장 큰 PDF/HWP/문서 파일 반환.
+def fetch_latest_ir_doc(corp_code: str) -> DartReport | None:
+    """기존 호환용 — 후보 중 가장 최근 1개. PDF 첨부 여부 미확인."""
+    candidates = fetch_ir_candidates(corp_code)
+    return candidates[0] if candidates else None
 
-    DART의 document.xml endpoint는 여러 파일이 zip으로 묶여 옴.
-    주요 본문 파일 1개 추출.
+
+def fetch_latest_ir_with_pdf(
+    corp_code: str, target_dir: Path, max_attempts: int = 5,
+) -> tuple[DartReport, Path] | None:
+    """가장 최근 IR 공시 중 PDF 첨부가 있는 첫 번째를 다운로드.
+
+    후보를 max_attempts개까지 순차 다운받아 PDF가 있는 것 발견 즉시 반환.
+    PDF 있는 후보 없으면 None.
+    """
+    candidates = fetch_ir_candidates(corp_code)
+    if not candidates:
+        return None
+
+    target_dir.mkdir(parents=True, exist_ok=True)
+    for i, cand in enumerate(candidates[:max_attempts]):
+        log.info("IR 후보 %d/%d 다운로드 시도: %s (%s)", i + 1, min(max_attempts, len(candidates)), cand.report_nm, cand.rcept_dt)
+        pdf = download_report_archive(cand.rcept_no, target_dir, require_pdf=True)
+        if pdf:
+            log.info("IR PDF 발견: %s → %s", cand.report_nm, pdf.name)
+            return cand, pdf
+    log.info("IR 공시 %d개 시도했으나 PDF 첨부 없음", min(max_attempts, len(candidates)))
+    return None
+
+
+def download_report_archive(
+    rcept_no: str, target_dir: Path, require_pdf: bool = False,
+) -> Path | None:
+    """rcept_no → 보고서 첨부서류(zip) 다운로드.
+
+    PDF가 있으면 PDF 우선. 없을 때:
+      - require_pdf=True: None 반환
+      - require_pdf=False: 가장 큰 파일 (보통 본문 XML) 반환
     """
     key = _api_key()
     if not key:
@@ -311,18 +346,21 @@ def download_report_archive(rcept_no: str, target_dir: Path) -> Path | None:
             r = cli.get(f"{DART_BASE}/document.xml", params={"crtfc_key": key, "rcept_no": rcept_no})
             r.raise_for_status()
             content_type = r.headers.get("content-type", "").lower()
-            # XML 응답이면 status 필드 있음 → 에러
             if "xml" in content_type and b"<status>" in r.content[:200]:
-                # 본문 zip이 아닌 에러 XML
                 log.warning("document.xml 에러 응답 (rcept_no=%s): %s", rcept_no, r.content[:300])
                 return None
             zf = zipfile.ZipFile(io.BytesIO(r.content))
-            # PDF가 있으면 최우선, 없으면 가장 큰 파일
             members = zf.infolist()
             if not members:
                 return None
             pdf_members = [m for m in members if m.filename.lower().endswith(".pdf")]
-            picked = max(pdf_members, key=lambda m: m.file_size) if pdf_members else max(members, key=lambda m: m.file_size)
+            if pdf_members:
+                picked = max(pdf_members, key=lambda m: m.file_size)
+            elif require_pdf:
+                log.info("PDF 첨부 없음 (rcept_no=%s) — require_pdf=True라 스킵", rcept_no)
+                return None
+            else:
+                picked = max(members, key=lambda m: m.file_size)
             ext = Path(picked.filename).suffix.lower() or ".bin"
             safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", Path(picked.filename).stem)[:80] or "report"
             out_path = target_dir / f"{rcept_no}_{safe_name}{ext}"

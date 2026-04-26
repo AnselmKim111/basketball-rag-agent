@@ -200,7 +200,24 @@ async def _execute(bot, chat_id: int, ticker: str) -> None:
     if not report_pdf:
         await bot.send_message(chat_id=chat_id, text="ℹ️ 사업보고서 PDF 다운로드 실패 — 업의 본질 단계 스킵")
 
-    # 3) 업의 본질 요약
+    # 2.5) wisereport 보조 컨텍스트 (실패해도 무시)
+    wisereport_ctx_text: Optional[str] = None
+    try:
+        from src.deepdive import wisereport_context
+        wctx = await loop.run_in_executor(
+            None, wisereport_context.collect_for_ticker,
+            ticker, download_root / "wisereport",
+        )
+        wisereport_ctx_text = _format_wisereport_context(wctx)
+        if wisereport_ctx_text:
+            log.info(
+                "wisereport 컨텍스트 주입 준비: 기업 %d / 산업 %d",
+                len(wctx.company_texts), len(wctx.industry_texts),
+            )
+    except Exception:
+        log.exception("wisereport 컨텍스트 수집 단계 실패 — 빈 컨텍스트로 진행")
+
+    # 3) 업의 본질 요약 (wisereport 컨텍스트 주입)
     if report_pdf:
         try:
             await _summarize_and_send(
@@ -209,6 +226,7 @@ async def _execute(bot, chat_id: int, ticker: str) -> None:
                 prompt_name="deepdive_business",
                 header="🏢 *업의 본질*",
                 prefer_section="사업의 내용",
+                extra_context=wisereport_ctx_text,
             )
         except Exception as e:
             log.exception("업의 본질 요약 실패")
@@ -217,29 +235,28 @@ async def _execute(bot, chat_id: int, ticker: str) -> None:
                 text=f"⚠️ 업의 본질 요약 실패: {type(e).__name__}: {str(e)[:300]}",
             )
 
-    # 4) IR자료 메타 + PDF + 핵심 투자포인트 요약
-    ir_meta = await loop.run_in_executor(None, dart_client.fetch_latest_ir_doc, corp_code)
-    if not ir_meta:
-        await bot.send_message(chat_id=chat_id, text="ℹ️ 최근 IR 공시 없음 — 투자포인트 단계 스킵")
+    # 4) IR자료: 최근 IR 후보 중 PDF 첨부 있는 첫 번째 자동 선택
+    ir_pair = await loop.run_in_executor(
+        None, dart_client.fetch_latest_ir_with_pdf, corp_code, download_root,
+    )
+    if not ir_pair:
+        await bot.send_message(chat_id=chat_id, text="ℹ️ 최근 IR 공시(PDF 첨부) 없음 — 투자포인트 단계 스킵")
     else:
-        ir_pdf = await loop.run_in_executor(
-            None, dart_client.download_report_archive, ir_meta.rcept_no, download_root,
-        )
-        if ir_pdf:
-            try:
-                await _summarize_and_send(
-                    bot, chat_id,
-                    pdf_path=ir_pdf,
-                    prompt_name="deepdive_ir",
-                    header=f"💡 *핵심 투자 포인트* ({ir_meta.report_nm})",
-                    prefer_section=None,  # IR자료는 전체 본문 사용
-                )
-            except Exception as e:
-                log.exception("IR 요약 실패")
-                await bot.send_message(
-                    chat_id=chat_id,
-                    text=f"⚠️ IR 요약 실패: {type(e).__name__}: {str(e)[:300]}",
-                )
+        ir_meta, ir_pdf = ir_pair
+        try:
+            await _summarize_and_send(
+                bot, chat_id,
+                pdf_path=ir_pdf,
+                prompt_name="deepdive_ir",
+                header=f"💡 *핵심 투자 포인트* ({ir_meta.report_nm})",
+                prefer_section=None,  # IR자료는 전체 본문 사용
+            )
+        except Exception as e:
+            log.exception("IR 요약 실패")
+            await bot.send_message(
+                chat_id=chat_id,
+                text=f"⚠️ IR 요약 실패: {type(e).__name__}: {str(e)[:300]}",
+            )
 
     # 5) 분기별 재무 + 차트
     try:
@@ -298,12 +315,26 @@ async def _execute(bot, chat_id: int, ticker: str) -> None:
     await bot.send_message(chat_id=chat_id, text=f"✅ *{corp_name}* 심층분석 완료", parse_mode=ParseMode.MARKDOWN)
 
 
+def _format_wisereport_context(wctx) -> Optional[str]:
+    """WisereportContext → LLM 주입용 단일 문자열. 비어있으면 None."""
+    if wctx is None:
+        return None
+    parts: list[str] = []
+    for title, text in zip(wctx.industry_titles, wctx.industry_texts):
+        parts.append(f"[산업리포트] {title}\n{text}")
+    for title, text in zip(wctx.company_titles, wctx.company_texts):
+        parts.append(f"[기업리포트] {title}\n{text}")
+    return "\n\n---\n\n".join(parts) if parts else None
+
+
 async def _summarize_and_send(
     bot, chat_id: int, pdf_path: Path, prompt_name: str, header: str,
     prefer_section: Optional[str] = None,
+    extra_context: Optional[str] = None,
 ) -> None:
     """공통 헬퍼: DART 보고서 (PDF 또는 XML/HTML) → 텍스트 추출 → LLM 요약 → 발송.
 
+    extra_context: 시스템 프롬프트에 추가로 주입할 보조 자료 (예: wisereport 리포트 텍스트).
     내부에서 모든 예외를 catch해 문자열로 반환 — _summarize_and_send 자체는
     최대한 raise하지 않게 (상위 핸들러의 try/except 의존도 줄임).
     """
@@ -342,17 +373,20 @@ async def _summarize_and_send(
             return f"(LLM 초기화 실패: {type(e).__name__}: {str(e)[:200]})"
 
         # 4) LLM 호출 - 모든 예외 catch
+        user_msg = (
+            f"파일: {pdf_path.name}\n"
+            "1000자 이내로 시스템 프롬프트 형식대로 요약해주세요.\n\n"
+            f"<doc_text>\n{text}\n</doc_text>"
+        )
+        if extra_context:
+            user_msg += f"\n\n<wisereport_context>\n{extra_context}\n</wisereport_context>"
         try:
             resp = client.chat.completions.create(
                 model=summarizer.DEFAULT_MODEL,
                 max_tokens=1500,
                 messages=[
                     {"role": "system", "content": sys_prompt},
-                    {"role": "user", "content": (
-                        f"파일: {pdf_path.name}\n"
-                        "1000자 이내로 시스템 프롬프트 형식대로 요약해주세요.\n\n"
-                        f"<doc_text>\n{text}\n</doc_text>"
-                    )},
+                    {"role": "user", "content": user_msg},
                 ],
             )
         except summarizer.APIStatusError as e:

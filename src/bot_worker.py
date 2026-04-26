@@ -39,18 +39,25 @@ from src.pipeline_lock import PIPELINE_LOCK
 REPO_ROOT = Path(__file__).resolve().parent.parent
 HELP_TEXT = (
     "📊 *wisereport 자동 분석 봇*\n\n"
-    "*사용법:*\n"
+    "*리포트 다운로드 + 요약*\n"
     "  `/report 기업명 티커 [개수]`\n"
     "  예: `/report 삼성전자 005930`\n"
-    "  예: `/report 카카오 035720 5` (상위 5개)\n\n"
-    "*간편 입력:* 슬래시 없이 텍스트로도 가능\n"
-    "  예: `삼성전자 005930`\n"
-    "  예: `현대차 005380 3`\n\n"
-    "*명령:*\n"
+    "  예: `/report 카카오 035720 5` (상위 5개)\n"
+    "  슬래시 없이도 가능: `삼성전자 005930`\n\n"
+    "*심층 분석 (deepdive)*\n"
+    "  `/deepdive <티커 또는 종목명>`\n"
+    "  예: `/deepdive 삼성전자`\n"
+    "  예: `/deepdive 005930`\n"
+    "  → DART 사업보고서 + IR자료 + 분기별 재무 차트\n"
+    "  → 업의 본질 / 핵심 투자 포인트 1000자 요약\n"
+    "  → wisereport 기업·산업 리포트도 종합 반영\n\n"
+    "*명령어*\n"
     "  /start, /help — 이 도움말\n"
-    "  /report — 리포트 작업 시작\n"
+    "  /report — 리포트 작업\n"
+    "  /deepdive — 심층 분석\n"
+    "  /deephelp — deepdive 상세 도움말\n"
     "  /status — 현재 작업 상태\n\n"
-    "_작업 1건당 약 8-15분 소요됩니다._"
+    "_/report 약 8-15분, /deepdive 약 10-15분 소요_"
 )
 
 
