@@ -721,6 +721,14 @@ async def _send_results(
     industry_pdfs: list[Path],
     company_pdfs_by_ticker: dict[str, list[Path]],
 ) -> None:
+    """Top 5 결과 발송.
+
+    참고 리포트 처리 원칙 (종목별 ↔ 산업별 분리):
+      - 각 Top N 종목 블록에는 그 종목의 own 종목 리포트만 첨부.
+      - 산업 리포트는 마지막에 한 번 일괄 첨부 (모든 픽 공통 컨텍스트).
+      - LLM이 referenced_reports에 다른 회사 리포트나 산업 리포트를 끼워
+        넣어도 own 리포트가 아니면 본문에서 제외하고 PDF로도 발송 안 함.
+    """
     methodology = synthesis.get("ranking_methodology", "")
     top5 = synthesis.get("top5") or []
 
@@ -729,12 +737,6 @@ async def _send_results(
         f"랭킹 근거:\n{methodology}\n"
     )
     await send_text_chunked(bot, chat_id, intro)
-
-    # 파일명 → 경로 인덱스 (PDF 매칭용)
-    name_to_path: dict[str, Path] = {p.name: p for p in industry_pdfs}
-    for paths in company_pdfs_by_ticker.values():
-        for p in paths:
-            name_to_path[p.name] = p
 
     sent_pdf_names: set[str] = set()
 
@@ -746,6 +748,20 @@ async def _send_results(
         thesis = pick.get("operating_leverage_thesis", "(thesis 없음)")
         kn = pick.get("key_numbers") or {}
         refs = pick.get("referenced_reports") or []
+
+        # 이 종목 own 리포트 파일명 집합
+        own_pdfs = company_pdfs_by_ticker.get(ticker, [])
+        own_pdf_names = {p.name for p in own_pdfs}
+
+        # LLM이 인용한 refs 중 own 리포트만 채택. 그 외(산업/타종목)는 잘못 인용된
+        # 것으로 간주하고 표시·발송에서 제외.
+        valid_refs = [r for r in refs if (r or "").strip() in own_pdf_names]
+        invalid_refs = [r for r in refs if (r or "").strip() and (r or "").strip() not in own_pdf_names]
+        if invalid_refs:
+            log.info(
+                "Top%s %s (%s) 잘못된 ref 제외: %s",
+                rank, name, ticker, invalid_refs[:5],
+            )
 
         header = (
             f"━━━━━━━━━━━━━━━━━━━━\n"
@@ -759,30 +775,34 @@ async def _send_results(
             body += "\n\n📊 Key Numbers\n"
             for k, v in kn.items():
                 body += f"  • {k}: {v}\n"
-        if refs:
-            body += "\n📎 참고 리포트: " + ", ".join(refs)
+        if valid_refs:
+            body += "\n📎 참고 종목 리포트: " + ", ".join(valid_refs)
+        elif own_pdfs:
+            # LLM이 own 리포트를 명시 안 했어도 다운받은 own 리포트 모두 첨부
+            body += "\n📎 참고 종목 리포트: " + ", ".join(p.name for p in own_pdfs)
+        else:
+            body += "\n📎 참고 종목 리포트: (해당 종목 리포트 없음 — 산업 리포트 참조)"
         await send_text_chunked(bot, chat_id, body)
 
-        # 참고 PDF 매칭해서 발송 (중복 발송 방지)
-        # 종목 ticker의 PDF는 무조건 첨부, 그 외 referenced_reports 매칭은 fuzzy.
-        attached: list[Path] = []
-        for p in company_pdfs_by_ticker.get(ticker, []):
-            if p.name not in sent_pdf_names:
-                attached.append(p)
-        for ref in refs:
-            ref_name = (ref or "").strip()
-            if not ref_name:
+        # PDF 첨부: own 종목 리포트만 (산업 리포트는 종목별로 첨부 안 함).
+        for p in own_pdfs:
+            if p.name in sent_pdf_names:
                 continue
-            if ref_name in name_to_path and ref_name not in sent_pdf_names:
-                attached.append(name_to_path[ref_name])
-            else:
-                # fuzzy: 부분 매칭
-                for fn, p in name_to_path.items():
-                    if ref_name in fn and fn not in sent_pdf_names:
-                        attached.append(p)
-                        break
-        for p in attached:
             await send_pdf(bot, chat_id, p, caption=f"[Top {rank} {name}] {p.name}")
+            sent_pdf_names.add(p.name)
+
+    # ---- 산업 리포트는 마지막에 한 번만 일괄 첨부 (모든 픽의 공통 컨텍스트)
+    if industry_pdfs:
+        await send_text_chunked(
+            bot, chat_id,
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "🏭 공통 산업 리포트 (모든 픽의 매크로 컨텍스트)\n"
+            "━━━━━━━━━━━━━━━━━━━━",
+        )
+        for p in industry_pdfs:
+            if p.name in sent_pdf_names:
+                continue
+            await send_pdf(bot, chat_id, p, caption=f"[산업] {p.name}")
             sent_pdf_names.add(p.name)
 
 

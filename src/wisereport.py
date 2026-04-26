@@ -484,12 +484,20 @@ class WisereportClient:
                 )
             )
 
+        # 정렬 — list_reports와 동일 패턴 (명시적 sch_dt 내림차순).
+        # sort_by="popular"은 wisereport 응답이 이미 visit_cnt 내림차순.
         if sort_by == "latest":
             items.sort(key=lambda it: it.sch_dt, reverse=True)
-        # sort_by="popular"은 응답 순서가 이미 visit_cnt 내림차순
 
+        if items:
+            log.info(
+                "list_top_reports category=%s sort=%s 응답 %d건 (날짜 범위 %s ~ %s) → 상위 %d건 사용",
+                category, sort_by, len(items),
+                items[-1].sch_dt[:8] if len(items) > 1 else items[0].sch_dt[:8],
+                items[0].sch_dt[:8],
+                min(limit, len(items)),
+            )
         items = items[:limit]
-        log.info("TopHits 파싱: %d건", len(items))
         return items
 
     # ------------------------------------------------------------------
