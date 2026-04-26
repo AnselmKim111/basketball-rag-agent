@@ -30,8 +30,10 @@ KST = timezone(timedelta(hours=9))
 
 HELP_TEXT = (
     "🔍 *심층분석 (deepdive)*\n\n"
-    "사용법: `/deepdive <티커6자리>`\n"
-    "예: `/deepdive 005930` (삼성전자)\n\n"
+    "사용법: `/deepdive <티커6자리 또는 종목명>`\n"
+    "예: `/deepdive 005930`\n"
+    "예: `/deepdive 삼성전자`\n"
+    "예: `/deepdive HD현대중공업`\n\n"
     "*분석 항목:*\n"
     "  1️⃣ DART 사업보고서 → 업의 본질 (1000자)\n"
     "  2️⃣ DART IR자료 → 핵심 투자 포인트 (1000자)\n"
@@ -70,19 +72,19 @@ async def _cmd_deepdive(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if not bot_worker.is_authorized(update):
         return
     args = context.args or []
-    ticker = args[0].strip() if args else ""
-    if not re.match(r"^\d{6}$", ticker):
+    if not args:
         await update.message.reply_text(
-            "사용법: `/deepdive 005930` (6자리 티커)",
+            "사용법: `/deepdive 005930` 또는 `/deepdive 삼성전자`",
             parse_mode=ParseMode.MARKDOWN,
         )
         return
+    # 다단어 종목명 지원 (예: "/deepdive HD 현대중공업")
+    query = " ".join(args).strip()
+    asyncio.create_task(_run(update, context, query))
 
-    asyncio.create_task(_run(update, context, ticker))
 
-
-async def _run(update: Update, context: ContextTypes.DEFAULT_TYPE, ticker: str) -> None:
-    """파이프라인 실행. 모든 단계 try/except, 봇 프로세스로 예외 전파 안 함."""
+async def _run(update: Update, context: ContextTypes.DEFAULT_TYPE, query: str) -> None:
+    """파이프라인 실행. query는 ticker(6자리) 또는 종목명. 모든 단계 try/except."""
     chat_id = update.effective_chat.id
     bot = context.bot
 
@@ -90,25 +92,75 @@ async def _run(update: Update, context: ContextTypes.DEFAULT_TYPE, ticker: str) 
         running = bot_worker.CURRENT_TASK['name'] if bot_worker.CURRENT_TASK else "다른 작업"
         await bot.send_message(
             chat_id=chat_id,
-            text=f"⏳ 진행중: *{running}*\n끝나면 처리: deepdive {ticker}",
+            text=f"⏳ 진행중: *{running}*\n끝나면 처리: deepdive {query}",
             parse_mode=ParseMode.MARKDOWN,
         )
 
     async with PIPELINE_LOCK:
-        bot_worker.CURRENT_TASK = {"name": f"deepdive {ticker}", "ticker": ticker, "top": 0}
+        bot_worker.CURRENT_TASK = {"name": f"deepdive {query}", "ticker": query, "top": 0}
         try:
+            # ticker(6자리 숫자) vs 종목명 자동 감지
+            ticker = await _resolve_ticker(bot, chat_id, query)
+            if not ticker:
+                return  # _resolve_ticker가 안내 메시지 발송
             await _execute(bot, chat_id, ticker)
         except Exception:
             log.exception("deepdive 파이프라인 최상위 예외 — 무시하고 봇 유지")
             try:
                 await bot.send_message(
                     chat_id=chat_id,
-                    text=f"❌ 예상치 못한 오류 발생 (ticker={ticker}). 로그 확인 필요.",
+                    text=f"❌ 예상치 못한 오류 발생 (query={query}). 로그 확인 필요.",
                 )
             except Exception:
                 pass
         finally:
             bot_worker.CURRENT_TASK = None
+
+
+async def _resolve_ticker(bot, chat_id: int, query: str) -> Optional[str]:
+    """ticker(6자리 숫자) → 그대로, 아니면 DART 종목명 lookup → ticker."""
+    q = query.strip()
+    if re.match(r"^\d{6}$", q):
+        return q
+
+    # 종목명으로 lookup
+    try:
+        from src.deepdive import dart_client
+    except Exception:
+        log.exception("dart_client import 실패")
+        await bot.send_message(chat_id=chat_id, text="❌ DART 모듈 로드 실패")
+        return None
+
+    loop = asyncio.get_running_loop()
+    try:
+        ticker = await loop.run_in_executor(None, dart_client.lookup_ticker_by_name, q)
+    except Exception as e:
+        log.exception("종목명 lookup 실패")
+        await bot.send_message(
+            chat_id=chat_id,
+            text=f"❌ 종목명 검색 실패: {type(e).__name__}: {str(e)[:200]}",
+        )
+        return None
+
+    if not ticker:
+        await bot.send_message(
+            chat_id=chat_id,
+            text=(
+                f"❓ '{q}'에 해당하는 상장사를 찾지 못했습니다.\n"
+                "다른 표현으로 시도하거나 6자리 티커로 입력해주세요.\n"
+                "예: `/deepdive 005930`"
+            ),
+        )
+        return None
+
+    # 매칭된 회사명 안내
+    name = dart_client._CORP_NAME_CACHE.get(ticker, "")
+    await bot.send_message(
+        chat_id=chat_id,
+        text=f"🔎 '{q}' → *{name}* ({ticker})",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+    return ticker
 
 
 async def _execute(bot, chat_id: int, ticker: str) -> None:

@@ -93,6 +93,7 @@ def _get(path: str, params: dict[str, Any], timeout: httpx.Timeout = DEFAULT_TIM
 # ------------------------------------------------------------------
 _CORP_MAP_CACHE: dict[str, str] | None = None  # ticker → corp_code
 _CORP_NAME_CACHE: dict[str, str] = {}  # ticker → corp_name
+_NAME_TO_TICKER_CACHE: dict[str, str] = {}  # corp_name (정규화) → ticker
 
 
 def _load_corp_map() -> dict[str, str]:
@@ -126,9 +127,17 @@ def _load_corp_map() -> dict[str, str]:
             name = (el.findtext("corp_name") or "").strip()
             if stock and corp:
                 # ticker는 보통 6자리 숫자
-                m[stock.zfill(6)] = corp
-                _CORP_NAME_CACHE[stock.zfill(6)] = name
-        log.info("DART 회사목록 파싱 완료: %d개", len(m))
+                ticker6 = stock.zfill(6)
+                m[ticker6] = corp
+                _CORP_NAME_CACHE[ticker6] = name
+                # 종목명 → ticker 역색인 (lookup_ticker_by_name용)
+                if name:
+                    _NAME_TO_TICKER_CACHE[name] = ticker6
+                    # 정규화 키도 추가 (공백/괄호 제거)
+                    norm = re.sub(r"[\s()㈜（）]+", "", name)
+                    if norm and norm != name:
+                        _NAME_TO_TICKER_CACHE.setdefault(norm, ticker6)
+        log.info("DART 회사목록 파싱 완료: %d개 (이름역색인 %d개)", len(m), len(_NAME_TO_TICKER_CACHE))
         _CORP_MAP_CACHE = m
         return m
     except Exception:
@@ -144,6 +153,58 @@ def get_corp_code(ticker: str) -> tuple[str, str] | None:
     if not code:
         return None
     return code, _CORP_NAME_CACHE.get(t, ticker)
+
+
+def lookup_ticker_by_name(query: str) -> str | None:
+    """종목명 → 6자리 ticker. 정확 일치 → contains 매칭 순.
+
+    매칭 우선순위:
+      1. 정확히 일치 ("삼성전자" == "삼성전자")
+      2. 정규화 후 일치 (공백/괄호 제거: "(주)카카오" → "카카오")
+      3. startswith 매칭, 짧은 이름 우선
+      4. contains 매칭, 짧은 이름 우선
+
+    상장사만 검색 (stock_code 있는 회사). 못 찾으면 None.
+    """
+    if not query:
+        return None
+    _load_corp_map()  # cache 빌드
+    if not _NAME_TO_TICKER_CACHE:
+        return None
+
+    q = query.strip()
+
+    # 1) 정확 일치
+    if q in _NAME_TO_TICKER_CACHE:
+        log.info("종목명 정확 매칭: '%s' → %s", q, _NAME_TO_TICKER_CACHE[q])
+        return _NAME_TO_TICKER_CACHE[q]
+
+    # 2) 정규화 후 일치
+    q_norm = re.sub(r"[\s()㈜（）]+", "", q)
+    if q_norm in _NAME_TO_TICKER_CACHE:
+        log.info("종목명 정규화 매칭: '%s'→'%s' → %s", q, q_norm, _NAME_TO_TICKER_CACHE[q_norm])
+        return _NAME_TO_TICKER_CACHE[q_norm]
+
+    # 3, 4) startswith → contains, 짧은 이름 우선 (모회사가 보통 짧음)
+    starts: list[tuple[str, str]] = []
+    contains: list[tuple[str, str]] = []
+    for name, ticker in _NAME_TO_TICKER_CACHE.items():
+        if name.startswith(q):
+            starts.append((name, ticker))
+        elif q in name:
+            contains.append((name, ticker))
+
+    candidates = sorted(starts, key=lambda x: len(x[0])) or sorted(contains, key=lambda x: len(x[0]))
+    if candidates:
+        chosen = candidates[0]
+        log.info(
+            "종목명 부분 매칭: '%s' → '%s' (%s) [총 %d 후보]",
+            q, chosen[0], chosen[1], len(candidates),
+        )
+        return chosen[1]
+
+    log.warning("종목명 매칭 실패: '%s'", q)
+    return None
 
 
 # ------------------------------------------------------------------
