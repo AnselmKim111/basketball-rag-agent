@@ -40,10 +40,11 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 HELP_TEXT = (
     "📊 *wisereport 자동 분석 봇*\n\n"
     "*리포트 다운로드 + 요약*\n"
-    "  `/report 기업명 티커 [개수]`\n"
-    "  예: `/report 삼성전자 005930`\n"
-    "  예: `/report 카카오 035720 5` (상위 5개)\n"
-    "  슬래시 없이도 가능: `삼성전자 005930`\n\n"
+    "  `/report 종목명` (자동 ticker 매핑)\n"
+    "  `/report 종목명 6자리티커 [개수]`\n"
+    "  예: `/report 피에스케이`\n"
+    "  예: `/report 삼성전자` 또는 `/report 삼성전자 005930 5`\n"
+    "  슬래시 없이도 가능: `삼성전자` / `삼성전자 005930`\n\n"
     "*심층 분석 (deepdive)*\n"
     "  `/deepdive <티커 또는 종목명>`\n"
     "  예: `/deepdive 삼성전자`\n"
@@ -123,10 +124,14 @@ def _parse_args(parts: list[str]) -> tuple[str, str, int] | None:
 async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_authorized(update):
         return
-    parsed = _parse_args(context.args)
+    args = list(context.args or [])
+    parsed = _parse_args(args) or await _parse_args_with_lookup(update, args)
     if not parsed:
         await update.message.reply_text(
-            "사용법: `/report 기업명 6자리티커 [개수]`\n예: `/report 삼성전자 005930`",
+            "사용법:\n"
+            "  `/report 종목명` (자동 ticker 매핑)\n"
+            "  `/report 종목명 6자리티커 [개수]`\n"
+            "예: `/report 피에스케이` / `/report 삼성전자 005930 5`",
             parse_mode=ParseMode.MARKDOWN,
         )
         return
@@ -138,14 +143,72 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
     text = (update.message.text or "").strip()
     parts = text.split()
-    parsed = _parse_args(parts)
+    parsed = _parse_args(parts) or await _parse_args_with_lookup(update, parts)
     if not parsed:
         await update.message.reply_text(
-            "잘 모르겠어요. `/help` 또는 `기업명 6자리티커` 형식으로 보내주세요.",
+            "잘 모르겠어요. `/help` 또는 `종목명` (자동 매핑) / `종목명 6자리티커` 형식으로 보내주세요.",
             parse_mode=ParseMode.MARKDOWN,
         )
         return
     await _enqueue(update, *parsed)
+
+
+async def _parse_args_with_lookup(
+    update: Update, parts: list[str]
+) -> tuple[str, str, int] | None:
+    """ticker 없이 종목명만 들어왔을 때 DART 회사목록에서 자동 매핑.
+
+    parts 끝에 1~30 정수가 있으면 top으로 분리, 나머지는 모두 종목명으로 합침.
+    예) ['피에스케이']             → 피에스케이 lookup, top=10
+        ['HD', '현대중공업']        → 'HD 현대중공업' → 정규화 매칭
+        ['삼성전자', '5']           → 삼성전자 lookup, top=5
+    """
+    if not parts:
+        return None
+
+    name_parts = list(parts)
+    top = 10
+    # 끝이 1~30 정수면 top
+    if len(name_parts) >= 2 and re.match(r"^\d{1,2}$", name_parts[-1]):
+        try:
+            t = int(name_parts[-1])
+            if 1 <= t <= 30:
+                top = t
+                name_parts = name_parts[:-1]
+        except ValueError:
+            pass
+
+    if not name_parts:
+        return None
+    name_query = " ".join(name_parts).strip()
+    if not name_query or re.match(r"^\d{6}$", name_query):
+        # 6자리 숫자만 있으면 _parse_args가 이미 처리; 여기는 종목명만.
+        return None
+
+    try:
+        from src.deepdive import dart_client
+    except Exception:
+        logging.exception("dart_client import 실패 — 종목명 lookup 비활성")
+        return None
+
+    loop = asyncio.get_running_loop()
+    try:
+        ticker = await loop.run_in_executor(None, dart_client.lookup_ticker_by_name, name_query)
+    except Exception:
+        logging.exception("종목명 lookup 실패: %s", name_query)
+        return None
+    if not ticker:
+        return None
+
+    matched_name = dart_client._CORP_NAME_CACHE.get(ticker, name_query)
+    try:
+        await update.message.reply_text(
+            f"🔎 '{name_query}' → *{matched_name}* ({ticker})",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    except Exception:
+        pass
+    return matched_name, ticker, top
 
 
 async def _enqueue(
