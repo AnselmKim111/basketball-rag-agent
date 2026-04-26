@@ -422,36 +422,27 @@ async def _summarize_and_send(
             )
         if extra_context:
             user_msg += f"\n\n<wisereport_context>\n{extra_context}\n</wisereport_context>"
+        # 빈 응답/transient 에러 자동 재시도 (마지막 시도엔 OPENROUTER_FALLBACK_MODEL).
         try:
-            resp = client.chat.completions.create(
-                model=summarizer.DEFAULT_MODEL,
-                max_tokens=1500,
+            content = summarizer.chat_with_retry(
+                client,
                 messages=[
                     {"role": "system", "content": sys_prompt},
                     {"role": "user", "content": user_msg},
                 ],
+                max_tokens=1500,
+                context=f"deepdive {prompt_name}",
             )
-        except summarizer.APIStatusError as e:
-            if summarizer._is_credit_error(e):
-                return "(요약 실패: OpenRouter 토큰 부족)"
-            return f"(요약 실패 APIStatus: {e!r})"
+        except summarizer.OpenRouterCreditExhausted:
+            return "(요약 실패: OpenRouter 토큰 부족)"
         except Exception as e:
-            log.exception("LLM 호출 실패 (non-APIStatusError)")
+            log.exception("chat_with_retry 호출 자체 실패")
             return f"(요약 실패: {type(e).__name__}: {str(e)[:200]})"
 
-        try:
-            content = (resp.choices[0].message.content or "").strip()
-        except (IndexError, AttributeError) as e:
-            log.exception("LLM 응답 구조 비정상")
-            return f"(LLM 응답 구조 비정상: {type(e).__name__})"
-
-        # OpenRouter의 일부 모델은 stream idle timeout으로 빈 content를 반환.
-        # 헤더만 보내고 본문 사라지는 UX 방지용 명시적 안내.
         if not content:
-            log.warning("LLM이 빈 content 반환 (모델 idle timeout 가능성)")
             return (
-                "(LLM이 빈 응답 반환 — Stream idle timeout 가능성. "
-                "OPENROUTER_MODEL을 다른 모델로 바꾸거나 잠시 후 재시도)"
+                "(LLM 빈 응답이 3회 연속 — 모델/네트워크 일시 장애. "
+                "OPENROUTER_FALLBACK_MODEL을 설정해 두면 자동 폴백 가능. 잠시 후 재시도)"
             )
 
         try:
