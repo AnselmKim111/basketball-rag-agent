@@ -1,18 +1,19 @@
-"""Telegram bot worker: 종목명/티커 받아서 wisereport 파이프라인 실행.
+"""CompanyBot — wisereport 종목 리포트 + DART 심층분석.
 
-배포처(Railway/Fly.io 등) 에서 24/7 실행. 텔레그램으로 명령 받음.
+배포처(Railway 등) 에서 24/7 실행. 텔레그램으로 명령 받음.
 
-명령 형식:
-  /report 기업명 티커 [개수]   (예: /report 삼성전자 005930)
-  /report 기업명 티커 5         (상위 5개만)
-  또는 그냥 텍스트로: "기업명 티커"  (예: 삼성전자 005930)
+지원 입력:
+  /report 종목명                 — 자동 ticker 매핑 (DART 회사목록)
+  /report 종목명 6자리티커 [개수] — 명시적 티커 지정
+  /deepdive 종목명 또는 티커     — 심층분석 (deepdive.handler에서 처리)
+  슬래시 없는 텍스트(종목명/티커) — /deepdive 후 /report 자동 순차 실행
 
 환경변수 (전부 필수):
-  TELEGRAM_BOT_TOKEN   - @BotFather에서 받은 봇 토큰
-  ALLOWED_CHAT_IDS     - 콤마 구분 chat_id 화이트리스트 (예: 1813560888)
+  TELEGRAM_BOT_TOKEN   — @BotFather 봇 토큰
+  ALLOWED_CHAT_IDS     — 콤마 구분 chat_id 화이트리스트
   WISEREPORT_ID, WISEREPORT_PW
   OPENROUTER_API_KEY, OPENROUTER_MODEL
-  TELEGRAM_CHAT_ID 또는 TELEGRAM_USERNAME
+  DART_API_KEY         — /deepdive용 (없으면 deepdive 핸들러 등록 안 됨)
 """
 
 from __future__ import annotations
@@ -34,7 +35,11 @@ from telegram.ext import (
     filters,
 )
 
+from src.bot_helpers import allowed_chat_ids, is_authorized as _bh_is_authorized
 from src.pipeline_lock import PIPELINE_LOCK
+
+# CompanyBot용 chat_id allowlist 환경변수
+_ALLOWED_ENV = "ALLOWED_CHAT_IDS"
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 HELP_TEXT = (
@@ -43,8 +48,11 @@ HELP_TEXT = (
     "  `/report 종목명` (자동 ticker 매핑)\n"
     "  `/report 종목명 6자리티커 [개수]`\n"
     "  예: `/report 피에스케이`\n"
-    "  예: `/report 삼성전자` 또는 `/report 삼성전자 005930 5`\n"
-    "  슬래시 없이도 가능: `삼성전자` / `삼성전자 005930`\n\n"
+    "  예: `/report 삼성전자` 또는 `/report 삼성전자 005930 5`\n\n"
+    "*🚀 종합 (슬래시 없이 종목명/티커만 입력)*\n"
+    "  → `/deepdive` + `/report` 자동 순차 실행\n"
+    "  예: `삼성전자` / `005930` / `피에스케이`\n"
+    "  ⏱️ 약 20-30분 소요\n\n"
     "*심층 분석 (deepdive)*\n"
     "  `/deepdive <티커 또는 종목명>`\n"
     "  예: `/deepdive 삼성전자`\n"
@@ -63,14 +71,13 @@ HELP_TEXT = (
 
 
 def get_allowed_ids() -> set[str]:
-    raw = os.getenv("ALLOWED_CHAT_IDS", "").strip()
-    return {x.strip() for x in raw.split(",") if x.strip()}
+    """deepdive.handler가 import해 사용 중 — 호환을 위해 유지."""
+    return allowed_chat_ids(_ALLOWED_ENV)
 
 
 def is_authorized(update: Update) -> bool:
-    if not update.effective_chat:
-        return False
-    return str(update.effective_chat.id) in get_allowed_ids()
+    """deepdive.handler가 import해 사용 중 — 호환을 위해 유지."""
+    return _bh_is_authorized(update, _ALLOWED_ENV)
 
 
 # ------------------------------------------------------------------
@@ -139,6 +146,11 @@ async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """슬래시 없는 자유 입력: 종목명/티커만 보내면 /deepdive + /report 둘 다 실행.
+
+    명시적으로 /report 또는 /deepdive 명령을 쓰면 각각만 실행 (이 핸들러는
+    filters.TEXT & ~filters.COMMAND 로 등록되어 슬래시 명령은 안 들어옴).
+    """
     if not is_authorized(update):
         return
     text = (update.message.text or "").strip()
@@ -150,7 +162,71 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             parse_mode=ParseMode.MARKDOWN,
         )
         return
-    await _enqueue(update, *parsed)
+    await _enqueue_combined(update, context, *parsed)
+
+
+async def _enqueue_combined(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    name: str,
+    ticker: str,
+    top: int,
+) -> None:
+    """텍스트 입력 한 번 → /deepdive 후 /report 순차 실행.
+
+    각 단계 사이에 PIPELINE_LOCK이 release되므로 다른 봇/명령이 끼어들 수 있음
+    (의도된 동작 — 큐 fairness 유지). 같은 사용자의 다음 텍스트도 같은 방식으로
+    뒤에 줄 섬.
+    """
+    if PIPELINE_LOCK.locked():
+        running = CURRENT_TASK['name'] if CURRENT_TASK else "다른 작업"
+        await update.message.reply_text(
+            f"⏳ 진행중: *{running}*\n"
+            f"끝나면 처리: *{name}* ({ticker}) — /deepdive + /report",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    asyncio.create_task(_run_combined(update, context, name, ticker, top))
+
+
+async def _run_combined(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    name: str,
+    ticker: str,
+    top: int,
+) -> None:
+    """deepdive 먼저, 끝나면 report. 한쪽 실패해도 다른 쪽 계속."""
+    try:
+        await update.message.reply_text(
+            f"📋 *{name}* ({ticker}) — /deepdive + /report 순차 실행\n"
+            f"⏱️ 예상 약 20-30분",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    except Exception:
+        pass
+
+    # 1) /deepdive
+    try:
+        from src.deepdive.handler import _run as deepdive_run
+        await deepdive_run(update, context, ticker)
+    except Exception:
+        logging.exception("combined: deepdive 단계 실패 — report 단계 계속")
+        try:
+            await update.message.reply_text(
+                f"⚠️ {name} deepdive 단계 실패 — report로 계속 진행"
+            )
+        except Exception:
+            pass
+
+    # 2) /report (기존 로직 재사용)
+    try:
+        await _run_pipeline(update, name, ticker, top)
+    except Exception:
+        logging.exception("combined: report 단계 실패")
+        try:
+            await update.message.reply_text(f"⚠️ {name} report 단계 실패")
+        except Exception:
+            pass
 
 
 async def _parse_args_with_lookup(

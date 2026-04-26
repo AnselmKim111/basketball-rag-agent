@@ -15,9 +15,15 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 from pathlib import Path
 
 log = logging.getLogger(__name__)
+
+# 같은 프로세스 내 동시 read-modify-write 직렬화 (TOCTOU 방지).
+# orchestrator는 단일 프로세스라 이걸로 충분. 다중 프로세스 환경이면 fcntl
+# 레벨 lock 도입 필요.
+_LOCK = threading.RLock()
 
 
 def _state_dir() -> Path:
@@ -54,42 +60,47 @@ def _load() -> dict[str, list[str]]:
 
 
 def _save(state: dict[str, list[str]]) -> None:
+    """tmp 파일에 쓰고 원자적 rename — 동시 write 시 파일 손상 방지."""
     try:
-        STATE_FILE.write_text(
+        tmp = STATE_FILE.with_suffix(STATE_FILE.suffix + ".tmp")
+        tmp.write_text(
             json.dumps(state, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
+        tmp.replace(STATE_FILE)
     except Exception:
         log.exception("state 파일 저장 실패: %s", STATE_FILE)
 
 
 def seen(category: str) -> set[str]:
     """카테고리(예: 'industry_top10', 'strategy_daily')에서 이미 본 rpt_id 셋."""
-    return set(_load().get(category, []))
+    with _LOCK:
+        return set(_load().get(category, []))
 
 
 def mark_seen(category: str, rpt_ids: list[str], cap: int = 1000) -> None:
-    """rpt_id 리스트를 이미 본 것으로 마킹. 카테고리당 최대 cap개 보관 (오래된 것부터 삭제)."""
-    state = _load()
-    cur = state.get(category, [])
-    # 새 것을 뒤에 붙이고 중복 제거 (insertion order 보존)
-    merged = []
-    seen_set = set()
-    for r in cur + list(rpt_ids):
-        if r not in seen_set:
-            seen_set.add(r)
-            merged.append(r)
-    if len(merged) > cap:
-        merged = merged[-cap:]
-    state[category] = merged
-    _save(state)
-    log.info("state 갱신: %s에 %d개 추가 (총 %d)", category, len(rpt_ids), len(merged))
+    """rpt_id 리스트를 이미 본 것으로 마킹. 카테고리당 최대 cap개 (오래된 것부터 삭제)."""
+    with _LOCK:
+        state = _load()
+        cur = state.get(category, [])
+        merged = []
+        seen_set: set[str] = set()
+        for r in cur + list(rpt_ids):
+            if r not in seen_set:
+                seen_set.add(r)
+                merged.append(r)
+        if len(merged) > cap:
+            merged = merged[-cap:]
+        state[category] = merged
+        _save(state)
+        log.info("state 갱신: %s에 %d개 추가 (총 %d)", category, len(rpt_ids), len(merged))
 
 
 def reset(category: str | None = None) -> None:
-    if category is None:
-        _save({})
-        return
-    state = _load()
-    state.pop(category, None)
-    _save(state)
+    with _LOCK:
+        if category is None:
+            _save({})
+            return
+        state = _load()
+        state.pop(category, None)
+        _save(state)

@@ -22,6 +22,12 @@ from telegram import Bot, Update
 from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
+from src.bot_helpers import (
+    is_authorized as _bh_is_authorized,
+    safe_dirname as _bh_safe_dirname,
+    send_pdf as _bh_send_pdf,
+    send_text_chunked as _bh_send_text,
+)
 from src.pipeline_lock import PIPELINE_LOCK
 from src.state_store import mark_seen, seen
 from src.summarizer import (
@@ -38,39 +44,10 @@ log = logging.getLogger(__name__)
 KST = timezone(timedelta(hours=9))
 
 
-def _safe_dirname(name: str) -> str:
-    name = re.sub(r"[\\/:*?\"<>|\r\n\t]+", "_", name)
-    return name.strip().strip(".") or "category"
-
-
-# ------------------------------------------------------------------
-# 공통: 봇이 직접 PDF/텍스트 발송 (telegram_sender의 동기 httpx 대신
-# 비동기 PTB Bot 사용 — orchestrator 이벤트 루프 친화적)
-# ------------------------------------------------------------------
-async def _send_text(bot: Bot, chat_id: str, text: str) -> None:
-    while text:
-        chunk, text = text[:4000], text[4000:]
-        try:
-            await bot.send_message(chat_id=chat_id, text=chunk)
-        except Exception:
-            log.exception("send_message 실패")
-
-
-async def _send_pdf(bot: Bot, chat_id: str, path: Path, caption: str = "") -> None:
-    size_mb = path.stat().st_size / 1024 / 1024
-    if size_mb > 49:
-        log.warning("파일 너무 큼 (%.1fMB) 스킵: %s", size_mb, path.name)
-        return
-    try:
-        with path.open("rb") as f:
-            await bot.send_document(
-                chat_id=chat_id,
-                document=f,
-                filename=path.name,
-                caption=caption[:1024],
-            )
-    except Exception:
-        log.exception("send_document 실패: %s", path.name)
+# 헬퍼는 src.bot_helpers의 public 버전을 thin wrapper로 노출 — 기존 호출부 보존.
+_safe_dirname = _bh_safe_dirname
+_send_text = _bh_send_text
+_send_pdf = _bh_send_pdf
 
 
 # ------------------------------------------------------------------
@@ -200,15 +177,7 @@ INDUSTRY_HELP = (
 )
 
 
-def _allowed_chat_ids(env_key: str) -> set[str]:
-    raw = os.getenv(env_key, "").strip()
-    return {x.strip() for x in raw.split(",") if x.strip()}
-
-
-def _is_authorized(update: Update, env_key: str) -> bool:
-    if not update.effective_chat:
-        return False
-    return str(update.effective_chat.id) in _allowed_chat_ids(env_key)
+_is_authorized = _bh_is_authorized  # 시그니처 동일: (update, env_key) → bool
 
 
 async def industry_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

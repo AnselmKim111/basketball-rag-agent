@@ -88,21 +88,29 @@ def from_wisereport(wctx) -> dict[str, dict[str, Optional[float]]]:
 
 
 def _extract_one(client, model: str, title: str, text: str) -> Optional[dict]:
-    """단일 리포트 텍스트에서 forward JSON 추출."""
-    resp = client.chat.completions.create(
-        model=model,
-        max_tokens=900,
-        temperature=0.0,
-        messages=[
-            {"role": "system", "content": _FORWARD_SYS_PROMPT},
-            {"role": "user", "content": (
-                f"리포트 제목: {title}\n\n"
-                f"<report_text>\n{text[:30000]}\n</report_text>\n\n"
-                "위 텍스트에서 forward 전망 JSON만 출력하세요."
-            )},
-        ],
-    )
-    content = (resp.choices[0].message.content or "").strip()
+    """단일 리포트 텍스트에서 forward JSON 추출. 어느 단계 실패해도 None."""
+    try:
+        resp = client.chat.completions.create(
+            model=model,
+            max_tokens=900,
+            temperature=0.0,
+            messages=[
+                {"role": "system", "content": _FORWARD_SYS_PROMPT},
+                {"role": "user", "content": (
+                    f"리포트 제목: {title}\n\n"
+                    f"<report_text>\n{text[:30000]}\n</report_text>\n\n"
+                    "위 텍스트에서 forward 전망 JSON만 출력하세요."
+                )},
+            ],
+        )
+    except Exception:
+        log.exception("LLM 호출 실패 (forward, title=%s)", title[:40])
+        return None
+    try:
+        content = (resp.choices[0].message.content or "").strip()
+    except (IndexError, AttributeError):
+        log.exception("LLM 응답 구조 비정상 (forward, title=%s)", title[:40])
+        return None
     return _parse_json_object(content)
 
 

@@ -330,12 +330,6 @@ def fetch_ir_candidates(corp_code: str, days_back: int = 365 * 5) -> list[DartRe
     return candidates
 
 
-def fetch_latest_ir_doc(corp_code: str) -> DartReport | None:
-    """기존 호환용 — 후보 중 가장 최근 1개. PDF 첨부 여부 미확인."""
-    candidates = fetch_ir_candidates(corp_code)
-    return candidates[0] if candidates else None
-
-
 def fetch_latest_ir_with_pdf(
     corp_code: str, target_dir: Path, max_attempts: int = 15, days_back: int = 365 * 5,
 ) -> tuple[DartReport, Path] | None:

@@ -17,7 +17,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
-from telegram import Update
+from telegram import Bot, Update
 from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, ContextTypes
 
@@ -26,6 +26,7 @@ from src.pipeline_lock import PIPELINE_LOCK
 
 log = logging.getLogger(__name__)
 KST = timezone(timedelta(hours=9))
+ERR_MSG_LEN = 250  # 텔레그램에 노출하는 예외 메시지 최대 길이
 
 
 HELP_TEXT = (
@@ -117,7 +118,7 @@ async def _run(update: Update, context: ContextTypes.DEFAULT_TYPE, query: str) -
             bot_worker.CURRENT_TASK = None
 
 
-async def _resolve_ticker(bot, chat_id: int, query: str) -> Optional[str]:
+async def _resolve_ticker(bot: Bot, chat_id: int, query: str) -> Optional[str]:
     """ticker(6자리 숫자) → 그대로, 아니면 DART 종목명 lookup → ticker."""
     q = query.strip()
     if re.match(r"^\d{6}$", q):
@@ -343,25 +344,13 @@ async def _execute(bot, chat_id: int, ticker: str) -> None:
     else:
         await bot.send_message(chat_id=chat_id, text="ℹ️ 분기별 재무 데이터 없음 — 차트 스킵")
 
-    # 6) 사업보고서 PDF 원본 발송
+    # 6) 사업보고서 PDF 원본 발송 (50MB 초과는 send_pdf 내부에서 graceful 스킵)
     if report_pdf and report_pdf.exists():
-        try:
-            size_mb = report_pdf.stat().st_size / 1024 / 1024
-            if size_mb > 49:
-                await bot.send_message(
-                    chat_id=chat_id,
-                    text=f"ℹ️ 사업보고서 PDF가 너무 큼 ({size_mb:.1f}MB) — 원본 발송 스킵",
-                )
-            else:
-                with report_pdf.open("rb") as f:
-                    await bot.send_document(
-                        chat_id=chat_id,
-                        document=f,
-                        filename=report_pdf.name,
-                        caption=f"📄 {corp_name} {report.report_nm}",
-                    )
-        except Exception:
-            log.exception("PDF 발송 실패")
+        from src.bot_helpers import send_pdf
+        await send_pdf(
+            bot, chat_id, report_pdf,
+            caption=f"📄 {corp_name} {report.report_nm}",
+        )
 
     await bot.send_message(chat_id=chat_id, text=f"✅ *{corp_name}* 심층분석 완료", parse_mode=ParseMode.MARKDOWN)
 
