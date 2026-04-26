@@ -51,8 +51,9 @@ KST = timezone(timedelta(hours=9))
 
 # 환경변수 키
 ALLOWED_ENV = "IDEA_ALLOWED_CHAT_IDS"
-RESEARCH_MODEL_ENV = "IDEA_RESEARCH_MODEL"
-SYNTHESIS_MODEL_ENV = "IDEA_SYNTHESIS_MODEL"
+RESEARCH_MODEL_ENV = "IDEA_RESEARCH_MODEL"   # 1단계 웹검색 (perplexity 등)
+NARROW_MODEL_ENV = "IDEA_NARROW_MODEL"       # 3단계 30→10 (지능 덜 필요, 기본 OPENROUTER_MODEL)
+SYNTHESIS_MODEL_ENV = "IDEA_SYNTHESIS_MODEL" # 1.5/5단계 깊은 추론 (지능 필요, claude-sonnet 등)
 
 DEFAULT_RESEARCH_MODEL = "perplexity/sonar-pro"
 
@@ -170,6 +171,17 @@ async def _run_pipeline(
             await send_text_chunked(bot, chat_id, "❌ 리서치 결과에 산업/후보가 비어있음 — 종료")
             return
 
+        # ---- (1.5) 중요도 평가 (graceful — 실패해도 계속)
+        await send_text_chunked(bot, chat_id, "⚖️ 1.5단계: 현상의 중요도 비판적 검증")
+        importance = await _evaluate_importance(idea_text, research)
+        if importance:
+            await _send_importance_summary(bot, chat_id, importance)
+        else:
+            await send_text_chunked(
+                bot, chat_id, "ℹ️ 중요도 평가 단계 실패 — Top 5 분석은 계속 진행",
+            )
+            importance = {}  # 빈 dict로 placeholder, synthesis에 전달 가능
+
         # ---- (2) 산업 리포트 수집
         await send_text_chunked(
             bot, chat_id, f"📊 2단계: 산업 리포트 다운로드 ({len(industries)}개 산업)",
@@ -231,9 +243,12 @@ async def _run_pipeline(
         )
 
         # ---- (5) 최종 synthesis
-        await send_text_chunked(bot, chat_id, "🧠 5단계: 영업레버리지 분석 + Top 5 선정")
+        await send_text_chunked(
+            bot, chat_id,
+            "🧠 5단계: 사업부 식별 → 폭(magnitude) → 기울기(timing) → 영업레버리지 Top 5",
+        )
         synthesis = await _synthesize_top5(
-            idea_text, research, industry_pdfs, industry_texts,
+            idea_text, research, importance, industry_pdfs, industry_texts,
             top10, company_pdfs_by_ticker, company_texts_by_ticker,
         )
         if not synthesis or not synthesis.get("top5"):
@@ -322,6 +337,112 @@ async def _send_research_summary(bot: Bot, chat_id: str, research: dict) -> None
         rank = c.get("mcap_rank", "?")
         msg += f"  {rank}. {c.get('name','?')} ({c.get('ticker6','??????')}) — {c.get('industry','')}\n"
     # parse_mode 없이 plain text — 사용자 입력에 *,_,[,] 등 markdown 특수문자 있어도 안전
+    await send_text_chunked(bot, chat_id, msg)
+
+
+# ------------------------------------------------------------------
+# (1.5) 중요도 평가 — 단호한 비판적 검증
+# ------------------------------------------------------------------
+async def _evaluate_importance(idea_text: str, research: dict) -> dict | None:
+    """research 결과를 받아 '이 현상이 정말 중요한가'를 비판적으로 평가.
+
+    출력: importance_score, verdict, key_arguments_for/against,
+    investment_implication, proceed_with_top5.
+
+    실패해도 None 반환 — 파이프라인은 계속 진행 (graceful degradation).
+    """
+    loop = asyncio.get_running_loop()
+
+    def _blocking() -> dict | None:
+        from src import summarizer
+        try:
+            client = summarizer.get_client()
+        except Exception:
+            log.exception("OpenRouter client init 실패 (importance)")
+            return None
+        sys_prompt = idea_prompts.load("idea_importance")
+
+        # 작은 입력만 — research 핵심 필드만 발췌 (토큰 절감)
+        compact = {
+            "logic_gradient_text": research.get("logic_gradient_text", ""),
+            "industries": [
+                {"name": i.get("name"), "reasoning": i.get("reasoning")}
+                for i in (research.get("industries") or [])
+            ],
+            "top_candidates": [
+                {"name": c.get("name"), "industry": c.get("industry")}
+                for c in (research.get("candidates") or [])[:10]
+            ],
+        }
+        user_msg = (
+            f"# 사용자 투자 아이디어\n{idea_text}\n\n"
+            f"# 1단계 리서치 (요약)\n"
+            f"{json.dumps(compact, ensure_ascii=False, indent=2)}\n\n"
+            "위 자료를 비판적으로 검증해 시스템 프롬프트 형식대로 JSON 출력해주세요."
+        )
+        try:
+            resp = client.chat.completions.create(
+                model=_synthesis_model(),  # 지능 필요 — synthesis와 같은 등급
+                max_tokens=2000,
+                temperature=0.4,
+                messages=[
+                    {"role": "system", "content": sys_prompt},
+                    {"role": "user", "content": user_msg},
+                ],
+            )
+        except summarizer.APIStatusError as e:
+            if summarizer._is_credit_error(e):
+                log.error("OpenRouter credit 부족 (importance)")
+                return None
+            log.exception("importance LLM API 에러")
+            return None
+        except Exception:
+            log.exception("importance LLM 호출 실패")
+            return None
+        try:
+            content = (resp.choices[0].message.content or "").strip()
+        except Exception:
+            log.exception("importance 응답 파싱 실패")
+            return None
+        log.info(
+            "importance LLM 응답: %d chars (model=%s) — preview=%r",
+            len(content), _synthesis_model(), content[:300],
+        )
+        parsed = _parse_json(content)
+        if parsed is None:
+            log.warning("importance JSON 파싱 실패 — content: %r", content[:2000])
+        return parsed
+
+    return await loop.run_in_executor(None, _blocking)
+
+
+async def _send_importance_summary(bot: Bot, chat_id: str, imp: dict) -> None:
+    """1.5단계 중요도 평가 결과 발송."""
+    score = imp.get("importance_score", "?")
+    verdict = imp.get("verdict", "(평가 없음)")
+    fors = imp.get("key_arguments_for") or []
+    againsts = imp.get("key_arguments_against") or []
+    implication = imp.get("investment_implication", "")
+
+    # 점수에 따른 시각적 표시
+    try:
+        s = int(score)
+    except Exception:
+        s = 5
+    badge = "🟢" if s >= 7 else ("🟡" if s >= 5 else "🔴")
+
+    msg = f"⚖️ 중요도 평가 (Step 1.5)\n\n"
+    msg += f"{badge} 점수: {score}/10 — {verdict}\n\n"
+    msg += "✅ 중요한 이유\n"
+    for f in fors[:3]:
+        msg += f"  • {f}\n"
+    msg += "\n⚠️ 과대평가 우려\n"
+    for a in againsts[:3]:
+        msg += f"  • {a}\n"
+    if implication:
+        msg += f"\n💭 투자 시사점\n{implication}\n"
+    if s < 5:
+        msg += "\n⚡ 점수 < 5 — 이 아이디어는 제한적일 수 있음. 그래도 Top 5 분석은 계속 진행합니다.\n"
     await send_text_chunked(bot, chat_id, msg)
 
 
@@ -461,7 +582,7 @@ async def _narrow_candidates(
         )
         try:
             resp = client.chat.completions.create(
-                model=_synthesis_model(),
+                model=_narrow_model(),
                 max_tokens=4500,
                 temperature=0.3,
                 messages=[
@@ -485,7 +606,7 @@ async def _narrow_candidates(
             return None
         log.info(
             "narrow LLM 응답: %d chars (model=%s) — preview=%r",
-            len(content), _synthesis_model(), content[:300],
+            len(content), _narrow_model(), content[:300],
         )
         parsed = _parse_json(content)
         if parsed is None:
@@ -622,7 +743,7 @@ async def _collect_company_reports(
 # (5) 최종 Top 5 synthesis
 # ------------------------------------------------------------------
 async def _synthesize_top5(
-    idea_text: str, research: dict,
+    idea_text: str, research: dict, importance: dict,
     industry_pdfs: list[Path], industry_texts: dict[str, str],
     top10: list[dict],
     company_pdfs_by_ticker: dict[str, list[Path]],
@@ -662,16 +783,23 @@ async def _synthesize_top5(
                 )
         company_block = "\n\n".join(company_blocks) or "(종목 리포트 없음)"
 
+        # 1.5단계 중요도 평가도 컨텍스트로 주입 (verdict, score, args)
+        importance_ctx = json.dumps(importance or {}, ensure_ascii=False, indent=2)[:3000]
+
         user_msg = (
             f"# 사용자 투자 아이디어\n{idea_text}\n\n"
-            f"# 1단계 리서치\n"
+            f"# 1단계 리서치 — 논리의 기울기\n"
             f"{json.dumps(research.get('logic_gradient_text',''), ensure_ascii=False)[:3000]}\n\n"
+            f"# 1.5단계 중요도 평가 (이 평가를 진지하게 받아 thesis에 반영)\n"
+            f"{importance_ctx}\n\n"
             f"# top10 후보 (3단계 narrow 결과)\n"
             f"{json.dumps(top10, ensure_ascii=False, indent=2)[:8_000]}\n\n"
             f"# 산업 리포트 텍스트\n{ind_block[:50_000]}\n\n"
             f"# 종목 리포트 텍스트\n{company_block[:60_000]}\n\n"
             "시스템 프롬프트 형식대로 Top 5 JSON을 출력해주세요. "
-            "referenced_reports에는 위 입력의 파일명을 정확히 사용해주세요."
+            "각 종목마다 사업부 식별 → 영업레버리지 폭 → 기울기 → thesis 순으로 단계적으로 추론하고 "
+            "최종 thesis에 통합해주세요. "
+            "referenced_reports에는 해당 종목의 own 종목 리포트 파일명만 정확히 사용해주세요."
         )
         try:
             resp = client.chat.completions.create(
@@ -745,6 +873,9 @@ async def _send_results(
         name = pick.get("name", "?")
         ticker = pick.get("ticker6", "??????")
         industry = pick.get("industry", "")
+        business_unit = pick.get("business_unit", "")
+        magnitude = pick.get("magnitude", "")
+        gradient_timing = pick.get("gradient_timing", "")
         thesis = pick.get("operating_leverage_thesis", "(thesis 없음)")
         kn = pick.get("key_numbers") or {}
         refs = pick.get("referenced_reports") or []
@@ -770,7 +901,18 @@ async def _send_results(
         )
         await send_text_chunked(bot, chat_id, header)
 
-        body = thesis
+        # 5단계 추론 요약 헤더 (사업부/폭/기울기) — thesis 위에 짧게 노출
+        summary_header = ""
+        if business_unit:
+            summary_header += f"🏢 사업부: {business_unit}\n"
+        if magnitude:
+            summary_header += f"📐 폭(magnitude): {magnitude}\n"
+        if gradient_timing:
+            summary_header += f"⏱️ 기울기/시점: {gradient_timing}\n"
+        if summary_header:
+            summary_header += "\n"
+
+        body = summary_header + thesis
         if kn:
             body += "\n\n📊 Key Numbers\n"
             for k, v in kn.items():
@@ -810,7 +952,19 @@ async def _send_results(
 # 헬퍼
 # ------------------------------------------------------------------
 def _synthesis_model() -> str:
+    """1.5단계 중요도 평가 + 5단계 최종 Top 5 합성 — 가장 지능 필요. 기본 claude-sonnet."""
     explicit = os.getenv(SYNTHESIS_MODEL_ENV)
+    if explicit:
+        return explicit
+    return os.getenv("OPENROUTER_MODEL") or "anthropic/claude-sonnet-4.5"
+
+
+def _narrow_model() -> str:
+    """3단계 30→10 narrowing — 정형화된 스코어링이라 평소 모델로 충분.
+
+    명시값(IDEA_NARROW_MODEL) 없으면 OPENROUTER_MODEL(평소 모델) 사용.
+    """
+    explicit = os.getenv(NARROW_MODEL_ENV)
     if explicit:
         return explicit
     return os.getenv("OPENROUTER_MODEL") or "anthropic/claude-sonnet-4.5"
