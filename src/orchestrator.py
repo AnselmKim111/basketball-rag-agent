@@ -39,6 +39,7 @@ from src.category_bots import (
     industry_top10_job,
     market_daily_job,
 )
+from src.idea_bot import build_idea_app
 
 KST = timezone(timedelta(hours=9))
 
@@ -110,6 +111,12 @@ BOT_SPECS: list[BotSpec] = [
                 description="글로벌 Top10 — 매주 토 09:00 KST",
             ),
         ],
+    ),
+    BotSpec(
+        name="idea",
+        token_env="IDEA_BOT_TOKEN",
+        builder=build_idea_app,
+        jobs=[],  # 사용자 입력 기반, 스케줄 없음
     ),
 ]
 
