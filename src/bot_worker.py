@@ -38,6 +38,15 @@ from telegram.ext import (
 from src.bot_helpers import allowed_chat_ids, is_authorized as _bh_is_authorized
 from src.pipeline_lock import PIPELINE_LOCK
 
+
+def _log_task_exception(task: asyncio.Task) -> None:
+    """create_task done callback — 미캐치 예외를 silent drop하지 않게 로깅."""
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc:
+        logging.exception("백그라운드 태스크 실패: %s", task.get_name(), exc_info=exc)
+
 # CompanyBot용 chat_id allowlist 환경변수
 _ALLOWED_ENV = "ALLOWED_CHAT_IDS"
 
@@ -185,7 +194,11 @@ async def _enqueue_combined(
             f"끝나면 처리: *{name}* ({ticker}) — /deepdive + /report",
             parse_mode=ParseMode.MARKDOWN,
         )
-    asyncio.create_task(_run_combined(update, context, name, ticker, top))
+    task = asyncio.create_task(
+        _run_combined(update, context, name, ticker, top),
+        name=f"combined:{ticker}",
+    )
+    task.add_done_callback(_log_task_exception)
 
 
 async def _run_combined(
@@ -298,7 +311,11 @@ async def _enqueue(
             parse_mode=ParseMode.MARKDOWN,
         )
 
-    asyncio.create_task(_run_pipeline(update, name, ticker, top))
+    task = asyncio.create_task(
+        _run_pipeline(update, name, ticker, top),
+        name=f"pipeline:{ticker}",
+    )
+    task.add_done_callback(_log_task_exception)
 
 
 async def _run_pipeline(

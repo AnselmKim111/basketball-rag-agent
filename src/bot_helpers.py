@@ -105,6 +105,24 @@ def download_root_for(subdir: str = "") -> Path:
 # ------------------------------------------------------------------
 # 환경 진단 (로그용)
 # ------------------------------------------------------------------
+class MissingWisereportCreds(RuntimeError):
+    """WISEREPORT_ID/PW 환경변수 미설정."""
+
+
+def wisereport_creds() -> tuple[str, str]:
+    """(WISEREPORT_ID, WISEREPORT_PW). 미설정이면 MissingWisereportCreds raise.
+
+    `os.environ["..."]` 직접 접근은 KeyError로 봇 프로세스에 traceback이 그대로
+    노출되므로, 호출자가 잡아 사용자 친화적 메시지로 변환할 수 있게 typed error로 감쌈.
+    """
+    uid = os.environ.get("WISEREPORT_ID")
+    pw = os.environ.get("WISEREPORT_PW")
+    if not uid or not pw:
+        missing = [k for k, v in (("WISEREPORT_ID", uid), ("WISEREPORT_PW", pw)) if not v]
+        raise MissingWisereportCreds(f"환경변수 미설정: {', '.join(missing)}")
+    return uid, pw
+
+
 def diag_env_keys(prefixes: Iterable[str]) -> dict[str, str]:
     """주어진 prefix가 들어간 env key를 마스킹된 형태로 반환 (로깅 안전)."""
     out: dict[str, str] = {}

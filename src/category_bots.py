@@ -23,10 +23,12 @@ from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 from src.bot_helpers import (
+    MissingWisereportCreds,
     is_authorized as _bh_is_authorized,
     safe_dirname as _bh_safe_dirname,
     send_pdf as _bh_send_pdf,
     send_text_chunked as _bh_send_text,
+    wisereport_creds,
 )
 from src.pipeline_lock import PIPELINE_LOCK
 from src.state_store import mark_seen, seen
@@ -80,6 +82,13 @@ async def _process_and_send_category(
             f"⏳ *{label}*: 다른 작업 진행 중 — 끝나면 순차 처리합니다",
         )
 
+    try:
+        wr_id, wr_pw = wisereport_creds()
+    except MissingWisereportCreds as e:
+        log.error("wisereport 자격 증명 누락 (%s): %s", label, e)
+        await _send_text(bot, chat_id, f"⚠️ {label}: wisereport 자격 증명 미설정 — 관리자에게 문의")
+        return 0
+
     async with PIPELINE_LOCK:
         loop = asyncio.get_running_loop()
 
@@ -92,8 +101,8 @@ async def _process_and_send_category(
             from src.summarizer import IndividualSummary  # noqa: F401
             items: list[ReportItem] = []
             with WisereportClient(
-                user_id=os.environ["WISEREPORT_ID"],
-                password=os.environ["WISEREPORT_PW"],
+                user_id=wr_id,
+                password=wr_pw,
                 download_root=download_root,
                 headless=True,
                 ignore_https_errors=os.environ.get("IGNORE_HTTPS_ERRORS", "false").lower() == "true",
@@ -220,10 +229,17 @@ async def industry_on_demand(
     # 산업명 → gicscode (best effort)
     loop = asyncio.get_running_loop()
 
+    try:
+        wr_id, wr_pw = wisereport_creds()
+    except MissingWisereportCreds as e:
+        log.error("wisereport 자격 증명 누락 (industry lookup): %s", e)
+        await update.message.reply_text("⚠️ wisereport 자격 증명 미설정 — 관리자에게 문의")
+        return
+
     def _lookup() -> str | None:
         with WisereportClient(
-            user_id=os.environ["WISEREPORT_ID"],
-            password=os.environ["WISEREPORT_PW"],
+            user_id=wr_id,
+            password=wr_pw,
             download_root=Path("/tmp"),
             headless=True,
             ignore_https_errors=os.environ.get("IGNORE_HTTPS_ERRORS", "false").lower() == "true",

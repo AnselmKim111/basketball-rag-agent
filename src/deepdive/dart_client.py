@@ -33,6 +33,15 @@ DART_DOC_DOWN = "https://dart.fss.or.kr/pdf/download/main.do"
 DEFAULT_TIMEOUT = httpx.Timeout(30.0, connect=10.0)
 KST = timezone(timedelta(hours=9))
 
+# 다운로드 크기 가드 (압축/비압축 양쪽).
+# - corpCode: 정상 ~3MB, 사업보고서 zip: 보통 ~30MB (수십 페이지 PDF).
+# - 100MB 캡: 정상 응답은 절대 도달 안 하고, 악의적/오류 응답만 차단.
+MAX_DOWNLOAD_BYTES = 100 * 1024 * 1024
+MAX_ZIP_MEMBER_BYTES = 100 * 1024 * 1024
+
+# 잠정실적 공시 LLM 파싱용 텍스트 윈도우 (실적표는 보통 첫 1-2 페이지에 위치).
+PRELIMINARY_TEXT_WINDOW = 40_000
+
 
 # 사업보고서·반기·분기보고서 코드 (DART pblntf_detail_ty)
 PERIODIC_REPORT_CODES = ("A001", "A002", "A003")  # 사업/반기/분기
@@ -126,8 +135,15 @@ def _load_corp_map() -> dict[str, str]:
         with httpx.Client(timeout=httpx.Timeout(60.0, connect=15.0), verify=False) as cli:
             r = cli.get(f"{DART_BASE}/corpCode.xml", params={"crtfc_key": key})
             r.raise_for_status()
+            if len(r.content) > MAX_DOWNLOAD_BYTES:
+                log.warning("corpCode 응답 비정상 크기 %d bytes (cap %d)", len(r.content), MAX_DOWNLOAD_BYTES)
+                return {}
             zf = zipfile.ZipFile(io.BytesIO(r.content))
-            xml_content = zf.read("CORPCODE.xml").decode("utf-8")
+            xml_member = zf.getinfo("CORPCODE.xml")
+            if xml_member.file_size > MAX_ZIP_MEMBER_BYTES:
+                log.warning("CORPCODE.xml 비정상 크기 %d bytes", xml_member.file_size)
+                return {}
+            xml_content = zf.read(xml_member).decode("utf-8")
 
         from xml.etree import ElementTree as ET
         root = ET.fromstring(xml_content)
@@ -375,6 +391,9 @@ def download_report_archive(
         with httpx.Client(timeout=httpx.Timeout(60.0, connect=15.0), verify=False) as cli:
             r = cli.get(f"{DART_BASE}/document.xml", params={"crtfc_key": key, "rcept_no": rcept_no})
             r.raise_for_status()
+            if len(r.content) > MAX_DOWNLOAD_BYTES:
+                log.warning("document.xml 비정상 크기 %d bytes (rcept_no=%s)", len(r.content), rcept_no)
+                return None
             content_type = r.headers.get("content-type", "").lower()
             if "xml" in content_type and b"<status>" in r.content[:200]:
                 log.warning("document.xml 에러 응답 (rcept_no=%s): %s", rcept_no, r.content[:300])
@@ -391,6 +410,12 @@ def download_report_archive(
                 return None
             else:
                 picked = max(members, key=lambda m: m.file_size)
+            if picked.file_size > MAX_ZIP_MEMBER_BYTES:
+                log.warning(
+                    "zip member 비정상 크기 %d bytes (rcept_no=%s, member=%s)",
+                    picked.file_size, rcept_no, picked.filename,
+                )
+                return None
             ext = Path(picked.filename).suffix.lower() or ".bin"
             safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", Path(picked.filename).stem)[:80] or "report"
             out_path = target_dir / f"{rcept_no}_{safe_name}{ext}"
@@ -540,7 +565,7 @@ def fetch_latest_preliminary_quarter(
         path = download_report_archive(cand.rcept_no, target_dir, require_pdf=False)
         if not path:
             continue
-        text = extract_doc_text(path, max_chars=40_000, prefer_section="")
+        text = extract_doc_text(path, max_chars=PRELIMINARY_TEXT_WINDOW, prefer_section="")
         if not text.strip():
             continue
         parsed = _llm_parse_preliminary(text, cand.report_nm)
