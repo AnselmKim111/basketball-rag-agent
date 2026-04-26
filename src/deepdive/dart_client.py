@@ -389,7 +389,7 @@ def _extract_pl_metrics(items: list[dict]) -> tuple[int, int, int] | None:
 # 4) 보고서 본문 텍스트 추출 (PDF / XML / HTML 통합)
 # ------------------------------------------------------------------
 def extract_doc_text(path: Path, max_chars: int = 80_000, prefer_section: str = "사업의 내용") -> str:
-    """DART 보고서 파일에서 텍스트 추출.
+    """DART 보고서 파일에서 텍스트 추출 - 매우 견고하게 (다단계 폴백).
 
     DART는 사업보고서를 자체 XML 포맷으로 제공 (PDF 아님). 파일 확장자에 따라
     적절한 파서 선택. 가능하면 'prefer_section'에 해당하는 섹션만 추출,
@@ -398,25 +398,60 @@ def extract_doc_text(path: Path, max_chars: int = 80_000, prefer_section: str = 
     실패 시 빈 문자열 반환 (예외 던지지 않음).
     """
     if not path or not path.exists():
+        log.warning("extract_doc_text: path 없음 (%s)", path)
         return ""
 
+    size = path.stat().st_size
     ext = path.suffix.lower()
+    log.info("extract_doc_text: %s (%d bytes, ext=%s)", path.name, size, ext)
+
     try:
         if ext == ".pdf":
-            return _extract_pdf(path, max_chars)
+            text = _extract_pdf(path, max_chars)
         elif ext in (".xml", ".html", ".htm"):
-            return _extract_xml_or_html(path, max_chars, prefer_section)
+            text = _extract_xml_or_html(path, max_chars, prefer_section)
         elif ext in (".txt",):
-            return path.read_text(encoding="utf-8", errors="ignore")[:max_chars]
+            text = path.read_text(encoding="utf-8", errors="ignore")[:max_chars]
         else:
             # 알 수 없는 형식: 일단 텍스트로 시도
             try:
-                return path.read_text(encoding="utf-8", errors="ignore")[:max_chars]
+                text = path.read_text(encoding="utf-8", errors="ignore")[:max_chars]
             except Exception:
-                return ""
+                text = ""
+
+        if text and text.strip():
+            log.info("extract_doc_text: %d자 추출 성공", len(text))
+            return text
+
+        # 1차 실패 - 폴백: 파일을 최대한 일반 텍스트로 읽고 태그 제거
+        log.warning("extract_doc_text 1차 시도 빈 텍스트 — fallback 시도")
+        return _fallback_strip_tags(path, max_chars)
     except Exception:
-        log.exception("보고서 본문 텍스트 추출 실패: %s", path)
-        return ""
+        log.exception("보고서 본문 텍스트 추출 1차 실패: %s — fallback 시도", path)
+        try:
+            return _fallback_strip_tags(path, max_chars)
+        except Exception:
+            log.exception("보고서 본문 텍스트 추출 fallback도 실패")
+            return ""
+
+
+def _fallback_strip_tags(path: Path, max_chars: int) -> str:
+    """최후 수단: 파일을 텍스트로 읽고 정규식으로 XML/HTML 태그 제거."""
+    raw = path.read_bytes()
+    for enc in ("utf-8", "cp949", "euc-kr", "latin-1"):
+        try:
+            text = raw.decode(enc)
+            break
+        except UnicodeDecodeError:
+            continue
+    else:
+        text = raw.decode("utf-8", errors="ignore")
+    # XML/HTML 태그 제거
+    text = re.sub(r"<[^>]+>", " ", text)
+    # 연속 공백 정리
+    text = re.sub(r"\s+", " ", text).strip()
+    log.info("_fallback_strip_tags: %d자 추출 (정규식 폴백)", len(text))
+    return text[:max_chars]
 
 
 def _extract_pdf(path: Path, max_chars: int) -> str:

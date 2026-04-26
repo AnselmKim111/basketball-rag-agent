@@ -158,9 +158,12 @@ async def _execute(bot, chat_id: int, ticker: str) -> None:
                 header="🏢 *업의 본질*",
                 prefer_section="사업의 내용",
             )
-        except Exception:
+        except Exception as e:
             log.exception("업의 본질 요약 실패")
-            await bot.send_message(chat_id=chat_id, text="⚠️ 업의 본질 요약 실패 (계속 진행)")
+            await bot.send_message(
+                chat_id=chat_id,
+                text=f"⚠️ 업의 본질 요약 실패: {type(e).__name__}: {str(e)[:300]}",
+            )
 
     # 4) IR자료 메타 + PDF + 핵심 투자포인트 요약
     ir_meta = await loop.run_in_executor(None, dart_client.fetch_latest_ir_doc, corp_code)
@@ -179,9 +182,12 @@ async def _execute(bot, chat_id: int, ticker: str) -> None:
                     header=f"💡 *핵심 투자 포인트* ({ir_meta.report_nm})",
                     prefer_section=None,  # IR자료는 전체 본문 사용
                 )
-            except Exception:
+            except Exception as e:
                 log.exception("IR 요약 실패")
-                await bot.send_message(chat_id=chat_id, text="⚠️ IR 요약 실패 (계속 진행)")
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=f"⚠️ IR 요약 실패: {type(e).__name__}: {str(e)[:300]}",
+                )
 
     # 5) 분기별 재무 + 차트
     try:
@@ -244,7 +250,11 @@ async def _summarize_and_send(
     bot, chat_id: int, pdf_path: Path, prompt_name: str, header: str,
     prefer_section: Optional[str] = None,
 ) -> None:
-    """공통 헬퍼: DART 보고서 (PDF 또는 XML/HTML) → 텍스트 추출 → LLM 요약 → 발송."""
+    """공통 헬퍼: DART 보고서 (PDF 또는 XML/HTML) → 텍스트 추출 → LLM 요약 → 발송.
+
+    내부에서 모든 예외를 catch해 문자열로 반환 — _summarize_and_send 자체는
+    최대한 raise하지 않게 (상위 핸들러의 try/except 의존도 줄임).
+    """
     from src.deepdive import prompts as prompt_loader
     from src.deepdive import dart_client
     from src import summarizer
@@ -252,15 +262,34 @@ async def _summarize_and_send(
     loop = asyncio.get_running_loop()
 
     def _do_summary() -> str:
-        # PDF/XML/HTML 통합 추출 (DART 사업보고서는 보통 XML)
-        text = dart_client.extract_doc_text(
-            pdf_path, max_chars=80_000,
-            prefer_section=prefer_section or "",
-        )
+        # 1) 텍스트 추출
+        try:
+            text = dart_client.extract_doc_text(
+                pdf_path, max_chars=80_000,
+                prefer_section=prefer_section or "",
+            )
+        except Exception as e:
+            log.exception("extract_doc_text 호출 자체 예외")
+            return f"(텍스트 추출 예외: {type(e).__name__}: {str(e)[:200]})"
+
         if not text.strip():
-            return "(보고서 텍스트 추출 실패)"
-        sys_prompt = prompt_loader.load(prompt_name)
-        client = summarizer.get_client()
+            return f"(보고서 텍스트 추출 결과 빈 문자열 - file={pdf_path.name})"
+
+        # 2) 프롬프트 로드 (fallback 포함, 거의 raise 안 함)
+        try:
+            sys_prompt = prompt_loader.load(prompt_name)
+        except Exception as e:
+            log.exception("prompt 로드 실패")
+            return f"(프롬프트 로드 실패: {type(e).__name__}: {str(e)[:200]})"
+
+        # 3) OpenRouter 클라이언트
+        try:
+            client = summarizer.get_client()
+        except Exception as e:
+            log.exception("OpenRouter client 초기화 실패")
+            return f"(LLM 초기화 실패: {type(e).__name__}: {str(e)[:200]})"
+
+        # 4) LLM 호출 - 모든 예외 catch
         try:
             resp = client.chat.completions.create(
                 model=summarizer.DEFAULT_MODEL,
@@ -277,15 +306,31 @@ async def _summarize_and_send(
         except summarizer.APIStatusError as e:
             if summarizer._is_credit_error(e):
                 return "(요약 실패: OpenRouter 토큰 부족)"
-            return f"(요약 실패: {e!r})"
-        return summarizer._trim_to_chars(
-            resp.choices[0].message.content or "", summarizer.MAX_SUMMARY_CHARS_SHORT,
-        )
+            return f"(요약 실패 APIStatus: {e!r})"
+        except Exception as e:
+            log.exception("LLM 호출 실패 (non-APIStatusError)")
+            return f"(요약 실패: {type(e).__name__}: {str(e)[:200]})"
 
-    summary = await loop.run_in_executor(None, _do_summary)
+        try:
+            return summarizer._trim_to_chars(
+                resp.choices[0].message.content or "", summarizer.MAX_SUMMARY_CHARS_SHORT,
+            )
+        except Exception as e:
+            log.exception("응답 trim 실패")
+            return f"(응답 처리 실패: {type(e).__name__})"
+
+    try:
+        summary = await loop.run_in_executor(None, _do_summary)
+    except Exception as e:
+        log.exception("run_in_executor 자체 실패")
+        summary = f"(executor 실패: {type(e).__name__}: {str(e)[:200]})"
 
     full = f"{header}\n\n{summary}"
     # 4096 char limit handling
     while full:
         chunk, full = full[:4000], full[4000:]
-        await bot.send_message(chat_id=chat_id, text=chunk)
+        try:
+            await bot.send_message(chat_id=chat_id, text=chunk)
+        except Exception:
+            log.exception("텔레그램 발송 실패 (chunk)")
+            break
