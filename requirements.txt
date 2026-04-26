@@ -6,3 +6,6 @@ python-dotenv>=1.0.1
 python-telegram-bot>=21.6
 APScheduler>=3.10.4
 tzdata>=2024.1
+# deepdive 기능
+matplotlib>=3.8
+beautifulsoup4>=4.12

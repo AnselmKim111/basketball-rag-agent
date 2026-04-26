@@ -227,6 +227,13 @@ def build_company_app(token: str) -> Application:
     app.add_handler(CommandHandler(["start", "help"], cmd_start))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("report", cmd_report))
+    # --- deepdive (격리: 실패해도 기존 봇 정상) ---
+    try:
+        from src.deepdive.handler import register as register_deepdive
+        register_deepdive(app)
+    except Exception:
+        logging.exception("deepdive 핸들러 등록 실패 — 기능 비활성화, 기존 봇은 정상 가동")
+    # ----------------------------------------------
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
     app.add_error_handler(error_handler)
     return app

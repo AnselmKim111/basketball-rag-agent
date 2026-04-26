@@ -1,0 +1,367 @@
+"""DART (전자공시) API 클라이언트.
+
+dart-fss 라이브러리에 직접 의존하지 않고, OpenDART HTTP API를 httpx로 직접 호출.
+이유:
+  - dart-fss는 문서 다운로드 시 경로 의존성이 있어 Docker 컨테이너 권한 이슈 가능
+  - 우리가 필요한 endpoint는 4-5개뿐
+  - 직접 호출이 디버깅·격리 측면에서 단순
+
+환경변수 DART_API_KEY 필수 (handler.register()에서 사전 체크).
+모든 함수는 graceful — 실패 시 None/빈 dict 반환, 예외 던지지 않음.
+"""
+
+from __future__ import annotations
+
+import io
+import logging
+import os
+import re
+import zipfile
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any
+
+import httpx
+
+log = logging.getLogger(__name__)
+
+DART_BASE = "https://opendart.fss.or.kr/api"
+DART_VIEWER = "https://dart.fss.or.kr/dsaf001/main.do"
+DART_DOC_DOWN = "https://dart.fss.or.kr/pdf/download/main.do"
+
+DEFAULT_TIMEOUT = httpx.Timeout(30.0, connect=10.0)
+KST = timezone(timedelta(hours=9))
+
+
+# 사업보고서·반기·분기보고서 코드 (DART pblntf_detail_ty)
+PERIODIC_REPORT_CODES = ("A001", "A002", "A003")  # 사업/반기/분기
+
+# IR 관련 공시 코드 (B001=주요사항보고, I001=거래소공시 IR관련 - 환경별 변동 가능)
+# 보수적으로 보고서명 텍스트 매칭도 함께 사용
+IR_REPORT_CODES = ("I001",)
+
+
+@dataclass
+class DartReport:
+    rcept_no: str       # 접수번호 (URL 파라미터)
+    report_nm: str      # 보고서명
+    rcept_dt: str       # 접수일자 YYYYMMDD
+    flr_nm: str         # 제출인
+
+
+@dataclass
+class FinancialMetrics:
+    """회사 전체 분기별 매출/영업이익/순이익 (단위: 백만원)."""
+    revenue_qoq: dict[str, int]    # "2024Q1" → 매출액
+    op_profit_qoq: dict[str, int]  # 영업이익
+    net_profit_qoq: dict[str, int] # 당기순이익
+
+
+def _api_key() -> str | None:
+    return os.getenv("DART_API_KEY")
+
+
+def _get(path: str, params: dict[str, Any], timeout: httpx.Timeout = DEFAULT_TIMEOUT) -> dict | None:
+    """OpenDART JSON API 호출. 실패 시 None."""
+    key = _api_key()
+    if not key:
+        log.warning("DART_API_KEY 미설정")
+        return None
+    params = {"crtfc_key": key, **params}
+    try:
+        with httpx.Client(timeout=timeout, verify=False) as cli:
+            r = cli.get(f"{DART_BASE}/{path}", params=params)
+            r.raise_for_status()
+            data = r.json()
+            status = str(data.get("status", "000"))
+            # 000=정상, 013=조회된 데이터가 없음 (정상이지만 결과 없음)
+            if status not in ("000", "013"):
+                log.warning("DART API status=%s message=%s path=%s", status, data.get("message"), path)
+                return None if status != "013" else data
+            return data
+    except httpx.HTTPError as e:
+        log.warning("DART API HTTP 에러 (%s): %s", path, e)
+        return None
+    except Exception:
+        log.exception("DART API 예상치 못한 에러 (%s)", path)
+        return None
+
+
+# ------------------------------------------------------------------
+# 1) ticker → corp_code 매핑
+# ------------------------------------------------------------------
+_CORP_MAP_CACHE: dict[str, str] | None = None  # ticker → corp_code
+_CORP_NAME_CACHE: dict[str, str] = {}  # ticker → corp_name
+
+
+def _load_corp_map() -> dict[str, str]:
+    """DART 전체 회사 목록 ZIP 다운로드 → ticker(stock_code) → corp_code 매핑 생성.
+
+    한 번 캐싱. 컨테이너 재시작 시까지 메모리 보관.
+    """
+    global _CORP_MAP_CACHE
+    if _CORP_MAP_CACHE is not None:
+        return _CORP_MAP_CACHE
+
+    key = _api_key()
+    if not key:
+        log.warning("DART_API_KEY 미설정")
+        return {}
+
+    log.info("DART 회사목록 다운로드 시작 (CORPCODE.xml)")
+    try:
+        with httpx.Client(timeout=httpx.Timeout(60.0, connect=15.0), verify=False) as cli:
+            r = cli.get(f"{DART_BASE}/corpCode.xml", params={"crtfc_key": key})
+            r.raise_for_status()
+            zf = zipfile.ZipFile(io.BytesIO(r.content))
+            xml_content = zf.read("CORPCODE.xml").decode("utf-8")
+
+        from xml.etree import ElementTree as ET
+        root = ET.fromstring(xml_content)
+        m: dict[str, str] = {}
+        for el in root.iter("list"):
+            stock = (el.findtext("stock_code") or "").strip()
+            corp = (el.findtext("corp_code") or "").strip()
+            name = (el.findtext("corp_name") or "").strip()
+            if stock and corp:
+                # ticker는 보통 6자리 숫자
+                m[stock.zfill(6)] = corp
+                _CORP_NAME_CACHE[stock.zfill(6)] = name
+        log.info("DART 회사목록 파싱 완료: %d개", len(m))
+        _CORP_MAP_CACHE = m
+        return m
+    except Exception:
+        log.exception("DART 회사목록 다운로드 실패")
+        return {}
+
+
+def get_corp_code(ticker: str) -> tuple[str, str] | None:
+    """ticker → (corp_code, corp_name) 또는 None."""
+    t = ticker.strip().zfill(6)
+    m = _load_corp_map()
+    code = m.get(t)
+    if not code:
+        return None
+    return code, _CORP_NAME_CACHE.get(t, ticker)
+
+
+# ------------------------------------------------------------------
+# 2) 사업보고서 메타데이터 + PDF 다운로드
+# ------------------------------------------------------------------
+def fetch_latest_business_report(corp_code: str) -> DartReport | None:
+    """가장 최근 사업/반기/분기 보고서 메타데이터 조회 (실 PDF는 별도)."""
+    today = datetime.now(KST).strftime("%Y%m%d")
+    one_year_ago = (datetime.now(KST) - timedelta(days=400)).strftime("%Y%m%d")
+
+    for code in PERIODIC_REPORT_CODES:
+        data = _get("list.json", {
+            "corp_code": corp_code,
+            "bgn_de": one_year_ago,
+            "end_de": today,
+            "pblntf_detail_ty": code,
+            "page_count": 5,
+        })
+        if not data:
+            continue
+        items = data.get("list") or []
+        if not items:
+            continue
+        # 최신 정렬 (rcept_dt 내림차순)
+        items.sort(key=lambda x: x.get("rcept_dt", ""), reverse=True)
+        top = items[0]
+        log.info("사업/반기/분기 보고서 발견 (%s): %s", code, top.get("report_nm"))
+        return DartReport(
+            rcept_no=top["rcept_no"],
+            report_nm=top["report_nm"],
+            rcept_dt=top["rcept_dt"],
+            flr_nm=top.get("flr_nm", ""),
+        )
+    log.warning("사업보고서를 찾지 못함: corp_code=%s", corp_code)
+    return None
+
+
+def fetch_latest_ir_doc(corp_code: str) -> DartReport | None:
+    """가장 최근 IR자료/실적발표/사업설명회 메타데이터."""
+    today = datetime.now(KST).strftime("%Y%m%d")
+    six_months_ago = (datetime.now(KST) - timedelta(days=200)).strftime("%Y%m%d")
+
+    candidates: list[DartReport] = []
+
+    # 1순위: pblntf_detail_ty=I001 (거래소 공시 - IR자료)
+    for code in IR_REPORT_CODES:
+        data = _get("list.json", {
+            "corp_code": corp_code,
+            "bgn_de": six_months_ago,
+            "end_de": today,
+            "pblntf_detail_ty": code,
+            "page_count": 30,
+        })
+        if not data:
+            continue
+        for it in data.get("list") or []:
+            nm = it.get("report_nm", "")
+            if any(kw in nm for kw in ("IR", "실적발표", "기업설명회", "투자설명회", "컨퍼런스콜", "사업설명회")):
+                candidates.append(DartReport(
+                    rcept_no=it["rcept_no"], report_nm=nm,
+                    rcept_dt=it["rcept_dt"], flr_nm=it.get("flr_nm", ""),
+                ))
+
+    # 2순위: 전체 공시 검색에서 IR 키워드 포함 보고서
+    if not candidates:
+        data = _get("list.json", {
+            "corp_code": corp_code,
+            "bgn_de": six_months_ago,
+            "end_de": today,
+            "page_count": 30,
+        })
+        if data:
+            for it in data.get("list") or []:
+                nm = it.get("report_nm", "")
+                if any(kw in nm for kw in ("IR자료", "실적발표", "기업설명회", "투자설명회", "사업설명회")):
+                    candidates.append(DartReport(
+                        rcept_no=it["rcept_no"], report_nm=nm,
+                        rcept_dt=it["rcept_dt"], flr_nm=it.get("flr_nm", ""),
+                    ))
+
+    if not candidates:
+        log.info("IR 자료 없음: corp_code=%s", corp_code)
+        return None
+
+    candidates.sort(key=lambda x: x.rcept_dt, reverse=True)
+    top = candidates[0]
+    log.info("IR자료 발견: %s (%s)", top.report_nm, top.rcept_dt)
+    return top
+
+
+def download_report_archive(rcept_no: str, target_dir: Path) -> Path | None:
+    """rcept_no → 보고서 첨부서류(zip) 다운로드 후 가장 큰 PDF/HWP/문서 파일 반환.
+
+    DART의 document.xml endpoint는 여러 파일이 zip으로 묶여 옴.
+    주요 본문 파일 1개 추출.
+    """
+    key = _api_key()
+    if not key:
+        return None
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        with httpx.Client(timeout=httpx.Timeout(60.0, connect=15.0), verify=False) as cli:
+            r = cli.get(f"{DART_BASE}/document.xml", params={"crtfc_key": key, "rcept_no": rcept_no})
+            r.raise_for_status()
+            content_type = r.headers.get("content-type", "").lower()
+            # XML 응답이면 status 필드 있음 → 에러
+            if "xml" in content_type and b"<status>" in r.content[:200]:
+                # 본문 zip이 아닌 에러 XML
+                log.warning("document.xml 에러 응답 (rcept_no=%s): %s", rcept_no, r.content[:300])
+                return None
+            zf = zipfile.ZipFile(io.BytesIO(r.content))
+            # PDF가 있으면 최우선, 없으면 가장 큰 파일
+            members = zf.infolist()
+            if not members:
+                return None
+            pdf_members = [m for m in members if m.filename.lower().endswith(".pdf")]
+            picked = max(pdf_members, key=lambda m: m.file_size) if pdf_members else max(members, key=lambda m: m.file_size)
+            ext = Path(picked.filename).suffix.lower() or ".bin"
+            safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", Path(picked.filename).stem)[:80] or "report"
+            out_path = target_dir / f"{rcept_no}_{safe_name}{ext}"
+            out_path.write_bytes(zf.read(picked))
+            log.info("DART 문서 저장: %s (%d bytes)", out_path, out_path.stat().st_size)
+            return out_path
+    except Exception:
+        log.exception("DART 문서 다운로드 실패 rcept_no=%s", rcept_no)
+        return None
+
+
+# ------------------------------------------------------------------
+# 3) 분기별 회사 전체 재무제표 (매출/영업이익/순이익)
+# ------------------------------------------------------------------
+def fetch_quarterly_financials(corp_code: str, years: int = 3) -> FinancialMetrics:
+    """최근 N년 분기별 누적 재무 → 분기 단위로 변환.
+
+    API: fnlttSinglAcntAll.json (전체 계정과목)
+    DART는 1Q/반기/3Q/연간 누적(YTD) 값으로 제공 → 분기값은 직접 계산.
+    """
+    revenue_qoq: dict[str, int] = {}
+    op_qoq: dict[str, int] = {}
+    net_qoq: dict[str, int] = {}
+
+    now_year = datetime.now(KST).year
+    # 보고서코드: 11013=1분기, 11012=반기, 11014=3분기, 11011=사업보고서(연간)
+    quarter_codes = [
+        ("11013", "Q1"),
+        ("11012", "Q2"),  # 반기 누적
+        ("11014", "Q3"),  # 3분기 누적
+        ("11011", "Q4"),  # 사업보고서 누적(연간)
+    ]
+
+    for year in range(now_year - years, now_year + 1):
+        prev_revenue = 0
+        prev_op = 0
+        prev_net = 0
+        for reprt_code, q_label in quarter_codes:
+            data = _get("fnlttSinglAcntAll.json", {
+                "corp_code": corp_code,
+                "bsns_year": str(year),
+                "reprt_code": reprt_code,
+                "fs_div": "CFS",  # 연결재무제표 (없으면 OFS도 시도)
+            })
+            list_items = (data or {}).get("list") or []
+            if not list_items:
+                # 연결 없으면 별도(OFS) 시도
+                data = _get("fnlttSinglAcntAll.json", {
+                    "corp_code": corp_code,
+                    "bsns_year": str(year),
+                    "reprt_code": reprt_code,
+                    "fs_div": "OFS",
+                })
+                list_items = (data or {}).get("list") or []
+            if not list_items:
+                continue
+
+            ytd = _extract_pl_metrics(list_items)
+            if not ytd:
+                continue
+            rev_ytd, op_ytd, net_ytd = ytd
+
+            # 분기값 = YTD - 이전까지 YTD
+            label = f"{year}{q_label}"
+            revenue_qoq[label] = rev_ytd - prev_revenue
+            op_qoq[label] = op_ytd - prev_op
+            net_qoq[label] = net_ytd - prev_net
+            prev_revenue, prev_op, prev_net = rev_ytd, op_ytd, net_ytd
+
+    log.info(
+        "분기 재무 추출: revenue=%d, op=%d, net=%d 분기",
+        len(revenue_qoq), len(op_qoq), len(net_qoq),
+    )
+    return FinancialMetrics(
+        revenue_qoq=revenue_qoq,
+        op_profit_qoq=op_qoq,
+        net_profit_qoq=net_qoq,
+    )
+
+
+def _extract_pl_metrics(items: list[dict]) -> tuple[int, int, int] | None:
+    """fnlttSinglAcntAll 결과에서 매출액/영업이익/당기순이익 YTD 추출 (백만원)."""
+    rev = op = net = None
+    for it in items:
+        sj = it.get("sj_div", "")  # IS=손익계산서, CIS=포괄손익계산서
+        if sj not in ("IS", "CIS"):
+            continue
+        nm = (it.get("account_nm") or "").replace(" ", "")
+        amount_str = (it.get("thstrm_amount") or "0").replace(",", "")
+        try:
+            amount = int(amount_str)
+        except (ValueError, TypeError):
+            continue
+        # 단위: 원 → 백만원으로 변환은 하지 않음 (DART는 보통 원 단위)
+        if rev is None and ("매출액" in nm or "수익(매출액)" in nm or nm == "영업수익"):
+            rev = amount
+        elif op is None and "영업이익" in nm and "영업이익률" not in nm:
+            op = amount
+        elif net is None and ("당기순이익" in nm or "분기순이익" in nm or "반기순이익" in nm) and "비지배" not in nm:
+            net = amount
+    if rev is None:
+        return None
+    return rev, op or 0, net or 0
