@@ -365,9 +365,18 @@ class WisereportClient:
                 )
             )
 
-        # 응답 자체가 최신순. limit만 자르면 됨.
+        # wisereport 응답이 항상 최신순이라는 보장이 없어 명시적으로 sch_dt 내림차순.
+        # sort_by="popular"은 별도 popular 호출이 필요해 현재는 latest와 동일하게 처리.
+        items.sort(key=lambda it: it.sch_dt, reverse=True)
+        if items:
+            log.info(
+                "list_reports ticker=%s 응답 %d건 (날짜 범위 %s ~ %s) → 상위 %d건 사용",
+                ticker, len(items),
+                items[-1].sch_dt[:8] if len(items) > 1 else items[0].sch_dt[:8],
+                items[0].sch_dt[:8],
+                min(limit, len(items)),
+            )
         items = items[:limit]
-        log.info("파싱된 리포트: %d건", len(items))
         return items
 
     # ------------------------------------------------------------------
