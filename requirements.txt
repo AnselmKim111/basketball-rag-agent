@@ -6,3 +6,4 @@ python-dotenv>=1.0.1
 python-telegram-bot>=21.6
 APScheduler>=3.10.4
 tzdata>=2024.1
+filelock>=3.13.0
