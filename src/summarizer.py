@@ -175,6 +175,23 @@ def _trim_to_chars(text: str, max_chars: int = MAX_SUMMARY_CHARS) -> str:
     return truncated.rstrip() + "\n\n... (5000자 제한으로 잘림)"
 
 
+def _safe_content(resp, *, context: str) -> str:
+    """LLM 응답에서 content 추출. 빈 응답이면 placeholder 반환.
+
+    OpenRouter stream idle timeout 등으로 빈 content가 올 수 있는데,
+    그대로 호출자에 빈 string을 돌려주면 헤더만 발송되는 버그가 난다.
+    """
+    try:
+        raw = (resp.choices[0].message.content or "").strip()
+    except (IndexError, AttributeError):
+        log.warning("LLM 응답 구조 비정상 (%s)", context)
+        return "(LLM 응답 구조 비정상 — 재시도 필요)"
+    if not raw:
+        log.warning("LLM이 빈 content 반환 (%s) — stream idle timeout 가능성", context)
+        return "(LLM이 빈 응답 반환 — stream idle timeout 가능성. 잠시 후 재시도 권장)"
+    return raw
+
+
 def summarize_pdf(
     client: OpenAI,
     pdf_path: Path,
@@ -207,7 +224,7 @@ def summarize_pdf(
             raise OpenRouterCreditExhausted(str(e)) from e
         raise
 
-    summary = _trim_to_chars(resp.choices[0].message.content or "")
+    summary = _trim_to_chars(_safe_content(resp, context=f"summarize_pdf {pdf_path.name}"))
     log.info(
         "요약 완료: %s (in=%s, out=%s, chars=%d)",
         pdf_path.name,
@@ -248,7 +265,10 @@ def summarize_pdf_short(
         if _is_credit_error(e):
             raise OpenRouterCreditExhausted(str(e)) from e
         raise
-    summary = _trim_to_chars(resp.choices[0].message.content or "", MAX_SUMMARY_CHARS_SHORT)
+    summary = _trim_to_chars(
+        _safe_content(resp, context=f"summarize_pdf_short {pdf_path.name}"),
+        MAX_SUMMARY_CHARS_SHORT,
+    )
     log.info(
         "짧은 요약 완료: %s (in=%s, out=%s, chars=%d)",
         pdf_path.name,
@@ -289,7 +309,7 @@ def summarize_combined(
         if _is_credit_error(e):
             raise OpenRouterCreditExhausted(str(e)) from e
         raise
-    return _trim_to_chars(resp.choices[0].message.content or "")
+    return _trim_to_chars(_safe_content(resp, context=f"summarize_combined {company_name}"))
 
 
 def write_report(

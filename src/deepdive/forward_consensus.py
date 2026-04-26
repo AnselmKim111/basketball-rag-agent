@@ -10,7 +10,7 @@
 견고성:
   - LLM JSON 파싱 실패해도 빈 dict로 fallback.
   - 텍스트 비었거나 client 초기화 실패하면 빈 dict.
-  - 모든 LLM 응답을 raw로 INFO 로그 (디버그 — 한국 분석가 리포트 패턴 검증용).
+  - LLM raw 응답은 DEBUG 로그 (한국 분석가 리포트 패턴 검증용 — 평소 비활성).
 """
 
 from __future__ import annotations
@@ -130,7 +130,7 @@ def _extract_one(client, model: str, title: str, text: str) -> Optional[dict]:
         log.exception("LLM 응답 구조 비정상 (forward, title=%s)", title[:40])
         return None
 
-    log.info("forward LLM raw [%s]: %s", title[:40], content[:600])
+    log.debug("forward LLM raw [%s]: %s", title[:40], content[:600])
     return _parse_json_object(content)
 
 
