@@ -440,9 +440,22 @@ async def _summarize_and_send(
             return f"(요약 실패: {type(e).__name__}: {str(e)[:200]})"
 
         try:
-            return summarizer._trim_to_chars(
-                resp.choices[0].message.content or "", summarizer.MAX_SUMMARY_CHARS_SHORT,
+            content = (resp.choices[0].message.content or "").strip()
+        except (IndexError, AttributeError) as e:
+            log.exception("LLM 응답 구조 비정상")
+            return f"(LLM 응답 구조 비정상: {type(e).__name__})"
+
+        # OpenRouter의 일부 모델은 stream idle timeout으로 빈 content를 반환.
+        # 헤더만 보내고 본문 사라지는 UX 방지용 명시적 안내.
+        if not content:
+            log.warning("LLM이 빈 content 반환 (모델 idle timeout 가능성)")
+            return (
+                "(LLM이 빈 응답 반환 — Stream idle timeout 가능성. "
+                "OPENROUTER_MODEL을 다른 모델로 바꾸거나 잠시 후 재시도)"
             )
+
+        try:
+            return summarizer._trim_to_chars(content, summarizer.MAX_SUMMARY_CHARS_SHORT)
         except Exception as e:
             log.exception("응답 trim 실패")
             return f"(응답 처리 실패: {type(e).__name__})"

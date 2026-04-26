@@ -125,9 +125,13 @@ def get_client() -> OpenAI:
         raise RuntimeError(
             "OPENROUTER_API_KEY 환경변수가 없습니다. .env에 추가하세요."
         )
+    # OpenRouter 쪽 일부 모델(xiaomi/mimo 등)이 stream idle timeout으로 partial response를
+    # 자주 흘림. 명시적 timeout(180s) + 자동 재시도(2회)로 transient 실패 흡수.
     return OpenAI(
         api_key=api_key,
         base_url=OPENROUTER_BASE_URL,
+        timeout=180.0,
+        max_retries=2,
         default_headers={
             "HTTP-Referer": "https://github.com/anselmkim111/basketball-rag-agent",
             "X-Title": "wisereport-auto-downloader",
