@@ -1,51 +1,156 @@
-"""12M Forward consensus 수집 (best-effort).
+"""wisereport 기업 리포트(최근 3개) → 분기별 forward consensus 추정.
 
-소스 우선순위:
-  1. 네이버 금융 종목 페이지 - 추정 실적 테이블
-  2. (TODO) wisereport 종목 페이지 — 향후 추가
+흐름:
+  1. wisereport_context.collect_for_ticker가 이미 다운받아둔 기업 리포트 텍스트들을 입력으로 받음.
+  2. 각 리포트마다 LLM이 "향후 4분기 매출/영업이익/순이익 전망"을 JSON 추출.
+     - 분기별 명시 추정이 있으면 그대로.
+     - 연간만 있으면 4 분기 균등 분할 (LLM 자체 판단).
+  3. 같은 분기 키에 대해 N개 리포트 평균 → 컨센서스.
 
-DART에는 추정 데이터가 없으므로 외부 스크래핑.
-실패 시 빈 dict 반환 — chart.py가 graceful 처리.
+견고성:
+  - LLM JSON 파싱 실패해도 빈 dict로 fallback.
+  - 텍스트 비었거나 client 초기화 실패하면 빈 dict.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 from typing import Optional
 
-import httpx
-
 log = logging.getLogger(__name__)
 
-NAVER_TIMEOUT = httpx.Timeout(15.0, connect=8.0)
-NAVER_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0) Chrome/131.0.0.0 Safari/537.36",
+
+_FORWARD_SYS_PROMPT = """당신은 한국 분석가 리포트에서 forward 전망 숫자를 추출하는 데이터 추출기입니다.
+
+입력으로 받은 기업 분석 리포트 텍스트에서 **향후 4-8 분기**의 매출/영업이익/순이익 전망 수치를
+JSON 형식으로만 출력하세요. 자연어 설명 절대 금지, JSON만.
+
+규칙:
+- 분기 키는 "2026Q1", "2026Q2" 형식.
+- 수치 단위는 **원**(KRW) 정수. (조원이면 ×1조, 억원이면 ×1억)
+- 분기 전망이 명시 안 되어 있고 연간 전망만 있으면, 회사의 분기 분포 패턴
+  (예: 반도체는 하반기 비중 큼)을 활용해 적절히 분할. 모호하면 균등 분할.
+- 발견 못한 항목은 키에서 누락 (null로 채우지 말 것).
+- 추정치가 없으면 빈 객체 {} 반환.
+- 과거 실적은 추출 대상이 아님. 명시적으로 "E", "F", "예상", "전망", "추정" 표시된 미래 수치만.
+
+출력 예:
+{
+  "2026Q2": {"revenue": 22500000000000, "op_profit": 6800000000000, "net_profit": 5200000000000},
+  "2026Q3": {"revenue": 24000000000000, "op_profit": 7500000000000, "net_profit": 5800000000000},
+  "2026Q4": {"revenue": 25000000000000, "op_profit": 8000000000000, "net_profit": 6200000000000},
+  "2027Q1": {"revenue": 23000000000000, "op_profit": 7000000000000, "net_profit": 5400000000000}
 }
+"""
 
 
-def fetch(ticker: str) -> dict[str, dict[str, Optional[float]]]:
-    """ticker → {"2026Q2": {"revenue": ..., "op_profit": ..., "net_profit": ...}, ...}.
+def from_wisereport(wctx) -> dict[str, dict[str, Optional[float]]]:
+    """WisereportContext → forward consensus dict.
 
-    네이버 금융 추정실적 테이블 best-effort 파싱.
-    실패 시 빈 dict.
+    빈 dict 반환 가능 (입력 없음, LLM 실패, 파싱 실패 모두).
     """
-    try:
-        return _fetch_naver(ticker)
-    except Exception:
-        log.exception("네이버 forward 수집 실패: %s", ticker)
+    if wctx is None or not getattr(wctx, "company_texts", None):
+        log.info("forward consensus: wisereport company_texts 없음 → 빈 결과")
         return {}
 
+    try:
+        from src import summarizer
+    except Exception:
+        log.exception("summarizer import 실패")
+        return {}
 
-def _fetch_naver(ticker: str) -> dict[str, dict[str, Optional[float]]]:
-    """네이버 금융의 종목 분석 페이지에서 분기별 컨센서스 추출.
+    try:
+        client = summarizer.get_client()
+    except Exception:
+        log.exception("OpenRouter client 초기화 실패 → forward 빈 dict")
+        return {}
 
-    URL: https://finance.naver.com/item/coinfo.naver?code={ticker}
-    실제 분석 데이터는 iframe (https://navercomp.wisereport.co.kr/...) 안에 있음.
-    여기서는 단순 fallback — 빈 dict 반환을 기본으로 하고,
-    추후 실제 파싱 로직으로 확장.
+    extractions: list[dict] = []
+    for title, text in zip(wctx.company_titles, wctx.company_texts):
+        if not text or not text.strip():
+            continue
+        try:
+            ext = _extract_one(client, summarizer.DEFAULT_MODEL, title, text)
+        except Exception:
+            log.exception("forward 추출 실패: %s", title)
+            continue
+        if ext:
+            log.info("forward 추출 성공 [%s]: %d 분기", title[:40], len(ext))
+            extractions.append(ext)
+
+    if not extractions:
+        log.warning("모든 리포트에서 forward 전망 추출 실패")
+        return {}
+
+    return _aggregate(extractions)
+
+
+def _extract_one(client, model: str, title: str, text: str) -> Optional[dict]:
+    """단일 리포트 텍스트에서 forward JSON 추출."""
+    resp = client.chat.completions.create(
+        model=model,
+        max_tokens=900,
+        temperature=0.0,
+        messages=[
+            {"role": "system", "content": _FORWARD_SYS_PROMPT},
+            {"role": "user", "content": (
+                f"리포트 제목: {title}\n\n"
+                f"<report_text>\n{text[:30000]}\n</report_text>\n\n"
+                "위 텍스트에서 forward 전망 JSON만 출력하세요."
+            )},
+        ],
+    )
+    content = (resp.choices[0].message.content or "").strip()
+    return _parse_json_object(content)
+
+
+def _parse_json_object(content: str) -> Optional[dict]:
+    """LLM 출력에서 첫 번째 valid JSON 객체 추출. 실패 시 None."""
+    if not content:
+        return None
+    # 코드펜스 벗기기
+    fence = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", content, re.DOTALL)
+    if fence:
+        content = fence.group(1)
+    # 첫 { ~ 마지막 } 매칭 (간단한 휴리스틱; 보통 단일 객체 한 개라 OK)
+    m = re.search(r"\{.*\}", content, re.DOTALL)
+    if not m:
+        return None
+    try:
+        obj = json.loads(m.group(0))
+    except Exception:
+        log.exception("forward JSON 파싱 실패. raw=%s", content[:500])
+        return None
+    if not isinstance(obj, dict):
+        return None
+    return obj
+
+
+def _aggregate(extractions: list[dict]) -> dict[str, dict[str, Optional[float]]]:
+    """여러 리포트 추정치 → 분기별 평균.
+
+    분기 키에 대한 매출/영업이익/순이익 각각 산술평균.
+    한 리포트에만 있는 분기는 그 값을 그대로 사용.
     """
-    # MVP: 네이버 페이지가 iframe + JS heavy라 정확 파싱은 별도 작업 필요.
-    # 일단 빈 결과 반환 → chart.py가 forward 자리 비우고 캡션으로 안내.
-    log.info("forward consensus 수집 (naver) — MVP에서는 미구현, 빈 dict 반환")
-    return {}
+    bucket: dict[str, dict[str, list[float]]] = {}
+    for ext in extractions:
+        for q, vals in ext.items():
+            if not isinstance(q, str) or not isinstance(vals, dict):
+                continue
+            if not re.match(r"^\d{4}Q[1-4]$", q):
+                continue
+            slot = bucket.setdefault(q, {"revenue": [], "op_profit": [], "net_profit": []})
+            for k in ("revenue", "op_profit", "net_profit"):
+                v = vals.get(k)
+                if isinstance(v, (int, float)) and not isinstance(v, bool):
+                    slot[k].append(float(v))
+
+    result: dict[str, dict[str, Optional[float]]] = {}
+    for q, slot in bucket.items():
+        result[q] = {}
+        for k, lst in slot.items():
+            result[q][k] = sum(lst) / len(lst) if lst else None
+    log.info("forward 컨센서스 집계: %d 분기, 키=%s", len(result), sorted(result.keys()))
+    return result

@@ -477,6 +477,160 @@ def fetch_quarterly_financials(corp_code: str, years: int = 3) -> FinancialMetri
     )
 
 
+# ------------------------------------------------------------------
+# 3-bis) 잠정실적 (영업(잠정)실적공시) — 정식 분기보고서 전 회사가 미리 발표하는 매출/영업이익
+# ------------------------------------------------------------------
+PRELIMINARY_KEYWORDS = (
+    "영업(잠정)실적", "영업잠정실적",
+    "잠정실적", "잠정 실적",
+    "(잠정)실적", "(잠정) 실적",
+    "Earnings Release", "earnings release",
+)
+
+
+def fetch_latest_preliminary_quarter(
+    corp_code: str, target_dir: Path, days_back: int = 90,
+) -> tuple[str, int, int, int] | None:
+    """가장 최근 영업(잠정)실적 공시에서 매출/영업이익/순이익 + 분기 라벨 추출.
+
+    반환: ("2026Q1", revenue_won, op_profit_won, net_profit_won) 또는 None.
+
+    흐름:
+      1. list.json — PRELIMINARY_KEYWORDS 매칭, 최근 days_back일.
+      2. 첫 번째(최근) 공시 archive 다운로드 → 텍스트 추출.
+      3. LLM이 분기 라벨 + 3개 수치를 JSON으로 추출.
+
+    LLM/네트워크/파싱 어느 단계가 실패해도 None.
+    """
+    today = datetime.now(KST).strftime("%Y%m%d")
+    bgn_de = (datetime.now(KST) - timedelta(days=days_back)).strftime("%Y%m%d")
+
+    # I001 (거래소 공시) + 전체 공시 둘 다 검색 — 회사마다 분류가 다름
+    candidates: list[DartReport] = []
+    seen: set[str] = set()
+
+    def _matches(nm: str) -> bool:
+        return any(kw in nm for kw in PRELIMINARY_KEYWORDS)
+
+    queries = [
+        {"corp_code": corp_code, "bgn_de": bgn_de, "end_de": today,
+         "pblntf_detail_ty": "I001", "page_count": 50},
+        {"corp_code": corp_code, "bgn_de": bgn_de, "end_de": today,
+         "page_count": 100},
+    ]
+    for q in queries:
+        data = _get("list.json", q)
+        if not data:
+            continue
+        for it in data.get("list") or []:
+            nm = it.get("report_nm", "")
+            if _matches(nm):
+                rcept = it["rcept_no"]
+                if rcept in seen:
+                    continue
+                seen.add(rcept)
+                candidates.append(DartReport(
+                    rcept_no=rcept, report_nm=nm,
+                    rcept_dt=it["rcept_dt"], flr_nm=it.get("flr_nm", ""),
+                ))
+
+    if not candidates:
+        log.info("잠정실적 공시 없음 (corp_code=%s, %d일 이내)", corp_code, days_back)
+        return None
+    candidates.sort(key=lambda x: x.rcept_dt, reverse=True)
+    log.info("잠정실적 후보 %d건, 최신=%s (%s)", len(candidates), candidates[0].report_nm, candidates[0].rcept_dt)
+
+    target_dir.mkdir(parents=True, exist_ok=True)
+    # 최대 3개 후보까지 시도 (일부는 빈 archive 가능)
+    for cand in candidates[:3]:
+        path = download_report_archive(cand.rcept_no, target_dir, require_pdf=False)
+        if not path:
+            continue
+        text = extract_doc_text(path, max_chars=40_000, prefer_section="")
+        if not text.strip():
+            continue
+        parsed = _llm_parse_preliminary(text, cand.report_nm)
+        if parsed:
+            log.info("잠정실적 추출 성공: %s → %s", cand.report_nm, parsed)
+            return parsed
+    log.warning("잠정실적 후보 모두에서 LLM 추출 실패 (corp_code=%s)", corp_code)
+    return None
+
+
+def _llm_parse_preliminary(text: str, report_nm: str) -> tuple[str, int, int, int] | None:
+    """잠정실적 본문 텍스트 → ("2026Q1", revenue, op, net). 실패 시 None."""
+    try:
+        from src import summarizer
+    except Exception:
+        log.exception("summarizer import 실패 (잠정실적 파싱)")
+        return None
+    try:
+        client = summarizer.get_client()
+    except Exception:
+        log.exception("OpenRouter client 초기화 실패 (잠정실적 파싱)")
+        return None
+
+    sys_prompt = (
+        "당신은 한국 기업의 영업(잠정)실적 공시에서 숫자를 추출하는 도구입니다. "
+        "입력 텍스트에서 다음 4개를 JSON으로만 출력하세요. 자연어 설명 금지.\n"
+        "  - year_quarter: 'YYYYQn' 형식 (예: '2026Q1')\n"
+        "  - revenue: 매출액 (원 단위 정수, 조원이면 ×1조)\n"
+        "  - op_profit: 영업이익 (원 단위 정수, 적자면 음수)\n"
+        "  - net_profit: 당기순이익 (원 단위 정수, 적자면 음수)\n"
+        "당기 실적(이번 분기)만 추출 (전년동기·전분기 비교는 무시).\n"
+        "찾지 못한 항목은 null. 모두 못 찾으면 빈 객체 {}.\n\n"
+        '예: {"year_quarter": "2026Q1", "revenue": 17000000000000, "op_profit": 8000000000000, "net_profit": 5000000000000}'
+    )
+    try:
+        resp = client.chat.completions.create(
+            model=summarizer.DEFAULT_MODEL,
+            max_tokens=400,
+            temperature=0.0,
+            messages=[
+                {"role": "system", "content": sys_prompt},
+                {"role": "user", "content": (
+                    f"공시명: {report_nm}\n\n<doc_text>\n{text[:25_000]}\n</doc_text>"
+                )},
+            ],
+        )
+    except Exception:
+        log.exception("LLM 잠정실적 파싱 호출 실패")
+        return None
+
+    content = (resp.choices[0].message.content or "").strip()
+    import json as _json
+    fence = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", content, re.DOTALL)
+    if fence:
+        content = fence.group(1)
+    m = re.search(r"\{.*\}", content, re.DOTALL)
+    if not m:
+        log.warning("잠정실적 LLM 응답에 JSON 없음: %s", content[:300])
+        return None
+    try:
+        obj = _json.loads(m.group(0))
+    except Exception:
+        log.exception("잠정실적 JSON 파싱 실패: %s", content[:300])
+        return None
+    if not isinstance(obj, dict):
+        return None
+    yq = obj.get("year_quarter")
+    rev = obj.get("revenue")
+    op = obj.get("op_profit")
+    net = obj.get("net_profit")
+    if not isinstance(yq, str) or not re.match(r"^\d{4}Q[1-4]$", yq):
+        log.warning("잠정실적 year_quarter 형식 이상: %r", yq)
+        return None
+    if not isinstance(rev, (int, float)):
+        log.warning("잠정실적 revenue 미발견")
+        return None
+    return (
+        yq,
+        int(rev),
+        int(op) if isinstance(op, (int, float)) else 0,
+        int(net) if isinstance(net, (int, float)) else 0,
+    )
+
+
 def _extract_pl_metrics(items: list[dict]) -> tuple[int, int, int] | None:
     """fnlttSinglAcntAll 결과에서 매출액/영업이익/당기순이익 YTD(누적) 추출 (원 단위).
 

@@ -200,7 +200,9 @@ async def _execute(bot, chat_id: int, ticker: str) -> None:
     if not report_pdf:
         await bot.send_message(chat_id=chat_id, text="ℹ️ 사업보고서 PDF 다운로드 실패 — 업의 본질 단계 스킵")
 
-    # 2.5) wisereport 보조 컨텍스트 (실패해도 무시)
+    # 2.5) wisereport 보조 컨텍스트 (실패해도 무시).
+    #      wctx는 이후 step 5의 forward consensus 산출에도 재사용되므로 outer 스코프에 보관.
+    wctx = None  # WisereportContext | None
     wisereport_ctx_text: Optional[str] = None
     try:
         from src.deepdive import wisereport_context
@@ -290,10 +292,30 @@ async def _execute(bot, chat_id: int, ticker: str) -> None:
         log.exception("재무 조회 실패")
         fin = None
 
+    # 5-bis) 정식 분기보고서가 아직 DART에 없는 최신 분기를 잠정실적공시로 보강.
+    if fin is not None:
+        try:
+            preliminary = await loop.run_in_executor(
+                None, dart_client.fetch_latest_preliminary_quarter,
+                corp_code, download_root / "preliminary",
+            )
+            if preliminary:
+                yq, rev, op, net = preliminary
+                if yq not in fin.revenue_qoq:
+                    fin.revenue_qoq[yq] = rev
+                    fin.op_profit_qoq[yq] = op
+                    fin.net_profit_qoq[yq] = net
+                    log.info("잠정실적 보강: %s = 매출 %d원, 영업익 %d원, 순익 %d원", yq, rev, op, net)
+                else:
+                    log.info("잠정실적 분기(%s)는 이미 정식 보고서에 있어 스킵", yq)
+        except Exception:
+            log.exception("잠정실적 보강 단계 실패 — 무시")
+
     if fin and fin.revenue_qoq:
         try:
             from src.deepdive import forward_consensus, chart
-            forward = await loop.run_in_executor(None, forward_consensus.fetch, ticker)
+            # wisereport 기업 리포트(이미 다운로드된) 텍스트들로부터 LLM이 forward 산출
+            forward = await loop.run_in_executor(None, forward_consensus.from_wisereport, wctx)
             png_bytes = await loop.run_in_executor(
                 None, chart.build,
                 corp_name,
@@ -304,10 +326,14 @@ async def _execute(bot, chat_id: int, ticker: str) -> None:
                 forward or None,
             )
             if png_bytes:
+                fwd_info = (
+                    f" + Forward {len(forward)}분기 (wisereport 컨센서스)"
+                    if forward else " (Forward 미수집)"
+                )
                 await bot.send_photo(
                     chat_id=chat_id,
                     photo=png_bytes,
-                    caption=f"📈 {corp_name} 분기별 재무 (회사 전체)",
+                    caption=f"📈 {corp_name} 분기별 재무 (회사 전체){fwd_info}",
                 )
             else:
                 await bot.send_message(chat_id=chat_id, text="⚠️ 차트 생성 실패 (계속 진행)")
