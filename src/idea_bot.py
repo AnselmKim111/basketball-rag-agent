@@ -142,16 +142,14 @@ async def _run_pipeline(
     if PIPELINE_LOCK.locked():
         await send_text_chunked(
             bot, chat_id,
-            f"⏳ 다른 작업 진행 중 — 끝나면 순차 처리합니다\n💡 *{idea_text[:80]}*",
-            parse_mode=ParseMode.MARKDOWN,
+            f"⏳ 다른 작업 진행 중 — 끝나면 순차 처리합니다\n💡 {idea_text[:80]}",
         )
 
     started = datetime.now(KST).strftime("%Y-%m-%d %H:%M")
     await send_text_chunked(
         bot, chat_id,
-        f"💡 *아이디어:* {idea_text}\n_{started} 시작 — 약 15-25분 소요_\n\n"
+        f"💡 아이디어: {idea_text}\n{started} 시작 — 약 15-25분 소요\n\n"
         "🌐 1단계: 웹 검색 + 논리의 기울기 검증",
-        parse_mode=ParseMode.MARKDOWN,
     )
 
     download_root = download_root_for("idea") / safe_dirname(idea_text[:30] + "_" + datetime.now(KST).strftime("%H%M"))
@@ -187,11 +185,28 @@ async def _run_pipeline(
         await send_text_chunked(bot, chat_id, "🎯 3단계: 영업레버리지 4축 점수로 30→10 narrowing")
         narrow = await _narrow_candidates(idea_text, research, industry_texts, candidates)
         if not narrow or not narrow.get("top10"):
+            # LLM narrow 실패 → 후보 앞 10개로 폴백 (시총 상위 순)
+            log.warning("narrow 실패 — candidates 앞 10개로 폴백")
             await send_text_chunked(
-                bot, chat_id, "❌ 후보 narrow 실패 — 30 후보 그대로 진행하지 않고 종료",
+                bot, chat_id,
+                "⚠️ narrow LLM 실패 — 후보 시총 상위 10개로 폴백해서 계속 진행합니다",
             )
-            return
-        top10 = narrow["top10"]
+            top10 = [
+                {
+                    "name": c.get("name", ""),
+                    "ticker6": c.get("ticker6", ""),
+                    "industry": c.get("industry", ""),
+                    "operating_leverage_score": "?",
+                    "rationale": c.get("mechanism", ""),
+                }
+                for c in candidates[:10]
+            ]
+            narrow = {
+                "narrowing_summary": "(LLM narrow 실패 — 시총 상위 10개로 폴백)",
+                "top10": top10,
+            }
+        else:
+            top10 = narrow["top10"]
         await _send_narrow_summary(bot, chat_id, narrow)
 
         # ticker6 누락 보강 (DART 종목명 룩업)
@@ -235,8 +250,7 @@ async def _run_pipeline(
 
         ended = datetime.now(KST).strftime("%H:%M")
         await send_text_chunked(
-            bot, chat_id, f"✅ *완료* (_{started} → {ended}_)",
-            parse_mode=ParseMode.MARKDOWN,
+            bot, chat_id, f"✅ 완료 ({started} → {ended})",
         )
     except Exception:
         log.exception("idea pipeline 최상위 예외")
@@ -282,24 +296,33 @@ async def _research_idea(idea_text: str) -> dict | None:
         except Exception:
             log.exception("리서치 응답 파싱 실패")
             return None
-        return _parse_json(content)
+        log.info(
+            "research LLM 응답: %d chars (model=%s) — preview=%r",
+            len(content), model, content[:300],
+        )
+        parsed = _parse_json(content)
+        if parsed is None:
+            log.warning("research JSON 파싱 실패 — content 전문: %r", content[:3000])
+        return parsed
 
     return await loop.run_in_executor(None, _blocking)
 
 
 async def _send_research_summary(bot: Bot, chat_id: str, research: dict) -> None:
+    """1단계 결과 발송. 마크다운 파싱 실패 방지를 위해 plain text로 발송."""
     logic = research.get("logic_gradient_text", "(논리 검증 텍스트 없음)")
     industries = research.get("industries") or []
     candidates = research.get("candidates") or []
-    msg = f"📐 *논리의 기울기 검증*\n\n{logic}\n\n"
-    msg += "🏭 *수혜 산업*\n"
+    msg = f"📐 논리의 기울기 검증\n\n{logic}\n\n"
+    msg += "🏭 수혜 산업\n"
     for ind in industries:
-        msg += f"  • *{ind.get('name','?')}* — {ind.get('reasoning','')[:120]}\n"
-    msg += f"\n📋 *후보 종목 ({len(candidates)}개)*: 시총 상위 순\n"
+        msg += f"  • {ind.get('name','?')} — {ind.get('reasoning','')[:120]}\n"
+    msg += f"\n📋 후보 종목 ({len(candidates)}개) — 시총 상위 순\n"
     for c in candidates[:30]:
         rank = c.get("mcap_rank", "?")
         msg += f"  {rank}. {c.get('name','?')} ({c.get('ticker6','??????')}) — {c.get('industry','')}\n"
-    await send_text_chunked(bot, chat_id, msg, parse_mode=ParseMode.MARKDOWN)
+    # parse_mode 없이 plain text — 사용자 입력에 *,_,[,] 등 markdown 특수문자 있어도 안전
+    await send_text_chunked(bot, chat_id, msg)
 
 
 # ------------------------------------------------------------------
@@ -324,6 +347,8 @@ async def _collect_industry_reports(
 
         all_paths: list[Path] = []
         text_by_name: dict[str, str] = {}
+        seen_rpt_ids: set[str] = set()  # 산업이 같은 코드로 매핑돼도 중복 다운로드 방지
+        general_pool_used = False  # 일반 industry top reports는 한 번만
 
         try:
             with WisereportClient(
@@ -347,6 +372,12 @@ async def _collect_industry_reports(
                     except Exception:
                         log.exception("산업 코드 룩업 예외: %s", name)
 
+                    # 신뢰할 수 있는 코드만 사용. wisereport의 fallback 정규식은 G10 같은
+                    # 섹터(2자리) 레벨로 잘못 떨어지는 경우가 있음. 4자 이상이면 대체로 sub-industry.
+                    if code and not re.match(r"^[A-Z]?\d{4,}$", code):
+                        log.info("산업 코드 '%s' (산업: %s)는 너무 광범위 — 무시하고 일반 풀 사용", code, name)
+                        code = None
+
                     items = []
                     try:
                         if code:
@@ -355,26 +386,32 @@ async def _collect_industry_reports(
                                 limit=INDUSTRY_REPORTS_PER_INDUSTRY,
                                 days_back=60, industry_gics=code,
                             )
-                        if not items:
-                            # 폴백: 전체 industry 인기 (산업명에 의존하지 않음)
-                            log.info("산업 코드 폴백 → 전체 industry top reports: %s", name)
+                        if not items and not general_pool_used:
+                            # 폴백: 전체 industry 인기 (한 번만)
+                            log.info("산업 '%s' 매칭 실패 → 일반 industry top reports 1회 사용", name)
                             items = cli.list_top_reports(
                                 category="industry", sort_by="popular",
-                                limit=INDUSTRY_REPORTS_PER_INDUSTRY,
+                                limit=INDUSTRY_REPORTS_PER_INDUSTRY * 2,  # 더 넉넉히
                                 days_back=30,
                             )
+                            general_pool_used = True
                     except Exception:
                         log.exception("산업 리포트 목록 조회 실패: %s", name)
                         continue
 
+                    # 이미 다운로드한 rpt_id 제외
+                    items = [it for it in items if it.rpt_id not in seen_rpt_ids]
                     if not items:
+                        log.info("산업 '%s' — 신규 리포트 없음 (모두 중복 또는 매칭 실패)", name)
                         continue
+
                     try:
                         saved = cli.download_reports(items, sub_dir)
                     except Exception:
                         log.exception("산업 리포트 다운로드 실패: %s", name)
                         continue
                     all_paths.extend(saved)
+                    seen_rpt_ids.update(it.rpt_id for it in items)
 
                     for p in saved:
                         try:
@@ -446,25 +483,36 @@ async def _narrow_candidates(
         except Exception:
             log.exception("narrow 응답 파싱 실패")
             return None
-        return _parse_json(content)
+        log.info(
+            "narrow LLM 응답: %d chars (model=%s) — preview=%r",
+            len(content), _synthesis_model(), content[:300],
+        )
+        parsed = _parse_json(content)
+        if parsed is None:
+            log.warning("narrow JSON 파싱 실패 — content 전문: %r", content[:3000])
+            return None
+        if not parsed.get("top10"):
+            log.warning("narrow 응답에 top10 없음 — keys=%s", list(parsed.keys()))
+        return parsed
 
     return await loop.run_in_executor(None, _blocking)
 
 
 async def _send_narrow_summary(bot: Bot, chat_id: str, narrow: dict) -> None:
+    """3단계 결과 발송 (plain text)."""
     summary = narrow.get("narrowing_summary", "")
     top10 = narrow.get("top10") or []
-    msg = "🎯 *Narrow 결과 (30 → 10)*\n\n"
+    msg = "🎯 Narrow 결과 (30 → 10)\n\n"
     if summary:
         msg += summary + "\n\n"
-    msg += "*Top 10 (영업레버리지 점수순)*\n"
+    msg += "Top 10 (영업레버리지 점수순)\n"
     for i, c in enumerate(top10, 1):
         msg += (
-            f"{i}. *{c.get('name','?')}* ({c.get('ticker6','??????')}) — "
+            f"{i}. {c.get('name','?')} ({c.get('ticker6','??????')}) — "
             f"점수 {c.get('operating_leverage_score','?')}/10 — "
             f"{c.get('industry','')}\n"
         )
-    await send_text_chunked(bot, chat_id, msg, parse_mode=ParseMode.MARKDOWN)
+    await send_text_chunked(bot, chat_id, msg)
 
 
 async def _fix_tickers(top10: list[dict]) -> list[dict]:
@@ -649,7 +697,17 @@ async def _synthesize_top5(
         except Exception:
             log.exception("synthesis 응답 파싱 실패")
             return None
-        return _parse_json(content)
+        log.info(
+            "synthesis LLM 응답: %d chars (model=%s) — preview=%r",
+            len(content), _synthesis_model(), content[:300],
+        )
+        parsed = _parse_json(content)
+        if parsed is None:
+            log.warning("synthesis JSON 파싱 실패 — content 전문: %r", content[:5000])
+            return None
+        if not parsed.get("top5"):
+            log.warning("synthesis 응답에 top5 없음 — keys=%s", list(parsed.keys()))
+        return parsed
 
     return await loop.run_in_executor(None, _blocking)
 
@@ -667,10 +725,10 @@ async def _send_results(
     top5 = synthesis.get("top5") or []
 
     intro = (
-        "🏆 *영업레버리지 Top 5 — 최종 선정*\n\n"
-        f"*랭킹 근거:*\n{methodology}\n"
+        "🏆 영업레버리지 Top 5 — 최종 선정\n\n"
+        f"랭킹 근거:\n{methodology}\n"
     )
-    await send_text_chunked(bot, chat_id, intro, parse_mode=ParseMode.MARKDOWN)
+    await send_text_chunked(bot, chat_id, intro)
 
     # 파일명 → 경로 인덱스 (PDF 매칭용)
     name_to_path: dict[str, Path] = {p.name: p for p in industry_pdfs}
@@ -691,19 +749,19 @@ async def _send_results(
 
         header = (
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"🥇 *Top {rank}. {name}* (`{ticker}`) — {industry}\n"
+            f"🥇 Top {rank}. {name} ({ticker}) — {industry}\n"
             f"━━━━━━━━━━━━━━━━━━━━"
         )
-        await send_text_chunked(bot, chat_id, header, parse_mode=ParseMode.MARKDOWN)
+        await send_text_chunked(bot, chat_id, header)
 
         body = thesis
         if kn:
-            body += "\n\n📊 *Key Numbers*\n"
+            body += "\n\n📊 Key Numbers\n"
             for k, v in kn.items():
                 body += f"  • {k}: {v}\n"
         if refs:
-            body += "\n📎 *참고 리포트:* " + ", ".join(refs)
-        await send_text_chunked(bot, chat_id, body, parse_mode=ParseMode.MARKDOWN)
+            body += "\n📎 참고 리포트: " + ", ".join(refs)
+        await send_text_chunked(bot, chat_id, body)
 
         # 참고 PDF 매칭해서 발송 (중복 발송 방지)
         # 종목 ticker의 PDF는 무조건 첨부, 그 외 referenced_reports 매칭은 fuzzy.
@@ -741,28 +799,33 @@ def _synthesis_model() -> str:
 def _parse_json(content: str) -> dict | None:
     """LLM 응답에서 JSON 객체 추출. 코드 펜스 제거 + 첫 {...} 매칭.
 
-    파싱 실패 시 None.
+    파싱 실패 시 None. 단, 부분적으로 잘린 JSON은 마지막 닫힘 위치까지 잘라서 재시도.
     """
     if not content:
+        log.warning("_parse_json: 빈 content")
         return None
     # 코드 펜스 제거
     fence = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", content, re.DOTALL)
     if fence:
-        content = fence.group(1)
-    # 첫 {...} 블록
-    m = re.search(r"\{.*\}", content, re.DOTALL)
-    if not m:
-        log.warning("JSON 블록 못 찾음: %s", content[:300])
+        content_inner = fence.group(1)
+    else:
+        content_inner = content
+    # 첫 { 부터 마지막 } 까지
+    start = content_inner.find("{")
+    end = content_inner.rfind("}")
+    if start < 0 or end <= start:
+        log.warning("JSON 블록 못 찾음 (head=%r tail=%r)", content_inner[:200], content_inner[-200:])
         return None
+    blob = content_inner[start:end + 1]
     try:
-        obj = json.loads(m.group(0))
-        if isinstance(obj, dict):
-            return obj
+        obj = json.loads(blob)
+    except json.JSONDecodeError as e:
+        log.warning("JSON 파싱 실패 (%s) — head=%r tail=%r", e, blob[:200], blob[-200:])
+        return None
+    if not isinstance(obj, dict):
         log.warning("JSON이 dict 아님: %s", type(obj))
         return None
-    except Exception:
-        log.exception("JSON 파싱 실패: %s", m.group(0)[:300])
-        return None
+    return obj
 
 
 # ------------------------------------------------------------------
