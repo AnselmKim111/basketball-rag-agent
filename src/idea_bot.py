@@ -4,10 +4,11 @@
   사용자 입력(텍스트 or /idea <text>)
     → (1) perplexity/sonar-pro 웹검색: 논리의 기울기 검증 + 산업 2-3 + 후보 30
     → (2) wisereport 산업 리포트 수집 (PIPELINE_LOCK)
-    → (3) LLM narrow: 30 → 10 (영업레버리지 4축 점수)
+    → (3) LLM narrow: 30 → 10 + all30_scored (영업레버리지 4축 점수)
+        → 30종목 4축 산점도 PNG 발송
     → (4) wisereport 종목 리포트 수집 (PIPELINE_LOCK)
     → (5) LLM 최종 synthesis: Top 5 + 영업레버리지 thesis (JSON)
-    → (6) 텔레그램 발송: 텍스트 메시지 + Top 5 참고 PDF 첨부
+    → (6) 텔레그램 발송: 텍스트 메시지 + Top 5 참고 PDF + 공통 산업 PDF
 
 격리 원칙 (BOTS.md):
   - 모든 wisereport 호출은 async with PIPELINE_LOCK 안.
@@ -74,17 +75,19 @@ HELP_TEXT = (
     "*사용법:*\n"
     "  - 슬래시 없이 아이디어를 그냥 보내거나\n"
     "  - `/idea <아이디어 텍스트>`\n\n"
-    "*예:*\n"
-    "  `빈부격차, 내수 경기 회복과 중국인 관광객`\n"
-    "  `AI 데이터센터 전력 수요 급증`\n"
-    "  `K-방산 수출 사이클 재가속`\n\n"
+    "*제약 표현 지원* (자연어 그대로):\n"
+    "  - `1조 이하 소부장 중 AI 데이터센터 수혜`\n"
+    "  - `중소형 K-방산`\n"
+    "  - `코스닥만, 5천억 이하 반도체 장비`\n\n"
     "*동작:*\n"
-    "  1️⃣ 웹 검색으로 현황 + 논리의 기울기 검증\n"
-    "  2️⃣ 수혜 산업 2-3개 + 시총 상위 30 후보 발굴\n"
-    "  3️⃣ wisereport 산업 리포트 다운로드\n"
-    "  4️⃣ 영업레버리지 4축으로 30→10 narrowing\n"
-    "  5️⃣ Top10의 종목 리포트 다운로드 (각 2건)\n"
-    "  6️⃣ 영업레버리지가 세게 걸릴 *Top 5* + 논리 + PDF 발송\n\n"
+    "  🧭 0.5단계: 아이디어 파싱 (thesis + 시총/산업 제약 추출)\n"
+    "  🌐 1단계: 웹 검색 + 30 후보 발굴 (제약 적용)\n"
+    "  ⚖️ 1.5단계: 현상 중요도 비판적 평가\n"
+    "  📊 2단계: 산업 리포트 다운로드\n"
+    "  🎯 3단계: 영업레버리지 4축 점수로 30→10 + 산점도\n"
+    "  📈 4단계: Top10 종목 리포트 다운로드\n"
+    "  🧠 5단계: 사업부→폭→기울기 단계적 사고로 Top 5\n"
+    "  🏆 6단계: Top 5 thesis + 종목 PDF + 산업 PDF\n\n"
     "_⏱️ 약 15-25분 소요_\n"
     "_프롬프트 수정: GitHub `prompts/idea_*.txt` 편집 후 push_"
 )
@@ -158,8 +161,17 @@ async def _run_pipeline(
 
     CURRENT_IDEA = {"idea": idea_text, "started_at": started}
     try:
-        # ---- (1) 리서치
-        research = await _research_idea(idea_text)
+        # ---- (0.5) 아이디어 파싱: thesis + constraints 분리 (cheap 모델, graceful)
+        parsed = await _parse_idea(idea_text)
+        if parsed:
+            await _send_parse_summary(bot, chat_id, parsed)
+        else:
+            log.info("idea parse 단계 실패 또는 비어있음 — 제약 없이 진행")
+            parsed = {}  # 빈 dict — research에서 제약 없는 것으로 간주
+
+        # ---- (1) 리서치 (constraints 명시 주입)
+        await send_text_chunked(bot, chat_id, "🌐 1단계: 웹 검색 + 후보 30 발굴")
+        research = await _research_idea(idea_text, parsed)
         if not research:
             await send_text_chunked(bot, chat_id, "❌ 리서치 실패 — 종료합니다.")
             return
@@ -221,6 +233,11 @@ async def _run_pipeline(
             top10 = narrow["top10"]
         await _send_narrow_summary(bot, chat_id, narrow)
 
+        # 30종목 4축 산점도 발송 (LLM narrow 성공한 경우만 — all30_scored가 있어야 함)
+        all30_scored = (narrow or {}).get("all30_scored") or []
+        if all30_scored:
+            await _send_scatter_chart(bot, chat_id, idea_text, all30_scored)
+
         # ticker6 누락 보강 (DART 종목명 룩업)
         top10 = await _fix_tickers(top10)
         top10 = [c for c in top10 if c.get("ticker6")]
@@ -280,7 +297,93 @@ async def _run_pipeline(
 # ------------------------------------------------------------------
 # (1) 리서치 — perplexity/sonar-pro 웹검색
 # ------------------------------------------------------------------
-async def _research_idea(idea_text: str) -> dict | None:
+async def _parse_idea(idea_text: str) -> dict | None:
+    """0.5단계: 아이디어 텍스트에서 thesis + constraints 분리.
+
+    저렴한 모델(narrow와 동일) 사용. 실패 시 None — 호출자는 제약 없이 진행.
+    """
+    loop = asyncio.get_running_loop()
+
+    def _blocking() -> dict | None:
+        from src import summarizer
+        try:
+            client = summarizer.get_client()
+        except Exception:
+            log.exception("OpenRouter client init 실패 (parse)")
+            return None
+        sys_prompt = idea_prompts.load("idea_parse")
+        user_msg = f"사용자 투자 아이디어:\n{idea_text}\n\n시스템 프롬프트 형식대로 JSON 출력."
+        try:
+            resp = client.chat.completions.create(
+                model=_narrow_model(),  # 저렴한 모델 OK — 단순 추출
+                max_tokens=1000,
+                temperature=0.0,
+                messages=[
+                    {"role": "system", "content": sys_prompt},
+                    {"role": "user", "content": user_msg},
+                ],
+            )
+        except Exception:
+            log.exception("아이디어 파싱 LLM 호출 실패")
+            return None
+        try:
+            content = (resp.choices[0].message.content or "").strip()
+        except Exception:
+            log.exception("파싱 응답 추출 실패")
+            return None
+        log.info("parse LLM 응답: %d chars — preview=%r", len(content), content[:300])
+        parsed = _parse_json(content)
+        if parsed is None:
+            log.warning("parse JSON 파싱 실패 — content 전문: %r", content[:1500])
+        return parsed
+
+    return await loop.run_in_executor(None, _blocking)
+
+
+async def _send_parse_summary(bot: Bot, chat_id: str, parsed: dict) -> None:
+    """0.5단계 결과: 추출된 thesis + constraints를 사용자에게 보여줌."""
+    thesis = parsed.get("thesis", "")
+    summary = parsed.get("constraints_summary", "")
+    constraints = parsed.get("constraints") or {}
+    msg = "🧭 아이디어 파싱 결과\n\n"
+    if thesis:
+        msg += f"📌 핵심 논리: {thesis}\n"
+    if summary:
+        msg += f"🎯 후보 발굴 범위: {summary}\n"
+    # 디테일 — 사용자가 검증 가능하게
+    detail_lines = []
+    mcap_max = constraints.get("market_cap_max_krw")
+    mcap_min = constraints.get("market_cap_min_krw")
+    if mcap_max:
+        detail_lines.append(f"  • 시총 상한: {_fmt_krw(mcap_max)}")
+    if mcap_min:
+        detail_lines.append(f"  • 시총 하한: {_fmt_krw(mcap_min)}")
+    if constraints.get("industry_filter"):
+        detail_lines.append(f"  • 산업 필터: {', '.join(constraints['industry_filter'])}")
+    if constraints.get("exchange"):
+        detail_lines.append(f"  • 거래소: {constraints['exchange']}")
+    if constraints.get("exclude_keywords"):
+        detail_lines.append(f"  • 제외: {', '.join(constraints['exclude_keywords'])}")
+    if detail_lines:
+        msg += "\n적용 제약:\n" + "\n".join(detail_lines)
+    await send_text_chunked(bot, chat_id, msg)
+
+
+def _fmt_krw(v: int | float | None) -> str:
+    if v is None:
+        return "-"
+    try:
+        v = int(v)
+    except (TypeError, ValueError):
+        return str(v)
+    if v >= 1_000_000_000_000:
+        return f"{v / 1_000_000_000_000:.1f}조"
+    if v >= 100_000_000:
+        return f"{v / 100_000_000:.0f}억"
+    return f"{v:,}원"
+
+
+async def _research_idea(idea_text: str, parsed: dict | None = None) -> dict | None:
     loop = asyncio.get_running_loop()
 
     def _blocking() -> dict | None:
@@ -292,7 +395,27 @@ async def _research_idea(idea_text: str) -> dict | None:
             return None
         model = os.getenv(RESEARCH_MODEL_ENV) or DEFAULT_RESEARCH_MODEL
         sys_prompt = idea_prompts.load("idea_research")
-        user_msg = f"투자 아이디어:\n{idea_text}\n\n위 아이디어를 시스템 프롬프트의 형식대로 JSON으로 출력해주세요."
+
+        # parsed에서 thesis + constraints 추출. 없으면 원문만.
+        thesis = (parsed or {}).get("thesis") or idea_text
+        constraints = (parsed or {}).get("constraints") or {}
+        constraints_block = ""
+        if any(constraints.get(k) for k in (
+            "market_cap_max_krw", "market_cap_min_krw",
+            "industry_filter", "exchange", "exclude_keywords",
+        )):
+            constraints_block = (
+                "\n\n<constraints>\n"
+                f"{json.dumps(constraints, ensure_ascii=False, indent=2)}\n"
+                "</constraints>\n"
+                "위 제약을 반드시 엄격하게 적용하세요. 제약 위반 종목은 candidates에 절대 포함하지 마세요."
+            )
+
+        user_msg = (
+            f"투자 아이디어 원문:\n{idea_text}\n\n"
+            f"파싱된 thesis: {thesis}{constraints_block}\n\n"
+            "위 자료를 시스템 프롬프트의 형식대로 JSON으로 출력해주세요."
+        )
         try:
             resp = client.chat.completions.create(
                 model=model,
@@ -315,10 +438,10 @@ async def _research_idea(idea_text: str) -> dict | None:
             "research LLM 응답: %d chars (model=%s) — preview=%r",
             len(content), model, content[:300],
         )
-        parsed = _parse_json(content)
-        if parsed is None:
+        parsed_resp = _parse_json(content)
+        if parsed_resp is None:
             log.warning("research JSON 파싱 실패 — content 전문: %r", content[:3000])
-        return parsed
+        return parsed_resp
 
     return await loop.run_in_executor(None, _blocking)
 
@@ -634,6 +757,36 @@ async def _send_narrow_summary(bot: Bot, chat_id: str, narrow: dict) -> None:
             f"{c.get('industry','')}\n"
         )
     await send_text_chunked(bot, chat_id, msg)
+
+
+async def _send_scatter_chart(
+    bot: Bot, chat_id: str, idea_text: str, all30_scored: list[dict],
+) -> None:
+    """30종목 4축 산점도 PNG 발송. 차트 생성/발송 어느 단계 실패해도 봇은 계속."""
+    loop = asyncio.get_running_loop()
+    try:
+        from src import idea_chart
+        png_bytes = await loop.run_in_executor(
+            None, idea_chart.build, idea_text, all30_scored,
+        )
+    except Exception:
+        log.exception("산점도 생성 단계 실패 — 차트 스킵")
+        return
+    if not png_bytes:
+        log.info("산점도 PNG 비어있음 — 스킵 (all30_scored=%d개)", len(all30_scored))
+        return
+    try:
+        await bot.send_photo(
+            chat_id=chat_id,
+            photo=png_bytes,
+            caption=(
+                "📊 30 후보 4축 산점도\n"
+                "X=매출가속, Y=고정비비중, 점크기=마진민감도, 색=가동률여유\n"
+                "오른쪽 위 + 큰 점 + 진한 색 = 영업레버리지 강한 zone"
+            ),
+        )
+    except Exception:
+        log.exception("산점도 텔레그램 발송 실패 — 무시하고 계속")
 
 
 async def _fix_tickers(top10: list[dict]) -> list[dict]:

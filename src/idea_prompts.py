@@ -17,6 +17,10 @@ PROMPTS_DIR = Path(__file__).resolve().parent.parent / "prompts"
 
 
 DEFAULT_PROMPTS = {
+    "idea_parse": (
+        "사용자 투자 아이디어 텍스트에서 thesis(논리)와 constraints(시총·산업·거래소 제약)를 "
+        "분리해 JSON으로 출력하라. 제약이 없으면 null/빈 배열."
+    ),
     "idea_research": (
         "당신은 한국 주식 시니어 애널리스트. 사용자 투자 아이디어를 받아 웹검색으로 현황을 조사하고 "
         "'논리의 기울기'를 검증한 뒤 수혜 산업 2-3개와 시총 상위 30 후보 종목을 JSON으로 출력하라."

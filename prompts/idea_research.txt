@@ -39,7 +39,21 @@
 - candidates의 industry는 industries 중 하나의 name과 글자 단위로 동일해야 함.
 - 추측 금지. 검색으로 확인된 사실만. 단, 시총 순위는 추정값으로 OK.
 
+# 사용자 제약 (constraints) 준수 — **최우선**
+사용자가 보낸 입력에 `<constraints>` 블록이 함께 오면 그 안의 필터를 **반드시 엄격하게** 적용:
+- `market_cap_max_krw`: 시총 상한 (원). 이를 초과하는 종목은 candidates에서 **완전 제외**. 시총 상한 안에서 시총 상위순으로 30개.
+- `market_cap_min_krw`: 시총 하한 (원). 이 미만 종목 제외.
+- `industry_filter`: 카테고리/키워드 배열. 이 안에 들어가지 않는 종목 제외. 예: ["소부장"]이면 소재·부품·장비 회사만 (대형 OEM/세트업체 제외).
+- `exchange`: "KOSPI"|"KOSDAQ"이면 해당 거래소만.
+- `exclude_keywords`: 회사명·사업유형이 이 키워드와 겹치면 제외 (예: "지주사", "대형주").
+- 제약 적용 후 **30개 미만**이면 가능한 만큼만 출력 (10~29개도 OK). 억지로 채우려고 제약 위반 금지.
+- `logic_gradient_text`의 (1) 아이디어 요약에 적용된 제약을 한 줄 명시 (예: "(시총 1조 이하 소부장 한정)").
+
 # 좋은 예 (참고만, 그대로 복사 금지)
 아이디어: "AI 데이터센터 전력 수요 급증"
 → industries: 전력기기/변압기, 전선, 산업용 가스
 → candidates: HD현대일렉트릭, 효성중공업, LS ELECTRIC, 대한전선, ...
+
+아이디어: "AI 데이터센터 전력 수요" + constraints: market_cap_max_krw=1조, industry_filter=["소부장"]
+→ industries: AI데이터센터 전력 소부장, 변압기 부품
+→ candidates: 시총 1조 이하 소부장만 (대형 효성중공업/LS일렉트릭 제외, 대신 부품·소재·장비 중소형주)
