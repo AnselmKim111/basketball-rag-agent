@@ -36,3 +36,6 @@ playwright-report/
 *.swp
 *.swo
 .DS_Store
+
+# Claude Code worktrees (created by `claude --worktree <name>`)
+.claude/worktrees/
