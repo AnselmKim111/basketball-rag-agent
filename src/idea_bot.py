@@ -1265,8 +1265,78 @@ def _clean_json_loose(s: str) -> str:
 # ------------------------------------------------------------------
 # Application 빌더 — orchestrator가 호출
 # ------------------------------------------------------------------
+async def _self_test(app: Application) -> None:
+    """IDEA_TEST_PROMPT env가 설정돼 있으면 부팅 후 한 번 파이프라인 자동 실행.
+
+    검증용. 실제 사용자 인터랙션 없이도 idea_bot 동작을 끝까지 검증할 수 있게 한다.
+    chat_id는 IDEA_TEST_CHAT_ID > IDEA_CHAT_ID > IDEA_ALLOWED_CHAT_IDS의 첫 번째.
+    """
+    test_prompt = (os.getenv("IDEA_TEST_PROMPT") or "").strip()
+    if not test_prompt:
+        return
+    chat_id = (
+        os.getenv("IDEA_TEST_CHAT_ID")
+        or os.getenv("IDEA_CHAT_ID")
+        or (os.getenv("IDEA_ALLOWED_CHAT_IDS", "").split(",") + [""])[0].strip()
+    )
+    if not chat_id:
+        log.warning("[self-test] IDEA_TEST_PROMPT set but no chat_id — 스킵")
+        return
+
+    log.info("=" * 60)
+    log.info("[self-test] 자동 검증 시작 — chat_id=%s prompt=%r", chat_id, test_prompt)
+    log.info("=" * 60)
+
+    # 가짜 Update + Context — _run_pipeline는 이 안의 effective_chat.id, message.text, context.bot만 사용
+    class _FakeChat:
+        def __init__(self, cid: str) -> None:
+            self.id = int(cid)
+
+    class _FakeMessage:
+        def __init__(self, cid: str, text: str) -> None:
+            self.text = text
+            self.chat = _FakeChat(cid)
+
+        async def reply_text(self, *a, **kw) -> None:
+            try:
+                await app.bot.send_message(chat_id=self.chat.id, text=str(a[0]) if a else (kw.get("text") or ""))
+            except Exception:
+                log.exception("[self-test] reply_text 실패")
+
+    class _FakeUpdate:
+        def __init__(self, cid: str, text: str) -> None:
+            self.effective_chat = _FakeChat(cid)
+            self.message = _FakeMessage(cid, text)
+
+    class _FakeContext:
+        def __init__(self) -> None:
+            self.bot = app.bot
+            self.args: list[str] = []
+
+    # 약간 대기 — 폴링이 완전히 시작된 후 실행 (Conflict 메시지 안 끼게)
+    await asyncio.sleep(8)
+    try:
+        await _run_pipeline(_FakeUpdate(chat_id, test_prompt), _FakeContext(), test_prompt)
+    except Exception:
+        log.exception("[self-test] 파이프라인 최상위 예외")
+    log.info("=" * 60)
+    log.info("[self-test] 종료")
+    log.info("=" * 60)
+
+
+async def _post_init(app: Application) -> None:
+    """Application post_init 훅 — 폴링 시작 직후 호출됨."""
+    # self-test는 백그라운드 task로 띄움 (post_init은 await blocking이라 폴링 시작 전에 끝나야 함)
+    asyncio.create_task(_self_test(app))
+
+
 def build_idea_app(token: str) -> Application:
-    app = Application.builder().token(token).build()
+    app = (
+        Application.builder()
+        .token(token)
+        .post_init(_post_init)
+        .build()
+    )
     app.add_handler(CommandHandler(["start", "help"], _help))
     app.add_handler(CommandHandler("idea", _cmd_idea))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _on_text))
