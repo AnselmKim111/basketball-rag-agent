@@ -1141,6 +1141,11 @@ async def _send_results(
             await send_pdf(bot, chat_id, p, caption=f"[산업] {p.name}")
             sent_pdf_names.add(p.name)
 
+    log.info(
+        "[send_results 완료] top5=%d개, PDF 첨부 %d건",
+        len(top5), len(sent_pdf_names),
+    )
+
 
 # ------------------------------------------------------------------
 # 헬퍼
