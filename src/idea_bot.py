@@ -152,8 +152,7 @@ async def _run_pipeline(
     started = datetime.now(KST).strftime("%Y-%m-%d %H:%M")
     await send_text_chunked(
         bot, chat_id,
-        f"💡 아이디어: {idea_text}\n{started} 시작 — 약 15-25분 소요\n\n"
-        "🌐 1단계: 웹 검색 + 논리의 기울기 검증",
+        f"💡 아이디어: {idea_text}\n{started} 시작 — 약 15-25분 소요",
     )
 
     download_root = download_root_for("idea") / safe_dirname(idea_text[:30] + "_" + datetime.now(KST).strftime("%H%M"))
@@ -284,12 +283,29 @@ async def _run_pipeline(
         await send_text_chunked(
             bot, chat_id, f"✅ 완료 ({started} → {ended})",
         )
-    except Exception:
-        log.exception("idea pipeline 최상위 예외")
-        try:
-            await send_text_chunked(bot, chat_id, "❌ 예상치 못한 오류 — 봇 로그 확인 필요")
-        except Exception:
-            pass
+    except Exception as e:
+        # OpenRouter 키 한도 초과는 사용자가 즉시 조치 가능 → 명확한 안내.
+        from src import summarizer as _sm
+        if isinstance(e, _sm.OpenRouterCreditExhausted):
+            log.error("OpenRouter 한도 초과로 파이프라인 중단")
+            try:
+                await send_text_chunked(
+                    bot, chat_id,
+                    "❌ OpenRouter API 키 한도 초과\n\n"
+                    "다음 중 하나로 해결:\n"
+                    "  1) https://openrouter.ai/settings/keys 에서 사용 중인 키의 한도 상향\n"
+                    "  2) 새 키 발급 → Railway 환경변수 OPENROUTER_API_KEY 업데이트\n"
+                    "  3) 결제 잔액 충전 (https://openrouter.ai/credits)\n\n"
+                    "조치 후 다시 시도해주세요.",
+                )
+            except Exception:
+                pass
+        else:
+            log.exception("idea pipeline 최상위 예외")
+            try:
+                await send_text_chunked(bot, chat_id, "❌ 예상치 못한 오류 — 봇 로그 확인 필요")
+            except Exception:
+                pass
     finally:
         CURRENT_IDEA = None
 
@@ -323,7 +339,8 @@ async def _parse_idea(idea_text: str) -> dict | None:
                     {"role": "user", "content": user_msg},
                 ],
             )
-        except Exception:
+        except Exception as e:
+            _maybe_raise_credit(e)
             log.exception("아이디어 파싱 LLM 호출 실패")
             return None
         try:
@@ -426,7 +443,8 @@ async def _research_idea(idea_text: str, parsed: dict | None = None) -> dict | N
                     {"role": "user", "content": user_msg},
                 ],
             )
-        except Exception:
+        except Exception as e:
+            _maybe_raise_credit(e)
             log.exception("리서치 LLM 호출 실패")
             return None
         try:
@@ -515,11 +533,11 @@ async def _evaluate_importance(idea_text: str, research: dict) -> dict | None:
             )
         except summarizer.APIStatusError as e:
             if summarizer._is_credit_error(e):
-                log.error("OpenRouter credit 부족 (importance)")
-                return None
+                raise summarizer.OpenRouterCreditExhausted(str(e)) from e
             log.exception("importance LLM API 에러")
             return None
-        except Exception:
+        except Exception as e:
+            _maybe_raise_credit(e)
             log.exception("importance LLM 호출 실패")
             return None
         try:
@@ -715,11 +733,11 @@ async def _narrow_candidates(
             )
         except summarizer.APIStatusError as e:
             if summarizer._is_credit_error(e):
-                log.error("OpenRouter credit 부족 (narrow)")
-                return None
+                raise summarizer.OpenRouterCreditExhausted(str(e)) from e
             log.exception("narrow LLM API 에러")
             return None
-        except Exception:
+        except Exception as e:
+            _maybe_raise_credit(e)
             log.exception("narrow LLM 호출 실패")
             return None
         try:
@@ -966,11 +984,11 @@ async def _synthesize_top5(
             )
         except summarizer.APIStatusError as e:
             if summarizer._is_credit_error(e):
-                log.error("OpenRouter credit 부족 (synthesis)")
-                return None
+                raise summarizer.OpenRouterCreditExhausted(str(e)) from e
             log.exception("synthesis LLM API 에러")
             return None
-        except Exception:
+        except Exception as e:
+            _maybe_raise_credit(e)
             log.exception("synthesis LLM 호출 실패")
             return None
         try:
@@ -1121,6 +1139,17 @@ def _narrow_model() -> str:
     if explicit:
         return explicit
     return os.getenv("OPENROUTER_MODEL") or "anthropic/claude-sonnet-4.5"
+
+
+def _maybe_raise_credit(e: Exception) -> None:
+    """OpenRouter 키 한도/결제 오류면 OpenRouterCreditExhausted 재라이즈.
+
+    그렇지 않으면 no-op. 모든 LLM 호출의 except 블록에서 가장 먼저 호출하면
+    credit error를 silent 실패 대신 사용자에게 명확히 전달.
+    """
+    from src import summarizer
+    if isinstance(e, summarizer.APIStatusError) and summarizer._is_credit_error(e):
+        raise summarizer.OpenRouterCreditExhausted(str(e)) from e
 
 
 def _parse_json(content: str) -> dict | None:

@@ -159,11 +159,18 @@ def _extract_pdf_text(pdf_path: Path, max_chars: int = MAX_PDF_TEXT_CHARS) -> st
 
 
 def _is_credit_error(exc: Exception) -> bool:
-    """OpenRouter 결제·잔액 오류 판별."""
+    """OpenRouter 결제·잔액·키 한도 오류 판별.
+
+    - 402/429: payment / quota 관련 메시지
+    - 403: 'Key limit exceeded' (사용자 키의 spending limit 초과)
+    """
     if isinstance(exc, APIStatusError):
+        msg = (str(exc) + " " + str(getattr(exc, "body", ""))).lower()
         if exc.status_code in (402, 429):
-            msg = (str(exc) + " " + str(getattr(exc, "body", ""))).lower()
             if any(k in msg for k in ("credit", "balance", "payment", "insufficient", "quota")):
+                return True
+        if exc.status_code == 403:
+            if any(k in msg for k in ("key limit exceeded", "spending limit", "limit exceeded")):
                 return True
     return False
 
