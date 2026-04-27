@@ -1141,9 +1141,14 @@ async def _send_results(
             await send_pdf(bot, chat_id, p, caption=f"[산업] {p.name}")
             sent_pdf_names.add(p.name)
 
+    # Top 5 명세를 한 줄 요약으로 로그 — 검증·디버깅에 핵심.
+    top5_brief = " / ".join(
+        f"#{p.get('rank','?')} {p.get('name','?')}({p.get('ticker6','?')}) — {(p.get('business_unit') or '')[:25]}"
+        for p in top5
+    )
     log.info(
-        "[send_results 완료] top5=%d개, PDF 첨부 %d건",
-        len(top5), len(sent_pdf_names),
+        "[send_results 완료] top5=%d개, PDF 첨부 %d건 — %s",
+        len(top5), len(sent_pdf_names), top5_brief,
     )
 
 
