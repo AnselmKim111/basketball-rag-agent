@@ -1313,8 +1313,8 @@ async def _self_test(app: Application) -> None:
             self.bot = app.bot
             self.args: list[str] = []
 
-    # 약간 대기 — 폴링이 완전히 시작된 후 실행 (Conflict 메시지 안 끼게)
-    await asyncio.sleep(8)
+    # 모든 봇 폴링이 안정화된 후 실행 (구 컨테이너 Conflict 메시지 안 끼게)
+    await asyncio.sleep(15)
     try:
         await _run_pipeline(_FakeUpdate(chat_id, test_prompt), _FakeContext(), test_prompt)
     except Exception:
@@ -1324,20 +1324,20 @@ async def _self_test(app: Application) -> None:
     log.info("=" * 60)
 
 
-async def _post_init(app: Application) -> None:
-    """Application post_init 훅 — 폴링 시작 직후 호출됨."""
-    # self-test는 백그라운드 task로 띄움 (post_init은 await blocking이라 폴링 시작 전에 끝나야 함)
-    asyncio.create_task(_self_test(app))
-
-
 def build_idea_app(token: str) -> Application:
-    app = (
-        Application.builder()
-        .token(token)
-        .post_init(_post_init)
-        .build()
-    )
+    app = Application.builder().token(token).build()
     app.add_handler(CommandHandler(["start", "help"], _help))
     app.add_handler(CommandHandler("idea", _cmd_idea))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _on_text))
+
+    # self-test 자동 실행 — orchestrator가 build_idea_app을 async _run_forever 안에서
+    # 호출하므로 running loop이 이미 있음. PTB v22의 post_init 훅은 run_polling()
+    # 에서만 호출되고 orchestrator는 lifecycle을 수동 관리하므로 그 훅이 안 fire됨.
+    # 직접 create_task로 띄우면 _self_test가 sleep 후 자기 시점에 동작.
+    try:
+        loop = asyncio.get_running_loop()
+        loop.create_task(_self_test(app))
+    except RuntimeError:
+        # async context 밖 (예: CLI 단독 실행) — self-test 비활성
+        pass
     return app
