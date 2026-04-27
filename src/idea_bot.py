@@ -991,7 +991,7 @@ async def _synthesize_top5(
             try:
                 resp = client.chat.completions.create(
                     model=_synthesis_model(),
-                    max_tokens=12000,
+                    max_tokens=16000,
                     temperature=0.4 if attempt == 1 else 0.6,
                     messages=[
                         {"role": "system", "content": sys_prompt},
@@ -1217,23 +1217,123 @@ def _parse_json(content: str) -> dict | None:
         log.info("JSON 파싱 — cleanup 후 성공")
         return obj if isinstance(obj, dict) else None
 
-    # 3차: progressive truncate — 끝에서부터 } 위치를 줄이며 시도
-    #      (마지막 항목이 truncate된 경우 상위 구조 유지)
-    for cut in range(end, start, -1):
-        if content_inner[cut] != "}":
-            continue
-        candidate = content_inner[start:cut + 1]
-        candidate = _clean_json_loose(candidate)
-        # 닫히지 않은 배열 강제 닫기 + key:value 미완성 수정
-        for n_close in range(0, 4):
-            attempt = candidate + ("]" * n_close + "}" * (n_close + 1) if n_close else "")
-            obj = _try_loads(candidate)
-            if obj is not None:
-                log.info("JSON 파싱 — progressive truncate 성공 (cut=%d)", cut)
-                return obj if isinstance(obj, dict) else None
-            break  # 위 attempt는 사용 안 함, 단순 candidate 시도
+    # 3차: depth/string-tracking 으로 완전히 닫힌 마지막 top-level 위치까지 잘라냄
+    #      (Claude가 mid-string 으로 truncate된 경우에 대응. 단순 } 카운팅으론
+    #       문자열 안의 }와 진짜 }를 구별 못함.)
+    safe_blob = _truncate_to_balanced_json(content_inner, start)
+    if safe_blob is not None:
+        cleaned = _clean_json_loose(safe_blob)
+        obj = _try_loads(cleaned)
+        if obj is not None:
+            log.info("JSON 파싱 — balanced truncate 성공 (len=%d)", len(safe_blob))
+            return obj if isinstance(obj, dict) else None
+
+    # 4차: depth-aware partial recovery — 마지막 '완성된 top5 항목까지'라도 살리기.
+    #      중첩 array/object 가 닫히지 않은 채로 끝났으면, 강제로 ] 와 } 닫아서
+    #      직전까지의 항목만이라도 재구성.
+    forced = _force_close_open_brackets(content_inner, start, end)
+    if forced is not None:
+        cleaned = _clean_json_loose(forced)
+        obj = _try_loads(cleaned)
+        if obj is not None:
+            log.info("JSON 파싱 — force-close 성공 (len=%d)", len(forced))
+            return obj if isinstance(obj, dict) else None
+
     log.warning("JSON 파싱 최종 실패 — head=%r tail=%r", blob[:200], blob[-200:])
     return None
+
+
+def _truncate_to_balanced_json(s: str, start: int) -> str | None:
+    """문자열·이스케이프를 추적하며 depth가 0으로 돌아온 마지막 위치까지 잘라냄.
+
+    LLM이 출력 중간(예: 문자열 안)에서 끊긴 경우, 가장 가까운 안전한 cutoff를 찾는다.
+    반환: s[start:cutoff+1] 형태의 부분 문자열 (성공 시) 또는 None.
+    """
+    if start < 0 or start >= len(s):
+        return None
+    if s[start] != "{":
+        return None
+    depth = 0
+    in_string = False
+    escape = False
+    last_complete = -1  # depth가 0으로 돌아온 가장 최근 위치
+    for i in range(start, len(s)):
+        c = s[i]
+        if escape:
+            escape = False
+            continue
+        if c == "\\" and in_string:
+            escape = True
+            continue
+        if c == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if c == "{" or c == "[":
+            depth += 1
+        elif c == "}" or c == "]":
+            depth -= 1
+            if depth == 0:
+                last_complete = i
+    if last_complete < 0:
+        return None
+    return s[start:last_complete + 1]
+
+
+def _force_close_open_brackets(s: str, start: int, end: int) -> str | None:
+    """마지막 완전한 *항목* (top5 배열의 1~N개) 까지 보존하면서 강제로 닫음.
+
+    동작:
+      1. start 부터 한 글자씩 진행. 문자열·이스케이프 추적.
+      2. depth가 변할 때마다 stack에 push/pop. depth==1 이고 직전이 '}' 면
+         'top-level 자식 닫힘'으로 기록 (예: top5의 한 항목 끝).
+      3. 끝까지 가서 닫히지 않은 ']' 와 '}' 가 있으면 마지막 자식 닫힘 위치
+         이후를 잘라내고 강제로 ']' 와 '}' append.
+    """
+    if start < 0 or start >= len(s) or s[start] != "{":
+        return None
+    in_string = False
+    escape = False
+    stack: list[str] = []  # '{' 또는 '['
+    last_safe_end = -1  # depth==1에서 자식 } / ] 가 닫힌 가장 최근 위치
+    for i in range(start, len(s)):
+        c = s[i]
+        if escape:
+            escape = False
+            continue
+        if c == "\\" and in_string:
+            escape = True
+            continue
+        if c == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if c in "{[":
+            stack.append(c)
+        elif c in "}]":
+            if not stack:
+                return None  # 비정상 — 매칭 brackets 깨짐
+            stack.pop()
+            if len(stack) == 1:
+                # 최상위 객체의 직접 자식이 막 닫힘 (예: top5 배열 안의 한 객체).
+                last_safe_end = i
+    if not stack:
+        # 이상 — 정상 균형이면 이미 1차에서 성공했을 것
+        return s[start:end + 1] if end >= start else None
+    if last_safe_end <= start:
+        return None
+    # 안전 위치 이후 잘라내고 stack 역순으로 닫기
+    truncated = s[start:last_safe_end + 1]
+    closing = ""
+    for ch in reversed(stack):
+        if ch == "[":
+            closing += "]"
+        else:
+            closing += "}"
+    # trailing comma 가능성 → cleanup이 처리
+    return truncated + closing
 
 
 def _try_loads(s: str):
