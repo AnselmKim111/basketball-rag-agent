@@ -721,30 +721,41 @@ async def _narrow_candidates(
             f"# 산업 리포트 텍스트\n{ind_block[:60_000]}\n\n"
             "위 자료를 종합해 시스템 프롬프트 형식대로 top10 JSON을 출력해주세요."
         )
-        try:
-            resp = client.chat.completions.create(
-                model=_narrow_model(),
-                max_tokens=4500,
-                temperature=0.3,
-                messages=[
-                    {"role": "system", "content": sys_prompt},
-                    {"role": "user", "content": user_msg},
-                ],
-            )
-        except summarizer.APIStatusError as e:
-            if summarizer._is_credit_error(e):
-                raise summarizer.OpenRouterCreditExhausted(str(e)) from e
-            log.exception("narrow LLM API 에러")
-            return None
-        except Exception as e:
-            _maybe_raise_credit(e)
-            log.exception("narrow LLM 호출 실패")
-            return None
-        try:
-            content = (resp.choices[0].message.content or "").strip()
-        except Exception:
-            log.exception("narrow 응답 파싱 실패")
-            return None
+        # 빈 응답 재시도 (kimi가 가끔 idle timeout으로 0자 반환).
+        # 두 번째 시도는 temperature 약간 올려 동일 응답 회피.
+        content = ""
+        for attempt in (1, 2):
+            try:
+                resp = client.chat.completions.create(
+                    model=_narrow_model(),
+                    max_tokens=8000,
+                    temperature=0.3 if attempt == 1 else 0.5,
+                    messages=[
+                        {"role": "system", "content": sys_prompt},
+                        {"role": "user", "content": user_msg},
+                    ],
+                )
+            except summarizer.APIStatusError as e:
+                if summarizer._is_credit_error(e):
+                    raise summarizer.OpenRouterCreditExhausted(str(e)) from e
+                log.exception("narrow LLM API 에러 (attempt %d)", attempt)
+                return None
+            except Exception as e:
+                _maybe_raise_credit(e)
+                log.exception("narrow LLM 호출 실패 (attempt %d)", attempt)
+                if attempt == 2:
+                    return None
+                continue
+            try:
+                content = (resp.choices[0].message.content or "").strip()
+            except Exception:
+                log.exception("narrow 응답 추출 실패 (attempt %d)", attempt)
+                if attempt == 2:
+                    return None
+                continue
+            if content:
+                break
+            log.warning("narrow LLM 빈 응답 (attempt %d) — 재시도", attempt)
         log.info(
             "narrow LLM 응답: %d chars (model=%s) — preview=%r",
             len(content), _narrow_model(), content[:300],
@@ -972,30 +983,42 @@ async def _synthesize_top5(
             "최종 thesis에 통합해주세요. "
             "referenced_reports에는 해당 종목의 own 종목 리포트 파일명만 정확히 사용해주세요."
         )
-        try:
-            resp = client.chat.completions.create(
-                model=_synthesis_model(),
-                max_tokens=8000,
-                temperature=0.4,
-                messages=[
-                    {"role": "system", "content": sys_prompt},
-                    {"role": "user", "content": user_msg},
-                ],
-            )
-        except summarizer.APIStatusError as e:
-            if summarizer._is_credit_error(e):
-                raise summarizer.OpenRouterCreditExhausted(str(e)) from e
-            log.exception("synthesis LLM API 에러")
-            return None
-        except Exception as e:
-            _maybe_raise_credit(e)
-            log.exception("synthesis LLM 호출 실패")
-            return None
-        try:
-            content = (resp.choices[0].message.content or "").strip()
-        except Exception:
-            log.exception("synthesis 응답 파싱 실패")
-            return None
+        # max_tokens=12000 — Top 5 × 1500자 thesis + key_numbers + methodology
+        #   (이전 8000은 Claude Sonnet에서 마지막 종목의 referenced_reports 직전에 truncate됨).
+        # 빈 응답 재시도 1회.
+        content = ""
+        for attempt in (1, 2):
+            try:
+                resp = client.chat.completions.create(
+                    model=_synthesis_model(),
+                    max_tokens=12000,
+                    temperature=0.4 if attempt == 1 else 0.6,
+                    messages=[
+                        {"role": "system", "content": sys_prompt},
+                        {"role": "user", "content": user_msg},
+                    ],
+                )
+            except summarizer.APIStatusError as e:
+                if summarizer._is_credit_error(e):
+                    raise summarizer.OpenRouterCreditExhausted(str(e)) from e
+                log.exception("synthesis LLM API 에러 (attempt %d)", attempt)
+                return None
+            except Exception as e:
+                _maybe_raise_credit(e)
+                log.exception("synthesis LLM 호출 실패 (attempt %d)", attempt)
+                if attempt == 2:
+                    return None
+                continue
+            try:
+                content = (resp.choices[0].message.content or "").strip()
+            except Exception:
+                log.exception("synthesis 응답 추출 실패 (attempt %d)", attempt)
+                if attempt == 2:
+                    return None
+                continue
+            if content:
+                break
+            log.warning("synthesis LLM 빈 응답 (attempt %d) — 재시도", attempt)
         log.info(
             "synthesis LLM 응답: %d chars (model=%s) — preview=%r",
             len(content), _synthesis_model(), content[:300],
@@ -1153,9 +1176,17 @@ def _maybe_raise_credit(e: Exception) -> None:
 
 
 def _parse_json(content: str) -> dict | None:
-    """LLM 응답에서 JSON 객체 추출. 코드 펜스 제거 + 첫 {...} 매칭.
+    """LLM 응답에서 JSON 객체 추출 (tolerant).
 
-    파싱 실패 시 None. 단, 부분적으로 잘린 JSON은 마지막 닫힘 위치까지 잘라서 재시도.
+    처리 단계:
+      1. 코드 펜스 ```json ... ``` 제거
+      2. 첫 { 부터 마지막 } 까지 잘라냄
+      3. trailing comma 정리 (`,]` → `]`, `,}` → `}`)
+      4. JS 라인 코멘트 / 블록 코멘트 제거
+      5. 그래도 실패 시 progressive truncate — 끝에서부터 한 글자씩 빼며 재시도
+         (Claude가 마지막 객체에서 truncate된 경우 직전 } 까지 살리기)
+
+    파싱 실패 시 None.
     """
     if not content:
         log.warning("_parse_json: 빈 content")
@@ -1173,15 +1204,62 @@ def _parse_json(content: str) -> dict | None:
         log.warning("JSON 블록 못 찾음 (head=%r tail=%r)", content_inner[:200], content_inner[-200:])
         return None
     blob = content_inner[start:end + 1]
+
+    # 1차: 그대로 시도
+    obj = _try_loads(blob)
+    if obj is not None:
+        return obj if isinstance(obj, dict) else None
+
+    # 2차: 정리(trailing comma + 코멘트) 후 시도
+    cleaned = _clean_json_loose(blob)
+    obj = _try_loads(cleaned)
+    if obj is not None:
+        log.info("JSON 파싱 — cleanup 후 성공")
+        return obj if isinstance(obj, dict) else None
+
+    # 3차: progressive truncate — 끝에서부터 } 위치를 줄이며 시도
+    #      (마지막 항목이 truncate된 경우 상위 구조 유지)
+    for cut in range(end, start, -1):
+        if content_inner[cut] != "}":
+            continue
+        candidate = content_inner[start:cut + 1]
+        candidate = _clean_json_loose(candidate)
+        # 닫히지 않은 배열 강제 닫기 + key:value 미완성 수정
+        for n_close in range(0, 4):
+            attempt = candidate + ("]" * n_close + "}" * (n_close + 1) if n_close else "")
+            obj = _try_loads(candidate)
+            if obj is not None:
+                log.info("JSON 파싱 — progressive truncate 성공 (cut=%d)", cut)
+                return obj if isinstance(obj, dict) else None
+            break  # 위 attempt는 사용 안 함, 단순 candidate 시도
+    log.warning("JSON 파싱 최종 실패 — head=%r tail=%r", blob[:200], blob[-200:])
+    return None
+
+
+def _try_loads(s: str):
+    """json.loads 성공 시 객체, 실패 시 None."""
     try:
-        obj = json.loads(blob)
-    except json.JSONDecodeError as e:
-        log.warning("JSON 파싱 실패 (%s) — head=%r tail=%r", e, blob[:200], blob[-200:])
+        return json.loads(s)
+    except json.JSONDecodeError:
         return None
-    if not isinstance(obj, dict):
-        log.warning("JSON이 dict 아님: %s", type(obj))
+    except Exception:
         return None
-    return obj
+
+
+def _clean_json_loose(s: str) -> str:
+    """LLM JSON에서 흔한 비표준 표기 제거.
+
+    - trailing comma: `,\s*]` → `]`, `,\s*}` → `}`
+    - JS 라인 코멘트: `// ...` 줄
+    - JS 블록 코멘트: `/* ... */`
+    """
+    # 라인 코멘트 (행 끝까지)
+    s = re.sub(r"//[^\n\r]*", "", s)
+    # 블록 코멘트
+    s = re.sub(r"/\*.*?\*/", "", s, flags=re.DOTALL)
+    # trailing comma
+    s = re.sub(r",(\s*[}\]])", r"\1", s)
+    return s
 
 
 # ------------------------------------------------------------------
