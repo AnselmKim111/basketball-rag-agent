@@ -328,7 +328,8 @@ async def _run_pipeline(
 async def _parse_idea(idea_text: str) -> dict | None:
     """0.5단계: 아이디어 텍스트에서 thesis + constraints 분리.
 
-    저렴한 모델(narrow와 동일) 사용. 실패 시 None — 호출자는 제약 없이 진행.
+    갓성비 모델(kimi) 1차 + 빈 응답 시 2차 재시도 + 3차 haiku 폴백 (chat_with_retry).
+    파싱 실패는 graceful — 호출자가 제약 없이 계속 진행.
     """
     loop = asyncio.get_running_loop()
 
@@ -342,25 +343,26 @@ async def _parse_idea(idea_text: str) -> dict | None:
         sys_prompt = idea_prompts.load("idea_parse")
         user_msg = f"사용자 투자 아이디어:\n{idea_text}\n\n시스템 프롬프트 형식대로 JSON 출력."
         try:
-            resp = client.chat.completions.create(
-                model=_summary_model(),  # 갓성비 모델 (kimi 등) — 단순 JSON 추출
+            content = summarizer.chat_with_retry(
+                client,
+                model=_summary_model(),       # 1차/2차: kimi
+                fallback_model=_narrow_model(),  # 3차: haiku (kimi 빈 응답 폴백)
                 max_tokens=1000,
                 temperature=0.0,
                 messages=[
                     {"role": "system", "content": sys_prompt},
                     {"role": "user", "content": user_msg},
                 ],
+                context="idea_parse",
             )
-        except Exception as e:
-            _maybe_raise_credit(e)
-            log.exception("아이디어 파싱 LLM 호출 실패")
-            return None
-        try:
-            content = (resp.choices[0].message.content or "").strip()
+        except summarizer.OpenRouterCreditExhausted:
+            raise
         except Exception:
-            log.exception("파싱 응답 추출 실패")
+            log.exception("아이디어 파싱 LLM 호출 실패 (chat_with_retry)")
             return None
         log.info("parse LLM 응답: %d chars — preview=%r", len(content), content[:300])
+        if not content:
+            return None
         parsed = _parse_json(content)
         if parsed is None:
             log.warning("parse JSON 파싱 실패 — content 전문: %r", content[:1500])
