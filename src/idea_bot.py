@@ -1324,21 +1324,25 @@ def _truncate_to_balanced_json(s: str, start: int) -> str | None:
 
 
 def _force_close_open_brackets(s: str, start: int, end: int) -> str | None:
-    """마지막 완전한 *항목* (top5 배열의 1~N개) 까지 보존하면서 강제로 닫음.
+    """LLM이 array 중간에서 끊긴 경우 마지막 완전한 *항목* 까지 보존하고 강제 닫음.
 
     동작:
       1. start 부터 한 글자씩 진행. 문자열·이스케이프 추적.
-      2. depth가 변할 때마다 stack에 push/pop. depth==1 이고 직전이 '}' 면
-         'top-level 자식 닫힘'으로 기록 (예: top5의 한 항목 끝).
-      3. 끝까지 가서 닫히지 않은 ']' 와 '}' 가 있으면 마지막 자식 닫힘 위치
-         이후를 잘라내고 강제로 ']' 와 '}' append.
+      2. push/pop마다 stack 변화 기록.
+      3. **모든 depth에서** "직전이 닫힌 위치" safe_positions[depth] 를 추적.
+      4. 끝까지 가서 닫히지 않은 ']' 와 '}' 가 있으면, **현재 남은 stack depth와 일치하는**
+         safe_positions[len(stack)] 위치까지 잘라내고 stack 역순으로 닫기.
+
+    예: top5 배열에 5개 항목 중 5번째가 닫혔지만 array ']'와 root '}'가 missing인 경우
+        → stack=['{', '['] 길이 2. safe_positions[2] = 5번째 항목 '}' 위치.
+        → 그 위치까지 잘라낸 후 ']}' append → 5개 항목 보존된 valid JSON.
     """
     if start < 0 or start >= len(s) or s[start] != "{":
         return None
     in_string = False
     escape = False
-    stack: list[str] = []  # '{' 또는 '['
-    last_safe_end = -1  # depth==1에서 자식 } / ] 가 닫힌 가장 최근 위치
+    stack: list[str] = []
+    safe_positions: dict[int, int] = {}  # depth-after-pop → 그 depth에서 마지막 close 위치
     for i in range(start, len(s)):
         c = s[i]
         if escape:
@@ -1358,16 +1362,15 @@ def _force_close_open_brackets(s: str, start: int, end: int) -> str | None:
             if not stack:
                 return None  # 비정상 — 매칭 brackets 깨짐
             stack.pop()
-            if len(stack) == 1:
-                # 최상위 객체의 직접 자식이 막 닫힘 (예: top5 배열 안의 한 객체).
-                last_safe_end = i
+            safe_positions[len(stack)] = i
     if not stack:
         # 이상 — 정상 균형이면 이미 1차에서 성공했을 것
         return s[start:end + 1] if end >= start else None
-    if last_safe_end <= start:
+    target = safe_positions.get(len(stack))
+    if target is None or target <= start:
         return None
     # 안전 위치 이후 잘라내고 stack 역순으로 닫기
-    truncated = s[start:last_safe_end + 1]
+    truncated = s[start:target + 1]
     closing = ""
     for ch in reversed(stack):
         if ch == "[":
