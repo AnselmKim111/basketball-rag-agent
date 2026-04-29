@@ -273,6 +273,11 @@ def chat_with_retry(
                         "LLM call recovered [%s] attempt %d (model=%s, chars=%d)",
                         context, attempt, cur_model, len(content),
                     )
+                else:
+                    log.info(
+                        "LLM call ok [%s] (model=%s, chars=%d)",
+                        context, cur_model, len(content),
+                    )
                 return content
             last_reason = "empty content (stream idle timeout 가능성)"
             log.warning(
