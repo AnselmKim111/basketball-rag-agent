@@ -2,13 +2,25 @@
 
 사용 흐름:
   사용자 입력(텍스트 or /idea <text>)
-    → (1) perplexity/sonar-pro 웹검색: 논리의 기울기 검증 + 산업 2-3 + 후보 30
+    → (0.5) parse: thesis + 제약 추출 (cheap model)
+    → (1) research: 웹검색 + 가치사슬 분해 + 30 후보 (perplexity)
+    → (1.5) importance: 현상 중요도 비판 평가 (premium)
     → (2) wisereport 산업 리포트 수집 (PIPELINE_LOCK)
-    → (3) LLM narrow: 30 → 10 + all30_scored (영업레버리지 4축 점수)
+    → (3) narrow: 30 → 10 + all30_scored 4축 점수 (mid model — haiku)
         → 30종목 4축 산점도 PNG 발송
     → (4) wisereport 종목 리포트 수집 (PIPELINE_LOCK)
-    → (5) LLM 최종 synthesis: Top 5 + 영업레버리지 thesis (JSON)
-    → (6) 텔레그램 발송: 텍스트 메시지 + Top 5 참고 PDF + 공통 산업 PDF
+    → (5) synthesis: Top 5 + 영업레버리지 thesis (premium)
+    → (6) 텔레그램 발송: 텍스트 + Top 5 참고 PDF + 공통 산업 PDF
+
+# 모델 티어
+  - **summary tier** (OPENROUTER_MODEL, kimi 등) — 갓성비. 단순 추출·요약.
+    · 0.5 parse / PDF 요약 / DART 잠정실적 / forward 컨센서스 / deepdive 요약
+  - **research tier** (IDEA_RESEARCH_MODEL, perplexity/sonar-pro)
+    · 1단계 웹검색
+  - **narrow tier** (IDEA_NARROW_MODEL, haiku 등) — mid. 큰 출력 + 점수화.
+    · 3단계 30 → 10
+  - **synthesis tier** (IDEA_SYNTHESIS_MODEL, sonnet/opus) — 진짜 지능 필요.
+    · 1.5단계 importance / 5단계 Top 5 thesis
 
 격리 원칙 (BOTS.md):
   - 모든 wisereport 호출은 async with PIPELINE_LOCK 안.
@@ -331,7 +343,7 @@ async def _parse_idea(idea_text: str) -> dict | None:
         user_msg = f"사용자 투자 아이디어:\n{idea_text}\n\n시스템 프롬프트 형식대로 JSON 출력."
         try:
             resp = client.chat.completions.create(
-                model=_narrow_model(),  # 저렴한 모델 OK — 단순 추출
+                model=_summary_model(),  # 갓성비 모델 (kimi 등) — 단순 JSON 추출
                 max_tokens=1000,
                 temperature=0.0,
                 messages=[
@@ -1155,6 +1167,24 @@ async def _send_results(
 # ------------------------------------------------------------------
 # 헬퍼
 # ------------------------------------------------------------------
+# ------------------------------------------------------------------
+# 모델 티어 매트릭스 (OPENROUTER_MODEL = 갓성비 cheap, IDEA_NARROW_MODEL = mid,
+# IDEA_SYNTHESIS_MODEL = premium)
+#
+#   _summary_model()   → OPENROUTER_MODEL (kimi 등) — parse, 단순 JSON 추출
+#                        같은 티어를 PDF 요약·DART 파싱·deepdive 요약도 사용.
+#   _research_model()  → IDEA_RESEARCH_MODEL (perplexity/sonar-pro) — 웹검색
+#   _narrow_model()    → IDEA_NARROW_MODEL (haiku 등) — 30→10 점수화 (큰 출력)
+#   _synthesis_model() → IDEA_SYNTHESIS_MODEL (sonnet 등) — 1.5+5 단계 진짜 지능
+# ------------------------------------------------------------------
+def _summary_model() -> str:
+    """0.5단계 parse 등 단순 추출용 — 가장 저렴한 OPENROUTER_MODEL 사용.
+
+    PDF 요약·DART 파싱·deepdive 요약과 같은 티어. kimi-k2.6 등 갓성비 모델 권장.
+    """
+    return os.getenv("OPENROUTER_MODEL") or "moonshotai/kimi-k2.6"
+
+
 def _synthesis_model() -> str:
     """1.5단계 중요도 평가 + 5단계 최종 Top 5 합성 — 가장 지능 필요. 기본 claude-sonnet."""
     explicit = os.getenv(SYNTHESIS_MODEL_ENV)
