@@ -29,7 +29,7 @@
 
 ```json
 {
-  "narrowing_summary": "산업 리포트가 주는 메시지 + 30→10 narrowing 기준 적용 방식 600자 이내. **purity_score 가중치가 어떻게 작동했는지** 명시.",
+  "narrowing_summary": "**400자 이내(엄수, 초과시 truncate되어 결과 사용 불가)**. 산업 리포트 메시지 + 30→10 기준 + purity 가중치 적용 방식. 군더더기 없이 압축.",
   "all30_scored": [
     {
       "ticker6": "6자리 또는 빈 문자열",
@@ -64,6 +64,8 @@
 ```
 
 # 규칙
+- **출력은 압축적으로**. narrowing_summary 400자, axis_breakdown 근거는 각 1줄 (50자 이내), rationale 200자.
+  전체 JSON ~9000자 이내 권장 — 길어지면 truncate되어 사용 불가.
 - `all30_scored`는 정확히 30개 (입력 후보 모두). **각 score는 1~10 정수만**. 5축 모두 점수 부여.
 - `top10`는 정확히 10개. **선정 기준: (fixed_cost + capacity + growth + margin) × (purity / 10)**.
   → purity 가중 합산 상위 10개. 즉 purity 낮은 종목은 자동 후순위.

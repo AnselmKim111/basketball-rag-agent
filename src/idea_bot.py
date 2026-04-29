@@ -742,7 +742,7 @@ async def _narrow_candidates(
             try:
                 resp = client.chat.completions.create(
                     model=_narrow_model(),
-                    max_tokens=8000,
+                    max_tokens=12000,
                     temperature=0.3 if attempt == 1 else 0.5,
                     messages=[
                         {"role": "system", "content": sys_prompt},
