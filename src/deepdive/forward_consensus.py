@@ -107,10 +107,13 @@ def from_wisereport(wctx) -> dict[str, dict[str, Optional[float]]]:
 
 def _extract_one(client, model: str, title: str, text: str) -> Optional[dict]:
     """단일 리포트 텍스트에서 forward JSON 추출. 어느 단계 실패해도 None."""
+    from src import summarizer as _sz
+
     # forward 신호가 후반부에 있는 경우가 많아 텍스트 끝부분도 함께 보내기
     snippet = _smart_text_snippet(text, max_chars=FORWARD_TEXT_WINDOW)
     try:
-        resp = client.chat.completions.create(
+        content = _sz.chat_with_retry(
+            client,
             model=model,
             max_tokens=1200,
             temperature=0.0,
@@ -124,16 +127,17 @@ def _extract_one(client, model: str, title: str, text: str) -> Optional[dict]:
                     "추정 자체가 전혀 없으면 빈 객체 {} 반환."
                 )},
             ],
+            context=f"forward {title[:40]}",
         )
-    except Exception:
-        log.exception("LLM 호출 실패 (forward, title=%s)", title[:40])
+    except _sz.OpenRouterCreditExhausted:
+        log.warning("forward 추출 OpenRouter 토큰 부족 — 스킵")
         return None
-    try:
-        content = (resp.choices[0].message.content or "").strip()
-    except (IndexError, AttributeError):
-        log.exception("LLM 응답 구조 비정상 (forward, title=%s)", title[:40])
+    except Exception:
+        log.exception("chat_with_retry 호출 실패 (forward, title=%s)", title[:40])
         return None
 
+    if not content:
+        return None
     log.debug("forward LLM raw [%s]: %s", title[:40], content[:600])
     return _parse_json_object(content)
 

@@ -601,7 +601,8 @@ def _llm_parse_preliminary(text: str, report_nm: str) -> tuple[str, int, int, in
         '예: {"year_quarter": "2026Q1", "revenue": 17000000000000, "op_profit": 8000000000000, "net_profit": 5000000000000}'
     )
     try:
-        resp = client.chat.completions.create(
+        content = summarizer.chat_with_retry(
+            client,
             model=summarizer.DEFAULT_MODEL,
             max_tokens=400,
             temperature=0.0,
@@ -611,12 +612,17 @@ def _llm_parse_preliminary(text: str, report_nm: str) -> tuple[str, int, int, in
                     f"공시명: {report_nm}\n\n<doc_text>\n{text[:25_000]}\n</doc_text>"
                 )},
             ],
+            context=f"preliminary {report_nm[:40]}",
         )
+    except summarizer.OpenRouterCreditExhausted:
+        log.warning("잠정실적 파싱 OpenRouter 토큰 부족 — 스킵")
+        return None
     except Exception:
-        log.exception("LLM 잠정실적 파싱 호출 실패")
+        log.exception("chat_with_retry 호출 실패 (잠정실적 파싱)")
         return None
 
-    content = (resp.choices[0].message.content or "").strip()
+    if not content:
+        return None
     import json as _json
     fence = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", content, re.DOTALL)
     if fence:
