@@ -81,50 +81,74 @@ def _build_inner(idea_text: str, all30_scored: list[dict]) -> Optional[bytes]:
     if not xs:
         return None
 
-    fig, ax = plt.subplots(figsize=(11.5, 8.5), dpi=120)
+    fig, ax = plt.subplots(figsize=(13.5, 9.5), dpi=120)
 
-    # 점 크기는 100~900 범위로 매핑 (margin 1~10)
-    point_sizes = [100 + (s - 1) * (800 / 9) for s in sizes]
+    # ── Jitter: 같은 (round(x), round(y)) 그룹의 점들을 원형 패턴으로 분산 ──
+    # 같은 점수의 종목이 한 점에 뭉쳐 라벨이 깨지는 문제를 시각적으로 해소.
+    # 점수 의미는 보존 (그룹 중심은 원래 좌표).
+    import math as _math
+    from collections import defaultdict as _dd
+    cluster: dict[tuple[int, int], list[int]] = _dd(list)
+    for idx, (x, y) in enumerate(zip(xs, ys)):
+        cluster[(int(round(x)), int(round(y)))].append(idx)
+    jx = list(xs)
+    jy = list(ys)
+    for (_, _), idxs in cluster.items():
+        n = len(idxs)
+        if n <= 1:
+            continue
+        # 종목 수에 따라 반지름 조정. n=2~3은 0.20, 5+는 0.32 정도
+        radius = min(0.18 + 0.04 * (n - 1), 0.42)
+        for j, idx in enumerate(idxs):
+            angle = 2 * _math.pi * j / n
+            jx[idx] = xs[idx] + radius * _math.cos(angle)
+            jy[idx] = ys[idx] + radius * _math.sin(angle)
+
+    # 점 크기는 80~700 범위로 매핑 (margin 1~10) — 라벨 공간 확보 위해 살짝 작게
+    point_sizes = [80 + (s - 1) * (620 / 9) for s in sizes]
 
     sc = ax.scatter(
-        xs, ys,
+        jx, jy,
         s=point_sizes,
         c=colors,
         cmap="viridis",
         vmin=1, vmax=10,
-        alpha=0.55,  # 점 약간 투명 → 라벨 가독성 우선
+        alpha=0.6,
         edgecolors="black",
         linewidths=0.7,
     )
 
-    # 라벨: 회사명을 점 옆에 — 동일 (x,y) 좌표에 여러 종목 겹치면 위·아래로 fan-out
-    from collections import defaultdict
-    cluster: dict[tuple[int, int], list[int]] = defaultdict(list)
-    for idx, (x, y) in enumerate(zip(xs, ys)):
-        cluster[(int(round(x)), int(round(y)))].append(idx)
-    placed_labels: list[tuple[float, float]] = []
-    for (cx, cy), idxs in cluster.items():
+    # 라벨: 점에서 fan-out. 같은 클러스터 내 종목은 시계방향 12/3/6/9시 등.
+    for (_, _), idxs in cluster.items():
+        n = len(idxs)
         for j, idx in enumerate(idxs):
-            x = xs[idx]
-            y = ys[idx]
-            n = names[idx]
-            # fan-out: 겹치면 위·아래로 흩어줌
-            offset_y = 8 + j * 14 if j % 2 == 0 else -(8 + j * 14)
-            offset_x = 8 if j % 2 == 0 else -8
-            ha = "left" if j % 2 == 0 else "right"
+            x = jx[idx]
+            y = jy[idx]
+            name_ = names[idx]
+            # 클러스터 중심으로부터의 방향각으로 offset 결정 (점이 중심에서 밀려난 방향으로 라벨)
+            if n > 1:
+                angle = 2 * _math.pi * j / n
+                ox = 14 * _math.cos(angle)
+                oy = 14 * _math.sin(angle)
+                ha = "left" if ox >= 0 else "right"
+                va = "bottom" if oy >= 0 else "top"
+            else:
+                ox, oy = 10, 6
+                ha, va = "left", "bottom"
             ax.annotate(
-                n[:12], (x, y),
-                xytext=(offset_x, offset_y), textcoords="offset points",
-                fontsize=10, fontweight="bold", alpha=0.95,
-                ha=ha, va="center",
+                name_[:14], (x, y),
+                xytext=(ox, oy), textcoords="offset points",
+                fontsize=11, fontweight="bold", color="black",
+                ha=ha, va=va,
                 bbox=dict(
-                    boxstyle="round,pad=0.25",
-                    facecolor="white", edgecolor="gray",
-                    alpha=0.85, linewidth=0.5,
+                    boxstyle="round,pad=0.3",
+                    facecolor="white", edgecolor="dimgray",
+                    alpha=0.92, linewidth=0.6,
                 ),
                 arrowprops=dict(
-                    arrowstyle="-", color="gray", alpha=0.4, linewidth=0.5,
+                    arrowstyle="-", color="gray", alpha=0.5, linewidth=0.6,
                 ),
+                zorder=5,
             )
 
     # 영업레버리지 강도 zone — 우상단을 강조
