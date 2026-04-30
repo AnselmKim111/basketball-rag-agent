@@ -833,7 +833,16 @@ async def _send_scatter_chart(
 
 
 async def _fix_tickers(top10: list[dict]) -> list[dict]:
-    """ticker6가 비어있으면 DART 회사명 룩업으로 채움."""
+    """후보의 (name, ticker6) 페어를 DART corp_map과 대조해 검증·교정.
+
+    동작:
+      1. ticker6 있음 → DART에서 ticker → 등록 회사명 조회
+         - LLM이 준 name과 정규화 비교해 일치 → OK
+         - 불일치 (예: HD현대오일뱅크는 비상장, LLM이 002380=KCC를 잘못 매핑) →
+           LLM name으로 재lookup해서 새 ticker 교체. 못 찾으면 ticker 비움.
+      2. ticker6 없음 → name으로 lookup (기존 동작).
+      3. 그래도 ticker 못 찾으면 비워둠 → 후속 _collect_company_reports에서 스킵.
+    """
     loop = asyncio.get_running_loop()
     try:
         from src.deepdive import dart_client
@@ -841,13 +850,48 @@ async def _fix_tickers(top10: list[dict]) -> list[dict]:
         log.exception("dart_client import 실패 — ticker 룩업 스킵")
         return top10
 
+    # corp_map 빌드 (한 번)
+    try:
+        await loop.run_in_executor(None, dart_client._load_corp_map)
+    except Exception:
+        log.exception("DART corp_map 로딩 실패")
+
+    def _norm(s: str) -> str:
+        return re.sub(r"[\s()㈜（）\-]+", "", s or "").lower()
+
     out: list[dict] = []
     for c in top10:
         ticker = (c.get("ticker6") or "").strip()
+        name = (c.get("name") or "").strip()
+
         if re.match(r"^\d{6}$", ticker):
+            # ticker 있음 — 회사명 일치 검증
+            dart_name = dart_client._CORP_NAME_CACHE.get(ticker, "")
+            if dart_name and _norm(dart_name) == _norm(name):
+                out.append(c)
+                continue
+            # 불일치 → name으로 재lookup
+            log.warning(
+                "ticker mismatch: name='%s' ticker=%s but DART에는 '%s' — name으로 재lookup",
+                name, ticker, dart_name,
+            )
+            new_ticker = None
+            if name:
+                try:
+                    new_ticker = await loop.run_in_executor(None, dart_client.lookup_ticker_by_name, name)
+                except Exception:
+                    log.exception("재lookup 실패: %s", name)
+            if new_ticker and new_ticker != ticker:
+                log.info("ticker 교체: %s '%s' → %s '%s'", ticker, name, new_ticker, dart_client._CORP_NAME_CACHE.get(new_ticker, ""))
+                c["ticker6"] = new_ticker
+            else:
+                # 비상장이거나 매칭 못 함 — ticker 비우면 후속 단계에서 스킵
+                log.warning("ticker 매칭 실패 (비상장 가능성) — '%s' candidate ticker6 비움", name)
+                c["ticker6"] = ""
             out.append(c)
             continue
-        name = (c.get("name") or "").strip()
+
+        # ticker 비어있음 — name으로 lookup
         if not name:
             out.append(c)
             continue
@@ -897,6 +941,10 @@ async def _collect_company_reports(
                 for c in top10:
                     ticker = (c.get("ticker6") or "").strip()
                     if not re.match(r"^\d{6}$", ticker):
+                        log.info(
+                            "ticker 없음 → 종목 리포트 스킵: name='%s' (비상장 또는 매칭 실패)",
+                            c.get("name", "?"),
+                        )
                         continue
                     sub_dir = target_dir / ticker
                     try:

@@ -86,6 +86,13 @@
 - **컨글로머릿/지주사를 단순 산업 노출 이유로 넣지 마라.** purity_score 낮으면 영업레버리지가 EPS에 안 잡힘.
 - **소형주 specialty 발굴이 핵심 가치.** 검색에 잘 안 잡히면 산업 deep-dive로 의도적 발굴.
 
+# 비상장사·자회사 처리 — **반드시 읽기**
+- **비상장 회사는 candidates에서 제외**. 한국 KOSPI/KOSDAQ 상장사만 (ticker6가 실제로 존재하는 회사). ticker를 모르거나 추측해서 적지 마라.
+- 예: HD현대오일뱅크(비상장, 자회사) / 삼성디스플레이 / 현대오토에버 일부 자회사 등은 candidates에 직접 포함 금지.
+- **비상장 자회사가 핵심 노출인 경우** → 모회사를 candidates에 포함하고 mechanism_link에 "<자회사명> 100% 자회사" 명시.
+  예: HD현대오일뱅크 idea → candidates에는 HD현대(267250) 또는 HD현대중공업(329180) 포함, mechanism_link="HD현대오일뱅크 100% 자회사 — 정유 사업 전사 EBITDA 큰 비중" 식으로.
+- **ticker6는 절대 추측·hallucinate 금지**. 정확히 모르면 빈 문자열 "" 두기 (후속 lookup 단계에서 회사명으로 자동 매핑).
+
 # 사용자 제약 (constraints) 준수 — **최우선**
 사용자가 보낸 입력에 `<constraints>` 블록이 함께 오면 그 안의 필터를 **반드시 엄격하게** 적용:
 - `market_cap_max_krw`: 시총 상한 (원). 이를 초과하는 종목은 candidates에서 **완전 제외**.
