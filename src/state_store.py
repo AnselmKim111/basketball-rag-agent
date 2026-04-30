@@ -1,13 +1,17 @@
-"""dedup state — 이미 보낸 rpt_id 추적.
+"""dedup state — 이미 보낸 rpt_id + 정규화된 title 추적.
 
 저장 위치 우선순위:
   1) RAILWAY_VOLUME_MOUNT_PATH (Railway 볼륨)
   2) STATE_DIR 환경변수
-  3) /app/data (도커 기본)
-  4) /tmp/wisereport_state (fallback)
+  3) /data → /app/data → /tmp/wisereport_state (fallback)
 
-볼륨 없으면 컨테이너 재시작 시 state 손실 — 일부 리포트가 중복 발송될 수 있으나
-치명적이지 않음.
+볼륨 없으면 컨테이너 재시작 시 state 손실 — Railway는 반드시 볼륨을 /data
+같은 경로에 attach하고 STATE_DIR=/data 설정 권장.
+
+dedup은 두 축 모두 사용:
+  - rpt_id: wisereport 고유 ID (정확하지만 같은 리포트가 다른 채널로
+    재등록되면 새 id 부여돼 못 잡음)
+  - 정규화 title: "[전략공감 2.0] X" 와 "X" 같은 prefix 차이 무시.
 """
 
 from __future__ import annotations
@@ -15,6 +19,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import threading
 from pathlib import Path
 
@@ -24,6 +29,9 @@ log = logging.getLogger(__name__)
 # orchestrator는 단일 프로세스라 이걸로 충분. 다중 프로세스 환경이면 fcntl
 # 레벨 lock 도입 필요.
 _LOCK = threading.RLock()
+
+# 정규화 title을 저장할 카테고리별 key suffix (state json 안에서).
+_TITLE_KEY_SUFFIX = "__titles"
 
 
 def _state_dir() -> Path:
@@ -47,6 +55,24 @@ def _state_dir() -> Path:
 
 
 STATE_FILE = _state_dir() / "seen_rpt_ids.json"
+
+
+def normalize_title(title: str) -> str:
+    """Title 정규화 — 같은 리포트가 다른 prefix/포맷으로 중복 등록되는 케이스 대응.
+
+    예시 (모두 같은 키로 매핑됨):
+      "구체화되는 AI 수익화, AI 인프라 투자의 정당성"
+      "[전략공감 2.0] 구체화되는 AI 수익화, AI 인프라 투자의 정당성"
+      "<NH> 구체화되는 AI 수익화, AI 인프라 투자의 정당성"
+    """
+    t = title or ""
+    # 시작 위치의 [...]·<...>·(...) prefix 한 번 제거
+    t = re.sub(r"^\s*[\[\<\(][^\]\>\)]+[\]\>\)]\s*", "", t)
+    # 본문 안의 모든 [...] / <...> 제거 (괄호()는 본문 의미 유지)
+    t = re.sub(r"[\[\<][^\]\>]*[\]\>]", "", t)
+    # 한글/영문/숫자만 남기고 모두 제거 (공백·구두점·특수문자 무시)
+    t = re.sub(r"[^\w가-힣]+", "", t, flags=re.UNICODE)
+    return t.lower()
 
 
 def _load() -> dict[str, list[str]]:
@@ -78,22 +104,61 @@ def seen(category: str) -> set[str]:
         return set(_load().get(category, []))
 
 
+def seen_titles(category: str) -> set[str]:
+    """카테고리에서 이미 본 정규화된 title 셋."""
+    with _LOCK:
+        return set(_load().get(category + _TITLE_KEY_SUFFIX, []))
+
+
+def _merge_with_cap(existing: list[str], new_items: list[str], cap: int) -> list[str]:
+    """순서 보존 + dedup + cap 적용 (오래된 것부터 drop)."""
+    merged: list[str] = []
+    seen_set: set[str] = set()
+    for x in existing + new_items:
+        if not x or x in seen_set:
+            continue
+        seen_set.add(x)
+        merged.append(x)
+    if len(merged) > cap:
+        merged = merged[-cap:]
+    return merged
+
+
 def mark_seen(category: str, rpt_ids: list[str], cap: int = 1000) -> None:
-    """rpt_id 리스트를 이미 본 것으로 마킹. 카테고리당 최대 cap개 (오래된 것부터 삭제)."""
+    """rpt_id 리스트를 이미 본 것으로 마킹. 카테고리당 최대 cap개 (오래된 것부터 삭제).
+
+    title 함께 마킹하려면 mark_seen_with_titles 사용.
+    """
     with _LOCK:
         state = _load()
-        cur = state.get(category, [])
-        merged = []
-        seen_set: set[str] = set()
-        for r in cur + list(rpt_ids):
-            if r not in seen_set:
-                seen_set.add(r)
-                merged.append(r)
-        if len(merged) > cap:
-            merged = merged[-cap:]
+        merged = _merge_with_cap(state.get(category, []), list(rpt_ids), cap)
         state[category] = merged
         _save(state)
-        log.info("state 갱신: %s에 %d개 추가 (총 %d)", category, len(rpt_ids), len(merged))
+        log.info("state 갱신: %s에 %d개 추가 (총 %d, ids only)", category, len(rpt_ids), len(merged))
+
+
+def mark_seen_with_titles(
+    category: str,
+    items: list[tuple[str, str]],
+    cap: int = 1000,
+) -> None:
+    """(rpt_id, title) 페어 마킹. rpt_id + 정규화 title 둘 다 저장 → 다음 실행에서
+    같은 채널·다른 prefix 리포트가 와도 title로 잡힘.
+    """
+    rpt_ids = [r for r, _ in items if r]
+    titles_norm = [normalize_title(t) for _, t in items if t and normalize_title(t)]
+    title_key = category + _TITLE_KEY_SUFFIX
+    with _LOCK:
+        state = _load()
+        merged_ids = _merge_with_cap(state.get(category, []), rpt_ids, cap)
+        merged_titles = _merge_with_cap(state.get(title_key, []), titles_norm, cap)
+        state[category] = merged_ids
+        state[title_key] = merged_titles
+        _save(state)
+        log.info(
+            "state 갱신: %s에 %d개 추가 (총 ids=%d, titles=%d)",
+            category, len(items), len(merged_ids), len(merged_titles),
+        )
 
 
 def reset(category: str | None = None) -> None:
@@ -103,4 +168,5 @@ def reset(category: str | None = None) -> None:
             return
         state = _load()
         state.pop(category, None)
+        state.pop(category + _TITLE_KEY_SUFFIX, None)
         _save(state)
