@@ -660,17 +660,18 @@ async def _collect_industry_reports(
                             items = cli.list_top_reports(
                                 category="industry", sort_by="popular",
                                 limit=INDUSTRY_REPORTS_PER_INDUSTRY,
-                                days_back=60, industry_gics=code,
+                                days_back=180, industry_gics=code,  # 6개월 cap
                             )
                         if not items and not general_pool_used:
-                            # 폴백: 전체 industry 인기 (한 번만)
                             log.info("산업 '%s' 매칭 실패 → 일반 industry top reports 1회 사용", name)
                             items = cli.list_top_reports(
                                 category="industry", sort_by="popular",
-                                limit=INDUSTRY_REPORTS_PER_INDUSTRY * 2,  # 더 넉넉히
-                                days_back=30,
+                                limit=INDUSTRY_REPORTS_PER_INDUSTRY * 2,
+                                days_back=180,
                             )
                             general_pool_used = True
+                        # 인기순이지만 sch_dt 최신 우선 보조 정렬 (같은 visit_cnt 그룹 안에서 최신 우대)
+                        items.sort(key=lambda it: it.sch_dt, reverse=True)
                     except Exception:
                         log.exception("산업 리포트 목록 조회 실패: %s", name)
                         continue
@@ -951,6 +952,7 @@ async def _collect_company_reports(
                         items = cli.list_reports(
                             ticker=ticker, sort_by="latest",
                             limit=COMPANY_REPORTS_PER_TICKER,
+                            days_back=180,  # 6개월 이내만 — 옛날 리포트 차단
                         )
                     except Exception:
                         log.exception("종목 리포트 목록 실패: %s", ticker)

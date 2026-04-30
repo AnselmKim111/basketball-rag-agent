@@ -294,11 +294,13 @@ class WisereportClient:
         sort_by: Literal["latest", "popular"] = "latest",
         limit: int = 10,
         list_type: str = "33",
+        days_back: int | None = None,
     ) -> list[ReportItem]:
         """ticker code로 리포트 목록 가져오기.
 
         wisereport는 응답 정렬을 별도 옵션으로 받지 않고 기본 최신순으로 반환.
         sort_by='popular'은 클라이언트 사이드에서 별도 호출이 필요해 현재는 latest와 동일.
+        days_back: 지정 시 KST 기준 N일 이내(sch_dt) 리포트만 통과. None이면 필터 안 함.
         """
         log.info("리포트 목록 AJAX: ticker=%s (top %d)", ticker, limit)
         if "ReportList" not in self.page.url:
@@ -368,12 +370,19 @@ class WisereportClient:
         # wisereport 응답이 항상 최신순이라는 보장이 없어 명시적으로 sch_dt 내림차순.
         # sort_by="popular"은 별도 popular 호출이 필요해 현재는 latest와 동일하게 처리.
         items.sort(key=lambda it: it.sch_dt, reverse=True)
-        if items:
+
+        # days_back 필터 — 지정 시 KST 기준 N일 이내만 통과
+        original_count = len(items)
+        if days_back is not None and items:
+            from datetime import datetime, timedelta, timezone as _tz
+            kst = _tz(timedelta(hours=9))
+            cutoff = (datetime.now(kst) - timedelta(days=days_back)).strftime("%Y%m%d")
+            items = [it for it in items if it.sch_dt[:8] >= cutoff]
+
+        if original_count:
             log.info(
-                "list_reports ticker=%s 응답 %d건 (날짜 범위 %s ~ %s) → 상위 %d건 사용",
-                ticker, len(items),
-                items[-1].sch_dt[:8] if len(items) > 1 else items[0].sch_dt[:8],
-                items[0].sch_dt[:8],
+                "list_reports ticker=%s 응답 %d건 (필터 후 %d건, days_back=%s) → 상위 %d건 사용",
+                ticker, original_count, len(items), days_back,
                 min(limit, len(items)),
             )
         items = items[:limit]
