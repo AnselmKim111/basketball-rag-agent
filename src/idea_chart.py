@@ -92,18 +92,40 @@ def _build_inner(idea_text: str, all30_scored: list[dict]) -> Optional[bytes]:
         c=colors,
         cmap="viridis",
         vmin=1, vmax=10,
-        alpha=0.75,
+        alpha=0.55,  # 점 약간 투명 → 라벨 가독성 우선
         edgecolors="black",
-        linewidths=0.6,
+        linewidths=0.7,
     )
 
-    # 라벨: 회사명을 점 옆에 (겹치는 부분은 alpha로 완화)
-    for x, y, n in zip(xs, ys, names):
-        ax.annotate(
-            n[:10], (x, y),
-            xytext=(6, 4), textcoords="offset points",
-            fontsize=8, alpha=0.85,
-        )
+    # 라벨: 회사명을 점 옆에 — 동일 (x,y) 좌표에 여러 종목 겹치면 위·아래로 fan-out
+    from collections import defaultdict
+    cluster: dict[tuple[int, int], list[int]] = defaultdict(list)
+    for idx, (x, y) in enumerate(zip(xs, ys)):
+        cluster[(int(round(x)), int(round(y)))].append(idx)
+    placed_labels: list[tuple[float, float]] = []
+    for (cx, cy), idxs in cluster.items():
+        for j, idx in enumerate(idxs):
+            x = xs[idx]
+            y = ys[idx]
+            n = names[idx]
+            # fan-out: 겹치면 위·아래로 흩어줌
+            offset_y = 8 + j * 14 if j % 2 == 0 else -(8 + j * 14)
+            offset_x = 8 if j % 2 == 0 else -8
+            ha = "left" if j % 2 == 0 else "right"
+            ax.annotate(
+                n[:12], (x, y),
+                xytext=(offset_x, offset_y), textcoords="offset points",
+                fontsize=10, fontweight="bold", alpha=0.95,
+                ha=ha, va="center",
+                bbox=dict(
+                    boxstyle="round,pad=0.25",
+                    facecolor="white", edgecolor="gray",
+                    alpha=0.85, linewidth=0.5,
+                ),
+                arrowprops=dict(
+                    arrowstyle="-", color="gray", alpha=0.4, linewidth=0.5,
+                ),
+            )
 
     # 영업레버리지 강도 zone — 우상단을 강조
     ax.axhline(y=7, color="gray", linestyle=":", alpha=0.4, linewidth=0.8)

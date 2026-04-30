@@ -858,7 +858,26 @@ async def _fix_tickers(top10: list[dict]) -> list[dict]:
         log.exception("DART corp_map 로딩 실패")
 
     def _norm(s: str) -> str:
-        return re.sub(r"[\s()㈜（）\-]+", "", s or "").lower()
+        # 회사 suffix(공업/산업/홀딩스/지주)도 약식으로 제거 — 명칭 줄임 매칭 위해
+        s = re.sub(r"[\s()㈜（）\-]+", "", s or "").lower()
+        return s
+
+    def _names_match(llm_name: str, dart_name: str) -> bool:
+        """LLM이 준 회사명과 DART 등록명이 사실상 같은 회사를 가리키는지 fuzzy 판단.
+
+        - 정규화 후 정확 일치 → True
+        - 정규화 후 한쪽이 다른 쪽의 substring → True (예: '한국석유' ↔ '한국석유공업')
+        - 빈 문자열 → False
+        """
+        nl = _norm(llm_name)
+        nd = _norm(dart_name)
+        if not nl or not nd:
+            return False
+        if nl == nd:
+            return True
+        if nl in nd or nd in nl:
+            return True
+        return False
 
     out: list[dict] = []
     for c in top10:
@@ -866,9 +885,9 @@ async def _fix_tickers(top10: list[dict]) -> list[dict]:
         name = (c.get("name") or "").strip()
 
         if re.match(r"^\d{6}$", ticker):
-            # ticker 있음 — 회사명 일치 검증
+            # ticker 있음 — 회사명 일치 검증 (substring 허용)
             dart_name = dart_client._CORP_NAME_CACHE.get(ticker, "")
-            if dart_name and _norm(dart_name) == _norm(name):
+            if _names_match(name, dart_name):
                 out.append(c)
                 continue
             # 불일치 → name으로 재lookup
