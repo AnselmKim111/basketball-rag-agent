@@ -2,6 +2,7 @@
 .env
 .env.local
 *.env
+CLAUDE.local.md
 
 # Downloaded reports (do not commit user data)
 downloads/
