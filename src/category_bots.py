@@ -223,8 +223,8 @@ def _filter_and_order(
 # ------------------------------------------------------------------
 INDUSTRY_HELP = (
     "📊 *산업 리서치 봇*\n\n"
-    "*자동 발송:* 매주 월/수/금 오전 9시\n"
-    "  조회수 Top 산업 리포트 10건 (중복 제외)\n\n"
+    "*자동 발송:* 매일 오전 9시 (시황봇과 동일 인터벌)\n"
+    "  조회수 Top 산업 리포트 10건 (rpt_id+title 중복 제외, 최신 날짜 우선)\n\n"
     "*수동 요청:* 산업명 입력하면 5+5 발송\n"
     "  - 인기순 5건 + 최신순 5건\n"
     "  - 각 5000자 요약\n"
@@ -353,7 +353,7 @@ async def industry_trigger(
 
 # 스케줄 잡 — orchestrator의 APScheduler가 호출
 async def industry_top10_job(bot: Bot) -> None:
-    """월/수/금 09:00 KST: 산업 카테고리 조회수 Top 10 (중복 제외)."""
+    """매일 09:00 KST: 산업 카테고리 조회수 Top 10 (rpt_id+title 중복 제외, 최신 날짜 우선)."""
     log.info("[scheduled] industry_top10_job 시작")
     chat_id = os.environ.get("INDUSTRY_CHAT_ID")
     if not chat_id:
