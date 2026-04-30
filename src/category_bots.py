@@ -31,7 +31,7 @@ from src.bot_helpers import (
     wisereport_creds,
 )
 from src.pipeline_lock import PIPELINE_LOCK
-from src.state_store import mark_seen, seen
+from src.state_store import mark_seen, mark_seen_with_titles, normalize_title, seen, seen_titles
 from src.summarizer import (
     OpenRouterCreditExhausted,
     get_client,
@@ -93,11 +93,17 @@ async def _process_and_send_category(
         loop = asyncio.get_running_loop()
 
         seen_ids: set[str] = set()
+        seen_t_set: set[str] = set()
         if dedup_key:
             seen_ids = await loop.run_in_executor(None, seen, dedup_key)
+            seen_t_set = await loop.run_in_executor(None, seen_titles, dedup_key)
+            log.info(
+                "dedup state [%s]: rpt_ids=%d, titles=%d",
+                dedup_key, len(seen_ids), len(seen_t_set),
+            )
 
         # blocking 파이프라인을 thread에서 실행
-        def _blocking() -> tuple[list[Path], list[str], list[str]]:
+        def _blocking() -> tuple[list[Path], list[str], list[tuple[str, str]]]:
             from src.summarizer import IndividualSummary  # noqa: F401
             items: list[ReportItem] = []
             with WisereportClient(
@@ -109,21 +115,28 @@ async def _process_and_send_category(
                 state_file=Path(os.environ.get("STORAGE_STATE", "./.wisereport_state.json")),
             ) as cli:
                 cli.ensure_logged_in()
-                items = cli.list_top_reports(
+                # dedup으로 잘릴 가능성 보정 — 넉넉하게 가져온 뒤 필터.
+                fetch_limit = limit + len(seen_ids) + 30
+                raw = cli.list_top_reports(
                     category=category,  # type: ignore[arg-type]
                     sort_by=sort_by,    # type: ignore[arg-type]
-                    limit=limit + len(seen_ids),  # dedup으로 잘릴 가능성 보정
+                    limit=fetch_limit,
                     days_back=days_back,
                     industry_gics=industry_gics,
                 )
-                # dedup
-                if dedup_key:
-                    items = [it for it in items if it.rpt_id not in seen_ids][:limit]
-                else:
-                    items = items[:limit]
-
+                items = _filter_and_order(
+                    raw,
+                    seen_ids=seen_ids if dedup_key else set(),
+                    seen_titles_norm=seen_t_set if dedup_key else set(),
+                    limit=limit,
+                )
                 if not items:
                     return [], [], []
+                if len(raw) != len(items):
+                    log.info(
+                        "dedup [%s]: %d → %d (rpt_id+title+batch+freshness)",
+                        dedup_key or "no-dedup", len(raw), len(items),
+                    )
 
                 target_dir = download_root / _safe_dirname(label)
                 saved_paths = cli.download_reports(items, target_dir)
@@ -143,9 +156,10 @@ async def _process_and_send_category(
                 except Exception as e:
                     summaries.append(f"(요약 실패: {e!r})")
 
-            return saved_paths, summaries, [it.rpt_id for it in items[: len(saved_paths)]]
+            sent_pairs = [(it.rpt_id, it.title) for it in items[: len(saved_paths)]]
+            return saved_paths, summaries, sent_pairs
 
-        saved_paths, summaries, sent_rpt_ids = await loop.run_in_executor(None, _blocking)
+        saved_paths, summaries, sent_pairs = await loop.run_in_executor(None, _blocking)
 
         if not saved_paths:
             await _send_text(bot, chat_id, f"📭 {label}: 새 리포트 없음")
@@ -162,10 +176,46 @@ async def _process_and_send_category(
             await _send_text(bot, chat_id, header + summary)
             await _send_pdf(bot, chat_id, p, caption=f"[{i}/{len(saved_paths)}] {p.name}")
 
-        if dedup_key and sent_rpt_ids:
-            await loop.run_in_executor(None, mark_seen, dedup_key, sent_rpt_ids)
+        if dedup_key and sent_pairs:
+            await loop.run_in_executor(
+                None, mark_seen_with_titles, dedup_key, sent_pairs, 5000,
+            )
 
         return len(saved_paths)
+
+
+def _filter_and_order(
+    raw: list[ReportItem],
+    *,
+    seen_ids: set[str],
+    seen_titles_norm: set[str],
+    limit: int,
+) -> list[ReportItem]:
+    """rpt_id + 정규화 title + 같은 batch 내 dedup → 최신 날짜 우선 재정렬 → top-limit.
+
+    재정렬 규칙: 같은 sch_dt(날짜)끼리 묶고 날짜 내림차순으로 이어붙이기.
+    같은 날짜 내부에서는 wisereport 응답 순서(인기순) 그대로 보존 → "오늘 인기순 먼저,
+    부족하면 어제, 그 다음 그제..." 효과.
+    """
+    # 1) dedup
+    batch_titles: set[str] = set()
+    filtered: list[ReportItem] = []
+    for it in raw:
+        if it.rpt_id in seen_ids:
+            continue
+        norm = normalize_title(it.title)
+        if norm and norm in seen_titles_norm:
+            continue
+        if norm and norm in batch_titles:
+            continue
+        if norm:
+            batch_titles.add(norm)
+        filtered.append(it)
+
+    # 2) 같은 날짜끼리 묶고 날짜 내림차순 — Python sort는 stable이라
+    # 같은 날짜 내부의 인기순(원본 응답 순서)이 보존됨.
+    filtered.sort(key=lambda it: (it.sch_dt or ""), reverse=True)
+    return filtered[:limit]
 
 
 # ------------------------------------------------------------------
@@ -173,8 +223,8 @@ async def _process_and_send_category(
 # ------------------------------------------------------------------
 INDUSTRY_HELP = (
     "📊 *산업 리서치 봇*\n\n"
-    "*자동 발송:* 매주 월/수/금 오전 9시\n"
-    "  조회수 Top 산업 리포트 10건 (중복 제외)\n\n"
+    "*자동 발송:* 매일 오전 9시 (시황봇과 동일 인터벌)\n"
+    "  조회수 Top 산업 리포트 10건 (rpt_id+title 중복 제외, 최신 날짜 우선)\n\n"
     "*수동 요청:* 산업명 입력하면 5+5 발송\n"
     "  - 인기순 5건 + 최신순 5건\n"
     "  - 각 5000자 요약\n"
@@ -303,7 +353,7 @@ async def industry_trigger(
 
 # 스케줄 잡 — orchestrator의 APScheduler가 호출
 async def industry_top10_job(bot: Bot) -> None:
-    """월/수/금 09:00 KST: 산업 카테고리 조회수 Top 10 (중복 제외)."""
+    """매일 09:00 KST: 산업 카테고리 조회수 Top 10 (rpt_id+title 중복 제외, 최신 날짜 우선)."""
     log.info("[scheduled] industry_top10_job 시작")
     chat_id = os.environ.get("INDUSTRY_CHAT_ID")
     if not chat_id:

@@ -2,7 +2,7 @@
 
 현재 등록된 봇:
   - CompanyBot (TELEGRAM_BOT_TOKEN): /report, /deepdive
-  - IndustryBot (INDUSTRY_BOT_TOKEN): 산업 리포트 (월/수/금 9시 + on-demand)
+  - IndustryBot (INDUSTRY_BOT_TOKEN): 산업 리포트 (매일 9시 + on-demand)
   - MarketBot (MARKET_BOT_TOKEN): 투자전략/시황 (매일 9시)
   - GlobalBot (GLOBAL_BOT_TOKEN): 글로벌 Top10 (매주 토 9시)
 
@@ -81,8 +81,8 @@ BOT_SPECS: list[BotSpec] = [
             ScheduledJob(
                 func=industry_top10_job,
                 job_id="industry_top10",
-                cron={"day_of_week": "mon,wed,fri", "hour": 9, "minute": 0},
-                description="산업 Top10 — 월/수/금 09:00 KST",
+                cron={"hour": 9, "minute": 0},
+                description="산업 Top10 — 매일 09:00 KST (시황봇과 동일 인터벌)",
             ),
         ],
     ),
