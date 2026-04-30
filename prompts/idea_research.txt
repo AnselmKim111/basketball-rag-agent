@@ -60,16 +60,17 @@
       "industry": "위 industries 중 하나의 name과 일치",
       "mechanism": "위 mechanisms 중 어느 것에 가장 강하게 노출되는지 (name 일치)",
       "size_tier": "large|mid|small",
-      "mcap_estimate_krw_eok": "시총 추정 (단위: 억원, 예: 50000=5조원)",
-      "purity_score": "1~10 — 회사 매출 중 이 메커니즘 노출 비중",
-      "specialty_note": "왜 이 종목이 다른 회사 대비 specialty인지 1줄 (100자, 옵션)",
-      "mechanism_link": "이 종목이 정확히 어떻게 수혜 받는지 1줄 (100자)"
+      "mcap_estimate_krw_eok": "시총 추정 정수 (단위 억원, 예: 50000)",
+      "purity_score": "1~10 정수",
+      "mechanism_link": "수혜 메커니즘 1줄 (60자 이내, 압축적)"
     }
   ]
 }
 ```
 
 # 규칙
+- **출력은 압축적으로**. logic_gradient_text 800자, mechanism reasoning 200자, mechanism_link 60자 이내.
+  전체 JSON ~9000자 이내 권장 — 길어지면 truncate되어 사용 불가.
 - `mechanisms`: 3-5개. 너무 광범위하지 않게.
 - `industries`: 2-3개. 메커니즘의 산업 추상화.
 - `candidates`: **정확히 30개**. size_tier 비율 엄수 (large 30% / mid 40% / small 30%, ±2 허용).

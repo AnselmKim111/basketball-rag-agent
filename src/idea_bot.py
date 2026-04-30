@@ -450,7 +450,7 @@ async def _research_idea(idea_text: str, parsed: dict | None = None) -> dict | N
         try:
             resp = client.chat.completions.create(
                 model=model,
-                max_tokens=6000,
+                max_tokens=12000,
                 temperature=0.3,
                 messages=[
                     {"role": "system", "content": sys_prompt},
@@ -1330,7 +1330,9 @@ def _force_close_open_brackets(s: str, start: int, end: int) -> str | None:
       1. start 부터 한 글자씩 진행. 문자열·이스케이프 추적.
       2. push/pop마다 stack 변화 기록.
       3. **모든 depth에서** "직전이 닫힌 위치" safe_positions[depth] 를 추적.
-      4. 끝까지 가서 닫히지 않은 ']' 와 '}' 가 있으면, **현재 남은 stack depth와 일치하는**
+      4. **문자열 안에서 EOF 만나면** 그 문자열 시작 직전의 마지막 안전 위치까지 백트랙
+         (perplexity 등이 specialty_note 같은 string field 안에서 truncate되는 케이스 대응).
+      5. 끝까지 가서 닫히지 않은 ']' 와 '}' 가 있으면, **현재 남은 stack depth와 일치하는**
          safe_positions[len(stack)] 위치까지 잘라내고 stack 역순으로 닫기.
 
     예: top5 배열에 5개 항목 중 5번째가 닫혔지만 array ']'와 root '}'가 missing인 경우
@@ -1364,21 +1366,25 @@ def _force_close_open_brackets(s: str, start: int, end: int) -> str | None:
             stack.pop()
             safe_positions[len(stack)] = i
     if not stack:
-        # 이상 — 정상 균형이면 이미 1차에서 성공했을 것
         return s[start:end + 1] if end >= start else None
-    target = safe_positions.get(len(stack))
-    if target is None or target <= start:
-        return None
-    # 안전 위치 이후 잘라내고 stack 역순으로 닫기
-    truncated = s[start:target + 1]
+    # safe_positions[len(stack)]이 None인 경우 = 현재 top stack 안에서 한 번도 자식이 닫히지 않음.
+    # (예: candidate object 안의 string field에서 truncate되어 자식이 0개 닫힘)
+    # stack을 가상으로 pop하면서 가능한 safe position 탐색 — 가장 데이터 많이 보존되는 거 우선.
+    truncated_blob = None
     closing = ""
-    for ch in reversed(stack):
-        if ch == "[":
-            closing += "]"
-        else:
-            closing += "}"
+    for pop_count in range(0, len(stack) + 1):
+        target_depth = len(stack) - pop_count
+        safe = safe_positions.get(target_depth)
+        if safe is None or safe <= start:
+            continue
+        truncated_blob = s[start:safe + 1]
+        items_to_close = stack[:target_depth]
+        closing = "".join("]" if ch == "[" else "}" for ch in reversed(items_to_close))
+        break
+    if truncated_blob is None:
+        return None
     # trailing comma 가능성 → cleanup이 처리
-    return truncated + closing
+    return truncated_blob + closing
 
 
 def _try_loads(s: str):
