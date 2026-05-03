@@ -57,6 +57,26 @@ def _state_dir() -> Path:
 STATE_FILE = _state_dir() / "seen_rpt_ids.json"
 
 
+def diag_log() -> None:
+    """orchestrator 부팅 시 호출. 실제 state 경로 + 영구 보존 여부 진단."""
+    try:
+        sd = STATE_FILE.parent
+        existed = STATE_FILE.exists()
+        size = STATE_FILE.stat().st_size if existed else 0
+        # 볼륨 마운트 추정: /data 또는 RAILWAY_VOLUME_MOUNT_PATH 하위면 영구
+        mount_hint = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH") or os.environ.get("STATE_DIR") or ""
+        persistent = bool(mount_hint) and str(sd).startswith(mount_hint)
+        # 카테고리별 누적 통계
+        st = _load()
+        cats = {k: len(v) for k, v in st.items() if not k.endswith(_TITLE_KEY_SUFFIX)}
+        log.info(
+            "state_store 진단: path=%s, exists=%s, size=%d, persistent=%s, categories=%s",
+            STATE_FILE, existed, size, persistent, cats or "(빈 state)",
+        )
+    except Exception:
+        log.exception("state_store 진단 실패")
+
+
 def normalize_title(title: str) -> str:
     """Title 정규화 — 같은 리포트가 다른 prefix/포맷으로 중복 등록되는 케이스 대응.
 
