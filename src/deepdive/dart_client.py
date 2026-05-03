@@ -233,19 +233,29 @@ def lookup_ticker_by_name(query: str) -> str | None:
         return chosen[1]
 
     # 5) difflib fuzzy — 오타 1-2자 (예: "머터리얼즈" → "머티리얼즈")
-    # 너무 짧은 query는 fuzzy 매칭이 위험 (LG → 수백개 회사) → 4자 이상에서만.
-    if len(q_norm) >= 4:
+    # 가변 cutoff (query 길이가 짧을수록 한 글자 비중이 커서 ratio가 자연히 낮음).
+    # 너무 짧은 query (1-2자)는 fuzzy 위험 (LG → 수백개 매칭) → 3자 이상에서만.
+    if len(q_norm) >= 3:
+        if len(q_norm) >= 8:
+            cutoff = 0.82  # 8+자: 2-char 오타까지 허용
+        elif len(q_norm) >= 5:
+            cutoff = 0.78  # 5-7자: 1-char 오타
+        elif len(q_norm) >= 4:
+            cutoff = 0.70  # 4자: 1-char 오타 (예: 삼성전쟈 → 삼성전자)
+        else:
+            cutoff = 0.65  # 3자: 1-char 오타 (예: 카가오 → 카카오) — 후보 1개로 제한
         import difflib
         # 정규화된 키만 후보로 사용 (raw 이름은 (주) 등 prefix 포함되어 distance 부풀림)
         norm_keys = [k for k in _NAME_TO_TICKER_CACHE.keys() if k]
-        matches = difflib.get_close_matches(q_norm, norm_keys, n=3, cutoff=0.82)
+        n_results = 1 if len(q_norm) <= 4 else 3
+        matches = difflib.get_close_matches(q_norm, norm_keys, n=n_results, cutoff=cutoff)
         if matches:
             best = matches[0]
             ticker = _NAME_TO_TICKER_CACHE[best]
             ratio = difflib.SequenceMatcher(None, q_norm, best).ratio()
             log.info(
-                "종목명 fuzzy 매칭: '%s' → '%s' (%s) ratio=%.2f [후보=%s]",
-                q, best, ticker, ratio, matches,
+                "종목명 fuzzy 매칭: '%s' → '%s' (%s) ratio=%.2f cutoff=%.2f [후보=%s]",
+                q, best, ticker, ratio, cutoff, matches,
             )
             return ticker
 
