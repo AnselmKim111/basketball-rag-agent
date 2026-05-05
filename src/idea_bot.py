@@ -1618,11 +1618,22 @@ async def _send_results(
                 rank, name, ticker, invalid_refs[:5],
             )
 
+        # 가격 정보 (Naver Finance) — fetch 실패 시 빈 문자열
+        try:
+            from src import price_fetcher
+            quote = price_fetcher.fetch_quote(ticker) if re.match(r"^\d{6}$", ticker) else None
+            price_brief = price_fetcher.format_quote_brief(quote)
+        except Exception:
+            log.info("가격 fetch 실패 (Top %s %s) — 무시", rank, ticker)
+            price_brief = ""
+
         header = (
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"🥇 Top {rank}. {name} ({ticker}) — {industry}\n"
-            f"━━━━━━━━━━━━━━━━━━━━"
         )
+        if price_brief:
+            header += f"   💰 {price_brief}\n"
+        header += "━━━━━━━━━━━━━━━━━━━━"
         await send_text_chunked(bot, chat_id, header)
 
         # 5단계 추론 요약 헤더 (사업부/폭/기울기) — thesis 위에 짧게 노출
