@@ -24,6 +24,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandl
 
 from src.bot_helpers import (
     MissingWisereportCreds,
+    deny_message,
     is_authorized as _bh_is_authorized,
     safe_dirname as _bh_safe_dirname,
     send_pdf as _bh_send_pdf,
@@ -241,10 +242,7 @@ _is_authorized = _bh_is_authorized  # 시그니처 동일: (update, env_key) →
 
 async def industry_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _is_authorized(update, "INDUSTRY_ALLOWED_CHAT_IDS"):
-        await update.message.reply_text(
-            f"이 봇은 인가된 사용자만 사용 가능합니다.\nchat_id: `{update.effective_chat.id}`",
-            parse_mode=ParseMode.MARKDOWN,
-        )
+        await deny_message(update, "산업봇")
         return
     await update.message.reply_text(INDUSTRY_HELP, parse_mode=ParseMode.MARKDOWN)
 
@@ -254,6 +252,7 @@ async def industry_on_demand(
 ) -> None:
     """사용자가 산업명 입력 → 인기 5 + 최신 5 발송."""
     if not _is_authorized(update, "INDUSTRY_ALLOWED_CHAT_IDS"):
+        await deny_message(update, "산업봇")
         return
     industry_name = " ".join(context.args) if context.args else (
         (update.message.text or "").strip()
@@ -346,6 +345,7 @@ async def industry_trigger(
 ) -> None:
     """수동으로 스케줄 작업 즉시 실행 (테스트용)."""
     if not _is_authorized(update, "INDUSTRY_ALLOWED_CHAT_IDS"):
+        await deny_message(update, "산업봇")
         return
     await update.message.reply_text("🔄 산업 Top10 작업 수동 실행")
     await industry_top10_job(context.bot)
@@ -387,16 +387,14 @@ MARKET_HELP = (
 
 async def market_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _is_authorized(update, "MARKET_ALLOWED_CHAT_IDS"):
-        await update.message.reply_text(
-            f"인가된 사용자만 사용 가능. chat_id: `{update.effective_chat.id}`",
-            parse_mode=ParseMode.MARKDOWN,
-        )
+        await deny_message(update, "시황봇")
         return
     await update.message.reply_text(MARKET_HELP, parse_mode=ParseMode.MARKDOWN)
 
 
 async def market_trigger(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _is_authorized(update, "MARKET_ALLOWED_CHAT_IDS"):
+        await deny_message(update, "시황봇")
         return
     await update.message.reply_text("🔄 시황 작업 수동 실행")
     await market_daily_job(context.bot)
@@ -438,16 +436,14 @@ GLOBAL_HELP = (
 
 async def global_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _is_authorized(update, "GLOBAL_ALLOWED_CHAT_IDS"):
-        await update.message.reply_text(
-            f"인가된 사용자만 사용 가능. chat_id: `{update.effective_chat.id}`",
-            parse_mode=ParseMode.MARKDOWN,
-        )
+        await deny_message(update, "글로벌봇")
         return
     await update.message.reply_text(GLOBAL_HELP, parse_mode=ParseMode.MARKDOWN)
 
 
 async def global_trigger(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _is_authorized(update, "GLOBAL_ALLOWED_CHAT_IDS"):
+        await deny_message(update, "글로벌봇")
         return
     await update.message.reply_text("🔄 글로벌 작업 수동 실행")
     await global_top10_job(context.bot)

@@ -51,6 +51,7 @@ from telegram.ext import (
 
 from src import idea_prompts
 from src.bot_helpers import (
+    deny_message,
     download_root_for,
     is_authorized,
     safe_dirname,
@@ -84,13 +85,20 @@ CURRENT_IDEA: dict | None = None
 
 HELP_TEXT = (
     "💡 *IdeaBot — 투자 아이디어 → 영업레버리지 Top 5*\n\n"
-    "*사용법:*\n"
+    "*기본 사용:*\n"
     "  - 슬래시 없이 아이디어를 그냥 보내거나\n"
     "  - `/idea <아이디어 텍스트>`\n\n"
     "*제약 표현 지원* (자연어 그대로):\n"
     "  - `1조 이하 소부장 중 AI 데이터센터 수혜`\n"
     "  - `중소형 K-방산`\n"
     "  - `코스닥만, 5천억 이하 반도체 장비`\n\n"
+    "*Tinkering 명령:*\n"
+    "  `/history` — 최근 20개 idea 분석 목록\n"
+    "  `/show <id>` — 과거 결과 다시 보기 (id 끝 6자리만 OK)\n"
+    "  `/dive <rank> [<id>]` — Top N 종목 deepdive 자동 실행\n"
+    "    예: `/dive 1` (가장 최근 idea의 Top 1)\n"
+    "  `/refine <id> <추가 제약>` — cached 데이터 재사용해서 빠르게 변형\n"
+    "    예: `/refine 143005 시총 1조 이하만 specialty pure-play`\n\n"
     "*동작:*\n"
     "  🧭 0.5단계: 아이디어 파싱 (thesis + 시총/산업 제약 추출)\n"
     "  🌐 1단계: 웹 검색 + 30 후보 발굴 (제약 적용)\n"
@@ -99,8 +107,8 @@ HELP_TEXT = (
     "  🎯 3단계: 영업레버리지 4축 점수로 30→10 + 산점도\n"
     "  📈 4단계: Top10 종목 리포트 다운로드\n"
     "  🧠 5단계: 사업부→폭→기울기 단계적 사고로 Top 5\n"
-    "  🏆 6단계: Top 5 thesis + 종목 PDF + 산업 PDF\n\n"
-    "_⏱️ 약 15-25분 소요_\n"
+    "  🏆 6단계: Top 5 thesis + Top 1 분기차트 + 참고 PDF\n\n"
+    "_⏱️ /idea 약 15-25분 / /refine 약 2-4분_\n"
     "_프롬프트 수정: GitHub `prompts/idea_*.txt` 편집 후 push_"
 )
 
@@ -110,17 +118,14 @@ HELP_TEXT = (
 # ------------------------------------------------------------------
 async def _help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_authorized(update, ALLOWED_ENV):
-        if update.effective_chat:
-            await update.message.reply_text(
-                f"이 봇은 인가된 사용자만 사용 가능합니다.\nchat_id: `{update.effective_chat.id}`",
-                parse_mode=ParseMode.MARKDOWN,
-            )
+        await deny_message(update, "아이디어봇")
         return
     await update.message.reply_text(HELP_TEXT, parse_mode=ParseMode.MARKDOWN)
 
 
 async def _cmd_idea(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_authorized(update, ALLOWED_ENV):
+        await deny_message(update, "아이디어봇")
         return
     args = " ".join(context.args or []).strip()
     if not args:
@@ -134,6 +139,7 @@ async def _cmd_idea(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def _on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_authorized(update, ALLOWED_ENV):
+        await deny_message(update, "아이디어봇")
         return
     text = (update.message.text or "").strip()
     if not text or len(text) > 500:
@@ -142,6 +148,317 @@ async def _on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
     asyncio.create_task(_run_pipeline(update, context, text))
+
+
+async def _cmd_dive(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/dive <rank> [<id>] — 가장 최근 idea의 Top 5 중 N번째 종목으로 deepdive 자동 실행.
+
+    예:
+      /dive 1     → 가장 최근 idea의 Top 1
+      /dive 3     → 가장 최근 idea의 Top 3
+      /dive 2 20260430-143005 → 특정 entry id의 Top 2
+    """
+    if not is_authorized(update, ALLOWED_ENV):
+        await deny_message(update, "아이디어봇")
+        return
+    from src import idea_cache
+    bot = context.bot
+    chat_id = str(update.effective_chat.id)
+    args = context.args or []
+    if not args:
+        await update.message.reply_text(
+            "사용법: `/dive <rank>` (예: `/dive 1`) — 가장 최근 idea의 Top N 종목 deepdive\n"
+            "또는: `/dive <rank> <id>` — 특정 entry의 Top N",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+    try:
+        rank = int(args[0])
+    except (ValueError, TypeError):
+        await send_text_chunked(bot, chat_id, "❌ rank는 1-5 사이 정수여야 합니다.")
+        return
+    if not (1 <= rank <= 5):
+        await send_text_chunked(bot, chat_id, "❌ rank는 1-5 사이.")
+        return
+
+    # 특정 id 지정 또는 latest
+    if len(args) >= 2:
+        record = idea_cache.find_by_partial_id(args[1])
+        if not record:
+            await send_text_chunked(bot, chat_id, f"❓ id='{args[1]}' 매칭 entry 없음")
+            return
+    else:
+        record = idea_cache.latest()
+        if not record:
+            await send_text_chunked(bot, chat_id, "📭 캐시된 idea 없음 — 먼저 idea 분석부터")
+            return
+
+    top5 = (record.get("synthesis") or {}).get("top5") or []
+    pick = next((p for p in top5 if int(p.get("rank", 0) or 0) == rank), None)
+    if not pick:
+        # rank 매칭 안 되면 인덱스로 fallback (일부 LLM이 rank 누락)
+        if rank - 1 < len(top5):
+            pick = top5[rank - 1]
+    if not pick:
+        await send_text_chunked(bot, chat_id, f"❓ Top {rank} 종목 없음 (top5 길이 {len(top5)})")
+        return
+
+    name = pick.get("name", "?")
+    ticker = (pick.get("ticker6") or "").strip()
+    if not re.match(r"^\d{6}$", ticker):
+        await send_text_chunked(
+            bot, chat_id,
+            f"❌ '{name}' ticker 없음/유효 X — deepdive 불가 (비상장 가능성)",
+        )
+        return
+
+    await send_text_chunked(
+        bot, chat_id,
+        f"🔍 *Deepdive 자동 체이닝*\n"
+        f"Idea: `{(record.get('idea_text') or '')[:80]}`\n"
+        f"Top {rank}: *{name}* ({ticker})\n"
+        f"⏱️ 5-10분 소요 — DART 사업보고서 + IR + 분기차트 통합 분석",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+    # deepdive _run 호출 — update/context 그대로 전달 (chat_id, bot 사용)
+    try:
+        from src.deepdive.handler import _run as deepdive_run
+    except Exception:
+        log.exception("deepdive 모듈 import 실패")
+        await send_text_chunked(bot, chat_id, "❌ deepdive 모듈 로드 실패 (DART_API_KEY 미설정 가능성)")
+        return
+    asyncio.create_task(deepdive_run(update, context, ticker))
+
+
+async def _cmd_refine(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/refine <id> <추가 제약/변경> — cached research·industry 재사용 + narrow·synthesis 재실행.
+
+    cached 데이터 재사용으로 ~3분 (full pipeline 15분 대비). 같은 idea에
+    다른 제약을 빠르게 시도하기 위함.
+
+    예: /refine 20260430-143005 시총 1조 이하만
+        /refine 143005 코스닥 + 시총 5천억 이하
+    """
+    if not is_authorized(update, ALLOWED_ENV):
+        await deny_message(update, "아이디어봇")
+        return
+    bot = context.bot
+    chat_id = str(update.effective_chat.id)
+    args = context.args or []
+    if len(args) < 2:
+        await update.message.reply_text(
+            "사용법: `/refine <id> <추가 제약>`\n"
+            "예: `/refine 143005 시총 1조 이하만 specialty pure-play`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+    asyncio.create_task(_run_refine(update, context, args[0], " ".join(args[1:])))
+
+
+async def _run_refine(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, entry_id: str, refinement: str,
+) -> None:
+    """cached entry 기반 narrow + synthesis 재실행. PIPELINE_LOCK 잡지 않음 (wisereport 호출 없음)."""
+    bot = context.bot
+    chat_id = str(update.effective_chat.id)
+
+    from src import idea_cache
+    record = idea_cache.find_by_partial_id(entry_id)
+    if not record:
+        await send_text_chunked(bot, chat_id, f"❓ id='{entry_id}' 매칭 entry 없음")
+        return
+
+    original_idea = record.get("idea_text", "")
+    refined_idea = f"{original_idea}\n\n[추가 제약] {refinement}"
+    await send_text_chunked(
+        bot, chat_id,
+        f"🔧 *Refine* (cached `{record.get('id','?')}`)\n"
+        f"📌 원본: {original_idea[:100]}\n"
+        f"➕ 추가: {refinement}\n"
+        f"⏱️ 약 2-4분 — research/산업 캐시 재사용, narrow+synthesis만 재실행",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+    # cached 데이터 추출
+    cached_research = record.get("research") or {}
+    cached_industry_texts = record.get("industry_texts") or {}
+    cached_industry_pdfs = [Path(p) for p in (record.get("industry_pdfs") or []) if Path(p).exists()]
+    cached_company_pdfs_by_ticker = {
+        k: [Path(p) for p in v if Path(p).exists()]
+        for k, v in (record.get("company_pdfs_by_ticker") or {}).items()
+    }
+    cached_company_texts_by_ticker = record.get("company_texts_by_ticker") or {}
+    cached_top10 = record.get("narrow", {}).get("top10") or record.get("top10") or []
+    candidates = cached_research.get("candidates") or []
+
+    if not candidates:
+        await send_text_chunked(bot, chat_id, "❌ cached candidates 없음 — refine 불가")
+        return
+
+    # parse: refined idea (제약 다시 추출)
+    parsed = await _parse_idea(refined_idea)
+    if parsed:
+        await _send_parse_summary(bot, chat_id, parsed)
+
+    # importance: 보존 또는 빠르게 재평가 (시간 절약 위해 보존)
+    importance = record.get("synthesis", {}).get("importance") or {}
+
+    # narrow 재실행 — refined idea + parsed constraints + cached industry texts + candidates
+    await send_text_chunked(bot, chat_id, "🎯 3단계: narrow 재실행 (cached industry 재사용)")
+    narrow = await _narrow_candidates(
+        refined_idea,
+        cached_research if not parsed else {**cached_research, "_refined_constraints": (parsed or {}).get("constraints", {})},
+        cached_industry_texts,
+        candidates,
+    )
+    if not narrow or not narrow.get("top10"):
+        log.warning("refine narrow 실패 — 원본 top10 재사용")
+        narrow = {"narrowing_summary": "(refine narrow 실패 — 원본 top10 폴백)", "top10": cached_top10}
+    new_top10 = narrow["top10"]
+    await _send_narrow_summary(bot, chat_id, narrow)
+
+    # 산점도 (refined narrow가 all30_scored 줬으면 재발송)
+    all30_scored = (narrow or {}).get("all30_scored") or []
+    if all30_scored:
+        await _send_scatter_chart(bot, chat_id, refined_idea, all30_scored)
+
+    # ticker 보강 (cached top10에는 이미 검증된 ticker — refine top10은 재검증)
+    new_top10 = await _fix_tickers(new_top10)
+    new_top10 = [c for c in new_top10 if c.get("ticker6")]
+
+    # synthesis 재실행 — cached company_texts 재사용 (있는 종목)
+    await send_text_chunked(bot, chat_id, "🧠 5단계: synthesis 재실행 (cached 종목 리포트 재사용)")
+    synthesis = await _synthesize_top5(
+        refined_idea, cached_research, importance,
+        cached_industry_pdfs, cached_industry_texts,
+        new_top10,
+        cached_company_pdfs_by_ticker,
+        cached_company_texts_by_ticker,
+    )
+    if not synthesis or not synthesis.get("top5"):
+        await send_text_chunked(bot, chat_id, "❌ refine synthesis 실패 — 종료")
+        return
+
+    await _send_results(
+        bot, chat_id, synthesis,
+        cached_industry_pdfs,
+        cached_company_pdfs_by_ticker,
+        cached_company_texts_by_ticker,
+    )
+
+    # 새 cache entry 저장
+    try:
+        new_id = idea_cache.save(
+            idea_text=refined_idea,
+            parsed=parsed,
+            research=cached_research,
+            industry_pdfs=cached_industry_pdfs,
+            industry_texts=cached_industry_texts,
+            narrow=narrow,
+            top10=new_top10,
+            company_pdfs_by_ticker=cached_company_pdfs_by_ticker,
+            company_texts_by_ticker=cached_company_texts_by_ticker,
+            synthesis=synthesis,
+            download_root=Path(record.get("download_root") or ""),
+        )
+    except Exception:
+        log.exception("refine cache 저장 실패")
+        new_id = ""
+    suffix = f" · id={new_id}" if new_id else ""
+    await send_text_chunked(bot, chat_id, f"✅ Refine 완료{suffix}")
+
+
+async def _cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/history — 최근 20개 아이디어 분석 목록."""
+    if not is_authorized(update, ALLOWED_ENV):
+        await deny_message(update, "아이디어봇")
+        return
+    from src import idea_cache
+    bot = context.bot
+    chat_id = str(update.effective_chat.id)
+    try:
+        entries = idea_cache.list_recent(limit=20)
+    except Exception:
+        log.exception("history 로드 실패")
+        await send_text_chunked(bot, chat_id, "❌ history 로드 실패")
+        return
+    if not entries:
+        await send_text_chunked(bot, chat_id, "📭 캐시된 아이디어 없음 — 먼저 아이디어 하나 시도해보세요")
+        return
+    lines = ["📜 최근 아이디어 분석 (최신 → 오래된 순)\n"]
+    for e in entries:
+        ts = (e.get("created_at") or "")[:16].replace("T", " ")
+        idea_short = e.get("idea_text", "")[:60].replace("\n", " ")
+        top5 = ", ".join(e.get("top5_brief", [])[:5]) or "(top5 없음)"
+        lines.append(f"• `{e['id']}` [{ts}]\n  💡 {idea_short}\n  🏆 {top5}\n")
+    lines.append("\n사용법:\n  `/show <id>` — 과거 결과 다시 보기 (id 끝 6자리만 입력해도 OK)")
+    await send_text_chunked(bot, chat_id, "\n".join(lines))
+
+
+async def _cmd_show(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/show <id> — 과거 idea 결과 텍스트 재발송. PDF는 첨부 안 함 (path만 안내)."""
+    if not is_authorized(update, ALLOWED_ENV):
+        await deny_message(update, "아이디어봇")
+        return
+    from src import idea_cache
+    bot = context.bot
+    chat_id = str(update.effective_chat.id)
+    args = " ".join(context.args or []).strip()
+    if not args:
+        await update.message.reply_text(
+            "사용법: `/show <id>` (예: `/show 20260430-143005` 또는 `/show 143005`)",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+    record = idea_cache.find_by_partial_id(args)
+    if not record:
+        await send_text_chunked(bot, chat_id, f"❓ id='{args}' 매칭 entry 없음. /history 로 목록 확인.")
+        return
+
+    idea_text = record.get("idea_text", "")
+    created_at = (record.get("created_at") or "")[:16].replace("T", " ")
+    parsed = record.get("parsed") or {}
+    research = record.get("research") or {}
+    importance = record.get("synthesis", {}) or {}  # 후속 호환을 위해 비워둠 (실제 importance는 별도 저장 안 됨)
+    synthesis = record.get("synthesis") or {}
+    top5 = synthesis.get("top5") or []
+
+    # 헤더
+    msg = f"📌 [캐시 재발송] `{record.get('id','?')}` ({created_at})\n💡 {idea_text}\n"
+    if parsed.get("constraints_summary"):
+        msg += f"\n🎯 {parsed['constraints_summary']}\n"
+    await send_text_chunked(bot, chat_id, msg)
+
+    # methodology + Top 5 thesis (간략)
+    methodology = synthesis.get("ranking_methodology", "")
+    if methodology:
+        await send_text_chunked(bot, chat_id, f"🏆 영업레버리지 Top 5\n\n랭킹 근거:\n{methodology}\n")
+    for pick in top5:
+        rank = pick.get("rank", "?")
+        name = pick.get("name", "?")
+        ticker = pick.get("ticker6", "??????")
+        industry = pick.get("industry", "")
+        thesis = pick.get("operating_leverage_thesis", "(thesis 없음)")
+        body = (
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"🥇 Top {rank}. {name} ({ticker}) — {industry}\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n\n{thesis}"
+        )
+        kn = pick.get("key_numbers") or {}
+        if kn:
+            body += "\n\n📊 Key Numbers\n" + "\n".join(f"  • {k}: {v}" for k, v in kn.items())
+        await send_text_chunked(bot, chat_id, body)
+
+    # 원본 PDF는 다시 안 보냄 (이미 전송됨). 경로만 안내.
+    pdf_paths = record.get("industry_pdfs", []) + [
+        p for paths in (record.get("company_pdfs_by_ticker") or {}).values() for p in paths
+    ]
+    if pdf_paths:
+        await send_text_chunked(
+            bot, chat_id,
+            f"📎 원본 PDF {len(pdf_paths)}건은 처음 발송 시 이미 전달됨 (경로 기록만 보존).",
+        )
 
 
 # ------------------------------------------------------------------
@@ -289,11 +606,34 @@ async def _run_pipeline(
             synthesis,
             industry_pdfs,
             company_pdfs_by_ticker,
+            company_texts_by_ticker,
         )
 
+        # ---- (7) 캐시 저장 — /history /show /refine /dive 등 후속 명령에서 사용
+        try:
+            from src import idea_cache
+            cache_id = idea_cache.save(
+                idea_text=idea_text,
+                parsed=parsed,
+                research=research,
+                industry_pdfs=industry_pdfs,
+                industry_texts=industry_texts,
+                narrow=narrow,
+                top10=top10,
+                company_pdfs_by_ticker=company_pdfs_by_ticker,
+                company_texts_by_ticker=company_texts_by_ticker,
+                synthesis=synthesis,
+                download_root=download_root,
+            )
+            idea_cache.cleanup_old(keep=200)
+        except Exception:
+            log.exception("idea_cache 저장 단계 실패 — 결과는 이미 발송됨")
+            cache_id = ""
+
         ended = datetime.now(KST).strftime("%H:%M")
+        suffix = f" · id={cache_id}" if cache_id else ""
         await send_text_chunked(
-            bot, chat_id, f"✅ 완료 ({started} → {ended})",
+            bot, chat_id, f"✅ 완료 ({started} → {ended}){suffix}",
         )
     except Exception as e:
         # OpenRouter 키 한도 초과는 사용자가 즉시 조치 가능 → 명확한 안내.
@@ -1120,11 +1460,118 @@ async def _synthesize_top5(
 # ------------------------------------------------------------------
 # (6) 텔레그램 발송
 # ------------------------------------------------------------------
+async def _send_top1_quarterly_chart(
+    bot: Bot,
+    chat_id: str,
+    top1_pick: dict,
+    company_texts_by_ticker: dict[str, dict[str, str]],
+) -> None:
+    """Top 1 종목의 분기 매출/영업이익/순이익 + (옵션) forward consensus 차트.
+
+    - DART에서 corp_code → 분기 재무 fetch + 잠정실적 보강.
+    - wisereport 종목 리포트 텍스트 → forward consensus 추출 (옵션).
+    - matplotlib 차트 PNG → bot.send_photo.
+
+    실패해도 다른 결과 영향 없음 (caller에서 try/except).
+    """
+    ticker = (top1_pick.get("ticker6") or "").strip()
+    name = top1_pick.get("name", "?")
+    if not re.match(r"^\d{6}$", ticker):
+        log.info("Top 1 ticker 없음 — 분기 차트 스킵: %s", name)
+        return
+
+    loop = asyncio.get_running_loop()
+
+    # corp_code lookup
+    try:
+        from src.deepdive import dart_client
+    except Exception:
+        log.exception("dart_client import 실패 — 분기 차트 스킵")
+        return
+    pair = await loop.run_in_executor(None, dart_client.get_corp_code, ticker)
+    if not pair:
+        log.info("Top 1 corp_code 없음: %s (%s) — 분기 차트 스킵", name, ticker)
+        return
+    corp_code, corp_name = pair
+
+    # 분기 재무 fetch
+    try:
+        fin = await loop.run_in_executor(None, dart_client.fetch_quarterly_financials, corp_code, 3)
+    except Exception:
+        log.exception("Top 1 분기 재무 fetch 실패")
+        return
+    if not fin or not fin.revenue_qoq:
+        log.info("Top 1 분기 재무 데이터 없음 — 차트 스킵")
+        return
+
+    # 잠정실적 보강 (실패해도 무시)
+    try:
+        from pathlib import Path as _P
+        prelim_dir = download_root_for("idea") / "_top1_preliminary" / ticker
+        preliminary = await loop.run_in_executor(
+            None, dart_client.fetch_latest_preliminary_quarter, corp_code, prelim_dir,
+        )
+        if preliminary:
+            yq, rev, op, net = preliminary
+            if yq not in fin.revenue_qoq:
+                fin.revenue_qoq[yq] = rev
+                fin.op_profit_qoq[yq] = op
+                fin.net_profit_qoq[yq] = net
+                log.info("Top 1 잠정실적 보강: %s", yq)
+    except Exception:
+        log.info("Top 1 잠정실적 보강 실패 — 무시")
+
+    # forward consensus — top 1 ticker의 wisereport 종목 리포트 텍스트로부터 LLM 추출
+    forward = None
+    try:
+        from src.deepdive import forward_consensus
+        from src.deepdive.wisereport_context import WisereportContext
+        # WisereportContext 형태로 wrap (forward_consensus.from_wisereport 시그니처 맞추기)
+        own_texts = list((company_texts_by_ticker.get(ticker) or {}).values())
+        own_titles = list((company_texts_by_ticker.get(ticker) or {}).keys())
+        if own_texts:
+            wctx = WisereportContext(
+                company_texts=own_texts, company_titles=own_titles,
+                industry_texts=[], industry_titles=[],
+            )
+            forward = await loop.run_in_executor(None, forward_consensus.from_wisereport, wctx)
+    except Exception:
+        log.info("Top 1 forward consensus 실패 — 무시")
+
+    # 차트 build + 발송
+    try:
+        from src.deepdive import chart
+        png_bytes = await loop.run_in_executor(
+            None, chart.build,
+            corp_name,
+            fin.revenue_qoq, fin.op_profit_qoq, fin.net_profit_qoq,
+            None, forward or None,
+        )
+    except Exception:
+        log.exception("Top 1 chart.build 실패")
+        return
+    if not png_bytes:
+        return
+    try:
+        fwd_info = (
+            f" + Forward {len(forward)}분기 (wisereport 컨센서스)" if forward
+            else " (Forward 미수집)"
+        )
+        await bot.send_photo(
+            chat_id=chat_id,
+            photo=png_bytes,
+            caption=f"📈 Top 1 {corp_name}({ticker}) 분기별 재무{fwd_info}",
+        )
+    except Exception:
+        log.exception("Top 1 분기 차트 발송 실패")
+
+
 async def _send_results(
     bot: Bot, chat_id: str,
     synthesis: dict,
     industry_pdfs: list[Path],
     company_pdfs_by_ticker: dict[str, list[Path]],
+    company_texts_by_ticker: dict[str, dict[str, str]] | None = None,
 ) -> None:
     """Top 5 결과 발송.
 
@@ -1209,6 +1656,13 @@ async def _send_results(
                 continue
             await send_pdf(bot, chat_id, p, caption=f"[Top {rank} {name}] {p.name}")
             sent_pdf_names.add(p.name)
+
+    # ---- Top 1 분기 차트 — DART 분기 재무 + (옵션) wisereport forward consensus
+    if top5:
+        try:
+            await _send_top1_quarterly_chart(bot, chat_id, top5[0], company_texts_by_ticker or {})
+        except Exception:
+            log.exception("Top 1 분기 차트 단계 실패 — 무시 (다른 결과는 정상)")
 
     # ---- 산업 리포트는 마지막에 한 번만 일괄 첨부 (모든 픽의 공통 컨텍스트)
     if industry_pdfs:
@@ -1548,6 +2002,10 @@ def build_idea_app(token: str) -> Application:
     app = Application.builder().token(token).build()
     app.add_handler(CommandHandler(["start", "help"], _help))
     app.add_handler(CommandHandler("idea", _cmd_idea))
+    app.add_handler(CommandHandler("history", _cmd_history))
+    app.add_handler(CommandHandler("show", _cmd_show))
+    app.add_handler(CommandHandler("dive", _cmd_dive))
+    app.add_handler(CommandHandler("refine", _cmd_refine))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _on_text))
 
     # self-test 자동 실행 — orchestrator가 build_idea_app을 async _run_forever 안에서

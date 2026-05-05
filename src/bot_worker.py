@@ -35,7 +35,7 @@ from telegram.ext import (
     filters,
 )
 
-from src.bot_helpers import allowed_chat_ids, is_authorized as _bh_is_authorized
+from src.bot_helpers import allowed_chat_ids, deny_message, is_authorized as _bh_is_authorized
 from src.pipeline_lock import PIPELINE_LOCK
 
 
@@ -109,6 +109,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_authorized(update):
+        await deny_message(update, "종목봇")
         return
     if CURRENT_TASK is None:
         await update.message.reply_text("✅ 대기 중. 명령 보낼 수 있습니다.")
@@ -139,6 +140,7 @@ def _parse_args(parts: list[str]) -> tuple[str, str, int] | None:
 
 async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_authorized(update):
+        await deny_message(update, "종목봇")
         return
     args = list(context.args or [])
     parsed = _parse_args(args) or await _parse_args_with_lookup(update, args)
@@ -161,6 +163,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     filters.TEXT & ~filters.COMMAND 로 등록되어 슬래시 명령은 안 들어옴).
     """
     if not is_authorized(update):
+        await deny_message(update, "종목봇")
         return
     text = (update.message.text or "").strip()
     parts = text.split()

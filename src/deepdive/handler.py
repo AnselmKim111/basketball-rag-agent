@@ -64,12 +64,16 @@ def register(app: Application) -> None:
 
 async def _cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not bot_worker.is_authorized(update):
+        from src.bot_helpers import deny_message
+        await deny_message(update, "종목봇 (deepdive)")
         return
     await update.message.reply_text(HELP_TEXT, parse_mode=ParseMode.MARKDOWN)
 
 
 async def _cmd_deepdive(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not bot_worker.is_authorized(update):
+        from src.bot_helpers import deny_message
+        await deny_message(update, "종목봇 (deepdive)")
         return
     args = context.args or []
     if not args:
