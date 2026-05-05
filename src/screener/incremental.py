@@ -42,6 +42,21 @@ def update_today() -> dict:
     if active_set:
         rows = [r for r in rows if r[0] in active_set]
 
+    # pykrx date-batch 실패 시 FDR ticker-batch 폴백 (어제~오늘 1-3일치)
+    if not rows and active_set:
+        log.warning("[incremental] %s pykrx 빈 결과 → FDR ticker-batch 폴백", iso)
+        start_iso = (today - timedelta(days=5)).strftime("%Y-%m-%d")
+        end_iso = iso
+        merged: list[tuple] = []
+        for ticker in sorted(active_set):
+            try:
+                tr = data_source.fetch_ohlcv_by_ticker_via_fdr(ticker, start_iso, end_iso)
+                # 오늘 또는 어제 데이터만 추출
+                merged.extend([r for r in tr if r[1] >= start_iso])
+            except Exception:
+                pass
+        rows = merged
+
     if not rows:
         log.info("[incremental] %s 빈 결과 (휴장일?)", iso)
         return {"date": iso, "rows": 0, "is_business_day": True, "empty": True}
