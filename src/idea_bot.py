@@ -144,6 +144,96 @@ async def _on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     asyncio.create_task(_run_pipeline(update, context, text))
 
 
+async def _cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/history — 최근 20개 아이디어 분석 목록."""
+    if not is_authorized(update, ALLOWED_ENV):
+        return
+    from src import idea_cache
+    bot = context.bot
+    chat_id = str(update.effective_chat.id)
+    try:
+        entries = idea_cache.list_recent(limit=20)
+    except Exception:
+        log.exception("history 로드 실패")
+        await send_text_chunked(bot, chat_id, "❌ history 로드 실패")
+        return
+    if not entries:
+        await send_text_chunked(bot, chat_id, "📭 캐시된 아이디어 없음 — 먼저 아이디어 하나 시도해보세요")
+        return
+    lines = ["📜 최근 아이디어 분석 (최신 → 오래된 순)\n"]
+    for e in entries:
+        ts = (e.get("created_at") or "")[:16].replace("T", " ")
+        idea_short = e.get("idea_text", "")[:60].replace("\n", " ")
+        top5 = ", ".join(e.get("top5_brief", [])[:5]) or "(top5 없음)"
+        lines.append(f"• `{e['id']}` [{ts}]\n  💡 {idea_short}\n  🏆 {top5}\n")
+    lines.append("\n사용법:\n  `/show <id>` — 과거 결과 다시 보기 (id 끝 6자리만 입력해도 OK)")
+    await send_text_chunked(bot, chat_id, "\n".join(lines))
+
+
+async def _cmd_show(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/show <id> — 과거 idea 결과 텍스트 재발송. PDF는 첨부 안 함 (path만 안내)."""
+    if not is_authorized(update, ALLOWED_ENV):
+        return
+    from src import idea_cache
+    bot = context.bot
+    chat_id = str(update.effective_chat.id)
+    args = " ".join(context.args or []).strip()
+    if not args:
+        await update.message.reply_text(
+            "사용법: `/show <id>` (예: `/show 20260430-143005` 또는 `/show 143005`)",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+    record = idea_cache.find_by_partial_id(args)
+    if not record:
+        await send_text_chunked(bot, chat_id, f"❓ id='{args}' 매칭 entry 없음. /history 로 목록 확인.")
+        return
+
+    idea_text = record.get("idea_text", "")
+    created_at = (record.get("created_at") or "")[:16].replace("T", " ")
+    parsed = record.get("parsed") or {}
+    research = record.get("research") or {}
+    importance = record.get("synthesis", {}) or {}  # 후속 호환을 위해 비워둠 (실제 importance는 별도 저장 안 됨)
+    synthesis = record.get("synthesis") or {}
+    top5 = synthesis.get("top5") or []
+
+    # 헤더
+    msg = f"📌 [캐시 재발송] `{record.get('id','?')}` ({created_at})\n💡 {idea_text}\n"
+    if parsed.get("constraints_summary"):
+        msg += f"\n🎯 {parsed['constraints_summary']}\n"
+    await send_text_chunked(bot, chat_id, msg)
+
+    # methodology + Top 5 thesis (간략)
+    methodology = synthesis.get("ranking_methodology", "")
+    if methodology:
+        await send_text_chunked(bot, chat_id, f"🏆 영업레버리지 Top 5\n\n랭킹 근거:\n{methodology}\n")
+    for pick in top5:
+        rank = pick.get("rank", "?")
+        name = pick.get("name", "?")
+        ticker = pick.get("ticker6", "??????")
+        industry = pick.get("industry", "")
+        thesis = pick.get("operating_leverage_thesis", "(thesis 없음)")
+        body = (
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"🥇 Top {rank}. {name} ({ticker}) — {industry}\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n\n{thesis}"
+        )
+        kn = pick.get("key_numbers") or {}
+        if kn:
+            body += "\n\n📊 Key Numbers\n" + "\n".join(f"  • {k}: {v}" for k, v in kn.items())
+        await send_text_chunked(bot, chat_id, body)
+
+    # 원본 PDF는 다시 안 보냄 (이미 전송됨). 경로만 안내.
+    pdf_paths = record.get("industry_pdfs", []) + [
+        p for paths in (record.get("company_pdfs_by_ticker") or {}).values() for p in paths
+    ]
+    if pdf_paths:
+        await send_text_chunked(
+            bot, chat_id,
+            f"📎 원본 PDF {len(pdf_paths)}건은 처음 발송 시 이미 전달됨 (경로 기록만 보존).",
+        )
+
+
 # ------------------------------------------------------------------
 # 메인 파이프라인
 # ------------------------------------------------------------------
@@ -291,9 +381,31 @@ async def _run_pipeline(
             company_pdfs_by_ticker,
         )
 
+        # ---- (7) 캐시 저장 — /history /show /refine /dive 등 후속 명령에서 사용
+        try:
+            from src import idea_cache
+            cache_id = idea_cache.save(
+                idea_text=idea_text,
+                parsed=parsed,
+                research=research,
+                industry_pdfs=industry_pdfs,
+                industry_texts=industry_texts,
+                narrow=narrow,
+                top10=top10,
+                company_pdfs_by_ticker=company_pdfs_by_ticker,
+                company_texts_by_ticker=company_texts_by_ticker,
+                synthesis=synthesis,
+                download_root=download_root,
+            )
+            idea_cache.cleanup_old(keep=200)
+        except Exception:
+            log.exception("idea_cache 저장 단계 실패 — 결과는 이미 발송됨")
+            cache_id = ""
+
         ended = datetime.now(KST).strftime("%H:%M")
+        suffix = f" · id={cache_id}" if cache_id else ""
         await send_text_chunked(
-            bot, chat_id, f"✅ 완료 ({started} → {ended})",
+            bot, chat_id, f"✅ 완료 ({started} → {ended}){suffix}",
         )
     except Exception as e:
         # OpenRouter 키 한도 초과는 사용자가 즉시 조치 가능 → 명확한 안내.
@@ -1548,6 +1660,8 @@ def build_idea_app(token: str) -> Application:
     app = Application.builder().token(token).build()
     app.add_handler(CommandHandler(["start", "help"], _help))
     app.add_handler(CommandHandler("idea", _cmd_idea))
+    app.add_handler(CommandHandler("history", _cmd_history))
+    app.add_handler(CommandHandler("show", _cmd_show))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _on_text))
 
     # self-test 자동 실행 — orchestrator가 build_idea_app을 async _run_forever 안에서
