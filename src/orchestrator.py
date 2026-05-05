@@ -40,6 +40,7 @@ from src.category_bots import (
     market_daily_job,
 )
 from src.idea_bot import build_idea_app
+from src.screener_bot import build_screener_app, screener_daily_job
 
 KST = timezone(timedelta(hours=9))
 
@@ -118,6 +119,19 @@ BOT_SPECS: list[BotSpec] = [
         builder=build_idea_app,
         jobs=[],  # 사용자 입력 기반, 스케줄 없음
     ),
+    BotSpec(
+        name="screener",
+        token_env="SCREENER_BOT_TOKEN",
+        builder=build_screener_app,
+        jobs=[
+            ScheduledJob(
+                func=screener_daily_job,
+                job_id="screener_daily",
+                cron={"hour": 16, "minute": 30},
+                description="한국 주식 기술적 신호 — 매일 16:30 KST",
+            ),
+        ],
+    ),
 ]
 
 
@@ -127,7 +141,7 @@ BOT_SPECS: list[BotSpec] = [
 def _diag_env() -> None:
     relevant = diag_env_keys(
         ("TELEGRAM", "WISE", "OPEN", "ALLOWED", "CHAT", "INDUSTRY", "MARKET",
-         "GLOBAL", "DART", "IDEA")
+         "GLOBAL", "DART", "IDEA", "SCREENER")
     )
     print(f"[orch] env keys total = {len(os.environ)}", flush=True)
     print(f"[orch] relevant env vars = {relevant}", flush=True)
