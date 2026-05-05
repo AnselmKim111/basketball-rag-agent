@@ -51,16 +51,43 @@ def is_authorized(update: Update, env_key: str) -> bool:
 async def send_text_chunked(
     bot: Bot, chat_id: str | int, text: str, parse_mode: str | None = None,
 ) -> None:
-    """긴 텍스트를 4000자 단위로 쪼개서 발송. 발송 실패는 로그만."""
+    """긴 텍스트를 4000자 단위로 쪼개서 발송. 2개 이상 청크면 `[1/N]` 헤더로
+    페이징 표시 (사용자가 흐름 파악). 발송 실패는 로그만.
+    """
     if not text:
         return
-    while text:
-        chunk, text = text[:MESSAGE_CHUNK], text[MESSAGE_CHUNK:]
+    # 청크 미리 계산 — 페이징 헤더에 총 개수 표기 위해.
+    chunks: list[str] = []
+    rest = text
+    while rest:
+        chunks.append(rest[:MESSAGE_CHUNK])
+        rest = rest[MESSAGE_CHUNK:]
+    total = len(chunks)
+    for idx, chunk in enumerate(chunks, start=1):
+        body = f"[{idx}/{total}]\n{chunk}" if total >= 2 else chunk
         try:
-            await bot.send_message(chat_id=chat_id, text=chunk, parse_mode=parse_mode)
+            await bot.send_message(chat_id=chat_id, text=body, parse_mode=parse_mode)
         except Exception:
             log.exception("send_message 실패 (chat_id=%s)", chat_id)
             break
+
+
+async def deny_message(update: Update, bot_label: str = "이 봇") -> None:
+    """비인가 chat_id에 일관된 거부 메시지. 모든 핸들러의 silent return 대신 호출.
+
+    봇 라벨을 받아 어떤 봇이 거부했는지 명시 (사용자가 다른 봇 사용 중일 수 있음).
+    update.message가 없으면 silent.
+    """
+    if not update.message or not update.effective_chat:
+        return
+    try:
+        await update.message.reply_text(
+            f"🔒 {bot_label}은 인가된 사용자만 이용 가능합니다.\n"
+            f"chat_id `{update.effective_chat.id}` 를 운영자에게 전달하세요.",
+            parse_mode="Markdown",
+        )
+    except Exception:
+        log.exception("deny_message 발송 실패 (chat_id=%s)", update.effective_chat.id)
 
 
 async def send_pdf(

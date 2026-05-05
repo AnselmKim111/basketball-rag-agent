@@ -51,6 +51,7 @@ from telegram.ext import (
 
 from src import idea_prompts
 from src.bot_helpers import (
+    deny_message,
     download_root_for,
     is_authorized,
     safe_dirname,
@@ -117,17 +118,14 @@ HELP_TEXT = (
 # ------------------------------------------------------------------
 async def _help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_authorized(update, ALLOWED_ENV):
-        if update.effective_chat:
-            await update.message.reply_text(
-                f"이 봇은 인가된 사용자만 사용 가능합니다.\nchat_id: `{update.effective_chat.id}`",
-                parse_mode=ParseMode.MARKDOWN,
-            )
+        await deny_message(update, "아이디어봇")
         return
     await update.message.reply_text(HELP_TEXT, parse_mode=ParseMode.MARKDOWN)
 
 
 async def _cmd_idea(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_authorized(update, ALLOWED_ENV):
+        await deny_message(update, "아이디어봇")
         return
     args = " ".join(context.args or []).strip()
     if not args:
@@ -141,6 +139,7 @@ async def _cmd_idea(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def _on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_authorized(update, ALLOWED_ENV):
+        await deny_message(update, "아이디어봇")
         return
     text = (update.message.text or "").strip()
     if not text or len(text) > 500:
@@ -160,6 +159,7 @@ async def _cmd_dive(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
       /dive 2 20260430-143005 → 특정 entry id의 Top 2
     """
     if not is_authorized(update, ALLOWED_ENV):
+        await deny_message(update, "아이디어봇")
         return
     from src import idea_cache
     bot = context.bot
@@ -241,6 +241,7 @@ async def _cmd_refine(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         /refine 143005 코스닥 + 시총 5천억 이하
     """
     if not is_authorized(update, ALLOWED_ENV):
+        await deny_message(update, "아이디어봇")
         return
     bot = context.bot
     chat_id = str(update.effective_chat.id)
@@ -371,6 +372,7 @@ async def _run_refine(
 async def _cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/history — 최근 20개 아이디어 분석 목록."""
     if not is_authorized(update, ALLOWED_ENV):
+        await deny_message(update, "아이디어봇")
         return
     from src import idea_cache
     bot = context.bot
@@ -397,6 +399,7 @@ async def _cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 async def _cmd_show(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/show <id> — 과거 idea 결과 텍스트 재발송. PDF는 첨부 안 함 (path만 안내)."""
     if not is_authorized(update, ALLOWED_ENV):
+        await deny_message(update, "아이디어봇")
         return
     from src import idea_cache
     bot = context.bot
