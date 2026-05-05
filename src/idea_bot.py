@@ -98,7 +98,11 @@ HELP_TEXT = (
     "  `/dive <rank> [<id>]` — Top N 종목 deepdive 자동 실행\n"
     "    예: `/dive 1` (가장 최근 idea의 Top 1)\n"
     "  `/refine <id> <추가 제약>` — cached 데이터 재사용해서 빠르게 변형\n"
-    "    예: `/refine 143005 시총 1조 이하만 specialty pure-play`\n\n"
+    "    예: `/refine 143005 시총 1조 이하만 specialty pure-play`\n"
+    "  `/contrarian <id>` — thesis가 깨질 때 가장 취약한 RISK Top 5\n"
+    "    예: `/contrarian 143005`\n"
+    "  `/compare <id1> <id2>` — 두 idea의 Top 10 교집합·차별 분석\n"
+    "    예: `/compare 143005 162018`\n\n"
     "*동작:*\n"
     "  🧭 0.5단계: 아이디어 파싱 (thesis + 시총/산업 제약 추출)\n"
     "  🌐 1단계: 웹 검색 + 30 후보 발굴 (제약 적용)\n"
@@ -367,6 +371,333 @@ async def _run_refine(
         new_id = ""
     suffix = f" · id={new_id}" if new_id else ""
     await send_text_chunked(bot, chat_id, f"✅ Refine 완료{suffix}")
+
+
+async def _cmd_contrarian(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/contrarian <id> — cached idea의 thesis가 깨질 때 가장 취약한 RISK Top 5.
+
+    cache 재사용: research/industry/company 데이터 그대로, synthesis 프롬프트만 contrarian.
+    """
+    if not is_authorized(update, ALLOWED_ENV):
+        return
+    from src import idea_cache
+    bot = context.bot
+    chat_id = str(update.effective_chat.id)
+    args = context.args or []
+    if not args:
+        await update.message.reply_text(
+            "사용법: `/contrarian <id>` — cached idea의 RISK Top 5 (반대 시각).\n"
+            "예: `/contrarian 143005`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+    record = idea_cache.find_by_partial_id(args[0])
+    if not record:
+        await send_text_chunked(bot, chat_id, f"❓ id='{args[0]}' 매칭 entry 없음")
+        return
+    asyncio.create_task(_run_contrarian(update, context, record))
+
+
+async def _run_contrarian(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, record: dict,
+) -> None:
+    bot = context.bot
+    chat_id = str(update.effective_chat.id)
+    idea_text = record.get("idea_text", "")
+
+    await send_text_chunked(
+        bot, chat_id,
+        f"⚠️ *Contrarian 분석* (cached `{record.get('id','?')}`)\n"
+        f"📌 Thesis: {idea_text[:100]}\n"
+        f"⏱️ 약 1-2분 — synthesis 프롬프트만 contrarian으로 swap, cache 재사용",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+    # cached 데이터
+    cached_research = record.get("research") or {}
+    cached_industry_texts = record.get("industry_texts") or {}
+    cached_industry_pdfs = [Path(p) for p in (record.get("industry_pdfs") or []) if Path(p).exists()]
+    cached_top10 = record.get("narrow", {}).get("top10") or record.get("top10") or []
+    cached_company_texts_by_ticker = record.get("company_texts_by_ticker") or {}
+    cached_company_pdfs_by_ticker = {
+        k: [Path(p) for p in v if Path(p).exists()]
+        for k, v in (record.get("company_pdfs_by_ticker") or {}).items()
+    }
+    importance = record.get("synthesis", {}).get("importance") or {}
+
+    # contrarian synthesis — _synthesize_top5와 동일 흐름이지만 다른 system prompt
+    loop = asyncio.get_running_loop()
+
+    def _blocking() -> dict | None:
+        from src import summarizer
+        try:
+            client = summarizer.get_client()
+        except Exception:
+            log.exception("OpenRouter client init 실패 (contrarian)")
+            return None
+        sys_prompt = idea_prompts.load("idea_contrarian")
+
+        ind_block = "\n\n".join(
+            f"=== 산업 리포트 파일: {fn} ===\n{txt}"
+            for fn, txt in cached_industry_texts.items()
+        ) or "(산업 리포트 없음)"
+
+        company_blocks: list[str] = []
+        for c in cached_top10:
+            ticker = (c.get("ticker6") or "")
+            name = c.get("name", "")
+            texts = cached_company_texts_by_ticker.get(ticker, {})
+            if not texts:
+                company_blocks.append(
+                    f"=== {name} ({ticker}) — 종목 리포트 없음 ===\n산업/리서치만으로 평가."
+                )
+                continue
+            for fn, txt in texts.items():
+                company_blocks.append(f"=== {name} ({ticker}) 리포트: {fn} ===\n{txt}")
+        company_block = "\n\n".join(company_blocks) or "(종목 리포트 없음)"
+
+        user_msg = (
+            f"# 사용자 투자 thesis (반대 시각으로 평가)\n{idea_text}\n\n"
+            f"# 1단계 리서치 요약\n"
+            f"{json.dumps(cached_research.get('logic_gradient_text',''), ensure_ascii=False)[:3000]}\n\n"
+            f"# 1.5 importance 평가\n{json.dumps(importance, ensure_ascii=False)[:1500]}\n\n"
+            f"# top10 후보\n{json.dumps(cached_top10, ensure_ascii=False, indent=2)[:8000]}\n\n"
+            f"# 산업 리포트 텍스트\n{ind_block[:50_000]}\n\n"
+            f"# 종목 리포트 텍스트\n{company_block[:60_000]}\n\n"
+            "thesis가 깨질 시나리오와 그때 가장 취약한 Top 5를 시스템 프롬프트 형식대로 JSON으로 출력해주세요."
+        )
+        content = ""
+        for attempt in (1, 2):
+            try:
+                resp = client.chat.completions.create(
+                    model=_synthesis_model(),  # contrarian도 지능 필요 — synthesis tier
+                    max_tokens=14000,
+                    temperature=0.4 if attempt == 1 else 0.6,
+                    messages=[
+                        {"role": "system", "content": sys_prompt},
+                        {"role": "user", "content": user_msg},
+                    ],
+                )
+            except summarizer.APIStatusError as e:
+                if summarizer._is_credit_error(e):
+                    raise summarizer.OpenRouterCreditExhausted(str(e)) from e
+                log.exception("contrarian LLM API 에러 (attempt %d)", attempt)
+                return None
+            except Exception as e:
+                _maybe_raise_credit(e)
+                log.exception("contrarian LLM 호출 실패 (attempt %d)", attempt)
+                if attempt == 2:
+                    return None
+                continue
+            try:
+                content = (resp.choices[0].message.content or "").strip()
+            except Exception:
+                if attempt == 2:
+                    return None
+                continue
+            if content:
+                break
+            log.warning("contrarian 빈 응답 (attempt %d)", attempt)
+        if not content:
+            return None
+        log.info("contrarian LLM 응답: %d chars", len(content))
+        parsed_resp = _parse_json(content)
+        if parsed_resp is None:
+            log.warning("contrarian JSON 파싱 실패")
+        return parsed_resp
+
+    try:
+        contrarian = await loop.run_in_executor(None, _blocking)
+    except Exception:
+        log.exception("contrarian 호출 실패")
+        contrarian = None
+
+    if not contrarian or not contrarian.get("top5"):
+        await send_text_chunked(bot, chat_id, "❌ contrarian 분석 실패")
+        return
+
+    # 발송 — _send_results 재사용 (구조 같음). 헤더만 RISK 표시.
+    methodology = contrarian.get("ranking_methodology", "")
+    top5 = contrarian.get("top5") or []
+    intro = (
+        "⚠️ Contrarian RISK Top 5 — thesis 깨질 때 가장 취약한 종목\n\n"
+        f"📌 원 thesis: {idea_text[:100]}\n\n"
+        f"분석 근거:\n{methodology}\n"
+    )
+    await send_text_chunked(bot, chat_id, intro)
+
+    sent_pdf_names: set[str] = set()
+    for pick in top5:
+        rank = pick.get("rank", "?")
+        name = pick.get("name", "?")
+        ticker = pick.get("ticker6", "??????")
+        industry = pick.get("industry", "")
+        thesis = pick.get("operating_leverage_thesis", "(thesis 없음)")
+        kn = pick.get("key_numbers") or {}
+        refs = pick.get("referenced_reports") or []
+        # 가격 정보
+        try:
+            from src import price_fetcher
+            quote = price_fetcher.fetch_quote(ticker) if re.match(r"^\d{6}$", ticker) else None
+            price_brief = price_fetcher.format_quote_brief(quote)
+        except Exception:
+            price_brief = ""
+
+        own_pdfs = cached_company_pdfs_by_ticker.get(ticker, [])
+        own_pdf_names = {p.name for p in own_pdfs}
+        valid_refs = [r for r in refs if (r or "").strip() in own_pdf_names]
+
+        header = (
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"🚨 RISK {rank}. {name} ({ticker}) — {industry}\n"
+        )
+        if price_brief:
+            header += f"   💰 {price_brief}\n"
+        header += "━━━━━━━━━━━━━━━━━━━━"
+        await send_text_chunked(bot, chat_id, header)
+
+        body = thesis
+        if kn:
+            body += "\n\n📊 Key Numbers\n" + "\n".join(f"  • {k}: {v}" for k, v in kn.items())
+        if valid_refs:
+            body += "\n📎 참고 리포트: " + ", ".join(valid_refs)
+        await send_text_chunked(bot, chat_id, body)
+
+        for p in own_pdfs:
+            if p.name in sent_pdf_names:
+                continue
+            await send_pdf(bot, chat_id, p, caption=f"[RISK {rank} {name}] {p.name}")
+            sent_pdf_names.add(p.name)
+
+    log.info(
+        "[contrarian 완료] top5=%d개 — %s",
+        len(top5),
+        " / ".join(f"#{p.get('rank','?')} {p.get('name','?')}" for p in top5),
+    )
+
+
+async def _cmd_compare(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/compare <id1> <id2> — 두 idea의 Top 10 종목 교집합 + 차별 분석.
+
+    같은 종목이 두 thesis 모두에 등장 = conviction 강한 신호.
+    각 idea에만 등장 = 차별화 메커니즘.
+    """
+    if not is_authorized(update, ALLOWED_ENV):
+        return
+    from src import idea_cache
+    bot = context.bot
+    chat_id = str(update.effective_chat.id)
+    args = context.args or []
+    if len(args) < 2:
+        await update.message.reply_text(
+            "사용법: `/compare <id1> <id2>` (id 끝 6자리만 입력해도 OK)\n"
+            "예: `/compare 143005 162018`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+    rec1 = idea_cache.find_by_partial_id(args[0])
+    rec2 = idea_cache.find_by_partial_id(args[1])
+    if not rec1 or not rec2:
+        missing = [a for a, r in zip(args[:2], [rec1, rec2]) if not r]
+        await send_text_chunked(bot, chat_id, f"❓ 매칭 안 되는 id: {missing}")
+        return
+
+    def _picks(rec: dict, key: str) -> list[dict]:
+        if key == "top5":
+            return (rec.get("synthesis") or {}).get("top5") or []
+        return rec.get("narrow", {}).get("top10") or rec.get("top10") or []
+
+    top10_1 = _picks(rec1, "top10")
+    top10_2 = _picks(rec2, "top10")
+    top5_1 = _picks(rec1, "top5")
+    top5_2 = _picks(rec2, "top5")
+
+    def _name_set(picks: list[dict]) -> set[tuple[str, str]]:
+        return {((p.get("name") or "").strip(), (p.get("ticker6") or "").strip()) for p in picks if p.get("name")}
+
+    s10_1, s10_2 = _name_set(top10_1), _name_set(top10_2)
+    s5_1, s5_2 = _name_set(top5_1), _name_set(top5_2)
+
+    common10 = sorted(s10_1 & s10_2, key=lambda x: x[0])
+    common5 = sorted(s5_1 & s5_2, key=lambda x: x[0])
+    only1_10 = sorted(s10_1 - s10_2, key=lambda x: x[0])[:8]
+    only2_10 = sorted(s10_2 - s10_1, key=lambda x: x[0])[:8]
+
+    idea1_text = (rec1.get("idea_text") or "")[:80]
+    idea2_text = (rec2.get("idea_text") or "")[:80]
+
+    msg = (
+        f"🔀 *두 아이디어 교차 분석*\n\n"
+        f"📌 A `{rec1.get('id','?')}`: {idea1_text}\n"
+        f"📌 B `{rec2.get('id','?')}`: {idea2_text}\n\n"
+        f"━━━ ⭐ Top 5 양쪽 모두 ({len(common5)}개) — 가장 강한 conviction ━━━\n"
+    )
+    if common5:
+        for name, ticker in common5:
+            msg += f"  ⭐ {name} ({ticker})\n"
+    else:
+        msg += "  (양쪽 Top 5 교집합 없음)\n"
+    msg += f"\n━━━ ✓ Top 10 양쪽 모두 ({len(common10)}개) ━━━\n"
+    if common10:
+        for name, ticker in common10:
+            msg += f"  ✓ {name} ({ticker})\n"
+    else:
+        msg += "  (Top 10 교집합 없음)\n"
+    msg += f"\n━━━ A에만 ({len(only1_10)}개) ━━━\n"
+    for name, ticker in only1_10:
+        msg += f"  🅰 {name} ({ticker})\n"
+    msg += f"\n━━━ B에만 ({len(only2_10)}개) ━━━\n"
+    for name, ticker in only2_10:
+        msg += f"  🅱 {name} ({ticker})\n"
+    await send_text_chunked(bot, chat_id, msg)
+
+    # 짧은 LLM 해석 — 공통/차별 종목 메커니즘 매핑 (옵션, 1회 호출)
+    if not (common10 or only1_10 or only2_10):
+        return
+    loop = asyncio.get_running_loop()
+
+    def _blocking() -> str:
+        from src import summarizer
+        try:
+            client = summarizer.get_client()
+        except Exception:
+            return ""
+        sys_prompt = (
+            "두 한국 주식 투자 아이디어의 후보 종목 비교 분석. "
+            "공통 등장 종목 = 강한 conviction (왜 두 thesis가 같은 종목으로 수렴?). "
+            "각 idea만의 종목 = 차별화 메커니즘. "
+            "한국어 600자 이내, 압축적으로."
+        )
+        user_msg = (
+            f"# Idea A\n{idea1_text}\n\n"
+            f"# Idea B\n{idea2_text}\n\n"
+            f"# 공통 Top 5: {[n for n,_ in common5]}\n"
+            f"# 공통 Top 10: {[n for n,_ in common10]}\n"
+            f"# A only: {[n for n,_ in only1_10]}\n"
+            f"# B only: {[n for n,_ in only2_10]}\n\n"
+            "공통 종목이 두 thesis로 수렴하는 메커니즘 + 각 idea만의 차별 종목 분석을 600자 이내."
+        )
+        try:
+            content = summarizer.chat_with_retry(
+                client,
+                model=_summary_model(),
+                fallback_model=_narrow_model(),
+                max_tokens=1200,
+                temperature=0.3,
+                messages=[
+                    {"role": "system", "content": sys_prompt},
+                    {"role": "user", "content": user_msg},
+                ],
+                context="idea_compare",
+            )
+        except Exception:
+            log.exception("compare LLM 호출 실패")
+            return ""
+        return content or ""
+
+    interp = await loop.run_in_executor(None, _blocking)
+    if interp:
+        await send_text_chunked(bot, chat_id, f"🧠 *교차 분석 해석*\n\n{interp}")
 
 
 async def _cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2017,6 +2348,8 @@ def build_idea_app(token: str) -> Application:
     app.add_handler(CommandHandler("show", _cmd_show))
     app.add_handler(CommandHandler("dive", _cmd_dive))
     app.add_handler(CommandHandler("refine", _cmd_refine))
+    app.add_handler(CommandHandler("contrarian", _cmd_contrarian))
+    app.add_handler(CommandHandler("compare", _cmd_compare))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _on_text))
 
     # self-test 자동 실행 — orchestrator가 build_idea_app을 async _run_forever 안에서
