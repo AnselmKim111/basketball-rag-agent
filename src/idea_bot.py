@@ -144,6 +144,86 @@ async def _on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     asyncio.create_task(_run_pipeline(update, context, text))
 
 
+async def _cmd_dive(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/dive <rank> [<id>] — 가장 최근 idea의 Top 5 중 N번째 종목으로 deepdive 자동 실행.
+
+    예:
+      /dive 1     → 가장 최근 idea의 Top 1
+      /dive 3     → 가장 최근 idea의 Top 3
+      /dive 2 20260430-143005 → 특정 entry id의 Top 2
+    """
+    if not is_authorized(update, ALLOWED_ENV):
+        return
+    from src import idea_cache
+    bot = context.bot
+    chat_id = str(update.effective_chat.id)
+    args = context.args or []
+    if not args:
+        await update.message.reply_text(
+            "사용법: `/dive <rank>` (예: `/dive 1`) — 가장 최근 idea의 Top N 종목 deepdive\n"
+            "또는: `/dive <rank> <id>` — 특정 entry의 Top N",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+    try:
+        rank = int(args[0])
+    except (ValueError, TypeError):
+        await send_text_chunked(bot, chat_id, "❌ rank는 1-5 사이 정수여야 합니다.")
+        return
+    if not (1 <= rank <= 5):
+        await send_text_chunked(bot, chat_id, "❌ rank는 1-5 사이.")
+        return
+
+    # 특정 id 지정 또는 latest
+    if len(args) >= 2:
+        record = idea_cache.find_by_partial_id(args[1])
+        if not record:
+            await send_text_chunked(bot, chat_id, f"❓ id='{args[1]}' 매칭 entry 없음")
+            return
+    else:
+        record = idea_cache.latest()
+        if not record:
+            await send_text_chunked(bot, chat_id, "📭 캐시된 idea 없음 — 먼저 idea 분석부터")
+            return
+
+    top5 = (record.get("synthesis") or {}).get("top5") or []
+    pick = next((p for p in top5 if int(p.get("rank", 0) or 0) == rank), None)
+    if not pick:
+        # rank 매칭 안 되면 인덱스로 fallback (일부 LLM이 rank 누락)
+        if rank - 1 < len(top5):
+            pick = top5[rank - 1]
+    if not pick:
+        await send_text_chunked(bot, chat_id, f"❓ Top {rank} 종목 없음 (top5 길이 {len(top5)})")
+        return
+
+    name = pick.get("name", "?")
+    ticker = (pick.get("ticker6") or "").strip()
+    if not re.match(r"^\d{6}$", ticker):
+        await send_text_chunked(
+            bot, chat_id,
+            f"❌ '{name}' ticker 없음/유효 X — deepdive 불가 (비상장 가능성)",
+        )
+        return
+
+    await send_text_chunked(
+        bot, chat_id,
+        f"🔍 *Deepdive 자동 체이닝*\n"
+        f"Idea: `{(record.get('idea_text') or '')[:80]}`\n"
+        f"Top {rank}: *{name}* ({ticker})\n"
+        f"⏱️ 5-10분 소요 — DART 사업보고서 + IR + 분기차트 통합 분석",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+    # deepdive _run 호출 — update/context 그대로 전달 (chat_id, bot 사용)
+    try:
+        from src.deepdive.handler import _run as deepdive_run
+    except Exception:
+        log.exception("deepdive 모듈 import 실패")
+        await send_text_chunked(bot, chat_id, "❌ deepdive 모듈 로드 실패 (DART_API_KEY 미설정 가능성)")
+        return
+    asyncio.create_task(deepdive_run(update, context, ticker))
+
+
 async def _cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/history — 최근 20개 아이디어 분석 목록."""
     if not is_authorized(update, ALLOWED_ENV):
@@ -379,6 +459,7 @@ async def _run_pipeline(
             synthesis,
             industry_pdfs,
             company_pdfs_by_ticker,
+            company_texts_by_ticker,
         )
 
         # ---- (7) 캐시 저장 — /history /show /refine /dive 등 후속 명령에서 사용
@@ -1232,11 +1313,118 @@ async def _synthesize_top5(
 # ------------------------------------------------------------------
 # (6) 텔레그램 발송
 # ------------------------------------------------------------------
+async def _send_top1_quarterly_chart(
+    bot: Bot,
+    chat_id: str,
+    top1_pick: dict,
+    company_texts_by_ticker: dict[str, dict[str, str]],
+) -> None:
+    """Top 1 종목의 분기 매출/영업이익/순이익 + (옵션) forward consensus 차트.
+
+    - DART에서 corp_code → 분기 재무 fetch + 잠정실적 보강.
+    - wisereport 종목 리포트 텍스트 → forward consensus 추출 (옵션).
+    - matplotlib 차트 PNG → bot.send_photo.
+
+    실패해도 다른 결과 영향 없음 (caller에서 try/except).
+    """
+    ticker = (top1_pick.get("ticker6") or "").strip()
+    name = top1_pick.get("name", "?")
+    if not re.match(r"^\d{6}$", ticker):
+        log.info("Top 1 ticker 없음 — 분기 차트 스킵: %s", name)
+        return
+
+    loop = asyncio.get_running_loop()
+
+    # corp_code lookup
+    try:
+        from src.deepdive import dart_client
+    except Exception:
+        log.exception("dart_client import 실패 — 분기 차트 스킵")
+        return
+    pair = await loop.run_in_executor(None, dart_client.get_corp_code, ticker)
+    if not pair:
+        log.info("Top 1 corp_code 없음: %s (%s) — 분기 차트 스킵", name, ticker)
+        return
+    corp_code, corp_name = pair
+
+    # 분기 재무 fetch
+    try:
+        fin = await loop.run_in_executor(None, dart_client.fetch_quarterly_financials, corp_code, 3)
+    except Exception:
+        log.exception("Top 1 분기 재무 fetch 실패")
+        return
+    if not fin or not fin.revenue_qoq:
+        log.info("Top 1 분기 재무 데이터 없음 — 차트 스킵")
+        return
+
+    # 잠정실적 보강 (실패해도 무시)
+    try:
+        from pathlib import Path as _P
+        prelim_dir = download_root_for("idea") / "_top1_preliminary" / ticker
+        preliminary = await loop.run_in_executor(
+            None, dart_client.fetch_latest_preliminary_quarter, corp_code, prelim_dir,
+        )
+        if preliminary:
+            yq, rev, op, net = preliminary
+            if yq not in fin.revenue_qoq:
+                fin.revenue_qoq[yq] = rev
+                fin.op_profit_qoq[yq] = op
+                fin.net_profit_qoq[yq] = net
+                log.info("Top 1 잠정실적 보강: %s", yq)
+    except Exception:
+        log.info("Top 1 잠정실적 보강 실패 — 무시")
+
+    # forward consensus — top 1 ticker의 wisereport 종목 리포트 텍스트로부터 LLM 추출
+    forward = None
+    try:
+        from src.deepdive import forward_consensus
+        from src.deepdive.wisereport_context import WisereportContext
+        # WisereportContext 형태로 wrap (forward_consensus.from_wisereport 시그니처 맞추기)
+        own_texts = list((company_texts_by_ticker.get(ticker) or {}).values())
+        own_titles = list((company_texts_by_ticker.get(ticker) or {}).keys())
+        if own_texts:
+            wctx = WisereportContext(
+                company_texts=own_texts, company_titles=own_titles,
+                industry_texts=[], industry_titles=[],
+            )
+            forward = await loop.run_in_executor(None, forward_consensus.from_wisereport, wctx)
+    except Exception:
+        log.info("Top 1 forward consensus 실패 — 무시")
+
+    # 차트 build + 발송
+    try:
+        from src.deepdive import chart
+        png_bytes = await loop.run_in_executor(
+            None, chart.build,
+            corp_name,
+            fin.revenue_qoq, fin.op_profit_qoq, fin.net_profit_qoq,
+            None, forward or None,
+        )
+    except Exception:
+        log.exception("Top 1 chart.build 실패")
+        return
+    if not png_bytes:
+        return
+    try:
+        fwd_info = (
+            f" + Forward {len(forward)}분기 (wisereport 컨센서스)" if forward
+            else " (Forward 미수집)"
+        )
+        await bot.send_photo(
+            chat_id=chat_id,
+            photo=png_bytes,
+            caption=f"📈 Top 1 {corp_name}({ticker}) 분기별 재무{fwd_info}",
+        )
+    except Exception:
+        log.exception("Top 1 분기 차트 발송 실패")
+
+
 async def _send_results(
     bot: Bot, chat_id: str,
     synthesis: dict,
     industry_pdfs: list[Path],
     company_pdfs_by_ticker: dict[str, list[Path]],
+    company_texts_by_ticker: dict[str, dict[str, str]] | None = None,
 ) -> None:
     """Top 5 결과 발송.
 
@@ -1321,6 +1509,13 @@ async def _send_results(
                 continue
             await send_pdf(bot, chat_id, p, caption=f"[Top {rank} {name}] {p.name}")
             sent_pdf_names.add(p.name)
+
+    # ---- Top 1 분기 차트 — DART 분기 재무 + (옵션) wisereport forward consensus
+    if top5:
+        try:
+            await _send_top1_quarterly_chart(bot, chat_id, top5[0], company_texts_by_ticker or {})
+        except Exception:
+            log.exception("Top 1 분기 차트 단계 실패 — 무시 (다른 결과는 정상)")
 
     # ---- 산업 리포트는 마지막에 한 번만 일괄 첨부 (모든 픽의 공통 컨텍스트)
     if industry_pdfs:
@@ -1662,6 +1857,7 @@ def build_idea_app(token: str) -> Application:
     app.add_handler(CommandHandler("idea", _cmd_idea))
     app.add_handler(CommandHandler("history", _cmd_history))
     app.add_handler(CommandHandler("show", _cmd_show))
+    app.add_handler(CommandHandler("dive", _cmd_dive))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _on_text))
 
     # self-test 자동 실행 — orchestrator가 build_idea_app을 async _run_forever 안에서
