@@ -298,6 +298,67 @@ def fetch_latest_business_report(corp_code: str) -> DartReport | None:
     return None
 
 
+def fetch_recent_disclosures(corp_code: str, days_back: int = 1) -> list[DartReport]:
+    """특정 회사의 최근 N일 공시 전체 (날짜 내림차순). DisclosureBot 폴링용.
+
+    days_back=1 (기본): 오늘 + 어제 (KST 기준 시차 안전 마진).
+    list.json은 한 번 호출에 100건까지. 하루 100건 넘으면 페이지 추가 필요하지만
+    개별 회사 기준 하루 100건은 사실상 도달 불가.
+    """
+    today = datetime.now(KST).strftime("%Y%m%d")
+    bgn_de = (datetime.now(KST) - timedelta(days=days_back)).strftime("%Y%m%d")
+
+    data = _get("list.json", {
+        "corp_code": corp_code,
+        "bgn_de": bgn_de,
+        "end_de": today,
+        "page_count": 100,
+    })
+    if not data:
+        return []
+    items = data.get("list") or []
+    items.sort(key=lambda x: (x.get("rcept_dt", ""), x.get("rcept_no", "")), reverse=True)
+    out: list[DartReport] = []
+    for it in items:
+        if not it.get("rcept_no"):
+            continue
+        out.append(DartReport(
+            rcept_no=it["rcept_no"],
+            report_nm=it.get("report_nm", ""),
+            rcept_dt=it.get("rcept_dt", ""),
+            flr_nm=it.get("flr_nm", ""),
+        ))
+    return out
+
+
+# 공시명에서 카테고리(critical/normal) 분류용 키워드.
+# critical: 시장 영향 큰 잠정실적·주요사항·자기주식·합병/분할·증자/감자 등
+# 다른 모든 공시는 normal — informational.
+CRITICAL_DISCLOSURE_KEYWORDS = (
+    "잠정실적", "잠정 실적", "영업(잠정)", "매출액또는손익구조",
+    "주요사항보고서",
+    "자기주식취득", "자기주식처분", "자기주식 취득", "자기주식 처분",
+    "유상증자", "무상증자", "감자결정",
+    "합병결정", "분할결정", "주식의포괄적교환",
+    "회사분할", "회사합병",
+    "전환사채", "신주인수권부사채", "교환사채",
+    "최대주주변경", "최대주주 변경",
+    "현금배당", "주식배당",
+    "공급계약", "단일판매·공급계약체결",
+    "유형자산취득", "유형자산처분",
+)
+
+
+def classify_disclosure(report_nm: str) -> str:
+    """공시명 → "critical" 또는 "normal".
+
+    DisclosureBot이 critical만 알림 보내거나, normal 포함 여부를 사용자가 토글할 수
+    있게 분류 정보 제공.
+    """
+    nm = report_nm or ""
+    return "critical" if any(kw in nm for kw in CRITICAL_DISCLOSURE_KEYWORDS) else "normal"
+
+
 def fetch_ir_candidates(corp_code: str, days_back: int = 365 * 5) -> list[DartReport]:
     """최근 IR자료/실적발표/컨퍼런스콜 등 후보 리스트 (날짜 내림차순). 빈 리스트 가능.
 

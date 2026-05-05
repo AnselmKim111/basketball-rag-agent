@@ -39,6 +39,7 @@ from src.category_bots import (
     industry_top10_job,
     market_daily_job,
 )
+from src.disclosure_bot import build_disclosure_app, disclosure_poll_job
 from src.idea_bot import build_idea_app
 
 KST = timezone(timedelta(hours=9))
@@ -118,6 +119,20 @@ BOT_SPECS: list[BotSpec] = [
         builder=build_idea_app,
         jobs=[],  # 사용자 입력 기반, 스케줄 없음
     ),
+    BotSpec(
+        name="disclosure",
+        token_env="DISCLOSURE_BOT_TOKEN",
+        builder=build_disclosure_app,
+        jobs=[
+            ScheduledJob(
+                func=disclosure_poll_job,
+                job_id="disclosure_poll",
+                # 5분마다. 비거래 시간엔 disclosure_poll_job 내부에서 minute 0/30만 실행.
+                cron={"minute": "*/5"},
+                description="DART 공시 폴링 — 5분 (거래시간) / 30분 (외부)",
+            ),
+        ],
+    ),
 ]
 
 
@@ -127,7 +142,7 @@ BOT_SPECS: list[BotSpec] = [
 def _diag_env() -> None:
     relevant = diag_env_keys(
         ("TELEGRAM", "WISE", "OPEN", "ALLOWED", "CHAT", "INDUSTRY", "MARKET",
-         "GLOBAL", "DART", "IDEA")
+         "GLOBAL", "DART", "IDEA", "DISCLOSURE")
     )
     print(f"[orch] env keys total = {len(os.environ)}", flush=True)
     print(f"[orch] relevant env vars = {relevant}", flush=True)
@@ -148,8 +163,9 @@ async def _run_forever() -> None:
 
     # state_store 진단 — 볼륨 mount + 영구 보존 여부 즉시 검증
     try:
-        from src import state_store
+        from src import state_store, watchlist_store
         state_store.diag_log()
+        watchlist_store.diag_log()
     except Exception:
         log.exception("state_store 진단 호출 실패 (orchestrator 계속 진행)")
 
