@@ -379,6 +379,7 @@ async def _cmd_contrarian(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     cache 재사용: research/industry/company 데이터 그대로, synthesis 프롬프트만 contrarian.
     """
     if not is_authorized(update, ALLOWED_ENV):
+        await deny_message(update, "아이디어봇")
         return
     from src import idea_cache
     bot = context.bot
@@ -583,6 +584,7 @@ async def _cmd_compare(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     각 idea에만 등장 = 차별화 메커니즘.
     """
     if not is_authorized(update, ALLOWED_ENV):
+        await deny_message(update, "아이디어봇")
         return
     from src import idea_cache
     bot = context.bot

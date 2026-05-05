@@ -16,7 +16,7 @@ from telegram import Bot, Update
 from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, ContextTypes
 
-from src.bot_helpers import is_authorized, send_text_chunked
+from src.bot_helpers import deny_message, is_authorized, send_text_chunked
 
 log = logging.getLogger(__name__)
 KST = timezone(timedelta(hours=9))
@@ -41,6 +41,7 @@ HELP_TEXT = (
 # ------------------------------------------------------------------
 async def _help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_authorized(update, ALLOWED_ENV):
+        await deny_message(update, "스크리너봇")
         return
     try:
         await update.message.reply_text(HELP_TEXT, parse_mode=ParseMode.MARKDOWN)
@@ -50,6 +51,7 @@ async def _help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def _cmd_screen(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_authorized(update, ALLOWED_ENV):
+        await deny_message(update, "스크리너봇")
         return
     try:
         await update.message.reply_text("🔄 스크리닝 즉시 실행 중...")
@@ -63,6 +65,7 @@ async def _cmd_screen(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 async def _cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_authorized(update, ALLOWED_ENV):
+        await deny_message(update, "스크리너봇")
         return
     loop = asyncio.get_running_loop()
     try:
@@ -79,6 +82,7 @@ async def _cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 async def _cmd_backfill(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_authorized(update, ALLOWED_ENV):
+        await deny_message(update, "스크리너봇")
         return
     chat_id = str(update.effective_chat.id)
     try:
