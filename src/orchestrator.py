@@ -146,6 +146,13 @@ async def _run_forever() -> None:
     log = logging.getLogger("orchestrator")
     _diag_env()
 
+    # state_store 진단 — 볼륨 mount + 영구 보존 여부 즉시 검증
+    try:
+        from src import state_store
+        state_store.diag_log()
+    except Exception:
+        log.exception("state_store 진단 호출 실패 (orchestrator 계속 진행)")
+
     apps: list[tuple[str, Application]] = []
     bot_objects: dict[str, Bot] = {}
     pending_jobs: list[tuple[str, ScheduledJob]] = []

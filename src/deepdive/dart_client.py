@@ -183,13 +183,15 @@ def get_corp_code(ticker: str) -> tuple[str, str] | None:
 
 
 def lookup_ticker_by_name(query: str) -> str | None:
-    """종목명 → 6자리 ticker. 정확 일치 → contains 매칭 순.
+    """종목명 → 6자리 ticker. 정확 → 정규화 → startswith → contains → fuzzy 순.
 
     매칭 우선순위:
       1. 정확히 일치 ("삼성전자" == "삼성전자")
       2. 정규화 후 일치 (공백/괄호 제거: "(주)카카오" → "카카오")
       3. startswith 매칭, 짧은 이름 우선
       4. contains 매칭, 짧은 이름 우선
+      5. difflib fuzzy 매칭 (cutoff=0.82) — 오타 1-2자 허용
+         예: "롯데에너지머터리얼즈" → "롯데에너지머티리얼즈"
 
     상장사만 검색 (stock_code 있는 회사). 못 찾으면 None.
     """
@@ -229,6 +231,33 @@ def lookup_ticker_by_name(query: str) -> str | None:
             q, chosen[0], chosen[1], len(candidates),
         )
         return chosen[1]
+
+    # 5) difflib fuzzy — 오타 1-2자 (예: "머터리얼즈" → "머티리얼즈")
+    # 가변 cutoff (query 길이가 짧을수록 한 글자 비중이 커서 ratio가 자연히 낮음).
+    # 너무 짧은 query (1-2자)는 fuzzy 위험 (LG → 수백개 매칭) → 3자 이상에서만.
+    if len(q_norm) >= 3:
+        if len(q_norm) >= 8:
+            cutoff = 0.82  # 8+자: 2-char 오타까지 허용
+        elif len(q_norm) >= 5:
+            cutoff = 0.78  # 5-7자: 1-char 오타
+        elif len(q_norm) >= 4:
+            cutoff = 0.70  # 4자: 1-char 오타 (예: 삼성전쟈 → 삼성전자)
+        else:
+            cutoff = 0.65  # 3자: 1-char 오타 (예: 카가오 → 카카오) — 후보 1개로 제한
+        import difflib
+        # 정규화된 키만 후보로 사용 (raw 이름은 (주) 등 prefix 포함되어 distance 부풀림)
+        norm_keys = [k for k in _NAME_TO_TICKER_CACHE.keys() if k]
+        n_results = 1 if len(q_norm) <= 4 else 3
+        matches = difflib.get_close_matches(q_norm, norm_keys, n=n_results, cutoff=cutoff)
+        if matches:
+            best = matches[0]
+            ticker = _NAME_TO_TICKER_CACHE[best]
+            ratio = difflib.SequenceMatcher(None, q_norm, best).ratio()
+            log.info(
+                "종목명 fuzzy 매칭: '%s' → '%s' (%s) ratio=%.2f cutoff=%.2f [후보=%s]",
+                q, best, ticker, ratio, cutoff, matches,
+            )
+            return ticker
 
     log.warning("종목명 매칭 실패: '%s'", q)
     return None

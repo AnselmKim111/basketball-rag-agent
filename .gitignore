@@ -37,3 +37,4 @@ playwright-report/
 *.swp
 *.swo
 .DS_Store
+CLAUDE.md
