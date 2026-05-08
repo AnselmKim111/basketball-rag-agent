@@ -26,6 +26,7 @@ from src.bot_helpers import (
     MissingWisereportCreds,
     deny_message,
     is_authorized as _bh_is_authorized,
+    make_post_init_set_commands,
     safe_dirname as _bh_safe_dirname,
     send_pdf as _bh_send_pdf,
     send_text_chunked as _bh_send_text,
@@ -590,8 +591,34 @@ async def global_top10_job(bot: Bot) -> None:
 # ------------------------------------------------------------------
 # Application 빌더 — orchestrator가 호출
 # ------------------------------------------------------------------
+INDUSTRY_COMMANDS = [
+    ("curate", "🎯 AI 큐레이션 — 주도산업·학습가치 산업 Top N"),
+    ("industry", "특정 산업 리포트 (예: /industry 반도체)"),
+    ("trigger", "9시 자동 작업 즉시 실행 (신규만)"),
+    ("help", "도움말"),
+]
+
+MARKET_COMMANDS = [
+    ("curate", "🎯 AI 큐레이션 — 주도주·주도산업 종합 Top N"),
+    ("recent", "단순 인기 N건 (dedup 무시, 예: /recent 10)"),
+    ("trigger", "9시 자동 작업 즉시 실행 (신규만)"),
+    ("help", "도움말"),
+]
+
+GLOBAL_COMMANDS = [
+    ("recent", "글로벌 인기 N건 (예: /recent 10)"),
+    ("trigger", "토요일 자동 Top10 즉시 실행"),
+    ("help", "도움말"),
+]
+
+
 def build_industry_app(token: str) -> Application:
-    app = Application.builder().token(token).build()
+    app = (
+        Application.builder()
+        .token(token)
+        .post_init(make_post_init_set_commands(INDUSTRY_COMMANDS))
+        .build()
+    )
     app.add_handler(CommandHandler(["start", "help"], industry_help))
     app.add_handler(CommandHandler("industry", industry_on_demand))
     app.add_handler(CommandHandler("trigger", industry_trigger))
@@ -601,7 +628,12 @@ def build_industry_app(token: str) -> Application:
 
 
 def build_market_app(token: str) -> Application:
-    app = Application.builder().token(token).build()
+    app = (
+        Application.builder()
+        .token(token)
+        .post_init(make_post_init_set_commands(MARKET_COMMANDS))
+        .build()
+    )
     app.add_handler(CommandHandler(["start", "help"], market_help))
     app.add_handler(CommandHandler("trigger", market_trigger))
     app.add_handler(CommandHandler("recent", market_recent))
@@ -612,7 +644,12 @@ def build_market_app(token: str) -> Application:
 
 
 def build_global_app(token: str) -> Application:
-    app = Application.builder().token(token).build()
+    app = (
+        Application.builder()
+        .token(token)
+        .post_init(make_post_init_set_commands(GLOBAL_COMMANDS))
+        .build()
+    )
     app.add_handler(CommandHandler(["start", "help"], global_help))
     app.add_handler(CommandHandler("trigger", global_trigger))
     app.add_handler(CommandHandler("recent", global_recent))

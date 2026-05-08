@@ -29,9 +29,14 @@ from apscheduler.triggers.cron import CronTrigger
 from telegram import Bot
 from telegram.ext import Application
 
+from telegram import BotCommand
+
 from src.bot_helpers import diag_env_keys
-from src.bot_worker import build_company_app
+from src.bot_worker import COMPANY_COMMANDS, build_company_app
 from src.category_bots import (
+    GLOBAL_COMMANDS,
+    INDUSTRY_COMMANDS,
+    MARKET_COMMANDS,
     build_global_app,
     build_industry_app,
     build_market_app,
@@ -39,9 +44,9 @@ from src.category_bots import (
     industry_top10_job,
     market_daily_job,
 )
-from src.disclosure_bot import build_disclosure_app, disclosure_poll_job
-from src.idea_bot import build_idea_app
-from src.screener_bot import build_screener_app, screener_daily_job
+from src.disclosure_bot import DISCLOSURE_COMMANDS, build_disclosure_app, disclosure_poll_job
+from src.idea_bot import IDEA_COMMANDS, build_idea_app
+from src.screener_bot import SCREENER_COMMANDS, build_screener_app, screener_daily_job
 
 KST = timezone(timedelta(hours=9))
 
@@ -65,6 +70,11 @@ class BotSpec:
     token_env: str                                  # 토큰 환경변수 이름
     builder: Callable[[str], Application]           # build_xxx_app(token) → Application
     jobs: list[ScheduledJob] = field(default_factory=list)
+    # 텔레그램 / 자동완성 명령 [(command, description), ...]. orchestrator가
+    # app.initialize() 후 app.bot.set_my_commands로 직접 등록.
+    # post_init은 manual lifecycle (initialize/start/start_polling)에서 호출
+    # 안 되므로 spec 단위로 직접 보관.
+    commands: list[tuple[str, str]] = field(default_factory=list)
     optional: bool = True                           # False면 토큰 없을 때 systemexit
 
 
@@ -73,12 +83,14 @@ BOT_SPECS: list[BotSpec] = [
         name="company",
         token_env="TELEGRAM_BOT_TOKEN",
         builder=build_company_app,
+        commands=COMPANY_COMMANDS,
         jobs=[],  # 스케줄 없음 (사용자 명령 기반)
     ),
     BotSpec(
         name="industry",
         token_env="INDUSTRY_BOT_TOKEN",
         builder=build_industry_app,
+        commands=INDUSTRY_COMMANDS,
         jobs=[
             ScheduledJob(
                 func=industry_top10_job,
@@ -92,6 +104,7 @@ BOT_SPECS: list[BotSpec] = [
         name="market",
         token_env="MARKET_BOT_TOKEN",
         builder=build_market_app,
+        commands=MARKET_COMMANDS,
         jobs=[
             ScheduledJob(
                 func=market_daily_job,
@@ -105,6 +118,7 @@ BOT_SPECS: list[BotSpec] = [
         name="global",
         token_env="GLOBAL_BOT_TOKEN",
         builder=build_global_app,
+        commands=GLOBAL_COMMANDS,
         jobs=[
             ScheduledJob(
                 func=global_top10_job,
@@ -118,12 +132,14 @@ BOT_SPECS: list[BotSpec] = [
         name="idea",
         token_env="IDEA_BOT_TOKEN",
         builder=build_idea_app,
+        commands=IDEA_COMMANDS,
         jobs=[],  # 사용자 입력 기반, 스케줄 없음
     ),
     BotSpec(
         name="disclosure",
         token_env="DISCLOSURE_BOT_TOKEN",
         builder=build_disclosure_app,
+        commands=DISCLOSURE_COMMANDS,
         jobs=[
             ScheduledJob(
                 func=disclosure_poll_job,
@@ -138,6 +154,7 @@ BOT_SPECS: list[BotSpec] = [
         name="screener",
         token_env="SCREENER_BOT_TOKEN",
         builder=build_screener_app,
+        commands=SCREENER_COMMANDS,
         jobs=[
             ScheduledJob(
                 func=screener_daily_job,
@@ -209,11 +226,25 @@ async def _run_forever() -> None:
     if not apps:
         raise SystemExit("활성화된 봇이 하나도 없음. 최소 한 봇의 토큰 환경변수가 필요합니다.")
 
+    # spec → commands 매핑 (initialize 후 set_my_commands 직접 호출용)
+    spec_by_name = {s.name: s for s in BOT_SPECS}
+
     # 모든 봇 시작 (lifecycle 수동 관리)
     for name, app in apps:
         await app.initialize()
         await app.start()
         await app.updater.start_polling(drop_pending_updates=True)
+        # 텔레그램 / 자동완성 명령 등록 — manual lifecycle은 post_init이 자동
+        # 호출 안 되므로 여기서 직접 호출.
+        spec = spec_by_name.get(name)
+        if spec and spec.commands:
+            try:
+                await app.bot.set_my_commands(
+                    [BotCommand(c, d) for c, d in spec.commands]
+                )
+                log.info("%s set_my_commands 등록: %d개", name, len(spec.commands))
+            except Exception:
+                log.exception("%s set_my_commands 실패 (봇은 정상 가동)", name)
         log.info("%s 폴링 시작", name)
 
     # APScheduler — KST 기준 cron

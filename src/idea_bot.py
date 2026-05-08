@@ -54,6 +54,7 @@ from src.bot_helpers import (
     deny_message,
     download_root_for,
     is_authorized,
+    make_post_init_set_commands,
     safe_dirname,
     send_pdf,
     send_text_chunked,
@@ -2342,8 +2343,25 @@ async def _self_test(app: Application) -> None:
     log.info("=" * 60)
 
 
+IDEA_COMMANDS = [
+    ("idea", "💡 아이디어 → 영업레버리지 Top 5 종목 (15-25분)"),
+    ("history", "최근 20개 아이디어 분석 목록"),
+    ("show", "과거 결과 다시 보기 (예: /show 143005)"),
+    ("dive", "Top N 종목 자동 deepdive (예: /dive 1)"),
+    ("refine", "캐시 재사용 + 새 제약으로 재합성"),
+    ("contrarian", "같은 thesis의 RISK Top 5 (반대 시각)"),
+    ("compare", "두 idea의 Top 10 교집합 + 차별 분석"),
+    ("help", "도움말"),
+]
+
+
 def build_idea_app(token: str) -> Application:
-    app = Application.builder().token(token).build()
+    app = (
+        Application.builder()
+        .token(token)
+        .post_init(make_post_init_set_commands(IDEA_COMMANDS))
+        .build()
+    )
     app.add_handler(CommandHandler(["start", "help"], _help))
     app.add_handler(CommandHandler("idea", _cmd_idea))
     app.add_handler(CommandHandler("history", _cmd_history))
