@@ -1,6 +1,6 @@
 """ScreenerBot — 한국 주식 기술적 신호 스크리너.
 
-매일 16:30 KST에 자동 실행 (장마감 + 정산 버퍼). 사용자 명령:
+매일 16:00 KST에 자동 실행 (15:30 장마감 + 30분 정산 버퍼). 사용자 명령:
   /help, /screen (즉시), /status (DB 상태), /backfill (강제 백필)
 
 격리 원칙: wisereport/PIPELINE_LOCK 미사용. 자체 SQLite DB(/data/screener.db).
@@ -31,7 +31,7 @@ CHAT_ID_ENV = "SCREENER_CHAT_ID"
 
 HELP_TEXT = (
     "📈 *ScreenerBot* — 한국 주식 기술적 신호\n\n"
-    "자동: 매일 16:30 KST (장마감 후)\n"
+    "자동: 매일 16:00 KST (15:30 종가 기준 · 30분 정산 버퍼)\n"
     "데이터: KRX (pykrx + FDR) — OHLCV + 시가총액 + 섹터\n"
     "유니버스: KOSPI + KOSDAQ 보통주, 시총 ≥ 3000억\n"
     "표시: 유가증권시장 우선 · 시총·상승률 복합 정렬 · 섹터 표시\n\n"

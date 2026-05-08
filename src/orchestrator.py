@@ -159,8 +159,8 @@ BOT_SPECS: list[BotSpec] = [
             ScheduledJob(
                 func=screener_daily_job,
                 job_id="screener_daily",
-                cron={"hour": 16, "minute": 30},
-                description="한국 주식 기술적 신호 — 매일 16:30 KST",
+                cron={"hour": 16, "minute": 0},
+                description="한국 주식 기술적 신호 — 매일 16:00 KST (15:30 종가 기준)",
             ),
         ],
     ),
