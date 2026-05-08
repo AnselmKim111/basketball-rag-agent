@@ -53,7 +53,11 @@ _ALLOWED_ENV = "ALLOWED_CHAT_IDS"
 REPO_ROOT = Path(__file__).resolve().parent.parent
 HELP_TEXT = (
     "📊 *wisereport 자동 분석 봇*\n\n"
-    "*리포트 다운로드 + 요약*\n"
+    "*🎯 추천 — AI 큐레이션 (오늘의 주도주·학습가치 종목 선별):*\n"
+    "  `/curate` — Top 10 똑똑한 종목 리포트 + 각 선별 이유 (5-15분)\n"
+    "  `/curate 5` — Top 5\n"
+    "  → 시총 자동 우대 금지, 새로 공부할 가치 있는 종목 우선\n\n"
+    "*리포트 다운로드 + 요약 (특정 종목)*\n"
     "  `/report 종목명` (자동 ticker 매핑)\n"
     "  `/report 종목명 6자리티커 [개수]`\n"
     "  예: `/report 피에스케이`\n"
@@ -71,7 +75,8 @@ HELP_TEXT = (
     "  → wisereport 기업·산업 리포트도 종합 반영\n\n"
     "*명령어*\n"
     "  /start, /help — 이 도움말\n"
-    "  /report — 리포트 작업\n"
+    "  /curate [개수] — AI 큐레이션 (위 추천)\n"
+    "  /report — 특정 종목 리포트\n"
     "  /deepdive — 심층 분석\n"
     "  /deephelp — deepdive 상세 도움말\n"
     "  /status — 현재 작업 상태\n\n"
@@ -387,12 +392,40 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
     logging.exception("Unhandled error: %s", context.error)
 
 
+async def cmd_curate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """종목 도메인 AI 큐레이션 — 주도주·학습가치 종목 선별 + Top N 리포트.
+
+    `/curate [N]`. COMPANY_MODE 사용 (company 카테고리만, 산업·증권사 분포 균형).
+    """
+    if not is_authorized(update):
+        await deny_message(update, "종목봇")
+        return
+    args = context.args or []
+    n = 10
+    if args:
+        try:
+            v = int(args[0])
+            n = max(1, min(15, v))
+        except (ValueError, TypeError):
+            pass
+    bot = context.bot
+    chat_id = str(update.effective_chat.id)
+    try:
+        from src.curator import COMPANY_MODE, run_curated
+    except Exception:
+        logging.exception("curator 모듈 로드 실패 (company)")
+        await update.message.reply_text("❌ 큐레이션 모듈 로드 실패")
+        return
+    await run_curated(bot, chat_id, n=n, mode=COMPANY_MODE)
+
+
 def build_company_app(token: str) -> Application:
     """orchestrator가 import해 사용. CompanyBot의 Application을 반환."""
     app = Application.builder().token(token).build()
     app.add_handler(CommandHandler(["start", "help"], cmd_start))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("report", cmd_report))
+    app.add_handler(CommandHandler("curate", cmd_curate))
     # --- deepdive (격리: 실패해도 기존 봇 정상) ---
     try:
         from src.deepdive.handler import register as register_deepdive
