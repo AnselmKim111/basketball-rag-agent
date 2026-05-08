@@ -26,7 +26,6 @@ from src.bot_helpers import (
     MissingWisereportCreds,
     deny_message,
     is_authorized as _bh_is_authorized,
-    make_post_init_set_commands,
     safe_dirname as _bh_safe_dirname,
     send_pdf as _bh_send_pdf,
     send_text_chunked as _bh_send_text,
@@ -613,12 +612,7 @@ GLOBAL_COMMANDS = [
 
 
 def build_industry_app(token: str) -> Application:
-    app = (
-        Application.builder()
-        .token(token)
-        .post_init(make_post_init_set_commands(INDUSTRY_COMMANDS))
-        .build()
-    )
+    app = Application.builder().token(token).build()
     app.add_handler(CommandHandler(["start", "help"], industry_help))
     app.add_handler(CommandHandler("industry", industry_on_demand))
     app.add_handler(CommandHandler("trigger", industry_trigger))
@@ -628,12 +622,7 @@ def build_industry_app(token: str) -> Application:
 
 
 def build_market_app(token: str) -> Application:
-    app = (
-        Application.builder()
-        .token(token)
-        .post_init(make_post_init_set_commands(MARKET_COMMANDS))
-        .build()
-    )
+    app = Application.builder().token(token).build()
     app.add_handler(CommandHandler(["start", "help"], market_help))
     app.add_handler(CommandHandler("trigger", market_trigger))
     app.add_handler(CommandHandler("recent", market_recent))
@@ -644,12 +633,7 @@ def build_market_app(token: str) -> Application:
 
 
 def build_global_app(token: str) -> Application:
-    app = (
-        Application.builder()
-        .token(token)
-        .post_init(make_post_init_set_commands(GLOBAL_COMMANDS))
-        .build()
-    )
+    app = Application.builder().token(token).build()
     app.add_handler(CommandHandler(["start", "help"], global_help))
     app.add_handler(CommandHandler("trigger", global_trigger))
     app.add_handler(CommandHandler("recent", global_recent))

@@ -19,7 +19,6 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 from src.bot_helpers import (
     deny_message,
     is_authorized,
-    make_post_init_set_commands,
     send_text_chunked,
 )
 
@@ -270,12 +269,7 @@ SCREENER_COMMANDS = [
 
 
 def build_screener_app(token: str) -> Application:
-    app = (
-        Application.builder()
-        .token(token)
-        .post_init(make_post_init_set_commands(SCREENER_COMMANDS))
-        .build()
-    )
+    app = Application.builder().token(token).build()
     app.add_handler(CommandHandler(["start", "help"], _help))
     app.add_handler(CommandHandler("screen", _cmd_screen))
     app.add_handler(CommandHandler("status", _cmd_status))

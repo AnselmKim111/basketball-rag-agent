@@ -54,7 +54,6 @@ from src.bot_helpers import (
     deny_message,
     download_root_for,
     is_authorized,
-    make_post_init_set_commands,
     safe_dirname,
     send_pdf,
     send_text_chunked,
@@ -2356,12 +2355,7 @@ IDEA_COMMANDS = [
 
 
 def build_idea_app(token: str) -> Application:
-    app = (
-        Application.builder()
-        .token(token)
-        .post_init(make_post_init_set_commands(IDEA_COMMANDS))
-        .build()
-    )
+    app = Application.builder().token(token).build()
     app.add_handler(CommandHandler(["start", "help"], _help))
     app.add_handler(CommandHandler("idea", _cmd_idea))
     app.add_handler(CommandHandler("history", _cmd_history))
