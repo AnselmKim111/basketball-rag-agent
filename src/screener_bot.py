@@ -27,8 +27,14 @@ CHAT_ID_ENV = "SCREENER_CHAT_ID"
 HELP_TEXT = (
     "📈 *ScreenerBot* — 한국 주식 기술적 신호\n\n"
     "자동: 매일 16:30 KST (장마감 후)\n"
-    "신호: 52주/60일/20일 신고가, 일목구름 상방 돌파, 거래량 돌파(≥2배), "
-    "52주 돌파 직전(95-99%)\n\n"
+    "데이터: KRX (pykrx) — 1년치 OHLCV + 시가총액\n"
+    "유니버스: KOSPI + KOSDAQ 보통주, 시총 ≥ 3000억\n"
+    "표시: 유가증권시장 우선, 코스닥 분리\n\n"
+    "신호 (4종):\n"
+    "  📈 52주/60일/20일 신고가 — 종가 > 과거 N일 최고가\n"
+    "  📊 일목구름 상방 돌파 (9/26/52)\n"
+    "  🔥 거래량 돌파 — 오늘 거래량 ≥ 20일 평균 ×2.0 + 종가 상승\n"
+    "  🎯 52주 돌파 직전 — 종가 = 52주고점 95-99% + 5일 거래량 ≥ ×1.3\n\n"
     "명령:\n"
     "  /screen — 즉시 실행\n"
     "  /status — DB 상태 확인\n"
@@ -149,6 +155,14 @@ async def screener_daily_job(bot: Bot, override_chat_id: str | None = None) -> N
             await send_text_chunked(bot, chat_id, "🌐 종목 유니버스 빌드 중...")
             count = await loop.run_in_executor(None, universe.refresh_universe)
             await send_text_chunked(bot, chat_id, f"🌐 활성 종목 {count}개")
+        else:
+            # 시총 갱신 (시장 변동 반영 + 기존 DB의 NULL 시총 채우기)
+            try:
+                updated = await loop.run_in_executor(None, universe.refresh_market_caps)
+                if updated:
+                    log.info("[scheduled] 시총 갱신 %d종목", updated)
+            except Exception:
+                log.exception("[scheduled] 시총 갱신 실패 — 신호 계산은 진행")
 
         # DB 비었으면 백필
         force = os.getenv("SCREENER_FORCE_BACKFILL", "0") == "1"

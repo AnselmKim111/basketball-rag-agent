@@ -120,6 +120,53 @@ def fetch_ohlcv_by_ticker_via_fdr(
     return rows
 
 
+def fetch_market_caps(date_str: str | None = None) -> dict[str, int]:
+    """KOSPI+KOSDAQ 전 종목 시가총액 (원 단위) — pykrx 사용.
+
+    date_str=None이면 최근 영업일 기준. 빈 dict면 fetch 실패.
+    """
+    stock = _import_pykrx()
+    if date_str is None:
+        # 오늘 또는 최근 영업일 — pykrx는 휴장일에 빈 결과
+        d = date.today()
+        for _ in range(7):
+            ds = d.strftime("%Y%m%d")
+            try:
+                df = stock.get_market_cap(ds, market="ALL")
+                if df is not None and not df.empty:
+                    date_str = ds
+                    break
+            except Exception:
+                pass
+            d -= timedelta(days=1)
+        else:
+            return {}
+    else:
+        try:
+            df = stock.get_market_cap(date_str, market="ALL")
+        except Exception as e:
+            log.warning("[data_source] market_cap fetch %s 실패: %s", date_str, e)
+            return {}
+        if df is None or df.empty:
+            return {}
+    cols = list(df.columns)
+    cap_c = next((c for c in ("시가총액", "MarketCap", "market_cap") if c in cols), None)
+    if cap_c is None:
+        log.warning("[data_source] market_cap 컬럼 인식 실패: %s", cols)
+        return {}
+    out: dict[str, int] = {}
+    for ticker, row in df.iterrows():
+        try:
+            cap = int(row[cap_c])
+        except Exception:
+            continue
+        if cap <= 0:
+            continue
+        out[str(ticker)] = cap
+    log.info("[data_source] market_cap fetched %d종목 (date=%s)", len(out), date_str)
+    return out
+
+
 def fetch_kospi_kosdaq_tickers() -> list[tuple]:
     """KOSPI+KOSDAQ 보통주 ticker 리스트. pykrx → FDR 자동 폴백.
 

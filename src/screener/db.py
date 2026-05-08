@@ -37,7 +37,7 @@ def _conn() -> Iterator[sqlite3.Connection]:
 
 
 def ensure_schema() -> None:
-    """첫 호출 시 스키마 생성. 이후 호출은 noop."""
+    """첫 호출 시 스키마 생성. 이후 호출은 noop. ALTER는 idempotent."""
     global _INITIALIZED
     if _INITIALIZED:
         return
@@ -77,6 +77,11 @@ def ensure_schema() -> None:
             );
             """
         )
+        # market_cap 컬럼 추가 (기존 DB 호환). SQLite는 IF NOT EXISTS for ALTER 미지원.
+        try:
+            c.execute("ALTER TABLE tickers ADD COLUMN market_cap INTEGER")
+        except sqlite3.OperationalError:
+            pass  # 이미 존재
     _INITIALIZED = True
     log.info("[screener.db] 스키마 준비 완료 path=%s", DB_PATH)
 
@@ -163,29 +168,62 @@ def delete_older_than(cutoff_date: str) -> int:
 # Tickers
 # ------------------------------------------------------------------
 def upsert_tickers(rows: Iterable[tuple]) -> int:
-    """rows: (ticker, name, market, is_active, updated_at)."""
+    """rows: (ticker, name, market, is_active, updated_at) 또는
+    (ticker, name, market, is_active, updated_at, market_cap)."""
     ensure_schema()
     rows = list(rows)
     if not rows:
         return 0
     with _conn() as c:
         c.execute("BEGIN")
-        c.executemany(
-            "INSERT OR REPLACE INTO tickers (ticker, name, market, is_active, updated_at) "
-            "VALUES (?, ?, ?, ?, ?)",
-            rows,
-        )
+        # row 길이로 분기 (5: 시총 없음 / 6: 시총 포함)
+        for r in rows:
+            if len(r) == 6:
+                c.execute(
+                    "INSERT INTO tickers (ticker, name, market, is_active, updated_at, market_cap) "
+                    "VALUES (?, ?, ?, ?, ?, ?) "
+                    "ON CONFLICT(ticker) DO UPDATE SET "
+                    "name=excluded.name, market=excluded.market, "
+                    "is_active=excluded.is_active, updated_at=excluded.updated_at, "
+                    "market_cap=excluded.market_cap",
+                    r,
+                )
+            else:
+                c.execute(
+                    "INSERT OR REPLACE INTO tickers (ticker, name, market, is_active, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    r,
+                )
         c.execute("COMMIT")
     return len(rows)
+
+
+def update_market_caps(caps: dict[str, int]) -> int:
+    """{ticker: market_cap} 일괄 업데이트. 신규 ticker는 무시 (universe 빌드 후 호출)."""
+    if not caps:
+        return 0
+    ensure_schema()
+    with _conn() as c:
+        c.execute("BEGIN")
+        c.executemany(
+            "UPDATE tickers SET market_cap=? WHERE ticker=?",
+            [(int(v), k) for k, v in caps.items()],
+        )
+        c.execute("COMMIT")
+    return len(caps)
 
 
 def get_active_tickers() -> list[dict]:
     ensure_schema()
     with _conn() as c:
         cur = c.execute(
-            "SELECT ticker, name, market FROM tickers WHERE is_active=1 ORDER BY ticker"
+            "SELECT ticker, name, market, market_cap FROM tickers "
+            "WHERE is_active=1 ORDER BY ticker"
         )
-        return [{"ticker": r[0], "name": r[1], "market": r[2]} for r in cur.fetchall()]
+        return [
+            {"ticker": r[0], "name": r[1], "market": r[2], "market_cap": r[3]}
+            for r in cur.fetchall()
+        ]
 
 
 def get_ticker_name(ticker: str) -> Optional[str]:

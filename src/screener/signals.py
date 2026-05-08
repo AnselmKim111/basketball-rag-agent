@@ -24,6 +24,8 @@ KST = timezone(timedelta(hours=9))
 DEFAULT_VOL_BREAKOUT_RATIO = 2.0
 DEFAULT_NEAR_BREAKOUT_LOWER = 0.95
 DEFAULT_NEAR_BREAKOUT_UPPER = 0.99
+# 시가총액 필터 (원). 기본 3000억 — 사용자 요구사항.
+DEFAULT_MIN_MARKET_CAP = 300_000_000_000
 
 
 def _get_float_env(key: str, default: float) -> float:
@@ -157,7 +159,10 @@ CATEGORIES = [
 def compute_all() -> dict[str, list[dict]]:
     """전 종목 신호 계산 → 카테고리별 정렬된 리스트.
 
-    {category_key: [ {ticker, name, market, ...신호 페이로드}, ... ]}
+    {category_key: [ {ticker, name, market, market_cap, ...신호 페이로드}, ... ]}
+
+    시가총액 < SCREENER_MIN_MARKET_CAP (기본 3000억) 종목은 신호에서 제외.
+    시총 정보 없는 (NULL) 종목은 보수적으로 통과 (신규상장/시총 fetch 실패 대비).
     """
     db.ensure_schema()
     tickers = db.get_active_tickers()
@@ -165,11 +170,19 @@ def compute_all() -> dict[str, list[dict]]:
         log.warning("[signals] universe 비어있음")
         return {}
 
+    min_cap = _get_float_env("SCREENER_MIN_MARKET_CAP", DEFAULT_MIN_MARKET_CAP)
+
     by_cat: dict[str, list[dict]] = {k: [] for k in CATEGORIES}
 
     processed = 0
+    skipped_cap = 0
     for tinfo in tickers:
         ticker = tinfo["ticker"]
+        cap = tinfo.get("market_cap")
+        # 시총 필터 (NULL은 통과)
+        if cap is not None and cap < min_cap:
+            skipped_cap += 1
+            continue
         rows = db.load_ohlcv(ticker, days=260)
         if len(rows) < 60:
             continue
@@ -183,6 +196,7 @@ def compute_all() -> dict[str, list[dict]]:
                 "ticker": ticker,
                 "name": tinfo.get("name") or ticker,
                 "market": tinfo.get("market") or "",
+                "market_cap": cap,
                 **payload,
             }
             by_cat.setdefault(cat_key, []).append(entry)
@@ -193,8 +207,8 @@ def compute_all() -> dict[str, list[dict]]:
         items.sort(key=lambda it: _sort_key(cat, it))
 
     log.info(
-        "[signals] processed=%d categories=%s",
-        processed,
+        "[signals] processed=%d skipped_cap=%d (min=%.1f억) categories=%s",
+        processed, skipped_cap, min_cap / 1e8,
         {k: len(v) for k, v in by_cat.items()},
     )
     return by_cat

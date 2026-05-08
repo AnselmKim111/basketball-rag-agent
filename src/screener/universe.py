@@ -42,7 +42,7 @@ def _is_preferred_or_special(ticker: str, name: str, all_prefixes: set[str]) -> 
 
 
 def refresh_universe() -> int:
-    """KRX에서 ticker 리스트 fetch → 필터 → DB upsert.
+    """KRX에서 ticker 리스트 fetch → 필터 → DB upsert. 시총도 함께 갱신.
     반환: 활성 종목 수.
     """
     raw = data_source.fetch_kospi_kosdaq_tickers()
@@ -55,18 +55,39 @@ def refresh_universe() -> int:
     prefixes = {t[:5] + "0" for t in all_codes if len(t) == 6}
 
     today = datetime.now(KST).strftime("%Y-%m-%d")
+
+    # 시총 fetch (실패해도 universe 자체는 진행)
+    caps: dict[str, int] = {}
+    try:
+        caps = data_source.fetch_market_caps()
+    except Exception:
+        log.exception("[universe] market_cap fetch 실패 — 시총 없이 진행")
+
     rows: list[tuple] = []
     for ticker, name, market in raw:
         if _is_preferred_or_special(ticker, name, prefixes):
             continue
-        rows.append((ticker, name or ticker, market, 1, today))
+        cap = caps.get(ticker)
+        rows.append((ticker, name or ticker, market, 1, today, cap))
 
     db.upsert_tickers(rows)
     log.info(
-        "[universe] %d/%d 종목 활성화 (KOSPI+KOSDAQ 보통주)",
-        len(rows), len(raw),
+        "[universe] %d/%d 종목 활성화 (시총 fetched=%d)",
+        len(rows), len(raw), len(caps),
     )
     return len(rows)
+
+
+def refresh_market_caps() -> int:
+    """시총만 갱신 (universe rebuild 없이). cron에서 매일 호출 가능."""
+    try:
+        caps = data_source.fetch_market_caps()
+    except Exception:
+        log.exception("[universe] market_cap fetch 실패")
+        return 0
+    if not caps:
+        return 0
+    return db.update_market_caps(caps)
 
 
 def get_universe_tickers() -> list[dict]:
