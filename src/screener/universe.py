@@ -79,7 +79,10 @@ def refresh_universe() -> int:
 
 
 def refresh_market_caps() -> int:
-    """시총 + 섹터 갱신 (universe rebuild 없이). cron에서 매일 호출 가능."""
+    """시총 + 섹터 갱신 (universe rebuild 없이). cron에서 매일 호출 가능.
+
+    섹터: pykrx 업종지수 → FDR 폴백 → 종목명 keyword 휴리스틱 (3단계).
+    """
     updated_caps = 0
     try:
         caps = data_source.fetch_market_caps()
@@ -90,11 +93,25 @@ def refresh_market_caps() -> int:
 
     try:
         secs = data_source.fetch_sectors()
-        if secs:
-            db.update_sectors(secs)
-            log.info("[universe] sector 갱신 %d종목", len(secs))
     except Exception:
         log.exception("[universe] sector fetch 실패")
+        secs = {}
+
+    # keyword 휴리스틱 — 미커버 종목은 종목명에서 추정
+    try:
+        for tinfo in db.get_active_tickers():
+            t = tinfo["ticker"]
+            if t in secs:
+                continue
+            guess = data_source.apply_sector_keywords(tinfo.get("name") or "")
+            if guess:
+                secs[t] = guess
+    except Exception:
+        log.exception("[universe] keyword 섹터 휴리스틱 실패")
+
+    if secs:
+        db.update_sectors(secs)
+        log.info("[universe] sector 갱신 %d종목 (총 매핑)", len(secs))
 
     return updated_caps
 

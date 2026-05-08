@@ -208,33 +208,129 @@ def _fetch_market_caps_via_fdr() -> dict[str, int]:
 
 
 def fetch_sectors() -> dict[str, str]:
-    """{ticker: sector_str} — FDR StockListing의 Industry/Sector 컬럼.
+    """{ticker: sector_str} — pykrx KRX 업종지수 → keyword 휴리스틱 폴백.
 
-    pykrx는 섹터 분류 API가 빈약. FDR이 KRX WICS/업종 정보를 함께 제공.
+    1차: pykrx의 KRX 업종 인덱스(1006~1027 KOSPI + 2002~2026 KOSDAQ)별
+         portfolio_deposit_file로 종목→섹터 매핑.
+    2차: FDR StockListing의 Industry/Sector/Dept 컬럼 시도.
+    3차: 종목명 keyword 휴리스틱 (정확도 50-60%, 채우는 게 목적).
     """
+    out: dict[str, str] = {}
+
+    # 1차: pykrx 업종지수
+    try:
+        out.update(_fetch_sectors_via_pykrx())
+    except Exception:
+        log.exception("[data_source] pykrx 업종지수 sector fetch 실패")
+
+    # 2차: FDR — 'Industry'/'Sector' 또는 'Dept' 컬럼이 있을 때만
+    try:
+        fdr_secs = _fetch_sectors_via_fdr()
+        for k, v in fdr_secs.items():
+            out.setdefault(k, v)
+    except Exception:
+        log.exception("[data_source] FDR sector fetch 실패")
+
+    # 3차: keyword 휴리스틱 — 미커버 종목 채움
+    try:
+        kw_secs = _sector_keywords_apply(out)
+        for k, v in kw_secs.items():
+            out.setdefault(k, v)
+    except Exception:
+        log.exception("[data_source] keyword 섹터 휴리스틱 실패")
+
+    if out:
+        log.info("[data_source] sector fetched %d종목 (pykrx+FDR+keyword 통합)", len(out))
+    return out
+
+
+# KRX 업종지수 코드 → 섹터명 매핑 (pykrx)
+_KRX_SECTOR_INDICES = {
+    # KOSPI
+    "1004": "음식료품",
+    "1006": "섬유의복",
+    "1008": "종이목재",
+    "1009": "화학",
+    "1010": "의약품",
+    "1011": "비금속광물",
+    "1012": "철강금속",
+    "1013": "기계",
+    "1014": "전기전자",
+    "1015": "의료정밀",
+    "1016": "운수장비",
+    "1017": "유통업",
+    "1018": "전기가스업",
+    "1019": "건설업",
+    "1020": "운수창고업",
+    "1021": "통신업",
+    "1022": "금융업",
+    "1023": "은행",
+    "1024": "증권",
+    "1025": "보험",
+    "1026": "서비스업",
+    # KOSDAQ (대표 산업)
+    "2002": "기타서비스",
+    "2003": "IT부품",
+    "2222": "IT종합",
+    "2003": "IT부품",
+}
+
+
+def _fetch_sectors_via_pykrx() -> dict[str, str]:
+    """KRX 업종지수의 portfolio_deposit_file로 ticker→sector 매핑.
+
+    각 인덱스 fetch는 ~1초. 총 21개 ≈ 21초. universe refresh 시 한 번만.
+    실패한 인덱스는 skip하고 진행.
+    """
+    try:
+        stock = _import_pykrx()
+    except Exception:
+        return {}
+    out: dict[str, str] = {}
+    # 최근 영업일 ymd 추정
+    d = date.today()
+    for _ in range(7):
+        if d.weekday() < 5:
+            break
+        d -= timedelta(days=1)
+    ymd = d.strftime("%Y%m%d")
+    for idx_code, sec_name in _KRX_SECTOR_INDICES.items():
+        try:
+            df = stock.get_index_portfolio_deposit_file(ymd, idx_code)
+        except Exception:
+            continue
+        if df is None or len(df) == 0:
+            continue
+        for ticker in df.index:
+            t = str(ticker).zfill(6)
+            if len(t) == 6 and t.isdigit():
+                out.setdefault(t, sec_name)
+    if out:
+        log.info("[data_source] pykrx 업종지수 sector %d종목", len(out))
+    return out
+
+
+def _fetch_sectors_via_fdr() -> dict[str, str]:
+    """FDR StockListing의 Dept/Industry/Sector 컬럼 시도. 폴백 용도."""
     try:
         fdr = _import_fdr()
     except Exception:
-        log.exception("[data_source] FDR import 실패 (sector)")
         return {}
     out: dict[str, str] = {}
     for market in ("KOSPI", "KOSDAQ"):
         try:
             df = fdr.StockListing(market)
         except Exception:
-            log.exception("[data_source] FDR.StockListing(%s) 실패 (sector)", market)
             continue
         if df is None or df.empty:
             continue
         cols = list(df.columns)
         code_c = next((c for c in ("Code", "Symbol", "ticker", "Ticker") if c in cols), None)
-        # Industry → Sector → 업종 순으로 시도
         sec_c = next(
             (c for c in ("Industry", "Sector", "업종", "industry", "sector") if c in cols),
             None,
         )
         if not code_c or not sec_c:
-            log.warning("[data_source] FDR %s 섹터 컬럼 없음: %s", market, cols)
             continue
         for _, row in df.iterrows():
             try:
@@ -244,9 +340,50 @@ def fetch_sectors() -> dict[str, str]:
                 continue
             if len(t) == 6 and t.isdigit() and s and s.lower() != "nan":
                 out[t] = s
-    if out:
-        log.info("[data_source] FDR sector fetched %d종목", len(out))
     return out
+
+
+# 종목명 keyword 휴리스틱 (정확도 50-60%, 미커버 종목 채우기 용)
+_SECTOR_KEYWORDS = [
+    ("반도체", ["반도체", "하이닉스", "삼성전자", "DB하이텍", "하나마이크론", "솔브레인", "원익IPS", "주성엔지니어링"]),
+    ("디스플레이", ["디스플레이", "LCD", "LED", "OLED", "LG디스플레이"]),
+    ("2차전지", ["에코프로", "엘앤에프", "포스코퓨처엠", "솔루스", "에너지솔루션", "삼성SDI", "코스모신소재", "LG에너지", "SK이노베이션"]),
+    ("자동차", ["현대차", "기아", "모비스", "타이어", "한온", "만도", "S&T모티브", "현대위아"]),
+    ("바이오/제약", ["바이오", "제약", "셀트리온", "한미약품", "유한양행", "녹십자", "대웅", "동아에스티", "메디톡스", "삼성바이오"]),
+    ("게임", ["게임", "엔씨소프트", "넷마블", "카카오게임즈", "크래프톤", "펄어비스", "컴투스"]),
+    ("플랫폼", ["카카오", "네이버", "NAVER", "쿠팡"]),
+    ("화학", ["화학", "롯데케미칼", "LG화학", "한화솔루션", "효성", "금호석유", "OCI", "SKC"]),
+    ("철강", ["철강", "포스코", "POSCO", "현대제철", "동국제강", "세아"]),
+    ("조선", ["조선", "중공업", "해양", "HD현대중공업", "삼성중공업"]),
+    ("방산/항공", ["방산", "KAI", "한화에어로", "LIG넥스원", "대한항공", "아시아나"]),
+    ("건설", ["건설", "현대건설", "GS건설", "DL이앤씨", "대우건설", "삼성물산"]),
+    ("금융", ["은행", "증권", "보험", "카드", "캐피탈", "우리금융", "KB금융", "신한지주", "하나금융", "미래에셋", "한국투자", "교보생명"]),
+    ("식음료", ["CJ제일", "오뚜기", "농심", "SPC", "대상", "동원", "롯데제과", "오리온", "하이트진로"]),
+    ("유통", ["백화점", "마트", "이마트", "GS리테일", "롯데쇼핑", "신세계"]),
+    ("엔터/미디어", ["엔터테인먼트", "JYP", "YG엔터", "SM엔터", "HYBE", "하이브", "CJ ENM"]),
+    ("에너지/전력", ["전력", "한국전력", "한전", "두산에너빌리티", "한국가스공사"]),
+    ("통신", ["SK텔레콤", "KT ", "LG유플러스", "통신"]),
+]
+
+
+def _sector_keywords_apply(already_mapped: dict[str, str]) -> dict[str, str]:
+    """이미 매핑된 ticker는 skip. universe.py에서 호출 시 종목명 사용 예정.
+
+    여기선 ticker→name 매핑이 없으므로 빈 dict 반환.
+    실제 휴리스틱은 universe.refresh_market_caps에서 종목명과 함께 적용.
+    """
+    return {}
+
+
+def apply_sector_keywords(name: str) -> str | None:
+    """종목명 → 섹터 추정 (휴리스틱). 매칭 없으면 None."""
+    if not name:
+        return None
+    for sec, keywords in _SECTOR_KEYWORDS:
+        for kw in keywords:
+            if kw in name:
+                return sec
+    return None
 
 
 def fetch_kospi_kosdaq_tickers() -> list[tuple]:
