@@ -376,16 +376,21 @@ async def industry_top10_job(bot: Bot) -> None:
 # ------------------------------------------------------------------
 MARKET_HELP = (
     "📊 *시황 리서치 봇*\n\n"
+    "*🎯 추천 — AI 큐레이션 (시황 분석 → 주도주·주도산업 선별):*\n"
+    "  `/curate` — Top 10 똑똑한 선별 + 각 선별 이유 (5-15분)\n"
+    "  `/curate 5` — Top 5만\n"
+    "  → 단순 인기/최신을 넘어 오늘 시황·학습가치까지 반영\n\n"
     "*자동 발송:* 매일 오전 9시\n"
     "  조회수 Top 투자전략/시황 리포트 중 *신규*(미발송)만\n\n"
-    "*on-demand (원할 때 즉시):*\n"
-    "  `/recent` — 인기 5건 다시 발송 (dedup 무시, 5000자 요약)\n"
+    "*단순 인기 (큐레이션 없이):*\n"
+    "  `/recent` — 인기 5건 (dedup 무시)\n"
     "  `/recent 10` — 인기 10건\n"
     "  자유 텍스트 `5` 또는 `시황` — `/recent` 와 동일\n\n"
     "*명령:*\n"
     "  /start, /help — 도움말\n"
     "  /trigger — 9시 자동 작업 즉시 실행 (신규만, dedup 적용)\n"
-    "  /recent [개수] — 위 설명 참고\n"
+    "  /recent [개수] — 단순 인기순\n"
+    "  /curate [개수] — AI 큐레이션 (위 설명 참고)\n"
 )
 
 
@@ -427,7 +432,7 @@ def _parse_recent_count(args: list[str], text: str, default: int = 5, cap: int =
 
 
 async def market_recent(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """원할 때 즉시 인기 N건 발송. dedup 무시 (이미 본 것 포함)."""
+    """원할 때 즉시 인기 N건 발송. dedup 무시 (이미 본 것 포함). 단순 인기순."""
     if not _is_authorized(update, "MARKET_ALLOWED_CHAT_IDS"):
         await deny_message(update, "시황봇")
         return
@@ -445,6 +450,27 @@ async def market_recent(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         download_root=Path(os.environ.get("DOWNLOAD_DIR", "./downloads")),
         short_summary=False,  # 5000자
     )
+
+
+async def market_curated(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """AI 큐레이션 — 오늘 시황 분석 → 주도산업·주도주 → Top N 선별 + 이유.
+
+    3단계 LLM 파이프라인 (curator 모듈). 단순 인기/최신 sort보다 비용 ↑ 가치 ↑.
+    """
+    if not _is_authorized(update, "MARKET_ALLOWED_CHAT_IDS"):
+        await deny_message(update, "시황봇")
+        return
+    text = (update.message.text or "").strip()
+    n = _parse_recent_count(context.args or [], text, default=10, cap=15)
+    bot: Bot = context.bot
+    chat_id = str(update.effective_chat.id)
+    try:
+        from src.curator import run_curated
+    except Exception:
+        log.exception("curator 모듈 로드 실패")
+        await update.message.reply_text("❌ 큐레이션 모듈 로드 실패 — /recent 폴백 사용")
+        return
+    await run_curated(bot, chat_id, n=n)
 
 
 async def market_daily_job(bot: Bot) -> None:
@@ -555,6 +581,7 @@ def build_market_app(token: str) -> Application:
     app.add_handler(CommandHandler(["start", "help"], market_help))
     app.add_handler(CommandHandler("trigger", market_trigger))
     app.add_handler(CommandHandler("recent", market_recent))
+    app.add_handler(CommandHandler("curate", market_curated))
     # 자유 텍스트 입력 — "/recent" 와 동일하게 처리 (숫자 → N건, 그 외 → 5건 기본)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, market_recent))
     return app
