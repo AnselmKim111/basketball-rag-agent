@@ -377,11 +377,15 @@ async def industry_top10_job(bot: Bot) -> None:
 MARKET_HELP = (
     "📊 *시황 리서치 봇*\n\n"
     "*자동 발송:* 매일 오전 9시\n"
-    "  조회수 Top 투자전략/시황 리포트 중 신규(미발송) 모두\n"
-    "  각 1000자 요약 + PDF\n\n"
+    "  조회수 Top 투자전략/시황 리포트 중 *신규*(미발송)만\n\n"
+    "*on-demand (원할 때 즉시):*\n"
+    "  `/recent` — 인기 5건 다시 발송 (dedup 무시, 5000자 요약)\n"
+    "  `/recent 10` — 인기 10건\n"
+    "  자유 텍스트 `5` 또는 `시황` — `/recent` 와 동일\n\n"
     "*명령:*\n"
     "  /start, /help — 도움말\n"
-    "  /trigger — 자동 발송 작업 즉시 실행\n"
+    "  /trigger — 9시 자동 작업 즉시 실행 (신규만, dedup 적용)\n"
+    "  /recent [개수] — 위 설명 참고\n"
 )
 
 
@@ -398,6 +402,49 @@ async def market_trigger(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
     await update.message.reply_text("🔄 시황 작업 수동 실행")
     await market_daily_job(context.bot)
+
+
+# ------------------------------------------------------------------
+# on-demand: 시황 인기 N건 즉시 (dedup 없이) — `/recent` 또는 자유 텍스트
+# ------------------------------------------------------------------
+def _parse_recent_count(args: list[str], text: str, default: int = 5, cap: int = 15) -> int:
+    """슬래시 명령 args 또는 자유 텍스트에서 N 추출. 없으면 default. cap 제한.
+
+    우선순위: args[0] → 자유 텍스트 첫 단어. 둘 다 int 변환 실패하면 default.
+    """
+    raw = ""
+    if args:
+        raw = args[0]
+    elif text:
+        parts = text.strip().split()
+        if parts:
+            raw = parts[0]
+    try:
+        n = int(raw)
+    except (ValueError, TypeError):
+        return default
+    return max(1, min(cap, n))
+
+
+async def market_recent(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """원할 때 즉시 인기 N건 발송. dedup 무시 (이미 본 것 포함)."""
+    if not _is_authorized(update, "MARKET_ALLOWED_CHAT_IDS"):
+        await deny_message(update, "시황봇")
+        return
+    text = (update.message.text or "").strip()
+    n = _parse_recent_count(context.args or [], text, default=5, cap=15)
+    bot: Bot = context.bot
+    chat_id = str(update.effective_chat.id)
+    await update.message.reply_text(f"🔄 시황 인기 {n}건 검색 중... (5000자 요약)")
+    await _process_and_send_category(
+        bot=bot, chat_id=chat_id,
+        category="strategy",
+        label=f"투자전략/시황 인기 {n}건",
+        sort_by="popular", limit=n, days_back=14,
+        dedup_key=None,  # ★ on-demand — dedup 안 함
+        download_root=Path(os.environ.get("DOWNLOAD_DIR", "./downloads")),
+        short_summary=False,  # 5000자
+    )
 
 
 async def market_daily_job(bot: Bot) -> None:
@@ -425,12 +472,15 @@ async def market_daily_job(bot: Bot) -> None:
 # ------------------------------------------------------------------
 GLOBAL_HELP = (
     "📊 *글로벌 리서치 봇*\n\n"
-    "*자동 발송:* 매주 토요일 오전 9시\n"
-    "  조회수 Top 글로벌 리포트 10건\n"
-    "  각 1000자 요약 + PDF\n\n"
+    "*자동 발송:* 매주 토요일 오전 9시 (신규 Top10)\n\n"
+    "*on-demand (원할 때 즉시):*\n"
+    "  `/recent` — 인기 5건 다시 발송 (dedup 무시, 5000자)\n"
+    "  `/recent 10` — 인기 10건\n"
+    "  자유 텍스트 `5` 또는 `글로벌` — `/recent` 와 동일\n\n"
     "*명령:*\n"
     "  /start, /help — 도움말\n"
-    "  /trigger — 자동 발송 작업 즉시 실행\n"
+    "  /trigger — 토요일 자동 작업 즉시 실행 (신규만, dedup 적용)\n"
+    "  /recent [개수] — 위 설명 참고\n"
 )
 
 
@@ -447,6 +497,27 @@ async def global_trigger(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
     await update.message.reply_text("🔄 글로벌 작업 수동 실행")
     await global_top10_job(context.bot)
+
+
+async def global_recent(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """원할 때 즉시 글로벌 인기 N건 발송. dedup 무시."""
+    if not _is_authorized(update, "GLOBAL_ALLOWED_CHAT_IDS"):
+        await deny_message(update, "글로벌봇")
+        return
+    text = (update.message.text or "").strip()
+    n = _parse_recent_count(context.args or [], text, default=5, cap=15)
+    bot: Bot = context.bot
+    chat_id = str(update.effective_chat.id)
+    await update.message.reply_text(f"🔄 글로벌 인기 {n}건 검색 중... (5000자 요약)")
+    await _process_and_send_category(
+        bot=bot, chat_id=chat_id,
+        category="global",
+        label=f"글로벌 인기 {n}건",
+        sort_by="popular", limit=n, days_back=14,
+        dedup_key=None,  # ★ on-demand — dedup 안 함
+        download_root=Path(os.environ.get("DOWNLOAD_DIR", "./downloads")),
+        short_summary=False,
+    )
 
 
 async def global_top10_job(bot: Bot) -> None:
@@ -483,6 +554,9 @@ def build_market_app(token: str) -> Application:
     app = Application.builder().token(token).build()
     app.add_handler(CommandHandler(["start", "help"], market_help))
     app.add_handler(CommandHandler("trigger", market_trigger))
+    app.add_handler(CommandHandler("recent", market_recent))
+    # 자유 텍스트 입력 — "/recent" 와 동일하게 처리 (숫자 → N건, 그 외 → 5건 기본)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, market_recent))
     return app
 
 
@@ -490,4 +564,6 @@ def build_global_app(token: str) -> Application:
     app = Application.builder().token(token).build()
     app.add_handler(CommandHandler(["start", "help"], global_help))
     app.add_handler(CommandHandler("trigger", global_trigger))
+    app.add_handler(CommandHandler("recent", global_recent))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, global_recent))
     return app
