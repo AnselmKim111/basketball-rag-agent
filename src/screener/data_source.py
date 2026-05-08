@@ -121,49 +121,131 @@ def fetch_ohlcv_by_ticker_via_fdr(
 
 
 def fetch_market_caps(date_str: str | None = None) -> dict[str, int]:
-    """KOSPI+KOSDAQ 전 종목 시가총액 (원 단위) — pykrx 사용.
+    """KOSPI+KOSDAQ 전 종목 시가총액 (원 단위) — pykrx 시도, 실패 시 FDR 폴백.
 
-    date_str=None이면 최근 영업일 기준. 빈 dict면 fetch 실패.
+    date_str=None이면 최근 영업일. 빈 dict면 fetch 실패.
     """
+    # pykrx 시도 (15일 backoff — 미래 날짜/연말 휴장 대응)
     stock = _import_pykrx()
     if date_str is None:
-        # 오늘 또는 최근 영업일 — pykrx는 휴장일에 빈 결과
         d = date.today()
-        for _ in range(7):
+        for _ in range(15):
             ds = d.strftime("%Y%m%d")
-            try:
-                df = stock.get_market_cap(ds, market="ALL")
-                if df is not None and not df.empty:
-                    date_str = ds
-                    break
-            except Exception:
-                pass
+            if d.weekday() < 5:  # 평일만
+                try:
+                    df = stock.get_market_cap(ds, market="ALL")
+                    if df is not None and not df.empty:
+                        date_str = ds
+                        break
+                except Exception:
+                    pass
             d -= timedelta(days=1)
         else:
-            return {}
+            df = None
     else:
         try:
             df = stock.get_market_cap(date_str, market="ALL")
+            if df is None or df.empty:
+                df = None
         except Exception as e:
-            log.warning("[data_source] market_cap fetch %s 실패: %s", date_str, e)
-            return {}
-        if df is None or df.empty:
-            return {}
-    cols = list(df.columns)
-    cap_c = next((c for c in ("시가총액", "MarketCap", "market_cap") if c in cols), None)
-    if cap_c is None:
-        log.warning("[data_source] market_cap 컬럼 인식 실패: %s", cols)
+            log.warning("[data_source] pykrx market_cap %s 실패: %s", date_str, e)
+            df = None
+
+    if df is not None:
+        cols = list(df.columns)
+        cap_c = next((c for c in ("시가총액", "MarketCap", "market_cap") if c in cols), None)
+        if cap_c:
+            out: dict[str, int] = {}
+            for ticker, row in df.iterrows():
+                try:
+                    cap = int(row[cap_c])
+                except Exception:
+                    continue
+                if cap > 0:
+                    out[str(ticker)] = cap
+            if out:
+                log.info("[data_source] pykrx market_cap fetched %d종목 (date=%s)", len(out), date_str)
+                return out
+
+    # FDR 폴백
+    log.warning("[data_source] pykrx market_cap 빈 결과 → FDR StockListing 폴백")
+    return _fetch_market_caps_via_fdr()
+
+
+def _fetch_market_caps_via_fdr() -> dict[str, int]:
+    """FDR StockListing의 Marcap 컬럼으로 시총 fetch."""
+    try:
+        fdr = _import_fdr()
+    except Exception:
+        log.exception("[data_source] FDR import 실패")
         return {}
     out: dict[str, int] = {}
-    for ticker, row in df.iterrows():
+    for market in ("KOSPI", "KOSDAQ"):
         try:
-            cap = int(row[cap_c])
+            df = fdr.StockListing(market)
         except Exception:
+            log.exception("[data_source] FDR.StockListing(%s) 실패", market)
             continue
-        if cap <= 0:
+        if df is None or df.empty:
             continue
-        out[str(ticker)] = cap
-    log.info("[data_source] market_cap fetched %d종목 (date=%s)", len(out), date_str)
+        cols = list(df.columns)
+        code_c = next((c for c in ("Code", "Symbol", "ticker", "Ticker") if c in cols), None)
+        cap_c = next((c for c in ("Marcap", "MarketCap", "market_cap") if c in cols), None)
+        if not code_c or not cap_c:
+            log.warning("[data_source] FDR %s 시총 컬럼 인식 실패: %s", market, cols)
+            continue
+        for _, row in df.iterrows():
+            try:
+                t = str(row[code_c]).zfill(6)
+                cap = int(row[cap_c])
+            except Exception:
+                continue
+            if len(t) == 6 and t.isdigit() and cap > 0:
+                out[t] = cap
+    if out:
+        log.info("[data_source] FDR market_cap fetched %d종목", len(out))
+    return out
+
+
+def fetch_sectors() -> dict[str, str]:
+    """{ticker: sector_str} — FDR StockListing의 Industry/Sector 컬럼.
+
+    pykrx는 섹터 분류 API가 빈약. FDR이 KRX WICS/업종 정보를 함께 제공.
+    """
+    try:
+        fdr = _import_fdr()
+    except Exception:
+        log.exception("[data_source] FDR import 실패 (sector)")
+        return {}
+    out: dict[str, str] = {}
+    for market in ("KOSPI", "KOSDAQ"):
+        try:
+            df = fdr.StockListing(market)
+        except Exception:
+            log.exception("[data_source] FDR.StockListing(%s) 실패 (sector)", market)
+            continue
+        if df is None or df.empty:
+            continue
+        cols = list(df.columns)
+        code_c = next((c for c in ("Code", "Symbol", "ticker", "Ticker") if c in cols), None)
+        # Industry → Sector → 업종 순으로 시도
+        sec_c = next(
+            (c for c in ("Industry", "Sector", "업종", "industry", "sector") if c in cols),
+            None,
+        )
+        if not code_c or not sec_c:
+            log.warning("[data_source] FDR %s 섹터 컬럼 없음: %s", market, cols)
+            continue
+        for _, row in df.iterrows():
+            try:
+                t = str(row[code_c]).zfill(6)
+                s = str(row[sec_c] or "").strip()
+            except Exception:
+                continue
+            if len(t) == 6 and t.isdigit() and s and s.lower() != "nan":
+                out[t] = s
+    if out:
+        log.info("[data_source] FDR sector fetched %d종목", len(out))
     return out
 
 

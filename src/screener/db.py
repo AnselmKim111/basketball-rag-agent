@@ -77,11 +77,15 @@ def ensure_schema() -> None:
             );
             """
         )
-        # market_cap 컬럼 추가 (기존 DB 호환). SQLite는 IF NOT EXISTS for ALTER 미지원.
-        try:
-            c.execute("ALTER TABLE tickers ADD COLUMN market_cap INTEGER")
-        except sqlite3.OperationalError:
-            pass  # 이미 존재
+        # market_cap, sector 컬럼 추가 (기존 DB 호환). SQLite ALTER는 IF NOT EXISTS 미지원.
+        for col_def in (
+            "ALTER TABLE tickers ADD COLUMN market_cap INTEGER",
+            "ALTER TABLE tickers ADD COLUMN sector TEXT",
+        ):
+            try:
+                c.execute(col_def)
+            except sqlite3.OperationalError:
+                pass  # 이미 존재
     _INITIALIZED = True
     log.info("[screener.db] 스키마 준비 완료 path=%s", DB_PATH)
 
@@ -213,15 +217,33 @@ def update_market_caps(caps: dict[str, int]) -> int:
     return len(caps)
 
 
+def update_sectors(secs: dict[str, str]) -> int:
+    """{ticker: sector} 일괄 업데이트."""
+    if not secs:
+        return 0
+    ensure_schema()
+    with _conn() as c:
+        c.execute("BEGIN")
+        c.executemany(
+            "UPDATE tickers SET sector=? WHERE ticker=?",
+            [(str(v), k) for k, v in secs.items()],
+        )
+        c.execute("COMMIT")
+    return len(secs)
+
+
 def get_active_tickers() -> list[dict]:
     ensure_schema()
     with _conn() as c:
         cur = c.execute(
-            "SELECT ticker, name, market, market_cap FROM tickers "
+            "SELECT ticker, name, market, market_cap, sector FROM tickers "
             "WHERE is_active=1 ORDER BY ticker"
         )
         return [
-            {"ticker": r[0], "name": r[1], "market": r[2], "market_cap": r[3]}
+            {
+                "ticker": r[0], "name": r[1], "market": r[2],
+                "market_cap": r[3], "sector": r[4],
+            }
             for r in cur.fetchall()
         ]
 

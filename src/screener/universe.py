@@ -79,15 +79,24 @@ def refresh_universe() -> int:
 
 
 def refresh_market_caps() -> int:
-    """시총만 갱신 (universe rebuild 없이). cron에서 매일 호출 가능."""
+    """시총 + 섹터 갱신 (universe rebuild 없이). cron에서 매일 호출 가능."""
+    updated_caps = 0
     try:
         caps = data_source.fetch_market_caps()
+        if caps:
+            updated_caps = db.update_market_caps(caps)
     except Exception:
         log.exception("[universe] market_cap fetch 실패")
-        return 0
-    if not caps:
-        return 0
-    return db.update_market_caps(caps)
+
+    try:
+        secs = data_source.fetch_sectors()
+        if secs:
+            db.update_sectors(secs)
+            log.info("[universe] sector 갱신 %d종목", len(secs))
+    except Exception:
+        log.exception("[universe] sector fetch 실패")
+
+    return updated_caps
 
 
 def get_universe_tickers() -> list[dict]:
