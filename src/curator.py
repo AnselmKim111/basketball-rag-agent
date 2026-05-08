@@ -51,7 +51,7 @@ KST = timezone(timedelta(hours=9))
 SYNTHESIS_MODEL_ENV = "IDEA_SYNTHESIS_MODEL"
 DEFAULT_SYNTHESIS_MODEL = "anthropic/claude-sonnet-4.5"
 
-DEFAULT_DAYS_BACK = 14
+DEFAULT_DAYS_BACK = 5  # 후보 풀: 최근 5일 (사용자 의도 — 즉시 거래 가능한 신선한 리서치)
 SUMMARY_CHARS = 5000  # 5000자 요약 (long)
 
 
@@ -182,6 +182,10 @@ def _collect_pool_blocking(mode: CuratorMode, days_back: int) -> list[CandidateI
         for label in CATEGORY_LABEL.values()
         if sum(1 for c in pool if c.category == label)
     )
+    # 신선도 우선 — 날짜 desc 정렬 후 LLM에 노출 (메타 블록 상단=최신)
+    def _sort_key(c: CandidateItem) -> str:
+        return getattr(c.item, "date", "") or getattr(c.item, "date_short", "") or ""
+    pool.sort(key=_sort_key, reverse=True)
     log.info("curator pool 수집 완료 [%s]: %d items (%s)", mode.name, len(pool), cat_breakdown)
     return pool
 
@@ -263,10 +267,13 @@ CURATE_PROMPT = """위 시황 컨텍스트를 기반으로, 사용자에게 보�
 {meta_block}
 
 선별 기준 (우선순위 순):
-1. 오늘 핵심 흐름을 짚는 리포트 (주도 영역 분석)
-2. 새로 공부할 가치 있는 영역의 깊이 있는 분석
-3. **도메인별 추가 강조**: {curate_focus}
-4. **단순 인기·최신만 보면 안 잡히는, 의미 있는 리포트 우선**
+1. **신선도 절대 우선** — 오늘({date_today}) 또는 최근 1-2일 발행 리포트만 우선 선별.
+   3일 이상 지난 리포트는 시황 변화 반영 못 해 즉시 거래에 부적합.
+   가능한 한 오늘 발행분만으로 채우고, 부족 시에만 어제·그제까지 확장.
+2. 오늘 핵심 흐름을 짚는 리포트 (주도 영역 분석)
+3. 새로 공부할 가치 있는 영역의 깊이 있는 분석
+4. **도메인별 추가 강조**: {curate_focus}
+5. **단순 인기에만 의존 금지** — 발행 빈도 높은 종목 자동 우대 X
 
 출력 (반드시 valid JSON만):
 {{
@@ -315,6 +322,7 @@ async def curate_picks(
         recon=recon_text or "(시황 컨텍스트 없음)",
         meta_block=_build_meta_block(pool),
         curate_focus=mode.curate_focus,
+        date_today=datetime.now(KST).strftime("%Y-%m-%d"),
     )
     model = os.getenv(SYNTHESIS_MODEL_ENV) or DEFAULT_SYNTHESIS_MODEL
     log.info("curator curate 호출 [%s]: model=%s, n=%d/%d", mode.name, model, n, len(pool))
