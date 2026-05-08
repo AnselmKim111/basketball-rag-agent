@@ -16,7 +16,12 @@ from telegram import Bot, Update
 from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, ContextTypes
 
-from src.bot_helpers import deny_message, is_authorized, send_text_chunked
+from src.bot_helpers import (
+    deny_message,
+    is_authorized,
+    make_post_init_set_commands,
+    send_text_chunked,
+)
 
 log = logging.getLogger(__name__)
 KST = timezone(timedelta(hours=9))
@@ -242,8 +247,21 @@ async def _self_test(bot: Bot) -> None:
 # ------------------------------------------------------------------
 # Entry point (orchestrator가 호출)
 # ------------------------------------------------------------------
+SCREENER_COMMANDS = [
+    ("screen", "📈 즉시 스크리닝 실행 (52주/일목/거래량 신호)"),
+    ("status", "DB 상태 + 데이터 최신성"),
+    ("backfill", "1년치 강제 재백필 (10분+)"),
+    ("help", "도움말"),
+]
+
+
 def build_screener_app(token: str) -> Application:
-    app = Application.builder().token(token).build()
+    app = (
+        Application.builder()
+        .token(token)
+        .post_init(make_post_init_set_commands(SCREENER_COMMANDS))
+        .build()
+    )
     app.add_handler(CommandHandler(["start", "help"], _help))
     app.add_handler(CommandHandler("screen", _cmd_screen))
     app.add_handler(CommandHandler("status", _cmd_status))

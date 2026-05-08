@@ -30,6 +30,7 @@ from src import disclosure_watcher, watchlist_store
 from src.bot_helpers import (
     deny_message,
     is_authorized,
+    make_post_init_set_commands,
     send_text_chunked,
 )
 
@@ -221,9 +222,24 @@ async def _cmd_unmute(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await update.message.reply_text(("✅ " if ok else "ℹ️ ") + msg)
 
 
+DISCLOSURE_COMMANDS = [
+    ("watch", "📡 종목 추적 시작 (예: /watch 005930 또는 /watch 카카오)"),
+    ("unwatch", "추적 해제"),
+    ("watchlist", "현재 추적 종목 + 음소거 상태"),
+    ("mute", "일시 음소거 (예: /mute 005930 7)"),
+    ("unmute", "음소거 해제"),
+    ("help", "도움말"),
+]
+
+
 def build_disclosure_app(token: str) -> Application:
     """오케스트레이터가 호출. 토큰만 받아 Application 반환."""
-    app = Application.builder().token(token).build()
+    app = (
+        Application.builder()
+        .token(token)
+        .post_init(make_post_init_set_commands(DISCLOSURE_COMMANDS))
+        .build()
+    )
     app.add_handler(CommandHandler(["start", "help"], _help))
     app.add_handler(CommandHandler("watch", _cmd_watch))
     app.add_handler(CommandHandler("unwatch", _cmd_unwatch))

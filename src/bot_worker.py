@@ -35,7 +35,12 @@ from telegram.ext import (
     filters,
 )
 
-from src.bot_helpers import allowed_chat_ids, deny_message, is_authorized as _bh_is_authorized
+from src.bot_helpers import (
+    allowed_chat_ids,
+    deny_message,
+    is_authorized as _bh_is_authorized,
+    make_post_init_set_commands,
+)
 from src.pipeline_lock import PIPELINE_LOCK
 
 
@@ -419,9 +424,24 @@ async def cmd_curate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await run_curated(bot, chat_id, n=n, mode=COMPANY_MODE)
 
 
+COMPANY_COMMANDS = [
+    ("curate", "🎯 AI 큐레이션 — 주도주·학습가치 종목 Top N 선별"),
+    ("report", "특정 종목 리포트 다운 + 요약"),
+    ("deepdive", "DART 사업보고서·IR·재무차트 심층분석"),
+    ("status", "현재 작업 진행 상태"),
+    ("deephelp", "deepdive 상세 도움말"),
+    ("help", "전체 도움말"),
+]
+
+
 def build_company_app(token: str) -> Application:
     """orchestrator가 import해 사용. CompanyBot의 Application을 반환."""
-    app = Application.builder().token(token).build()
+    app = (
+        Application.builder()
+        .token(token)
+        .post_init(make_post_init_set_commands(COMPANY_COMMANDS))
+        .build()
+    )
     app.add_handler(CommandHandler(["start", "help"], cmd_start))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("report", cmd_report))
