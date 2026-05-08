@@ -51,21 +51,83 @@ KST = timezone(timedelta(hours=9))
 SYNTHESIS_MODEL_ENV = "IDEA_SYNTHESIS_MODEL"
 DEFAULT_SYNTHESIS_MODEL = "anthropic/claude-sonnet-4.5"
 
-# 후보 풀 사이즈 — Sonnet 입력 한도 + 응답 시간 균형
-CANDIDATE_LIMITS = {
-    "strategy": 30,   # 시황·전략
-    "industry": 30,   # 산업
-    "global":   20,   # 글로벌
-}
 DEFAULT_DAYS_BACK = 14
 SUMMARY_CHARS = 5000  # 5000자 요약 (long)
+
+
+# ------------------------------------------------------------------
+# 모드 정의 — 시황봇 / 산업봇 / 종목봇 각각 도메인 다름
+# ------------------------------------------------------------------
+@dataclass
+class CuratorMode:
+    """각 봇별 큐레이션 도메인 설정.
+
+    sources    : wisereport 카테고리별 fetch 한도 ({카테고리: 한도}).
+                 popular + latest 두 번씩 호출 → dedup → 합집합.
+    recon_focus: Stage 1 프롬프트의 어디 집중해야 하는지 안내문.
+    curate_focus: Stage 2 선별 기준에 추가할 도메인별 강조점.
+    label      : 사용자에게 표시할 봇 도메인 라벨 ("시황 종합", "산업", "종목").
+    """
+    name: str
+    label: str
+    sources: dict[str, int]
+    recon_focus: str
+    curate_focus: str
+
+
+MARKET_MODE = CuratorMode(
+    name="market",
+    label="시황 종합",
+    sources={"strategy": 30, "industry": 30, "global": 20},
+    recon_focus=(
+        "시황·전략·산업·글로벌을 모두 종합. 오늘 시장의 큰 흐름·주도산업·주도종목, "
+        "그리고 새로 공부할 가치 있는 산업·테마까지 균형있게."
+    ),
+    curate_focus="산업/시황/글로벌 균형 (한 카테고리 60% 초과 금지). 시장 큰 그림 우선.",
+)
+
+INDUSTRY_MODE = CuratorMode(
+    name="industry",
+    label="산업",
+    sources={"industry": 60},
+    recon_focus=(
+        "산업 사이클·테마 트렌드 분석에 집중. 종목 단편 분석보다 산업 전체 사이클·"
+        "공급망·정책 방향이 핵심. 새로 공부할 가치 있는 산업도 적극 발굴."
+    ),
+    curate_focus=(
+        "다양한 산업 분포 우선 (한 산업 30% 초과 금지). 단편 분석보다 deep-dive 산업 "
+        "리포트, 사이클 진단·정책 임팩트 우선. 공부 가치 강조."
+    ),
+)
+
+COMPANY_MODE = CuratorMode(
+    name="company",
+    label="종목",
+    sources={"company": 60},
+    recon_focus=(
+        "오늘의 주도주·테마주를 식별. 어떤 종목들이 시장 주목 받는지, 새로 공부할 "
+        "가치 있는 (덜 알려진) 종목도 함께. 산업 흐름은 종목 컨텍스트로만."
+    ),
+    curate_focus=(
+        "다양한 산업·증권사 분포 (한 산업 40% 초과 금지). 시총 큰 종목 자동 우대 "
+        "금지 — 깊이 있는 분석·새로 공부할 가치 우선. 단순 매수의견 단편 보고서는 후순위."
+    ),
+)
+
+
+CATEGORY_LABEL = {
+    "strategy": "시황",
+    "industry": "산업",
+    "global":   "글로벌",
+    "company":  "종목",
+}
 
 
 @dataclass
 class CandidateItem:
     """ReportItem + 카테고리 라벨 (LLM에 전달용)."""
     item: ReportItem
-    category: str  # "시황" / "산업" / "글로벌"
+    category: str  # "시황" / "산업" / "글로벌" / "종목"
 
     @property
     def date_short(self) -> str:
@@ -73,7 +135,6 @@ class CandidateItem:
 
     def meta_line(self, idx: int) -> str:
         """LLM 프롬프트에 넣을 한 줄. idx는 1-based 선택용 번호."""
-        # 증권사 정보가 sch_cont (회사 코드?) 또는 title prefix에 있을 수 있음 — 단순 표기
         title = self.item.title or "(제목 없음)"
         return f"{idx}. [{self.category}] {self.date_short} | {title} (rpt_id={self.item.rpt_id})"
 
@@ -81,17 +142,14 @@ class CandidateItem:
 # ------------------------------------------------------------------
 # Stage 0: 후보 풀 수집 (wisereport list-only)
 # ------------------------------------------------------------------
-def _collect_pool_blocking(days_back: int) -> list[CandidateItem]:
-    """blocking — wisereport 세션 한 번 열어 3 카테고리 메타 수집.
+def _collect_pool_blocking(mode: CuratorMode, days_back: int) -> list[CandidateItem]:
+    """blocking — wisereport 세션 한 번 열어 mode.sources 카테고리 메타 수집.
 
-    각 카테고리에서 popular + latest 두 번 호출 → dedup → 합침.
-    PDF 다운로드는 안 함.
+    각 카테고리에서 popular + latest 두 번 호출 → dedup → 합침. PDF 다운 안 함.
     """
     wr_id, wr_pw = wisereport_creds()
     pool: list[CandidateItem] = []
     seen_ids: set[str] = set()
-
-    cat_label = {"strategy": "시황", "industry": "산업", "global": "글로벌"}
 
     with WisereportClient(
         user_id=wr_id,
@@ -102,7 +160,7 @@ def _collect_pool_blocking(days_back: int) -> list[CandidateItem]:
         state_file=Path(os.environ.get("STORAGE_STATE", "./.wisereport_state.json")),
     ) as cli:
         cli.ensure_logged_in()
-        for category, base_limit in CANDIDATE_LIMITS.items():
+        for category, base_limit in mode.sources.items():
             for sort_by in ("popular", "latest"):
                 try:
                     raw = cli.list_top_reports(
@@ -118,20 +176,21 @@ def _collect_pool_blocking(days_back: int) -> list[CandidateItem]:
                     if it.rpt_id in seen_ids:
                         continue
                     seen_ids.add(it.rpt_id)
-                    pool.append(CandidateItem(item=it, category=cat_label[category]))
-    log.info(
-        "curator pool 수집 완료: %d items (시황 %d, 산업 %d, 글로벌 %d)",
-        len(pool),
-        sum(1 for c in pool if c.category == "시황"),
-        sum(1 for c in pool if c.category == "산업"),
-        sum(1 for c in pool if c.category == "글로벌"),
+                    pool.append(CandidateItem(item=it, category=CATEGORY_LABEL.get(category, category)))
+    cat_breakdown = ", ".join(
+        f"{label}={sum(1 for c in pool if c.category == label)}"
+        for label in CATEGORY_LABEL.values()
+        if sum(1 for c in pool if c.category == label)
     )
+    log.info("curator pool 수집 완료 [%s]: %d items (%s)", mode.name, len(pool), cat_breakdown)
     return pool
 
 
-async def collect_candidate_pool(days_back: int = DEFAULT_DAYS_BACK) -> list[CandidateItem]:
+async def collect_candidate_pool(
+    mode: CuratorMode, days_back: int = DEFAULT_DAYS_BACK,
+) -> list[CandidateItem]:
     loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, _collect_pool_blocking, days_back)
+    return await loop.run_in_executor(None, _collect_pool_blocking, mode, days_back)
 
 
 # ------------------------------------------------------------------
@@ -141,15 +200,16 @@ RECON_PROMPT = """오늘은 {date} (KST). 한국·글로벌 증권사들이 발�
 
 이걸로 오늘의 시장 컨텍스트를 정리해줘.
 
+**도메인 집중 영역**: {recon_focus}
+
 [리포트 메타]
 {meta_block}
 
 분석 항목 (마크다운 ## 헤더 + bullet):
-1. **오늘 한국 시장 핵심 흐름** — 3-4줄, 발행 빈도·증권사·날짜 패턴에서 추론
-2. **주도산업 (3-5개)** — 각 1줄, 모멘텀 이유
-3. **주도종목 (2-4개)** — 가능하면 종목명·티커
-4. **새로 공부할 가치 있는 산업·테마 (1-2개)** — 왜 지금 봐야 하는지
-5. **글로벌 핵심 흐름 (1-2줄, 선택)**
+1. **오늘 핵심 흐름** — 3-4줄, 발행 빈도·증권사·날짜 패턴에서 추론
+2. **주도 영역 (3-5개)** — 각 1줄, 모멘텀 이유 (산업·종목·테마 중 도메인에 맞게)
+3. **새로 공부할 가치 있는 영역 (1-2개)** — 왜 지금 봐야 하는지
+4. **부수 흐름 (1-2줄, 선택)**
 
 규칙:
 - 메타데이터(제목·발행일·증권사)에 명시된 정보만 사용. 임의 추정 금지.
@@ -161,7 +221,7 @@ def _build_meta_block(pool: list[CandidateItem]) -> str:
     return "\n".join(c.meta_line(i + 1) for i, c in enumerate(pool))
 
 
-async def recon_today(pool: list[CandidateItem]) -> str:
+async def recon_today(pool: list[CandidateItem], mode: CuratorMode) -> str:
     """후보 메타로 오늘 시황 컨텍스트 추출. 실패 시 빈 string."""
     if not pool:
         return ""
@@ -172,10 +232,11 @@ async def recon_today(pool: list[CandidateItem]) -> str:
         date=today,
         days=DEFAULT_DAYS_BACK,
         n=len(pool),
+        recon_focus=mode.recon_focus,
         meta_block=_build_meta_block(pool),
     )
     model = os.getenv(SYNTHESIS_MODEL_ENV) or DEFAULT_SYNTHESIS_MODEL
-    log.info("curator recon 호출: model=%s, n=%d", model, len(pool))
+    log.info("curator recon 호출 [%s]: model=%s, n=%d", mode.name, model, len(pool))
     text = await loop.run_in_executor(
         None,
         lambda: chat_with_retry(
@@ -184,7 +245,7 @@ async def recon_today(pool: list[CandidateItem]) -> str:
             max_tokens=1200,
             model=model,
             temperature=0.3,
-            context="curator recon",
+            context=f"curator recon ({mode.name})",
         ),
     )
     return (text or "").strip()
@@ -202,9 +263,9 @@ CURATE_PROMPT = """위 시황 컨텍스트를 기반으로, 사용자에게 보�
 {meta_block}
 
 선별 기준 (우선순위 순):
-1. 오늘 시황 핵심을 짚는 리포트 (주도산업·주도주 분석)
-2. 새로 공부할 가치 있는 산업의 깊이 있는 분석
-3. 다양성 — 산업/시황/글로벌 균형 (한 카테고리 60% 초과 금지)
+1. 오늘 핵심 흐름을 짚는 리포트 (주도 영역 분석)
+2. 새로 공부할 가치 있는 영역의 깊이 있는 분석
+3. **도메인별 추가 강조**: {curate_focus}
 4. **단순 인기·최신만 보면 안 잡히는, 의미 있는 리포트 우선**
 
 출력 (반드시 valid JSON만):
@@ -241,7 +302,7 @@ def _extract_json(text: str) -> dict | None:
 
 
 async def curate_picks(
-    pool: list[CandidateItem], recon_text: str, n: int,
+    pool: list[CandidateItem], recon_text: str, n: int, mode: CuratorMode,
 ) -> list[tuple[CandidateItem, str]]:
     """Top N 선별 + 각 이유. 실패 시 빈 리스트 → 호출자가 fallback (인기순)."""
     if not pool:
@@ -253,9 +314,10 @@ async def curate_picks(
         n=n,
         recon=recon_text or "(시황 컨텍스트 없음)",
         meta_block=_build_meta_block(pool),
+        curate_focus=mode.curate_focus,
     )
     model = os.getenv(SYNTHESIS_MODEL_ENV) or DEFAULT_SYNTHESIS_MODEL
-    log.info("curator curate 호출: model=%s, n=%d/%d", model, n, len(pool))
+    log.info("curator curate 호출 [%s]: model=%s, n=%d/%d", mode.name, model, n, len(pool))
     raw = await loop.run_in_executor(
         None,
         lambda: chat_with_retry(
@@ -335,7 +397,7 @@ def _download_and_summarize_blocking(
     return out
 
 
-async def run_curated(bot: Bot, chat_id: str, n: int = 10) -> None:
+async def run_curated(bot: Bot, chat_id: str, n: int = 10, mode: CuratorMode = MARKET_MODE) -> None:
     """전체 큐레이션 파이프라인 + 발송.
 
     PIPELINE_LOCK 안에서 wisereport 세션 사용. LLM 호출은 lock 밖에서 가능하지만
@@ -354,12 +416,13 @@ async def run_curated(bot: Bot, chat_id: str, n: int = 10) -> None:
         return
 
     started = datetime.now(KST).strftime("%Y-%m-%d %H:%M")
+    src_label = " · ".join(mode.sources.keys())
     await send_text_chunked(
         bot, chat_id,
-        f"🔍 *오늘의 시황 큐레이션 시작* ({started})\n"
+        f"🔍 *오늘의 {mode.label} 큐레이션 시작* ({started})\n"
         f"3단계 분석 진행 — Top {n} 선별까지 5-15분 소요\n"
-        f"  1️⃣ 후보 풀 수집 (시황·산업·글로벌)\n"
-        f"  2️⃣ AI 시황 분석 → 주도산업·주도주\n"
+        f"  1️⃣ 후보 풀 수집 ({src_label})\n"
+        f"  2️⃣ AI 분석 → 주도 영역\n"
         f"  3️⃣ AI 큐레이션 → Top {n} + 선별 이유",
         parse_mode="Markdown",
     )
@@ -367,9 +430,9 @@ async def run_curated(bot: Bot, chat_id: str, n: int = 10) -> None:
     async with PIPELINE_LOCK:
         # Stage 0
         try:
-            pool = await collect_candidate_pool()
+            pool = await collect_candidate_pool(mode)
         except Exception:
-            log.exception("curator Stage 0 실패")
+            log.exception("curator Stage 0 실패 [%s]", mode.name)
             await send_text_chunked(bot, chat_id, "❌ wisereport 후보 수집 실패")
             return
         if not pool:
@@ -377,32 +440,32 @@ async def run_curated(bot: Bot, chat_id: str, n: int = 10) -> None:
             return
         await send_text_chunked(
             bot, chat_id,
-            f"✅ 후보 풀 {len(pool)}건 수집 완료 — 시황 분석 중...",
+            f"✅ 후보 풀 {len(pool)}건 수집 완료 — {mode.label} 분석 중...",
         )
 
         # Stage 1
         try:
-            recon_text = await recon_today(pool)
+            recon_text = await recon_today(pool, mode)
         except Exception:
-            log.exception("curator Stage 1 실패")
+            log.exception("curator Stage 1 실패 [%s]", mode.name)
             recon_text = ""
         if recon_text:
             await send_text_chunked(
                 bot, chat_id,
-                f"📊 *오늘의 시황 분석*\n\n{recon_text}",
+                f"📊 *오늘의 {mode.label} 분석*\n\n{recon_text}",
                 parse_mode="Markdown",
             )
         else:
             await send_text_chunked(
                 bot, chat_id,
-                "⚠️ 시황 분석 실패 — 큐레이션은 계속 진행 (인기순 폴백 가능)",
+                "⚠️ 분석 실패 — 큐레이션은 계속 진행 (인기순 폴백 가능)",
             )
 
         # Stage 2
         try:
-            picks = await curate_picks(pool, recon_text, n)
+            picks = await curate_picks(pool, recon_text, n, mode)
         except Exception:
-            log.exception("curator Stage 2 실패")
+            log.exception("curator Stage 2 실패 [%s]", mode.name)
             picks = [(c, "(큐레이션 실패 폴백)") for c in pool[:n]]
         if not picks:
             await send_text_chunked(bot, chat_id, "❌ 큐레이션 실패 — 후보 0")

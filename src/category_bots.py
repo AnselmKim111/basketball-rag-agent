@@ -224,16 +224,18 @@ def _filter_and_order(
 # ------------------------------------------------------------------
 INDUSTRY_HELP = (
     "📊 *산업 리서치 봇*\n\n"
-    "*자동 발송:* 매일 오전 9시 (시황봇과 동일 인터벌)\n"
-    "  조회수 Top 산업 리포트 10건 (rpt_id+title 중복 제외, 최신 날짜 우선)\n\n"
-    "*수동 요청:* 산업명 입력하면 5+5 발송\n"
-    "  - 인기순 5건 + 최신순 5건\n"
-    "  - 각 5000자 요약\n"
-    "  예: `반도체` 또는 `/industry 반도체`\n\n"
+    "*🎯 추천 — AI 큐레이션 (오늘의 주도산업·학습가치 산업 선별):*\n"
+    "  `/curate` — Top 10 똑똑한 산업 리포트 + 각 선별 이유 (5-15분)\n"
+    "  `/curate 5` — Top 5\n"
+    "  → 다양한 산업 분포 + 깊이 있는 사이클·테마 분석 우선\n\n"
+    "*자동 발송:* 매일 오전 9시 — 신규 Top 10 (dedup 적용)\n\n"
+    "*수동 요청 (특정 산업):*\n"
+    "  `반도체` 또는 `/industry 반도체` — 인기 5건 + 최신 5건, 5000자\n\n"
     "*명령:*\n"
     "  /start, /help — 도움말\n"
-    "  /industry <산업명> — 해당 산업 리포트\n"
-    "  /trigger — 자동 발송 작업 즉시 실행 (테스트)\n"
+    "  /curate [개수] — AI 큐레이션 (위 추천 참고)\n"
+    "  /industry <산업명> — 특정 산업 리포트\n"
+    "  /trigger — 9시 자동 작업 즉시 실행\n"
 )
 
 
@@ -351,6 +353,27 @@ async def industry_trigger(
     await industry_top10_job(context.bot)
 
 
+async def industry_curated(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """산업 도메인 AI 큐레이션 — 주도산업·학습가치 산업 선별 + Top N 리포트.
+
+    `/curate [N]`. INDUSTRY_MODE 사용 (industry 카테고리만, 다양한 산업 분포 우선).
+    """
+    if not _is_authorized(update, "INDUSTRY_ALLOWED_CHAT_IDS"):
+        await deny_message(update, "산업봇")
+        return
+    text = (update.message.text or "").strip()
+    n = _parse_recent_count(context.args or [], text, default=10, cap=15)
+    bot: Bot = context.bot
+    chat_id = str(update.effective_chat.id)
+    try:
+        from src.curator import INDUSTRY_MODE, run_curated
+    except Exception:
+        log.exception("curator 모듈 로드 실패 (industry)")
+        await update.message.reply_text("❌ 큐레이션 모듈 로드 실패")
+        return
+    await run_curated(bot, chat_id, n=n, mode=INDUSTRY_MODE)
+
+
 # 스케줄 잡 — orchestrator의 APScheduler가 호출
 async def industry_top10_job(bot: Bot) -> None:
     """매일 09:00 KST: 산업 카테고리 조회수 Top 10 (rpt_id+title 중복 제외, 최신 날짜 우선)."""
@@ -465,12 +488,12 @@ async def market_curated(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     bot: Bot = context.bot
     chat_id = str(update.effective_chat.id)
     try:
-        from src.curator import run_curated
+        from src.curator import MARKET_MODE, run_curated
     except Exception:
         log.exception("curator 모듈 로드 실패")
         await update.message.reply_text("❌ 큐레이션 모듈 로드 실패 — /recent 폴백 사용")
         return
-    await run_curated(bot, chat_id, n=n)
+    await run_curated(bot, chat_id, n=n, mode=MARKET_MODE)
 
 
 async def market_daily_job(bot: Bot) -> None:
@@ -572,6 +595,7 @@ def build_industry_app(token: str) -> Application:
     app.add_handler(CommandHandler(["start", "help"], industry_help))
     app.add_handler(CommandHandler("industry", industry_on_demand))
     app.add_handler(CommandHandler("trigger", industry_trigger))
+    app.add_handler(CommandHandler("curate", industry_curated))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, industry_on_demand))
     return app
 
