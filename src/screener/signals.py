@@ -46,19 +46,44 @@ def _import_pd():
     return pd
 
 
-def compute_signals_for_ticker(rows: list[dict]) -> dict:
-    """단일 종목 OHLCV (asc, 마지막 = today) → 발현 신호 dict.
+def compute_signals_for_ticker(rows: list[dict], base_date: str | None = None) -> dict:
+    """단일 종목 OHLCV (asc) → 발현 신호 dict. **base_date-anchored**.
 
-    rows 길이 < 60이면 {} (신규상장).
-    모든 신호 페이로드에 chg_pct(전일 대비 %)와 close가 공통 포함.
+    rows: date asc로 정렬된 OHLCV.
+    base_date: "YYYY-MM-DD" — 이 날짜의 close를 today로 사용. 명시 안 하면 마지막 row.
+
+    핵심 가드 (잘못된 신호 방지):
+      - base_date 명시 시: 그 날짜 row가 없으면 {} 반환 (silent skip)
+      - base_date 이후 row는 무시 (truncate) — 미래 데이터 누설 방지
+      - rows 길이 < 60이면 {} (신규상장)
+      - 결과 검증: prev_close > 0이고 today_close > 0이어야 신호 발생
     """
-    if len(rows) < 60:
+    if not rows:
         return {}
     pd = _import_pd()
     df = pd.DataFrame(rows)
 
+    # base_date anchoring — 그 날짜의 row를 today로 explicit lookup
+    if base_date is not None:
+        base_idx = df.index[df["date"] == base_date].tolist()
+        if not base_idx:
+            return {}  # base_date 데이터 없는 종목은 신호 계산 skip
+        # base_date 이후 row 제거 (안전성)
+        df = df.iloc[: base_idx[0] + 1].reset_index(drop=True)
+
+    if len(df) < 60:
+        return {}
+
     today = df.iloc[-1]
     prev = df.iloc[-2]
+
+    # today의 date가 진짜 base_date인지 sanity check (base_date 명시된 경우)
+    if base_date is not None and str(today["date"]) != base_date:
+        log.warning(
+            "[signals] base_date 불일치 — expected=%s actual=%s — skip",
+            base_date, today["date"],
+        )
+        return {}
 
     chg_pct = 0.0
     if prev["close"] > 0:
@@ -215,19 +240,34 @@ def _composite_score(item: dict, max_cap: float) -> float:
     return -score
 
 
-def compute_all() -> dict[str, list[dict]]:
+def compute_all(base_date: str | None = None) -> tuple[dict[str, list[dict]], dict]:
     """전 종목 신호 계산 → 카테고리별 시총·상승률 복합 정렬.
 
-    {category_key: [ {ticker, name, market, market_cap, sector, chg_pct, ...}, ... ]}
+    base_date: "YYYY-MM-DD" — 모든 종목이 이 날짜의 close를 today로 사용.
+               None이면 db.latest_date() 자동 사용.
 
-    시가총액 < SCREENER_MIN_MARKET_CAP (기본 3000억) 종목은 신호에서 제외.
-    시총 정보 없는 (NULL) 종목은 보수적으로 통과.
+    반환: (results, stats) 튜플
+      results: {category_key: [...]}
+      stats: {"base_date": str, "processed": int, "skipped_cap": int,
+              "skipped_no_base": int, "total_active": int}
+
+    구조 변경 (잘못된 신호 영구 방지):
+      - 모든 신호가 base_date의 close 기준 — 종목별 "today" 다른 날짜 가능성 차단
+      - base_date 데이터 없는 종목 = silent skip + skipped_no_base 카운트
+      - stats에 검증 정보 포함 → 사용자에게 명시적 표기
     """
     db.ensure_schema()
     tickers = db.get_active_tickers()
     if not tickers:
         log.warning("[signals] universe 비어있음")
-        return {}
+        return {}, {"base_date": base_date, "processed": 0, "skipped_cap": 0,
+                    "skipped_no_base": 0, "total_active": 0}
+
+    if base_date is None:
+        base_date = db.latest_date()
+        log.info("[signals] base_date 자동 결정: %s", base_date)
+    else:
+        log.info("[signals] base_date 명시: %s", base_date)
 
     min_cap = _get_float_env("SCREENER_MIN_MARKET_CAP", DEFAULT_MIN_MARKET_CAP)
 
@@ -235,6 +275,7 @@ def compute_all() -> dict[str, list[dict]]:
 
     processed = 0
     skipped_cap = 0
+    skipped_no_base = 0
     max_cap_seen = 0
     for tinfo in tickers:
         ticker = tinfo["ticker"]
@@ -245,8 +286,13 @@ def compute_all() -> dict[str, list[dict]]:
         rows = db.load_ohlcv(ticker, days=300)
         if len(rows) < 60:
             continue
+        # base_date row 보유 여부 검증
+        has_base = any(r["date"] == base_date for r in rows)
+        if not has_base:
+            skipped_no_base += 1
+            continue
         try:
-            sigs = compute_signals_for_ticker(rows)
+            sigs = compute_signals_for_ticker(rows, base_date=base_date)
         except Exception:
             log.exception("[signals] %s 계산 실패", ticker)
             continue
@@ -270,9 +316,17 @@ def compute_all() -> dict[str, list[dict]]:
     for cat, items in by_cat.items():
         items.sort(key=lambda it: _composite_score(it, max_cap_seen))
 
+    stats = {
+        "base_date": base_date,
+        "processed": processed,
+        "skipped_cap": skipped_cap,
+        "skipped_no_base": skipped_no_base,
+        "total_active": len(tickers),
+    }
     log.info(
-        "[signals] processed=%d skipped_cap=%d (min=%.1f억) categories=%s",
-        processed, skipped_cap, min_cap / 1e8,
+        "[signals] base_date=%s processed=%d skipped_cap=%d skipped_no_base=%d "
+        "(min=%.1f억) categories=%s",
+        base_date, processed, skipped_cap, skipped_no_base, min_cap / 1e8,
         {k: len(v) for k, v in by_cat.items()},
     )
-    return by_cat
+    return by_cat, stats

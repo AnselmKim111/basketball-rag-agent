@@ -244,14 +244,18 @@ async def screener_daily_job(bot: Bot, override_chat_id: str | None = None) -> N
         except Exception:
             log.exception("[scheduled] DIAG load_ohlcv 실패")
 
-        # 신호 계산
-        results = await loop.run_in_executor(None, signals.compute_all)
+        # 기준일 = DB의 가장 최근 OHLCV 날짜 (명시적 결정 → signals에 전달)
+        base_date = await loop.run_in_executor(None, db.latest_date) or datetime.now(KST).strftime("%Y-%m-%d")
+        log.info("[scheduled] base_date for signals: %s", base_date)
+
+        # 신호 계산 — 모든 종목이 동일 base_date 강제, 미보유 종목 자동 skip
+        results, stats = await loop.run_in_executor(
+            None, lambda: signals.compute_all(base_date=base_date)
+        )
+        log.info("[scheduled] signals stats: %s", stats)
         if not results:
             await send_text_chunked(bot, chat_id, "⚠️ 신호 계산 결과 비어있음 — DB 확인")
             return
-
-        # 기준일 = DB의 가장 최근 OHLCV 날짜
-        base_date = await loop.run_in_executor(None, db.latest_date) or datetime.now(KST).strftime("%Y-%m-%d")
 
         # 히스토리 저장
         try:
@@ -259,8 +263,10 @@ async def screener_daily_job(bot: Bot, override_chat_id: str | None = None) -> N
         except Exception:
             log.exception("signal 히스토리 저장 실패")
 
-        # 발송 — formatter에 base_date 명시적으로 전달
-        text = formatter.format_results(results, datetime.now(KST), base_date=base_date)
+        # 발송 — formatter에 base_date + stats 명시적으로 전달
+        text = formatter.format_results(
+            results, datetime.now(KST), base_date=base_date, stats=stats
+        )
         await send_text_chunked(bot, chat_id, text)
         log.info("[scheduled] 발송 완료 (base_date=%s)", base_date)
     except Exception:
