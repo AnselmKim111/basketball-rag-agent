@@ -117,19 +117,68 @@ def update_today() -> dict:
 
 
 def update_specific_date(target_iso: str) -> dict:
-    """지정 날짜 OHLCV fetch + DB 추가. 휴장일 무관 — 호출자가 영업일 보장.
+    """지정 날짜 OHLCV fetch + DB 추가. 휴장일 무관.
 
     반환: {"date": iso, "rows": int, "empty": bool}.
-    어제 데이터를 강제로 가져올 때(주말 발송, 16:00에 today 데이터 미발행 등) 사용.
+    pykrx 실패 시 FDR ticker-batch로 폴백 (active universe 종목별 fetch).
+    어제 데이터를 강제로 가져올 때(주말 발송, 16:00에 today 미발행 등) 사용.
     """
     db.ensure_schema()
     ymd = target_iso.replace("-", "")
+    active_set = {t["ticker"] for t in db.get_active_tickers()}
+
+    # 1차: pykrx
     rows = data_source.fetch_market_ohlcv_by_date(ymd)
+    if rows and active_set:
+        rows = [r for r in rows if r[0] in active_set]
+
+    # 2차: FDR ticker-batch (pykrx 실패 시 자동 폴백)
+    if not rows and active_set:
+        cap = _int_env("SCREENER_INCREMENTAL_FDR_CAP", 1000)
+        timeout_s = _int_env("SCREENER_INCREMENTAL_FDR_TIMEOUT_S", 480)
+        log.warning(
+            "[incremental] %s pykrx 빈 결과 → FDR ticker-batch 폴백 (cap=%d, timeout=%ds)",
+            target_iso, cap, timeout_s,
+        )
+        # 시총 3000억+ 종목만 우선 (보유 universe 정렬: 시총 큰 순서로 가져오면 좋지만
+        # 단순화 — DB ticker 정렬). target 날짜 전후 5일 fetch (어제·오늘 모두 포함되도록)
+        from datetime import datetime as _dt
+        target_dt = _dt.strptime(target_iso, "%Y-%m-%d").date()
+        start_iso = (target_dt - timedelta(days=5)).strftime("%Y-%m-%d")
+        end_iso = (target_dt + timedelta(days=1)).strftime("%Y-%m-%d")
+        merged: list[tuple] = []
+        target_match: list[tuple] = []
+        t0 = time.monotonic()
+        scanned = 0
+        for ticker in sorted(active_set)[:cap]:
+            if time.monotonic() - t0 > timeout_s:
+                log.warning(
+                    "[incremental] FDR 폴백 timeout %ds 초과 → %d/%d에서 중단",
+                    timeout_s, scanned, cap,
+                )
+                break
+            try:
+                tr = data_source.fetch_ohlcv_by_ticker_via_fdr(ticker, start_iso, end_iso)
+                merged.extend(tr)
+                # 정확히 target_iso 날짜 row 카운트
+                target_match.extend([r for r in tr if r[1] == target_iso])
+            except Exception:
+                pass
+            scanned += 1
+            if scanned % 100 == 0:
+                log.info(
+                    "[incremental] FDR 진행 %d/%d (rows=%d, target_match=%d)",
+                    scanned, cap, len(merged), len(target_match),
+                )
+        rows = merged
+        log.info(
+            "[incremental] FDR 폴백 완료 scanned=%d total_rows=%d target_match=%d",
+            scanned, len(rows), len(target_match),
+        )
+
     if not rows:
         return {"date": target_iso, "rows": 0, "empty": True}
-    active_set = {t["ticker"] for t in db.get_active_tickers()}
-    if active_set:
-        rows = [r for r in rows if r[0] in active_set]
+
     inserted = db.upsert_ohlcv_bulk(rows)
     log.info("[incremental] %s 강제 fetch 추가 rows=%d", target_iso, inserted)
     return {"date": target_iso, "rows": inserted, "empty": False}
