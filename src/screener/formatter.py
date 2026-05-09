@@ -126,14 +126,20 @@ def format_results(
         else:
             parts.append(f"📊 기준일: {base_date} 당일 종가")
     if stats:
-        # 데이터 정확성 명시 — 검증된 종목 수 / 누락 종목 수
+        # 데이터 정확성 명시 — 검증된 종목 수 / 누락 종목 수 + 이중확인 결과
         proc = stats.get("processed", 0)
         skipped_no_base = stats.get("skipped_no_base", 0)
-        skipped_cap = stats.get("skipped_cap", 0)
-        verify_msg = f"✓ {proc}종목 검증 (시총 3000억+)"
+        validated = stats.get("validated", -1)
+        rejected = stats.get("rejected", -1)
+        verify_lines = [f"✓ {proc}종목 신호 계산 (시총 3000억+)"]
         if skipped_no_base > 0:
-            verify_msg += f" · {skipped_no_base}종목 데이터 누락 제외"
-        parts.append(verify_msg)
+            verify_lines[-1] += f" · {skipped_no_base}종목 base_date 데이터 누락"
+        if validated >= 0:
+            v_line = f"✓ 이중확인: Naver 재 fetch로 {validated}종목 정합성 통과"
+            if rejected > 0:
+                v_line += f" · {rejected}종목 불일치/누락 제외"
+            verify_lines.append(v_line)
+        parts.append("\n".join(verify_lines))
     parts.append("(KOSPI/KOSDAQ · 섹터별 분류 · 시총·상승률 복합 정렬)\n")
 
     # 전체 신호 통합 섹터 요약

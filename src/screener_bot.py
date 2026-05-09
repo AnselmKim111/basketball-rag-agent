@@ -257,7 +257,22 @@ async def screener_daily_job(bot: Bot, override_chat_id: str | None = None) -> N
             await send_text_chunked(bot, chat_id, "⚠️ 신호 계산 결과 비어있음 — DB 확인")
             return
 
-        # 히스토리 저장
+        # 이중확인: 신호 종목들의 base_date close를 Naver에서 다시 fetch → DB와 대조
+        # 불일치(또는 fetch 실패) 종목은 메시지에서 제외 (잘못된 신호 영구 차단)
+        try:
+            from src.screener import validator
+            results, val_stats = await loop.run_in_executor(
+                None, lambda: validator.cross_validate(results, base_date)
+            )
+            log.info("[scheduled] validator stats: %s", val_stats)
+            stats["validated"] = val_stats.get("validated", 0)
+            stats["rejected"] = val_stats.get("rejected", 0)
+        except Exception:
+            log.exception("[scheduled] validator 실패 — 검증 없이 발송")
+            stats["validated"] = -1
+            stats["rejected"] = -1
+
+        # 히스토리 저장 (검증 통과만)
         try:
             await loop.run_in_executor(None, lambda: db.save_signals(base_date, results))
         except Exception:

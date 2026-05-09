@@ -126,7 +126,12 @@ def update_specific_date(target_iso: str, force: bool = False) -> dict:
     """
     db.ensure_schema()
     ymd = target_iso.replace("-", "")
-    active_set = {t["ticker"] for t in db.get_active_tickers()}
+    # 시총 desc 정렬 — 시총 큰 (대형주) 부터 fetch 보장. cap timeout 발생 시
+    # 소형주만 누락. 사용자가 보는 "역사적 신고가"는 보통 중·대형주.
+    all_tickers = db.get_active_tickers()
+    all_tickers.sort(key=lambda t: -(t.get("market_cap") or 0))
+    active_list = [t["ticker"] for t in all_tickers]
+    active_set = set(active_list)
 
     # 0차: Naver Finance ticker-batch (1순위 — FDR 시뮬레이션 미스매치 우회)
     naver_cap = _int_env("SCREENER_NAVER_CAP", 1200)
@@ -147,7 +152,7 @@ def update_specific_date(target_iso: str, force: bool = False) -> dict:
         t0 = time.monotonic()
         scanned = 0
         first_diag = False
-        for ticker in sorted(active_set)[:naver_cap]:
+        for ticker in active_list[:naver_cap]:  # 시총 desc 정렬된 순서대로
             if time.monotonic() - t0 > naver_timeout:
                 log.warning("[incremental] Naver timeout %ds → %d에서 중단", naver_timeout, scanned)
                 break
