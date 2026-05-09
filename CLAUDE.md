@@ -57,3 +57,76 @@
 ## 5. 토큰·자격증명
 
 토큰들은 git에 커밋 안 됨 — `CLAUDE.local.md` 참조 (gitignored).
+
+---
+
+## 6. ScreenerBot — 한국 주식 기술적 신호 (별도 봇)
+
+스크리닝봇은 IdeaBot/wisereport 와 격리. 자체 SQLite (`/data/screener.db`),
+별도 cron(매일 16:00 KST), 자체 텔레그램 봇 토큰.
+
+### 핵심 파일
+- `src/screener_bot.py` — 봇 entrypoint, `screener_daily_job` (cron), `_self_test`
+- `src/screener/signals.py` — 신호 계산 (base_date-anchored, **반드시** base_date 명시)
+- `src/screener/incremental.py` — `update_today` (cron), `update_specific_date` (강제 fetch),
+  `ensure_recent_business_day_data` (가장 최근 영업일 보장)
+- `src/screener/data_source.py` — Naver/pykrx/FDR 통합. `fetch_ohlcv_by_ticker_via_naver`가 1순위
+- `src/screener/validator.py` — 발송 직전 cross-validation (Naver 재 fetch ↔ DB)
+- `src/screener/formatter.py` — 미미 스타일 섹터별 그룹핑 출력
+- `src/screener/db.py` — SQLite (tickers, ohlcv, signals, meta), 280일 retention
+- `src/screener/universe.py` — KOSPI/KOSDAQ 보통주 + 시총 + 섹터 갱신
+
+### 데이터 소스 우선순위 (절대 순서 지킬 것)
+1. **Naver Finance siseJson API** — 1순위 (시뮬레이션 환경에서도 정확)
+2. **pykrx** date-batch — 폴백
+3. **FDR** ticker-batch — 최후 폴백 (cap+timeout 보호)
+
+시총·섹터:
+- 시총: pykrx fetch_market_cap → FDR StockListing Marcap 폴백
+- 섹터: pykrx 업종지수(1004~1026) → FDR Industry → 종목명 keyword 휴리스틱(28카테고리)
+
+### 신호 (4종)
+1. `high_all` — 보유 데이터(280일) 역사적 신고가
+2. `high_52w` — 252영업일 신고가
+3. `volume_breakout` — 오늘 거래량 ≥ 20일 평균 × 2.0 + 종가 상승
+4. `near_breakout_52w` — 52주고점 95~99% + 5일 거래량 ≥ ×1.3
+5. `vcp_breakout` — 50일 박스권(≤1.20) + ATR 30%+ 수축 + 거래량 dry-up + 거래량 동반 상방돌파
+
+### 이중확인 구조 (절대 깨지 말 것)
+신호의 정확성을 두 단계로 보장:
+1. **base_date-anchored signals**: `compute_all(base_date=...)` — 모든 종목이 동일 날짜의
+   close를 today로 사용. base_date 데이터 없는 종목은 자동 skip (`skipped_no_base`).
+   `compute_signals_for_ticker(rows, base_date)`가 base_date row를 explicit lookup.
+2. **cross-validation**: `validator.cross_validate(results, base_date)` — 신호 발생
+   종목들의 close를 Naver historical API로 재 fetch → DB값과 비교. 불일치/fetch 실패 시
+   그 종목 메시지에서 자동 제거 (`rejected`).
+
+이 둘 중 하나라도 깨지면 잘못된 chg_pct가 메시지에 표시될 수 있음.
+
+### 환경변수
+- `SCREENER_BOT_TOKEN` — 텔레그램 봇 토큰
+- `SCREENER_ALLOWED_CHAT_IDS` — 권한 chat id (콤마)
+- `SCREENER_CHAT_ID` — 자동 발송 대상 chat id
+- `SCREENER_TEST_MODE=1` — 부팅 시 self-test 자동 실행
+- `SCREENER_MIN_MARKET_CAP=300_000_000_000` — 시총 필터 (3000억)
+- `SCREENER_RETRY_INTERVAL_S=300`, `SCREENER_RETRY_MAX=6` — today fetch retry (16:00 cron이
+  KRX 미발행 대비 16:30까지 5분 간격 재시도)
+- `SCREENER_NAVER_CAP=1200`, `SCREENER_NAVER_TIMEOUT_S=600` — Naver fetch 보호
+- `SCREENER_FORCE_REFETCH=1` — cached 무시하고 매번 Naver 재 fetch (정확성 위해 켬)
+- `SCREENER_VALIDATE_TIMEOUT_S=60`, `SCREENER_VALIDATE_TOLERANCE=1`(원) — validator 보호
+- `SCREENER_INCREMENTAL_FDR_FALLBACK=0` — FDR 폴백 비활성 (sequential hang 방지)
+
+### Cron
+매일 **16:00 KST** (15:30 장마감 + 30분 정산 버퍼). KRX 미발행이면 5분×6회 retry → 그래도
+미수신이면 `ensure_recent_business_day_data`로 직전 영업일 fetch.
+
+### 메시지 포맷 (미미 스타일)
+- 섹션: 🚀 역사적 신고가 / 📈 52주 신고가 / 💎 VCP 돌파 / 🔥 거래량 돌파 / 🎯 52주 돌파 직전
+- 섹션 안에서 섹터별 그룹핑: `(반도체) 삼성전자(+5.2%), SK하이닉스(+3.1%)`
+- KOSPI 우선 정렬 (각 섹터 내부)
+- 헤더에 base_date + 검증 종목 수 + 이중확인 통과 수 명시
+
+### 알려진 환경 한계
+시뮬레이션 환경에서 외부 KRX/Naver/FDR 데이터에 lag/forward-fill 가능성. 따라서
+이중확인 구조가 핵심. 단일 소스만 신뢰하면 잘못된 chg_pct 발생 — 사용자에게 검증된 사례
+존재 (예: 첫 self-test에서 삼성E&A +21.5% 잘못 표시 → fix 후 -3.11% 정확).
