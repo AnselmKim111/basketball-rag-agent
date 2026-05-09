@@ -30,7 +30,6 @@ from src import disclosure_watcher, watchlist_store
 from src.bot_helpers import (
     deny_message,
     is_authorized,
-    make_post_init_set_commands,
     send_text_chunked,
 )
 
@@ -234,12 +233,7 @@ DISCLOSURE_COMMANDS = [
 
 def build_disclosure_app(token: str) -> Application:
     """오케스트레이터가 호출. 토큰만 받아 Application 반환."""
-    app = (
-        Application.builder()
-        .token(token)
-        .post_init(make_post_init_set_commands(DISCLOSURE_COMMANDS))
-        .build()
-    )
+    app = Application.builder().token(token).build()
     app.add_handler(CommandHandler(["start", "help"], _help))
     app.add_handler(CommandHandler("watch", _cmd_watch))
     app.add_handler(CommandHandler("unwatch", _cmd_unwatch))

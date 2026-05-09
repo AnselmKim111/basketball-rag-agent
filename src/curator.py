@@ -51,7 +51,7 @@ KST = timezone(timedelta(hours=9))
 SYNTHESIS_MODEL_ENV = "IDEA_SYNTHESIS_MODEL"
 DEFAULT_SYNTHESIS_MODEL = "anthropic/claude-sonnet-4.5"
 
-DEFAULT_DAYS_BACK = 14
+DEFAULT_DAYS_BACK = 5  # 후보 풀: 최근 5일 (사용자 의도 — 즉시 거래 가능한 신선한 리서치)
 SUMMARY_CHARS = 5000  # 5000자 요약 (long)
 
 
@@ -182,6 +182,10 @@ def _collect_pool_blocking(mode: CuratorMode, days_back: int) -> list[CandidateI
         for label in CATEGORY_LABEL.values()
         if sum(1 for c in pool if c.category == label)
     )
+    # 신선도 우선 — 날짜 desc 정렬 후 LLM에 노출 (메타 블록 상단=최신)
+    def _sort_key(c: CandidateItem) -> str:
+        return getattr(c.item, "date", "") or getattr(c.item, "date_short", "") or ""
+    pool.sort(key=_sort_key, reverse=True)
     log.info("curator pool 수집 완료 [%s]: %d items (%s)", mode.name, len(pool), cat_breakdown)
     return pool
 
@@ -198,23 +202,34 @@ async def collect_candidate_pool(
 # ------------------------------------------------------------------
 RECON_PROMPT = """오늘은 {date} (KST). 한국·글로벌 증권사들이 발행한 최근 {days}일 리포트 {n}건의 메타데이터다.
 
-이걸로 오늘의 시장 컨텍스트를 정리해줘.
+너는 헤지펀드 PM 입장에서 이 메타를 읽는다. 목표는 **다른 최고 투자자들보다
+한 발 빠르게 돈 될 기회를 포착**하는 것. 단순 흐름 정리가 아니라 5축으로 평가해
+**정보우위(edge)** 가 있는 영역을 짚어내라.
 
 **도메인 집중 영역**: {recon_focus}
 
 [리포트 메타]
 {meta_block}
 
-분석 항목 (마크다운 ## 헤더 + bullet):
-1. **오늘 핵심 흐름** — 3-4줄, 발행 빈도·증권사·날짜 패턴에서 추론
-2. **주도 영역 (3-5개)** — 각 1줄, 모멘텀 이유 (산업·종목·테마 중 도메인에 맞게)
-3. **새로 공부할 가치 있는 영역 (1-2개)** — 왜 지금 봐야 하는지
-4. **부수 흐름 (1-2줄, 선택)**
+평가 5축 (이 5축으로 모든 영역·종목을 머릿속에 점수화):
+- ⏱️  타이밍 — 방금 발생/발생 임박 (수주, 실적, 정책 발표 D-N) vs 이미 다 가격에 반영
+- 🎯 주도섹터 — 시장 흐름 전체를 끌고 가는 영역인가 (예: AI 인프라, 전력, 방산)
+- 🆕 새로움 — 이미 모두가 아는 thesis인가, 새로 부상한 thesis인가 (정보우위)
+- 💥 크기 — 파급 효과 큰 일 (구조 변화·정책 전환·대형 수주)인가, 자잘한 업데이트인가
+- ⚡ 시너지 — 타이밍×주도×새로움×크기가 동시에 충족되는 "킬러 셋업"이 있는가
+
+분석 항목 (마크다운 ## 헤더 + bullet, 600자 이내):
+1. **오늘의 킬러 셋업 (1-3개)** — 5축 모두 강한 영역. 각 1-2줄, "왜 지금이 진입 타이밍인지"
+2. **주도 영역 (2-4개)** — 시장이 따라가는 흐름. 각 1줄, 어느 종목·테마가 axis인지
+3. **새로 부상 (1-2개)** — 1-2주 전엔 없던 thesis. 정보우위 가능 영역
+4. **이미 가격에 반영 (선택, 1줄)** — 후보에 보이지만 늦은 영역 (warning)
 
 규칙:
 - 메타데이터(제목·발행일·증권사)에 명시된 정보만 사용. 임의 추정 금지.
-- 구체적이고 액션 가능하게. 추상적 언급 ("성장이 기대된다") 금지.
-- 출력은 600자 이내."""
+- 추상 표현 금지 ("성장 기대"·"긍정적"). 구체 사건·종목·날짜로 말할 것.
+- 발행 날짜가 오늘({date})에 가까울수록 가중치 강하게.
+- 한 증권사가 여러 발행 시 합의 형성 신호 — 명시.
+"""
 
 
 def _build_meta_block(pool: list[CandidateItem]) -> str:
@@ -256,22 +271,47 @@ async def recon_today(pool: list[CandidateItem], mode: CuratorMode) -> str:
 # ------------------------------------------------------------------
 CURATE_PROMPT = """위 시황 컨텍스트를 기반으로, 사용자에게 보낼 Top {n} 리포트를 선별하라.
 
+너는 헤지펀드 PM. 경쟁 상대는 한국·미국 최고의 액티브 PM·증권사 RA·퀀트.
+**그들이 이미 다 보고 가격에 반영시킨 종목은 가치 0**. 너의 알파는 (a) 그들도
+보긴 했지만 아직 진입 타이밍이 살아있는 셋업 + (b) 그들이 아직 충분히
+weighting 안 한 새 thesis. 이걸 잡는 게 사용자에게 진짜 돈 될 기회를 주는 것.
+
 [시황 컨텍스트]
 {recon}
 
 [리포트 메타]
 {meta_block}
 
-선별 기준 (우선순위 순):
-1. 오늘 핵심 흐름을 짚는 리포트 (주도 영역 분석)
-2. 새로 공부할 가치 있는 영역의 깊이 있는 분석
-3. **도메인별 추가 강조**: {curate_focus}
-4. **단순 인기·최신만 보면 안 잡히는, 의미 있는 리포트 우선**
+각 리포트를 5축으로 머릿속에 점수화 (각 0-3점):
+  ⏱️  타이밍 — 방금 발생/D-N 임박 catalyst (수주·실적·정책)인가? (3) vs 이미
+                 발생해 가격 반영 끝났나? (0)
+  🎯 주도섹터 — 위 시황 컨텍스트에서 짚은 주도 영역 핵심에 위치? (3) vs 변두리? (0)
+  🆕 새로움 — 1-2주 내 부상한 신규 thesis인가? (3) vs 모두가 아는 컨센서스? (0)
+  💥 크기 — 구조 변화·대형 수주·정책 전환급 임팩트? (3) vs 자잘한 업데이트? (0)
+  ⚡ 시너지 — 위 4축이 동시 충족되는 킬러 셋업? (3) vs 단일 축만 점수? (0)
+
+선별 알고리즘 (우선순위 순):
+1. **신선도 컷오프** — 발행일이 오늘({date_today}) 또는 최근 1-2일이어야 후보.
+   3일 이상 지난 리포트는 시장 변화 반영 못 해 컷. 부족 시에만 어제·그제까지 확장.
+2. **시너지 점수 가장 높은 것 우선** — 5축 합산 + 시너지 가중. 단일 축만 강한
+   리포트보다 4-5축 모두 강한 "킬러 셋업"이 위.
+3. **정보우위 우선** — 새로움 점수 높은 영역(아직 모두가 안 본 thesis) 가산점.
+4. **클러스터링 활용** — 같은 thesis에 여러 증권사가 짧은 시간 내 발행하면
+   합의 형성 신호 → 가산점. 단, 같은 종목 중복 선별은 1-2건까지만.
+5. **도메인별 추가 강조**: {curate_focus}
+6. **카테고리 다양성 유지** — 시황·산업·종목 어느 하나로 쏠리지 않게.
+7. **인기 단독 점수 우대 금지** — 발행 빈도만 높은 종목은 컨센서스 형성 끝났을
+   가능성. 새로움·시너지로 cross-check 했을 때 살아남는 것만.
 
 출력 (반드시 valid JSON만):
 {{
   "picks": [
-    {{"idx": <1-based 메타 번호>, "reason": "왜 이걸 골랐는지 1-2줄, 시황 연결"}},
+    {{
+      "idx": <1-based 메타 번호>,
+      "reason": "1-2줄. 5축 중 가장 강한 점수 2-3개를 자연어로 강조.
+                 예: '⚡ T+0 발행, 🆕 PAFC 데이터센터 신규 부상, 💥 수주 임박 (D-7).
+                 시너지 강 — 정보우위 가능.' 추상 표현 금지, 구체 catalyst 명시."
+    }},
     ...
   ]
 }}
@@ -315,6 +355,7 @@ async def curate_picks(
         recon=recon_text or "(시황 컨텍스트 없음)",
         meta_block=_build_meta_block(pool),
         curate_focus=mode.curate_focus,
+        date_today=datetime.now(KST).strftime("%Y-%m-%d"),
     )
     model = os.getenv(SYNTHESIS_MODEL_ENV) or DEFAULT_SYNTHESIS_MODEL
     log.info("curator curate 호출 [%s]: model=%s, n=%d/%d", mode.name, model, n, len(pool))

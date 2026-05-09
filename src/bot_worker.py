@@ -39,7 +39,6 @@ from src.bot_helpers import (
     allowed_chat_ids,
     deny_message,
     is_authorized as _bh_is_authorized,
-    make_post_init_set_commands,
 )
 from src.pipeline_lock import PIPELINE_LOCK
 
@@ -58,34 +57,20 @@ _ALLOWED_ENV = "ALLOWED_CHAT_IDS"
 REPO_ROOT = Path(__file__).resolve().parent.parent
 HELP_TEXT = (
     "📊 *wisereport 자동 분석 봇*\n\n"
-    "*🎯 추천 — AI 큐레이션 (오늘의 주도주·학습가치 종목 선별):*\n"
-    "  `/curate` — Top 10 똑똑한 종목 리포트 + 각 선별 이유 (5-15분)\n"
-    "  `/curate 5` — Top 5\n"
-    "  → 시총 자동 우대 금지, 새로 공부할 가치 있는 종목 우선\n\n"
-    "*리포트 다운로드 + 요약 (특정 종목)*\n"
-    "  `/report 종목명` (자동 ticker 매핑)\n"
-    "  `/report 종목명 6자리티커 [개수]`\n"
-    "  예: `/report 피에스케이`\n"
-    "  예: `/report 삼성전자` 또는 `/report 삼성전자 005930 5`\n\n"
-    "*🚀 종합 (슬래시 없이 종목명/티커만 입력)*\n"
-    "  → `/deepdive` + `/report` 자동 순차 실행\n"
+    "*🚀 추천 — 통합 딥리서치 (한 편의 아름다운 리포트):*\n"
+    "  종목명/티커만 입력 → 자동으로 통합 분석\n"
     "  예: `삼성전자` / `005930` / `피에스케이`\n"
-    "  ⏱️ 약 20-30분 소요\n\n"
-    "*심층 분석 (deepdive)*\n"
-    "  `/deepdive <티커 또는 종목명>`\n"
-    "  예: `/deepdive 삼성전자`\n"
-    "  예: `/deepdive 005930`\n"
-    "  → DART 사업보고서 + IR자료 + 분기별 재무 차트\n"
-    "  → 업의 본질 / 핵심 투자 포인트 1000자 요약\n"
-    "  → wisereport 기업·산업 리포트도 종합 반영\n\n"
-    "*명령어*\n"
-    "  /start, /help — 이 도움말\n"
-    "  /curate [개수] — AI 큐레이션 (위 추천)\n"
-    "  /report — 특정 종목 리포트\n"
-    "  /deepdive — 심층 분석\n"
-    "  /deephelp — deepdive 상세 도움말\n"
-    "  /status — 현재 작업 상태\n\n"
-    "_/report 약 8-15분, /deepdive 약 10-15분 소요_"
+    "  또는 `/research 삼성전자`\n"
+    "  → DART(공시·IR·재무) + 증권사 리포트 + 웹 딥리서치 90일\n"
+    "  → claude-sonnet 합성 → 8개 섹션 통합 리포트 + 차트 + 참고 PDF\n"
+    "  ⏱️ 약 8-15분\n\n"
+    "*🎯 AI 큐레이션 (오늘의 주도주):*\n"
+    "  `/curate` — Top 10 종목 리포트 + 각 선별 이유 (5-15분)\n\n"
+    "*분리 발송 (부분만 받고 싶을 때):*\n"
+    "  `/report 종목명 [6자리티커] [개수]` — 증권사 리포트만\n"
+    "  `/deepdive <티커 또는 종목명>` — DART만 (사업보고서·IR·재무차트)\n\n"
+    "*명령어 (/ 입력 시 자동완성 메뉴):*\n"
+    "  /research, /curate, /report, /deepdive, /status, /help"
 )
 
 
@@ -221,36 +206,37 @@ async def _run_combined(
     ticker: str,
     top: int,
 ) -> None:
-    """deepdive 먼저, 끝나면 report. 한쪽 실패해도 다른 쪽 계속."""
-    try:
-        await update.message.reply_text(
-            f"📋 *{name}* ({ticker}) — /deepdive + /report 순차 실행\n"
-            f"⏱️ 예상 약 20-30분",
-            parse_mode=ParseMode.MARKDOWN,
-        )
-    except Exception:
-        pass
+    """종목명 자유 텍스트 진입점 — 통합 딥리서치 실행.
 
-    # 1) /deepdive
+    이전엔 deepdive + report 순차 (25분, 메시지 ~25개). 이제 deep_research 모듈이
+    DART + wisereport + 웹 3축 병렬 수집 → 한 편의 통합 마크다운 리포트로 합성 →
+    리포트 + 차트 + 모든 PDF 일괄 발송 (~10-15분, 메시지 ~12-13개).
+
+    /deepdive와 /report 명시 호출은 그대로 동작 — 부분만 받고 싶을 때 사용.
+    """
+    chat_id = str(update.effective_chat.id)
+    bot = context.bot
     try:
-        from src.deepdive.handler import _run as deepdive_run
-        await deepdive_run(update, context, ticker)
+        from src.deep_research import run as deep_research_run
     except Exception:
-        logging.exception("combined: deepdive 단계 실패 — report 단계 계속")
+        logging.exception("deep_research 모듈 로드 실패 — 폴백: /report만 실행")
         try:
             await update.message.reply_text(
-                f"⚠️ {name} deepdive 단계 실패 — report로 계속 진행"
+                f"⚠️ 딥리서치 모듈 로드 실패 — /report만 실행으로 폴백"
             )
+            await _run_pipeline(update, name, ticker, top)
         except Exception:
-            pass
+            logging.exception("폴백 _run_pipeline 실패")
+        return
 
-    # 2) /report (기존 로직 재사용)
     try:
-        await _run_pipeline(update, name, ticker, top)
+        await deep_research_run(bot, chat_id, ticker)
     except Exception:
-        logging.exception("combined: report 단계 실패")
+        logging.exception("deep_research 실행 최상위 예외")
         try:
-            await update.message.reply_text(f"⚠️ {name} report 단계 실패")
+            await update.message.reply_text(
+                f"❌ {name} ({ticker}) 딥리서치 실행 실패 — 로그 확인"
+            )
         except Exception:
             pass
 
@@ -397,6 +383,38 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
     logging.exception("Unhandled error: %s", context.error)
 
 
+async def cmd_research(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """종목 통합 딥리서치 — DART + wisereport + 웹 3축 → 한 편의 통합 리포트.
+
+    `/research <ticker 또는 종목명>`. 자유 텍스트(슬래시 없이 종목명만) 입력해도
+    같은 동작 (text_handler가 _run_combined → deep_research.run 호출).
+    """
+    if not is_authorized(update):
+        await deny_message(update, "종목봇")
+        return
+    args = context.args or []
+    if not args:
+        await update.message.reply_text(
+            "사용법: `/research 005930` 또는 `/research 삼성전자`\n"
+            "_(슬래시 없이 종목명만 입력해도 동일 동작)_",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+    query = " ".join(args).strip()
+    bot = context.bot
+    chat_id = str(update.effective_chat.id)
+    try:
+        from src.deep_research import run as deep_research_run
+    except Exception:
+        logging.exception("deep_research 모듈 로드 실패")
+        await update.message.reply_text("❌ 딥리서치 모듈 로드 실패 — 로그 확인")
+        return
+    asyncio.create_task(
+        deep_research_run(bot, chat_id, query),
+        name=f"research:{query}",
+    ).add_done_callback(_log_task_exception)
+
+
 async def cmd_curate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """종목 도메인 AI 큐레이션 — 주도주·학습가치 종목 선별 + Top N 리포트.
 
@@ -425,9 +443,10 @@ async def cmd_curate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 COMPANY_COMMANDS = [
+    ("research", "📋 통합 딥리서치 — DART+증권사+웹 → 한 편의 리포트 (8-15분)"),
     ("curate", "🎯 AI 큐레이션 — 주도주·학습가치 종목 Top N 선별"),
-    ("report", "특정 종목 리포트 다운 + 요약"),
-    ("deepdive", "DART 사업보고서·IR·재무차트 심층분석"),
+    ("report", "특정 종목 리포트 다운 + 요약 (분리 발송)"),
+    ("deepdive", "DART 사업보고서·IR·재무차트 심층분석 (분리 발송)"),
     ("status", "현재 작업 진행 상태"),
     ("deephelp", "deepdive 상세 도움말"),
     ("help", "전체 도움말"),
@@ -435,16 +454,16 @@ COMPANY_COMMANDS = [
 
 
 def build_company_app(token: str) -> Application:
-    """orchestrator가 import해 사용. CompanyBot의 Application을 반환."""
-    app = (
-        Application.builder()
-        .token(token)
-        .post_init(make_post_init_set_commands(COMPANY_COMMANDS))
-        .build()
-    )
+    """orchestrator가 import해 사용. CompanyBot의 Application을 반환.
+
+    setMyCommands는 orchestrator가 app.initialize() 후 BotSpec.commands로 직접
+    호출 (manual lifecycle에서 .post_init이 자동 호출 안 되므로).
+    """
+    app = Application.builder().token(token).build()
     app.add_handler(CommandHandler(["start", "help"], cmd_start))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("report", cmd_report))
+    app.add_handler(CommandHandler("research", cmd_research))
     app.add_handler(CommandHandler("curate", cmd_curate))
     # --- deepdive (격리: 실패해도 기존 봇 정상) ---
     try:

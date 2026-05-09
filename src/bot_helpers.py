@@ -19,7 +19,7 @@ import re
 from pathlib import Path
 from typing import Iterable
 
-from telegram import Bot, BotCommand, Update
+from telegram import Bot, Update
 
 log = logging.getLogger(__name__)
 
@@ -70,28 +70,6 @@ async def send_text_chunked(
         except Exception:
             log.exception("send_message 실패 (chat_id=%s)", chat_id)
             break
-
-
-def make_post_init_set_commands(commands: list[tuple[str, str]]):
-    """python-telegram-bot의 `Application.post_init`에 넘길 coroutine factory.
-
-    텔레그램에서 사용자가 `/` 입력 시 자동완성 메뉴에 뜰 명령 리스트를 등록.
-    한 번 setMyCommands 호출하면 텔레그램 서버에 영구 저장 — 매번 호출해도 OK.
-    실패는 로그만 (set_my_commands 권한 문제 시에도 봇 부팅은 진행).
-
-    Args:
-        commands: [(command, description), ...]
-                  command 1-32자 lowercase, description 3-256자.
-    """
-    async def post_init(application) -> None:
-        try:
-            await application.bot.set_my_commands(
-                [BotCommand(c, d) for c, d in commands]
-            )
-            log.info("set_my_commands OK: %d개", len(commands))
-        except Exception:
-            log.exception("set_my_commands 실패 — 봇은 정상 가동")
-    return post_init
 
 
 async def deny_message(update: Update, bot_label: str = "이 봇") -> None:

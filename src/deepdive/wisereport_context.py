@@ -22,6 +22,15 @@ class WisereportContext:
     company_titles: list[str]
     industry_texts: list[str]  # 산업 리포트 텍스트 (최대 1개)
     industry_titles: list[str]
+    # 다운로드된 PDF 경로 (deep_research가 최종 발송에 첨부 — additive 필드)
+    company_paths: list = None  # type: ignore[assignment]
+    industry_paths: list = None  # type: ignore[assignment]
+
+    def __post_init__(self):
+        if self.company_paths is None:
+            self.company_paths = []
+        if self.industry_paths is None:
+            self.industry_paths = []
 
 
 def collect_for_ticker(ticker: str, target_dir: Path, max_chars_per_report: int = 15_000) -> WisereportContext:
@@ -112,4 +121,6 @@ def collect_for_ticker(ticker: str, target_dir: Path, max_chars_per_report: int 
         company_titles=company_titles,
         industry_texts=industry_texts,
         industry_titles=industry_titles,
+        company_paths=list(company_paths),
+        industry_paths=list(industry_paths),
     )
