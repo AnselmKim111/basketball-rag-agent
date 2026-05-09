@@ -198,33 +198,46 @@ async def screener_daily_job(bot: Bot, override_chat_id: str | None = None) -> N
                 f"✅ 백필 완료: success={result['success']} fail={result['fail']} rows={result['rows']}",
             )
 
-        # 증분 (오늘 1일치)
+        # 증분 (오늘 1일치) — KRX 16:30 이전 미발행 대비 retry
+        # SCREENER_RETRY_INTERVAL_S(기본 300=5분), SCREENER_RETRY_MAX(기본 6회 → 최대 30분)
+        retry_interval = int(os.getenv("SCREENER_RETRY_INTERVAL_S", "300"))
+        retry_max = int(os.getenv("SCREENER_RETRY_MAX", "6"))
         inc = await loop.run_in_executor(None, incremental.update_today)
+        attempt = 1
+        while inc.get("empty") and inc.get("is_business_day") and attempt < retry_max:
+            log.info(
+                "[scheduled] today fetch 미발행 → %d초 후 재시도 (%d/%d)",
+                retry_interval, attempt, retry_max,
+            )
+            await asyncio.sleep(retry_interval)
+            inc = await loop.run_in_executor(None, incremental.update_today)
+            attempt += 1
+
+        # 영업일인데도 끝까지 today 미수신이면 어제 영업일 데이터라도 보장
         if inc.get("empty"):
-            msg = "📭 오늘 데이터 없음 (휴장일?)" if inc.get("is_business_day") else "📭 주말 — 스킵"
-            await send_text_chunked(bot, chat_id, msg)
-            # 휴장일이라도 어제까지의 누적 데이터로 신호 계산을 진행 (사용자 요청 시 의미 있음)
-            if not inc.get("is_business_day"):
-                return
+            log.info("[scheduled] today 데이터 미수신 → ensure_recent_business_day_data")
+            ensured = await loop.run_in_executor(None, incremental.ensure_recent_business_day_data)
+            log.info("[scheduled] ensure_recent_business_day 결과: %s", ensured)
 
         # 신호 계산
-        await send_text_chunked(bot, chat_id, "🔍 신호 계산 중...")
         results = await loop.run_in_executor(None, signals.compute_all)
         if not results:
             await send_text_chunked(bot, chat_id, "⚠️ 신호 계산 결과 비어있음 — DB 확인")
             return
 
+        # 기준일 = DB의 가장 최근 OHLCV 날짜
+        base_date = await loop.run_in_executor(None, db.latest_date) or datetime.now(KST).strftime("%Y-%m-%d")
+
         # 히스토리 저장
         try:
-            today_iso = datetime.now(KST).strftime("%Y-%m-%d")
-            await loop.run_in_executor(None, lambda: db.save_signals(today_iso, results))
+            await loop.run_in_executor(None, lambda: db.save_signals(base_date, results))
         except Exception:
             log.exception("signal 히스토리 저장 실패")
 
-        # 발송
-        text = formatter.format_results(results, datetime.now(KST))
+        # 발송 — formatter에 base_date 명시적으로 전달
+        text = formatter.format_results(results, datetime.now(KST), base_date=base_date)
         await send_text_chunked(bot, chat_id, text)
-        log.info("[scheduled] 발송 완료")
+        log.info("[scheduled] 발송 완료 (base_date=%s)", base_date)
     except Exception:
         log.exception("[scheduled] screener_daily_job 실패")
         try:

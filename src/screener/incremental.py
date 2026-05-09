@@ -1,7 +1,8 @@
 """매일 1일치 증분 업데이트.
 
-매일 16:30 KST에 호출됨. 오늘 거래일 OHLCV를 fetch해 DB에 추가.
-휴장일/장중 미발행이면 빈 결과 → 신호 계산은 누적 DB로 진행.
+매일 16:00 KST cron 호출. 오늘 거래일 OHLCV를 fetch해 DB에 추가.
+KRX 데이터는 보통 16:30~17:00 사이 발행되므로 16:00에는 미발행. 호출자가
+재시도(최대 ~30분)할 수 있도록 fetch_today_or_recent를 별도 제공.
 
 또한 280일 이전 데이터는 정리 (DB 비대화 방지).
 """
@@ -28,6 +29,15 @@ def _int_env(key: str, default: int) -> int:
         return default
 
 
+def _last_business_day(d=None):
+    """KST 기준 가장 최근 영업일 (오늘이 영업일이면 오늘) — date 객체."""
+    if d is None:
+        d = datetime.now(KST).date()
+    while d.weekday() >= 5:
+        d -= timedelta(days=1)
+    return d
+
+
 def update_today() -> dict:
     """오늘(KST) 데이터 fetch + 280일 이전 정리.
 
@@ -35,10 +45,6 @@ def update_today() -> dict:
 
     pykrx date-batch 실패 시 FDR ticker-batch 폴백은 기본 비활성화 (sequential
     수천 종목 fetch가 1시간+ 걸려 self-test/cron을 hang시키기 때문).
-    `SCREENER_INCREMENTAL_FDR_FALLBACK=1` 시 활성화하되 cap+timeout으로 보호:
-      - SCREENER_INCREMENTAL_FDR_CAP (기본 80종목)
-      - SCREENER_INCREMENTAL_FDR_TIMEOUT_S (기본 180초)
-      - 50종목마다 progress log
     """
     db.ensure_schema()
     if not db.get_active_tickers():
@@ -90,12 +96,12 @@ def update_today() -> dict:
             log.info("[incremental] FDR 폴백 완료 scanned=%d rows=%d", scanned, len(rows))
         else:
             log.info(
-                "[incremental] %s pykrx 빈 결과 (장중/휴장일 가능) → 폴백 skip, 누적 DB로 신호 계산 진행",
+                "[incremental] %s pykrx 빈 결과 (KRX 16:30 이전 미발행 가능) → 호출자 재시도 또는 누적 DB로 진행",
                 iso,
             )
 
     if not rows:
-        log.info("[incremental] %s 빈 결과 (휴장일?)", iso)
+        log.info("[incremental] %s 빈 결과", iso)
         return {"date": iso, "rows": 0, "is_business_day": True, "empty": True}
 
     inserted = db.upsert_ohlcv_bulk(rows)
@@ -108,3 +114,67 @@ def update_today() -> dict:
 
     log.info("[incremental] %s 추가 rows=%d", iso, inserted)
     return {"date": iso, "rows": inserted, "is_business_day": True, "empty": False}
+
+
+def update_specific_date(target_iso: str) -> dict:
+    """지정 날짜 OHLCV fetch + DB 추가. 휴장일 무관 — 호출자가 영업일 보장.
+
+    반환: {"date": iso, "rows": int, "empty": bool}.
+    어제 데이터를 강제로 가져올 때(주말 발송, 16:00에 today 데이터 미발행 등) 사용.
+    """
+    db.ensure_schema()
+    ymd = target_iso.replace("-", "")
+    rows = data_source.fetch_market_ohlcv_by_date(ymd)
+    if not rows:
+        return {"date": target_iso, "rows": 0, "empty": True}
+    active_set = {t["ticker"] for t in db.get_active_tickers()}
+    if active_set:
+        rows = [r for r in rows if r[0] in active_set]
+    inserted = db.upsert_ohlcv_bulk(rows)
+    log.info("[incremental] %s 강제 fetch 추가 rows=%d", target_iso, inserted)
+    return {"date": target_iso, "rows": inserted, "empty": False}
+
+
+def ensure_recent_business_day_data() -> dict:
+    """가장 최근 영업일까지 데이터 보장. 호출자가 16:00 cron에서 today 미발행이거나
+    주말일 때 사용.
+
+    동작:
+      1. KST 오늘이 영업일이면 today 시도 → 실패 시 어제 영업일 시도
+      2. 오늘이 주말이면 가장 최근 평일(금) 시도
+      3. 이미 DB에 있는 날짜면 skip
+
+    반환: {"date": iso, "rows": int, "empty": bool, "source": "today"|"recent"}.
+    """
+    db.ensure_schema()
+    today = datetime.now(KST).date()
+    target = _last_business_day(today)
+    target_iso = target.strftime("%Y-%m-%d")
+
+    # 이미 있으면 skip
+    if db.has_date(target_iso):
+        log.info("[incremental] %s 이미 DB에 있음", target_iso)
+        return {"date": target_iso, "rows": 0, "empty": False, "source": "cached"}
+
+    # 우선 target 시도
+    res = update_specific_date(target_iso)
+    if not res["empty"]:
+        return {**res, "source": "target"}
+
+    # 실패 시 직전 영업일 시도 (최대 5영업일)
+    d = target - timedelta(days=1)
+    for _ in range(5):
+        d = _last_business_day(d)
+        d_iso = d.strftime("%Y-%m-%d")
+        if db.has_date(d_iso):
+            log.info("[incremental] fallback %s 이미 DB에 있음", d_iso)
+            return {"date": d_iso, "rows": 0, "empty": False, "source": "fallback_cached"}
+        res = update_specific_date(d_iso)
+        if not res["empty"]:
+            log.info("[incremental] fallback %s 사용", d_iso)
+            return {**res, "source": "fallback"}
+        d -= timedelta(days=1)
+
+    log.warning("[incremental] 최근 영업일 5일 모두 fetch 실패 — 누적 DB로 진행")
+    return {"date": target_iso, "rows": 0, "empty": True, "source": "none"}
+

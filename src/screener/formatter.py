@@ -106,10 +106,26 @@ def _fmt_kst_header(dt: datetime) -> str:
     return dt.strftime("%Y.%m.%d.") + f"({_KO_WEEKDAY[dt.weekday()]}) " + dt.strftime("%H:%M KST")
 
 
-def format_results(results: dict[str, list[dict]], as_of: datetime) -> str:
+def format_results(
+    results: dict[str, list[dict]],
+    as_of: datetime,
+    base_date: str | None = None,
+) -> str:
+    """미미 스타일 메시지 포맷.
+
+    base_date(YYYY-MM-DD): 신호 계산에 쓰인 OHLCV 종가 날짜. 사용자에게 명시적으로
+    "어떤 날 종가 기준인지" 알려주는 용도. None이면 as_of 날짜로 추정.
+    """
     parts: list[str] = []
     parts.append(f"📈 한국 주식 기술적 신호 — {_fmt_kst_header(as_of)}")
-    parts.append("(시총 3000억+ · 15:30 종가 기준 · 섹터별 분류)\n")
+    if base_date:
+        # base_date 가 오늘이 아니면 명시적 표기 (전일 종가 기준 등)
+        as_of_iso = as_of.strftime("%Y-%m-%d")
+        if base_date != as_of_iso:
+            parts.append(f"📊 기준일: {base_date} (장마감 종가)")
+        else:
+            parts.append(f"📊 기준일: {base_date} 당일 종가")
+    parts.append("(시총 3000억+ · KOSPI/KOSDAQ · 섹터별 분류)\n")
 
     # 전체 신호 통합 섹터 요약
     all_signals: list[dict] = []
