@@ -1,11 +1,12 @@
 """신호 결과 → 텔레그램 메시지.
 
-길이 제어:
-  - 카테고리당 Top N (기본 30, env SCREENER_PER_CATEGORY_TOP)
-  - 20일/60일 신고가는 종목명 콤마 구분 요약
+미미 스타일 포맷 (https://t.me/mimi_ATH 참고):
+  - 각 신호 카테고리(역사적 신고가/52주 신고가/거래량 돌파/52주 돌파 직전)
+    안에서 섹터별로 그룹핑
+  - 라인: "(섹터명) 종목명1(+5.2%), 종목명2(+3.1%), ..."
+  - 시총·구름상단·거래량배수 등 디테일은 헤더 1줄로만 안내
+  - KOSPI 우선 정렬 (각 섹터 내부)
   - 최종 텍스트는 send_text_chunked가 4000자 청크로 분할
-
-KOSPI(유가증권시장) / KOSDAQ 분리 출력. KOSPI 위주 (top_n_kospi >= top_n_kosdaq).
 """
 from __future__ import annotations
 
@@ -13,25 +14,12 @@ import os
 from datetime import datetime
 
 
-def _per_category_top_kospi() -> int:
+def _per_category_top() -> int:
+    """카테고리당 표시 한도 (기본 80, env SCREENER_PER_CATEGORY_TOP)."""
     try:
-        return max(1, int(os.getenv("SCREENER_PER_CATEGORY_TOP_KOSPI", "30")))
+        return max(1, int(os.getenv("SCREENER_PER_CATEGORY_TOP", "80")))
     except ValueError:
-        return 30
-
-
-def _per_category_top_kosdaq() -> int:
-    try:
-        return max(1, int(os.getenv("SCREENER_PER_CATEGORY_TOP_KOSDAQ", "10")))
-    except ValueError:
-        return 10
-
-
-def _fmt_money(v: float | int) -> str:
-    try:
-        return f"{int(v):,}"
-    except Exception:
-        return str(v)
+        return 80
 
 
 def _fmt_pct(v: float, signed: bool = True) -> str:
@@ -39,86 +27,65 @@ def _fmt_pct(v: float, signed: bool = True) -> str:
     return f"{sign}{v:.1f}%"
 
 
-def _fmt_cap(cap: int | None) -> str:
-    if cap is None or cap <= 0:
-        return ""
-    if cap >= 1_000_000_000_000:  # 1조+
-        return f", 시총 {cap / 1e12:.1f}조"
-    return f", 시총 {cap / 1e8:.0f}억"
+def _fmt_label_compact(item: dict) -> str:
+    """미미 스타일 단순 라벨: '삼성전자(+5.2%)'."""
+    name = item.get("name") or item.get("ticker", "")
+    chg = item.get("chg_pct", 0.0)
+    return f"{name}({_fmt_pct(chg)})"
 
 
-def _fmt_label(item: dict) -> str:
-    return f"{item.get('name', item['ticker'])}({item['ticker']})"
+def _market_rank(item: dict) -> int:
+    """KOSPI 0, 그 외 1 — 정렬용."""
+    m = (item.get("market") or "").upper()
+    return 0 if m != "KOSDAQ" else 1
 
 
-def _split_by_market(items: list[dict]) -> tuple[list[dict], list[dict]]:
-    """(kospi, kosdaq) 두 리스트로 분리. market 정보 없는 건 KOSPI로."""
-    kospi: list[dict] = []
-    kosdaq: list[dict] = []
+def _group_by_sector(items: list[dict]) -> list[tuple[str, list[dict]]]:
+    """섹터별 그룹화. 섹터 비어있으면 '기타'.
+
+    각 섹터 내부는 KOSPI 우선 → 시총·상승률 복합 정렬은 입력 그대로 유지.
+    섹터 순서: 종목 수가 많은 섹터 먼저 + 동률이면 첫 등장 순.
+    """
+    groups: dict[str, list[dict]] = {}
+    order: list[str] = []
     for it in items:
-        m = (it.get("market") or "").upper()
-        if m == "KOSDAQ":
-            kosdaq.append(it)
-        else:
-            kospi.append(it)
-    return kospi, kosdaq
+        sec = (it.get("sector") or "").strip() or "기타"
+        if sec not in groups:
+            groups[sec] = []
+            order.append(sec)
+        groups[sec].append(it)
 
+    # 섹터별 KOSPI 우선 정렬 (시총·상승률 정렬은 signals.py에서 이미 됨)
+    for sec in groups:
+        groups[sec].sort(key=lambda it: (_market_rank(it),))
 
-def _fmt_sector(s: str | None) -> str:
-    if not s:
-        return ""
-    # 섹터 너무 길면 줄임
-    s = s.strip()
-    if len(s) > 12:
-        s = s[:12]
-    return f" [{s}]"
-
-
-def _line_simple(i: int, it: dict) -> str:
-    """공통 단순 라인: '1. 삼성전자(005930) +5.2% — 75,000원, 시총 500조 [반도체]'."""
-    chg = it.get("chg_pct", 0.0)
-    return (
-        f"{i}. {_fmt_label(it)} {_fmt_pct(chg)} — "
-        f"{_fmt_money(it['close'])}원{_fmt_cap(it.get('market_cap'))}"
-        f"{_fmt_sector(it.get('sector'))}"
-    )
+    # 섹터 순서: 종목 수 desc + 첫 등장 순
+    sorted_secs = sorted(order, key=lambda s: (-len(groups[s]), order.index(s)))
+    return [(s, groups[s]) for s in sorted_secs]
 
 
 def _format_section(items: list[dict], emoji: str, title: str) -> str:
-    """KOSPI(top_n_kospi) + KOSDAQ(top_n_kosdaq) 분리 섹션. 단순 라인."""
-    kospi, kosdaq = _split_by_market(items)
-    n_kospi = _per_category_top_kospi()
-    n_kosdaq = _per_category_top_kosdaq()
-    head = f"━━━ {emoji} {title} (KOSPI {len(kospi)}, KOSDAQ {len(kosdaq)}) ━━━\n"
+    """미미 스타일 섹션: 섹터별 그룹 + 종목명(등락률) 콤마 나열."""
+    head = f"━━━ {emoji} {title} ({len(items)}) ━━━"
+    if not items:
+        return head + "\n해당 없음\n"
 
-    if not kospi and not kosdaq:
-        return head + "해당 없음\n"
+    cap = _per_category_top()
+    items_capped = items[:cap]
+    rest = len(items) - cap
 
-    out = [head]
-    out.append("📍 유가증권시장 (KOSPI)")
-    if kospi:
-        for i, it in enumerate(kospi[:n_kospi], 1):
-            out.append(_line_simple(i, it))
-        rest = len(kospi) - n_kospi
-        if rest > 0:
-            out.append(f"... 외 {rest}종목")
-    else:
-        out.append("해당 없음")
-    out.append("")
-    out.append("📍 코스닥 (KOSDAQ)")
-    if kosdaq:
-        for i, it in enumerate(kosdaq[:n_kosdaq], 1):
-            out.append(_line_simple(i, it))
-        rest = len(kosdaq) - n_kosdaq
-        if rest > 0:
-            out.append(f"... 외 {rest}종목")
-    else:
-        out.append("해당 없음")
-    return "\n".join(out) + "\n"
+    sector_groups = _group_by_sector(items_capped)
+    lines = [head]
+    for sec, sec_items in sector_groups:
+        names = ", ".join(_fmt_label_compact(it) for it in sec_items)
+        lines.append(f"({sec}) {names}")
+    if rest > 0:
+        lines.append(f"... 외 {rest}종목")
+    return "\n".join(lines) + "\n"
 
 
-def _sector_summary(items: list[dict], top_n: int = 5) -> str:
-    """섹터별 종목 수 집계 (KOSPI+KOSDAQ 통합)."""
+def _sector_summary(items: list[dict], top_n: int = 6) -> str:
+    """전체 신호 통합 섹터 집계."""
     if not items:
         return ""
     counts: dict[str, int] = {}
@@ -131,12 +98,20 @@ def _sector_summary(items: list[dict], top_n: int = 5) -> str:
     return ", ".join(f"{name}({n})" for name, n in sorted_items)
 
 
+_KO_WEEKDAY = ["월", "화", "수", "목", "금", "토", "일"]
+
+
+def _fmt_kst_header(dt: datetime) -> str:
+    """미미 스타일 헤더 날짜: '2026.05.08.(금) 16:00 KST'."""
+    return dt.strftime("%Y.%m.%d.") + f"({_KO_WEEKDAY[dt.weekday()]}) " + dt.strftime("%H:%M KST")
+
+
 def format_results(results: dict[str, list[dict]], as_of: datetime) -> str:
     parts: list[str] = []
-    parts.append(f"🔔 한국 주식 기술적 신호 ({as_of.strftime('%Y-%m-%d %H:%M KST')})")
-    parts.append("(시총 3000억원 이상 · 유가증권시장 우선 · 시총·상승률 복합 정렬)\n")
+    parts.append(f"📈 한국 주식 기술적 신호 — {_fmt_kst_header(as_of)}")
+    parts.append("(시총 3000억+ · 15:30 종가 기준 · 섹터별 분류)\n")
 
-    # 섹터 요약 (모든 신호 통합)
+    # 전체 신호 통합 섹터 요약
     all_signals: list[dict] = []
     for v in results.values():
         all_signals.extend(v)
@@ -147,7 +122,7 @@ def format_results(results: dict[str, list[dict]], as_of: datetime) -> str:
     parts.append(_format_section(results.get("high_all", []), "🚀", "역사적 신고가"))
     parts.append(_format_section(results.get("high_52w", []), "📈", "52주 신고가"))
     parts.append(_format_section(results.get("volume_breakout", []), "🔥", "거래량 돌파 ≥2배"))
-    parts.append(_format_section(results.get("near_breakout_52w", []), "🎯", "52주 돌파 직전 (95-99%)"))
+    parts.append(_format_section(results.get("near_breakout_52w", []), "🎯", "52주 돌파 직전 95-99%"))
 
     total = sum(len(v) for v in results.values())
     if total == 0:
