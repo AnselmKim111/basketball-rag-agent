@@ -130,12 +130,65 @@ def compute_signals_for_ticker(rows: list[dict]) -> dict:
                                 "chg_pct": chg_pct,
                             }
 
+    # 5) VCP 상방 돌파 (Volatility Contraction Pattern)
+    # 정의 (단순화된 미네르비니 휴리스틱):
+    #   (a) base 형성: 최근 50일 박스권 (high/low 비율 ≤ 1.20)
+    #   (b) 변동성 수축: 최근 20일 ATR < 50일 ATR × 0.7 (ATR 30% 이상 감소)
+    #   (c) 거래량 dry-up: 최근 10일 vol_avg < 50일 vol_avg × 0.85
+    #   (d) 돌파: 종가 > 50일 박스권 high(=base ceiling) AND 거래량 ≥ 20일 평균 × 1.5
+    if len(df) >= 50:
+        try:
+            recent50 = df.iloc[-50:]
+            recent50_high = float(recent50["high"].iloc[:-1].max())
+            recent50_low = float(recent50["low"].iloc[:-1].min())
+            base_ratio = recent50_high / recent50_low if recent50_low > 0 else 999
+
+            # ATR 계산 — high - low의 단순 평균 (TR 근사)
+            tr = (df["high"] - df["low"]).astype(float)
+            atr_recent = float(tr.iloc[-21:-1].mean()) if len(tr) >= 21 else 0
+            atr_base = float(tr.iloc[-51:-21].mean()) if len(tr) >= 51 else 0
+            atr_contraction = (atr_recent / atr_base) if atr_base > 0 else 999
+
+            vol_ma20 = df["volume"].rolling(20).mean().iloc[-2]
+            vol_recent10 = df["volume"].iloc[-11:-1].mean()
+            vol_base50 = df["volume"].iloc[-51:-11].mean() if len(df) >= 51 else 0
+            vol_dryup = (float(vol_recent10) / float(vol_base50)) if vol_base50 > 0 else 999
+
+            today_vol_ratio = (
+                float(today["volume"]) / float(vol_ma20) if (pd.notna(vol_ma20) and vol_ma20 > 0) else 0
+            )
+
+            # 모든 조건
+            is_base = base_ratio <= 1.20
+            is_contracted = atr_contraction <= 0.70
+            is_dryup = vol_dryup <= 0.85
+            is_breakout = (
+                today["close"] > recent50_high
+                and today_vol_ratio >= 1.5
+                and chg_pct > 0
+            )
+
+            if is_base and is_contracted and is_dryup and is_breakout:
+                out["vcp_breakout"] = {
+                    "close": int(today["close"]),
+                    "base_high": int(recent50_high),
+                    "base_low": int(recent50_low),
+                    "base_ratio": base_ratio,
+                    "atr_contraction": atr_contraction,
+                    "vol_dryup": vol_dryup,
+                    "vol_ratio": today_vol_ratio,
+                    "chg_pct": chg_pct,
+                }
+        except Exception:
+            log.exception("VCP 계산 실패")
+
     return out
 
 
 CATEGORIES = [
     "high_all",
     "high_52w",
+    "vcp_breakout",
     "volume_breakout",
     "near_breakout_52w",
 ]

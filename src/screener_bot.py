@@ -219,6 +219,17 @@ async def screener_daily_job(bot: Bot, override_chat_id: str | None = None) -> N
             ensured = await loop.run_in_executor(None, incremental.ensure_recent_business_day_data)
             log.info("[scheduled] ensure_recent_business_day 결과: %s", ensured)
 
+        # 진단: 삼성전자 005930 + SK하이닉스 000660의 최근 7일치 (date, close) 출력
+        # FDR/DB가 진짜 target 날짜 데이터를 가지고 있는지 검증
+        try:
+            for diag_t in ("005930", "000660"):
+                rows_diag = await loop.run_in_executor(None, lambda t=diag_t: db.load_ohlcv(t, days=7))
+                if rows_diag:
+                    snap = [(r["date"], r["close"]) for r in rows_diag]
+                    log.warning("[scheduled] DIAG db.load_ohlcv(%s) last7=%s", diag_t, snap)
+        except Exception:
+            log.exception("[scheduled] DIAG load_ohlcv 실패")
+
         # 신호 계산
         results = await loop.run_in_executor(None, signals.compute_all)
         if not results:

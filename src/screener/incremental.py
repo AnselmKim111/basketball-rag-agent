@@ -150,6 +150,7 @@ def update_specific_date(target_iso: str) -> dict:
         target_match: list[tuple] = []
         t0 = time.monotonic()
         scanned = 0
+        first_diag_logged = False
         for ticker in sorted(active_set)[:cap]:
             if time.monotonic() - t0 > timeout_s:
                 log.warning(
@@ -159,8 +160,17 @@ def update_specific_date(target_iso: str) -> dict:
                 break
             try:
                 tr = data_source.fetch_ohlcv_by_ticker_via_fdr(ticker, start_iso, end_iso)
+                # 진단: 첫 응답 ticker의 실제 dates + close 출력 (FDR이 진짜 target 날짜
+                # 데이터를 주는지 확인). 시뮬레이션 환경에서 외부 API가 미래 날짜에
+                # 어떤 응답을 주는지 디버깅 용도.
+                if not first_diag_logged and tr:
+                    dates_close = [(r[1], r[5]) for r in tr]  # (date_iso, close)
+                    log.warning(
+                        "[incremental] DIAG FDR(%s) range=%s~%s actual=%s",
+                        ticker, start_iso, end_iso, dates_close,
+                    )
+                    first_diag_logged = True
                 merged.extend(tr)
-                # 정확히 target_iso 날짜 row 카운트
                 target_match.extend([r for r in tr if r[1] == target_iso])
             except Exception:
                 pass
