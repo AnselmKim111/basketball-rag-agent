@@ -81,6 +81,64 @@ def fetch_market_ohlcv_by_date(date_str: str, market: str = "ALL") -> list[tuple
     return []
 
 
+def fetch_ohlcv_by_ticker_via_naver(
+    ticker: str, start_iso: str, end_iso: str
+) -> list[tuple]:
+    """단일 종목 일별 OHLCV — Naver Finance siseJson API.
+
+    pykrx/FDR 환경 미스매치 (시뮬레이션 시간) 우회용. Naver가 가장 최근 정규장
+    종가 데이터를 정확히 제공.
+
+    응답 형식 (JS array literal):
+      [['날짜','시가','고가','저가','종가','거래량','외국인소진율'],
+       ['20260507',271000,272000,270000,271500,12345678,xxx],
+       ...]
+
+    반환: (ticker, date_iso, o, h, l, c, v, value=None) — fetch_ohlcv_by_ticker_via_fdr와 호환.
+    """
+    import requests
+    start_ymd = start_iso.replace("-", "")
+    end_ymd = end_iso.replace("-", "")
+    url = (
+        "https://api.finance.naver.com/siseJson.naver"
+        f"?symbol={ticker}&requestType=1"
+        f"&startTime={start_ymd}&endTime={end_ymd}&timeframe=day"
+    )
+    try:
+        resp = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+        resp.raise_for_status()
+        text = resp.text.strip()
+    except Exception as e:
+        log.warning("[data_source] Naver fetch %s 실패: %s", ticker, e)
+        return []
+    # JS array literal → JSON: 작은따옴표를 큰따옴표로, trailing whitespace/newline 제거.
+    # 헤더 row는 모든 컬럼이 문자열이라 그대로 둠. 데이터 row는 숫자 + ' '단순 전환.
+    import json, re
+    norm = text.replace("'", '"')
+    norm = re.sub(r"\s+", "", norm)
+    norm = norm.rstrip(",")
+    try:
+        data = json.loads(norm)
+    except Exception as e:
+        log.warning("[data_source] Naver %s JSON 파싱 실패: %s preview=%s", ticker, e, text[:200])
+        return []
+    if not data or len(data) < 2:
+        return []
+    # 첫 row가 헤더 (한글), 나머지가 데이터
+    rows: list[tuple] = []
+    for row in data[1:]:
+        try:
+            ymd = str(row[0])  # '20260508'
+            iso = f"{ymd[:4]}-{ymd[4:6]}-{ymd[6:8]}"
+            o, h, l, c, v = int(row[1]), int(row[2]), int(row[3]), int(row[4]), int(row[5])
+        except Exception:
+            continue
+        if c <= 0 or v < 0:
+            continue
+        rows.append((str(ticker), iso, o, h, l, c, v, None))
+    return rows
+
+
 def fetch_ohlcv_by_ticker_via_fdr(
     ticker: str, start_iso: str, end_iso: str
 ) -> list[tuple]:

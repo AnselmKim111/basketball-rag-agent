@@ -116,23 +116,73 @@ def update_today() -> dict:
     return {"date": iso, "rows": inserted, "is_business_day": True, "empty": False}
 
 
-def update_specific_date(target_iso: str) -> dict:
+def update_specific_date(target_iso: str, force: bool = False) -> dict:
     """지정 날짜 OHLCV fetch + DB 추가. 휴장일 무관.
 
     반환: {"date": iso, "rows": int, "empty": bool}.
-    pykrx 실패 시 FDR ticker-batch로 폴백 (active universe 종목별 fetch).
-    어제 데이터를 강제로 가져올 때(주말 발송, 16:00에 today 미발행 등) 사용.
+    데이터 소스 우선순위: Naver Finance(정확도 1순위) → pykrx → FDR ticker-batch.
+    Naver는 한국 정규장 종가를 매일 정확히 갱신하므로 FDR/pykrx 환경 미스매치 우회.
+    force=True면 이미 DB에 있어도 덮어씀 (잘못된 데이터 정정 용도).
     """
     db.ensure_schema()
     ymd = target_iso.replace("-", "")
     active_set = {t["ticker"] for t in db.get_active_tickers()}
 
-    # 1차: pykrx
-    rows = data_source.fetch_market_ohlcv_by_date(ymd)
-    if rows and active_set:
-        rows = [r for r in rows if r[0] in active_set]
+    # 0차: Naver Finance ticker-batch (1순위 — FDR 시뮬레이션 미스매치 우회)
+    naver_cap = _int_env("SCREENER_NAVER_CAP", 1200)
+    naver_timeout = _int_env("SCREENER_NAVER_TIMEOUT_S", 600)
+    rows: list[tuple] = []
+    if active_set:
+        log.info(
+            "[incremental] %s Naver Finance ticker-batch 시작 (cap=%d, timeout=%ds)",
+            target_iso, naver_cap, naver_timeout,
+        )
+        from datetime import datetime as _dt
+        target_dt = _dt.strptime(target_iso, "%Y-%m-%d").date()
+        # 충분히 넓게 (10일) 받아서 target 날짜 포함 보장
+        nv_start = (target_dt - timedelta(days=10)).strftime("%Y-%m-%d")
+        nv_end = (target_dt + timedelta(days=1)).strftime("%Y-%m-%d")
+        merged: list[tuple] = []
+        target_match: list[tuple] = []
+        t0 = time.monotonic()
+        scanned = 0
+        first_diag = False
+        for ticker in sorted(active_set)[:naver_cap]:
+            if time.monotonic() - t0 > naver_timeout:
+                log.warning("[incremental] Naver timeout %ds → %d에서 중단", naver_timeout, scanned)
+                break
+            try:
+                tr = data_source.fetch_ohlcv_by_ticker_via_naver(ticker, nv_start, nv_end)
+                if not first_diag and tr:
+                    sample = [(r[1], r[5]) for r in tr]
+                    log.warning("[incremental] DIAG NAVER(%s) range=%s~%s actual=%s",
+                                ticker, nv_start, nv_end, sample)
+                    first_diag = True
+                merged.extend(tr)
+                target_match.extend([r for r in tr if r[1] == target_iso])
+            except Exception as e:
+                log.debug("Naver %s 실패: %s", ticker, e)
+            scanned += 1
+            if scanned % 200 == 0:
+                log.info(
+                    "[incremental] Naver 진행 %d/%d (rows=%d, target_match=%d)",
+                    scanned, naver_cap, len(merged), len(target_match),
+                )
+        log.info(
+            "[incremental] Naver 완료 scanned=%d total_rows=%d target_match=%d",
+            scanned, len(merged), len(target_match),
+        )
+        # target 날짜 매치된 게 있으면 그걸 사용
+        if target_match:
+            rows = merged
 
-    # 2차: FDR ticker-batch (pykrx 실패 시 자동 폴백)
+    # 1차 폴백: pykrx (Naver가 빈 결과일 때만)
+    if not rows:
+        rows = data_source.fetch_market_ohlcv_by_date(ymd)
+        if rows and active_set:
+            rows = [r for r in rows if r[0] in active_set]
+
+    # 2차 폴백: FDR ticker-batch
     if not rows and active_set:
         cap = _int_env("SCREENER_INCREMENTAL_FDR_CAP", 1000)
         timeout_s = _int_env("SCREENER_INCREMENTAL_FDR_TIMEOUT_S", 480)
@@ -210,13 +260,16 @@ def ensure_recent_business_day_data() -> dict:
     target = _last_business_day(today)
     target_iso = target.strftime("%Y-%m-%d")
 
-    # 이미 있으면 skip
-    if db.has_date(target_iso):
-        log.info("[incremental] %s 이미 DB에 있음", target_iso)
+    # cached 여부와 무관하게 Naver 1차 fetch (이전 잘못된 데이터 정정 가능)
+    # 강제로 다시 받지 않으려면 SCREENER_FORCE_REFETCH=0 으로 설정.
+    force_refetch = _int_env("SCREENER_FORCE_REFETCH", 1) == 1
+
+    if not force_refetch and db.has_date(target_iso):
+        log.info("[incremental] %s 이미 DB에 있음 (force_refetch=0)", target_iso)
         return {"date": target_iso, "rows": 0, "empty": False, "source": "cached"}
 
-    # 우선 target 시도
-    res = update_specific_date(target_iso)
+    # target 시도 (Naver→pykrx→FDR 순)
+    res = update_specific_date(target_iso, force=force_refetch)
     if not res["empty"]:
         return {**res, "source": "target"}
 
