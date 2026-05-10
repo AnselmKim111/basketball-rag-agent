@@ -1,9 +1,11 @@
 """ScreenerBot — 한국 주식 기술적 신호 스크리너.
 
 매일 16:00 KST에 자동 실행 (15:30 장마감 + 30분 정산 버퍼). 사용자 명령:
-  /help, /screen (즉시), /status (DB 상태), /backfill (강제 백필)
+  /start (가입), /stop (탈퇴), /help, /screen (즉시), /status, /backfill
+  /list (admin), /block <chat_id> (admin), /unblock <chat_id> (admin)
 
 격리 원칙: wisereport/PIPELINE_LOCK 미사용. 자체 SQLite DB(/data/screener.db).
+가입자 (subscribers) DB로 친구 공유 가능 — 봇 link만 주면 자동 가입 + 자동 발송.
 """
 from __future__ import annotations
 
@@ -21,38 +23,196 @@ from src.bot_helpers import (
     is_authorized,
     send_text_chunked,
 )
+from src.screener import subscribers as subs
 
 log = logging.getLogger(__name__)
 KST = timezone(timedelta(hours=9))
 
-ALLOWED_ENV = "SCREENER_ALLOWED_CHAT_IDS"
-CHAT_ID_ENV = "SCREENER_CHAT_ID"
+ALLOWED_ENV = "SCREENER_ALLOWED_CHAT_IDS"  # admin chat_ids (콤마 구분)
+CHAT_ID_ENV = "SCREENER_CHAT_ID"  # legacy: 단일 chat_id (admin 호환용)
+
+
+def _is_admin(update: Update) -> bool:
+    """관리자 권한 (env vars의 ALLOWED_CHAT_IDS / CHAT_ID에 등록된 chat_id)."""
+    return is_authorized(update, ALLOWED_ENV)
+
+
+def _is_subscribed_or_admin(update: Update) -> bool:
+    """관리자 또는 활성 가입자."""
+    if _is_admin(update):
+        return True
+    cid = str(update.effective_chat.id)
+    try:
+        return subs.is_subscribed(cid)
+    except Exception:
+        log.exception("subscriber check 실패")
+        return False
+
+
+WELCOME_TEXT = (
+    "👋 *ScreenerBot에 오신 걸 환영합니다!*\n\n"
+    "📈 한국 주식 기술적 신호를 매일 16:00 KST에 자동 발송합니다.\n"
+    "(15:30 장마감 + 30분 정산 버퍼)\n\n"
+    "신호:\n"
+    "  🚀 역사적 신고가  📈 52주 신고가\n"
+    "  🔥 거래량 돌파 ≥2배  🎯 52주 돌파 직전\n"
+    "  💎 VCP 돌파 (변동성 수축 후 돌파)\n\n"
+    "명령:\n"
+    "  /screen — 지금 즉시 신호 분석 (~2-3분)\n"
+    "  /help — 도움말\n"
+    "  /stop — 자동 발송 해제\n\n"
+    "_시총 3000억+ KOSPI/KOSDAQ 종목, 섹터별 분류, 시총·상승률 복합 정렬, "
+    "Naver 이중확인 통과만 발송_"
+)
 
 HELP_TEXT = (
     "📈 *ScreenerBot* — 한국 주식 기술적 신호\n\n"
     "자동: 매일 16:00 KST (15:30 종가 기준 · 30분 정산 버퍼)\n"
-    "데이터: KRX (pykrx + FDR) — OHLCV + 시가총액 + 섹터\n"
+    "데이터: KRX (Naver Finance 1순위 + pykrx/FDR 폴백)\n"
     "유니버스: KOSPI + KOSDAQ 보통주, 시총 ≥ 3000억\n"
-    "표시: 유가증권시장 우선 · 시총·상승률 복합 정렬 · 섹터 표시\n\n"
+    "이중확인: base_date-anchored signals + Naver 재 fetch cross-validation\n\n"
     "신호:\n"
     "  🚀 역사적 신고가 — 종가 > 보유 데이터(280일) 최고가\n"
     "  📈 52주 신고가 — 종가 > 과거 252영업일 최고가\n"
     "  🔥 거래량 돌파 — 오늘 거래량 ≥ 20일 평균 ×2.0 + 종가 상승\n"
-    "  🎯 52주 돌파 직전 — 종가 = 52주고점 95-99% + 5일 거래량 ≥ ×1.3\n\n"
+    "  🎯 52주 돌파 직전 — 종가 = 52주고점 95-99% + 5일 거래량 ≥ ×1.3\n"
+    "  💎 VCP 돌파 — 50일 박스권 + ATR 30%+ 수축 + 거래량 dry-up + 돌파\n\n"
     "명령:\n"
+    "  /start — 가입 (자동 발송 활성화)\n"
+    "  /stop — 탈퇴\n"
     "  /screen — 즉시 실행\n"
-    "  /status — DB 상태 확인\n"
-    "  /backfill — 1년치 강제 재백필 (10분+ 소요)\n"
+    "  /help — 이 메시지\n"
 )
 
 
 # ------------------------------------------------------------------
-# 핸들러
+# 가입/탈퇴 핸들러 (누구나 가능)
 # ------------------------------------------------------------------
-async def _help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_authorized(update, ALLOWED_ENV):
+async def _cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/start — 누구나 가입. 차단된 chat_id는 거부."""
+    chat_id = str(update.effective_chat.id)
+    user = update.effective_user
+    username = user.username if user else None
+    full_name = user.full_name if user else None
+    loop = asyncio.get_running_loop()
+    try:
+        is_new = await loop.run_in_executor(
+            None, lambda: subs.subscribe(chat_id, username, full_name)
+        )
+    except Exception:
+        log.exception("[start] subscribe 실패")
+        try:
+            await update.message.reply_text("⚠️ 가입 실패 — 관리자에게 문의해 주세요.")
+        except Exception:
+            pass
+        return
+
+    try:
+        await update.message.reply_text(WELCOME_TEXT, parse_mode=ParseMode.MARKDOWN)
+    except Exception:
+        log.exception("[start] welcome 발송 실패")
+
+    # admin에게 신규 가입 알림
+    if is_new:
+        try:
+            admin_ids_str = (os.getenv(ALLOWED_ENV, "") or os.getenv(CHAT_ID_ENV, "")).strip()
+            admin_ids = [a.strip() for a in admin_ids_str.split(",") if a.strip()]
+            for aid in admin_ids:
+                if aid == chat_id:
+                    continue  # admin 본인 알림 skip
+                try:
+                    await context.bot.send_message(
+                        chat_id=aid,
+                        text=(
+                            f"🆕 ScreenerBot 신규 가입자\n"
+                            f"  chat_id: {chat_id}\n"
+                            f"  username: @{username or '(없음)'}\n"
+                            f"  name: {full_name or '(없음)'}\n\n"
+                            f"차단하려면: /block {chat_id}"
+                        ),
+                    )
+                except Exception:
+                    log.exception("admin 알림 실패 aid=%s", aid)
+        except Exception:
+            log.exception("[start] admin 알림 절차 실패")
+
+
+async def _cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/stop — 자가 탈퇴."""
+    chat_id = str(update.effective_chat.id)
+    loop = asyncio.get_running_loop()
+    try:
+        ok = await loop.run_in_executor(None, lambda: subs.unsubscribe(chat_id))
+    except Exception:
+        log.exception("[stop] unsubscribe 실패")
+        ok = False
+    try:
+        await update.message.reply_text(
+            "👋 탈퇴 완료. 자동 발송이 중단됩니다." if ok
+            else "ℹ️ 가입되어 있지 않습니다."
+        )
+    except Exception:
+        pass
+
+
+async def _cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/list — admin 전용. 가입자 목록 조회."""
+    if not _is_admin(update):
         await deny_message(update, "스크리너봇")
         return
+    loop = asyncio.get_running_loop()
+    try:
+        items = await loop.run_in_executor(None, subs.list_all)
+    except Exception:
+        log.exception("[list] 실패")
+        items = []
+    if not items:
+        await update.message.reply_text("📭 가입자 없음")
+        return
+    lines = [f"👥 가입자 {len(items)}명:"]
+    for it in items:
+        flag = "🚫" if it["is_blocked"] else "✓"
+        lines.append(
+            f"{flag} {it['chat_id']} @{it['username'] or '?'} ({it['full_name'] or '?'}) "
+            f"— {it['subscribed_at'][:10]}"
+        )
+    await send_text_chunked(context.bot, str(update.effective_chat.id), "\n".join(lines))
+
+
+async def _cmd_block(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/block <chat_id> — admin 전용."""
+    if not _is_admin(update):
+        await deny_message(update, "스크리너봇")
+        return
+    args = context.args or []
+    if not args:
+        await update.message.reply_text("사용: /block <chat_id>")
+        return
+    target = args[0].strip()
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, lambda: subs.block(target))
+    await update.message.reply_text(f"🚫 차단 완료: {target}")
+
+
+async def _cmd_unblock(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_admin(update):
+        await deny_message(update, "스크리너봇")
+        return
+    args = context.args or []
+    if not args:
+        await update.message.reply_text("사용: /unblock <chat_id>")
+        return
+    target = args[0].strip()
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, lambda: subs.unblock(target))
+    await update.message.reply_text(f"✓ 차단 해제: {target}")
+
+
+# ------------------------------------------------------------------
+# 기존 핸들러 (가입자/admin 모두 사용)
+# ------------------------------------------------------------------
+async def _help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # /help는 누구나 — 봇 안내용
     try:
         await update.message.reply_text(HELP_TEXT, parse_mode=ParseMode.MARKDOWN)
     except Exception:
@@ -60,11 +220,13 @@ async def _help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def _cmd_screen(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_authorized(update, ALLOWED_ENV):
-        await deny_message(update, "스크리너봇")
+    if not _is_subscribed_or_admin(update):
+        await update.message.reply_text(
+            "🔒 가입자만 사용 가능합니다. /start 입력으로 가입하세요."
+        )
         return
     try:
-        await update.message.reply_text("🔄 스크리닝 즉시 실행 중...")
+        await update.message.reply_text("🔄 스크리닝 즉시 실행 중... (~2-3분 소요)")
     except Exception:
         log.exception("screen 안내 실패")
     try:
@@ -135,11 +297,37 @@ async def _cmd_backfill(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 # 일일 스케줄 잡 (orchestrator가 호출)
 # ------------------------------------------------------------------
 async def screener_daily_job(bot: Bot, override_chat_id: str | None = None) -> None:
-    log.info("[scheduled] screener_daily_job 시작")
-    chat_id = override_chat_id or os.environ.get(CHAT_ID_ENV)
-    if not chat_id:
-        log.error("%s 미설정 — 스킵", CHAT_ID_ENV)
+    """매일 16:00 cron 또는 /screen 즉시 실행.
+
+    override_chat_id: 명시되면 그 chat_id 1명에게만 (사용자 /screen 명령용).
+    None이면 모든 가입자 + admin에게 broadcast (cron용).
+
+    신호 계산은 한 번만 수행 + 결과를 모든 대상자에게 발송 (효율).
+    진행 상황(universe 빌드/백필) 메시지는 첫 대상자(주로 admin)에게만 발송.
+    """
+    log.info("[scheduled] screener_daily_job 시작 override=%s", override_chat_id)
+
+    # 발송 대상 chat_id 리스트 결정
+    if override_chat_id:
+        target_chat_ids = [str(override_chat_id)]
+    else:
+        # admin (env) + 가입자 (DB) union
+        admin_str = (os.getenv(ALLOWED_ENV, "") or os.getenv(CHAT_ID_ENV, "")).strip()
+        admin_ids = [a.strip() for a in admin_str.split(",") if a.strip()]
+        try:
+            from src.screener import subscribers as _subs
+            sub_ids = _subs.list_active_chat_ids()
+        except Exception:
+            log.exception("[scheduled] subscribers 조회 실패")
+            sub_ids = []
+        target_chat_ids = list(dict.fromkeys(admin_ids + sub_ids))  # 순서 유지 + 중복 제거
+
+    if not target_chat_ids:
+        log.error("발송 대상 chat_id 없음 — 스킵 (admin env 또는 subscribers 등록 필요)")
         return
+
+    log.info("[scheduled] 발송 대상 %d명: %s", len(target_chat_ids), target_chat_ids)
+    progress_chat = target_chat_ids[0]  # 진행 메시지는 첫 대상자(admin 우선)
 
     loop = asyncio.get_running_loop()
     try:
@@ -147,10 +335,13 @@ async def screener_daily_job(bot: Bot, override_chat_id: str | None = None) -> N
     except Exception:
         log.exception("[scheduled] screener 모듈 import 실패")
         try:
-            await send_text_chunked(bot, chat_id, "⚠️ screener import 실패 — 로그 확인")
+            await send_text_chunked(bot, progress_chat, "⚠️ screener import 실패 — 로그 확인")
         except Exception:
             pass
         return
+
+    # 진행 메시지 helper (admin에게만)
+    chat_id = progress_chat  # 기존 코드 변수명 유지 (진행 메시지용)
 
     try:
         # universe 보장
@@ -282,8 +473,16 @@ async def screener_daily_job(bot: Bot, override_chat_id: str | None = None) -> N
         text = formatter.format_results(
             results, datetime.now(KST), base_date=base_date, stats=stats
         )
-        await send_text_chunked(bot, chat_id, text)
-        log.info("[scheduled] 발송 완료 (base_date=%s)", base_date)
+        # 모든 대상자에게 broadcast (한 번 계산 → N번 발송)
+        sent_count = 0
+        for cid in target_chat_ids:
+            try:
+                await send_text_chunked(bot, cid, text)
+                sent_count += 1
+            except Exception:
+                log.exception("[scheduled] 발송 실패 cid=%s", cid)
+        log.info("[scheduled] 발송 완료 (base_date=%s, sent=%d/%d)",
+                 base_date, sent_count, len(target_chat_ids))
     except Exception:
         log.exception("[scheduled] screener_daily_job 실패")
         try:
@@ -320,19 +519,26 @@ async def _self_test(bot: Bot) -> None:
 # Entry point (orchestrator가 호출)
 # ------------------------------------------------------------------
 SCREENER_COMMANDS = [
-    ("screen", "📈 즉시 스크리닝 실행 (52주/일목/거래량 신호)"),
-    ("status", "DB 상태 + 데이터 최신성"),
-    ("backfill", "1년치 강제 재백필 (10분+)"),
+    ("start", "🚀 가입 (자동 발송 활성화)"),
+    ("screen", "📈 즉시 스크리닝 실행"),
+    ("stop", "탈퇴 (자동 발송 해제)"),
     ("help", "도움말"),
 ]
 
 
 def build_screener_app(token: str) -> Application:
     app = Application.builder().token(token).build()
-    app.add_handler(CommandHandler(["start", "help"], _help))
+    # 누구나 (가입/도움말/screen은 가입자만 내부 가드)
+    app.add_handler(CommandHandler("start", _cmd_start))
+    app.add_handler(CommandHandler("stop", _cmd_stop))
+    app.add_handler(CommandHandler("help", _help))
     app.add_handler(CommandHandler("screen", _cmd_screen))
+    # admin 전용
     app.add_handler(CommandHandler("status", _cmd_status))
     app.add_handler(CommandHandler("backfill", _cmd_backfill))
+    app.add_handler(CommandHandler("list", _cmd_list))
+    app.add_handler(CommandHandler("block", _cmd_block))
+    app.add_handler(CommandHandler("unblock", _cmd_unblock))
 
     if os.getenv("SCREENER_TEST_MODE", "0") == "1":
         try:
