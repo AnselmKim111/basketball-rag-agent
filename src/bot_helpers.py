@@ -39,10 +39,18 @@ def allowed_chat_ids(env_key: str) -> set[str]:
 
 
 def is_authorized(update: Update, env_key: str) -> bool:
-    """update의 chat_id가 env_key의 allowlist에 있는지."""
+    """update의 chat_id가 env_key의 allowlist에 있는지.
+
+    Sentinel "*" 가 allowlist에 있으면 open mode — 모든 chat_id 허용.
+    공개 운영 시 사용 (env에 "*" inject). 봇 username 알면 누구나 사용 가능
+    하므로 비용·정보우위 손해 감수 영역.
+    """
     if not update.effective_chat:
         return False
-    return str(update.effective_chat.id) in allowed_chat_ids(env_key)
+    allowed = allowed_chat_ids(env_key)
+    if "*" in allowed:
+        return True
+    return str(update.effective_chat.id) in allowed
 
 
 # ------------------------------------------------------------------
