@@ -115,8 +115,7 @@ async def _cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     # admin에게 신규 가입 알림
     if is_new:
         try:
-            admin_ids_str = (os.getenv(ALLOWED_ENV, "") or os.getenv(CHAT_ID_ENV, "")).strip()
-            admin_ids = [a.strip() for a in admin_ids_str.split(",") if a.strip()]
+            admin_ids = _parse_chat_ids(ALLOWED_ENV, CHAT_ID_ENV)
             for aid in admin_ids:
                 if aid == chat_id:
                     continue  # admin 본인 알림 skip
@@ -296,6 +295,33 @@ async def _cmd_backfill(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 # ------------------------------------------------------------------
 # 일일 스케줄 잡 (orchestrator가 호출)
 # ------------------------------------------------------------------
+def _parse_chat_ids(*env_keys: str) -> list[str]:
+    """env 여러 개를 합쳐서 진짜 chat_id (숫자 token) 만 추출.
+
+    걸러내는 케이스:
+      - '*' (wildcard 인증용 sentinel — 발송 대상 아님)
+      - '1813560888    (← 주석)' → '1813560888' 만 추출
+      - 빈 문자열 / 공백
+      - 음수·0 같은 비정상 값
+    """
+    import re
+    out: list[str] = []
+    seen: set[str] = set()
+    for key in env_keys:
+        raw = os.getenv(key, "") or ""
+        for token in raw.split(","):
+            # 숫자만 (보통 9~12자리 텔레그램 chat_id)
+            m = re.search(r"-?\d{6,}", token)
+            if not m:
+                continue
+            cid = m.group(0)
+            if cid in seen:
+                continue
+            seen.add(cid)
+            out.append(cid)
+    return out
+
+
 async def screener_daily_job(bot: Bot, override_chat_id: str | None = None) -> None:
     """매일 16:00 cron 또는 /screen 즉시 실행.
 
@@ -312,15 +338,15 @@ async def screener_daily_job(bot: Bot, override_chat_id: str | None = None) -> N
         target_chat_ids = [str(override_chat_id)]
     else:
         # admin (env) + 가입자 (DB) union
-        admin_str = (os.getenv(ALLOWED_ENV, "") or os.getenv(CHAT_ID_ENV, "")).strip()
-        admin_ids = [a.strip() for a in admin_str.split(",") if a.strip()]
+        admin_ids = _parse_chat_ids(ALLOWED_ENV, CHAT_ID_ENV)
         try:
             from src.screener import subscribers as _subs
             sub_ids = _subs.list_active_chat_ids()
         except Exception:
             log.exception("[scheduled] subscribers 조회 실패")
             sub_ids = []
-        target_chat_ids = list(dict.fromkeys(admin_ids + sub_ids))  # 순서 유지 + 중복 제거
+        # admin + subscribers union, 중복 제거, '*' 같은 비정상 값 자동 필터됨
+        target_chat_ids = list(dict.fromkeys(admin_ids + sub_ids))
 
     if not target_chat_ids:
         log.error("발송 대상 chat_id 없음 — 스킵 (admin env 또는 subscribers 등록 필요)")
@@ -495,12 +521,22 @@ async def screener_daily_job(bot: Bot, override_chat_id: str | None = None) -> N
 # Self-test (CLAUDE.md 자동 검증 의무)
 # ------------------------------------------------------------------
 async def _self_test(bot: Bot) -> None:
-    """SCREENER_TEST_MODE=1 시 부팅 후 1회 자동 실행."""
-    chat_id = (
-        os.getenv("SCREENER_TEST_CHAT_ID")
-        or os.getenv(CHAT_ID_ENV)
-        or (os.getenv(ALLOWED_ENV, "").split(",") + [""])[0].strip()
-    )
+    """SCREENER_TEST_MODE=1 시 부팅 후 1회 자동 실행.
+
+    chat_id 결정: SCREENER_TEST_CHAT_ID → 통합 robust 파싱
+    (CHAT_ID_ENV + ALLOWED_ENV에서 진짜 chat_id만 추출. wildcard '*'·주석 등 무시).
+    """
+    test_chat = os.getenv("SCREENER_TEST_CHAT_ID", "").strip()
+    chat_id = None
+    if test_chat:
+        import re
+        m = re.search(r"-?\d{6,}", test_chat)
+        if m:
+            chat_id = m.group(0)
+    if not chat_id:
+        ids = _parse_chat_ids(CHAT_ID_ENV, ALLOWED_ENV)
+        if ids:
+            chat_id = ids[0]
     if not chat_id:
         log.warning("[self-test] chat_id 없음 — 스킵")
         return
