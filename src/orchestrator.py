@@ -45,6 +45,7 @@ from src.category_bots import (
     market_daily_job,
 )
 from src.disclosure_bot import DISCLOSURE_COMMANDS, build_disclosure_app, disclosure_poll_job
+from src.earnings_bot import EARNINGS_COMMANDS, build_earnings_app
 from src.idea_bot import IDEA_COMMANDS, build_idea_app
 from src.screener_bot import SCREENER_COMMANDS, build_screener_app, screener_daily_job
 
@@ -151,6 +152,13 @@ BOT_SPECS: list[BotSpec] = [
         ],
     ),
     BotSpec(
+        name="earnings",
+        token_env="EARNINGS_BOT_TOKEN",
+        builder=build_earnings_app,
+        commands=EARNINGS_COMMANDS,
+        jobs=[],  # 사용자 입력 기반, 스케줄 없음
+    ),
+    BotSpec(
         name="screener",
         token_env="SCREENER_BOT_TOKEN",
         builder=build_screener_app,
@@ -173,7 +181,7 @@ BOT_SPECS: list[BotSpec] = [
 def _diag_env() -> None:
     relevant = diag_env_keys(
         ("TELEGRAM", "WISE", "OPEN", "ALLOWED", "CHAT", "INDUSTRY", "MARKET",
-         "GLOBAL", "DART", "IDEA", "DISCLOSURE", "SCREENER")
+         "GLOBAL", "DART", "IDEA", "DISCLOSURE", "SCREENER", "EARNINGS", "SEC")
     )
     print(f"[orch] env keys total = {len(os.environ)}", flush=True)
     print(f"[orch] relevant env vars = {relevant}", flush=True)

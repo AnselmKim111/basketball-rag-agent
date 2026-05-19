@@ -130,3 +130,51 @@
 시뮬레이션 환경에서 외부 KRX/Naver/FDR 데이터에 lag/forward-fill 가능성. 따라서
 이중확인 구조가 핵심. 단일 소스만 신뢰하면 잘못된 chg_pct 발생 — 사용자에게 검증된 사례
 존재 (예: 첫 self-test에서 삼성E&A +21.5% 잘못 표시 → fix 후 -3.11% 정확).
+
+---
+
+## 7. EarningsBot — 미국 기업 어닝콜 + 비교 PDF (별도 봇)
+
+미국 상장사 한정. 어닝콜 전문 + 6년치 재무 비교 + 한국어 PDF 보고서.
+
+### 핵심 파일
+- `src/earnings_bot.py` — 봇 entrypoint, `_run_pipeline` (0~6단계), `_self_test`
+- `src/earnings/sec_edgar.py` — SEC EDGAR Company Facts API (CapEx/OCF/FCF/Revenue/R&D/NI)
+  · ticker→CIK 캐시 (메모리), rate limit 6.6 req/s, User-Agent 헤더 필수
+- `src/earnings/transcripts.py` — perplexity/sonar-pro로 어닝콜 전문 fetch (JSON schema)
+  + 조건→티커 확장 (`expand_criteria_to_tickers`)
+- `src/earnings/charts.py` — matplotlib 차트 6종 (CapEx 절대/YoY, FCF, OCF/CapEx, intensity, Revenue)
+- `src/earnings/pdf_report.py` — PdfPages로 PDF 빌드 (표지/Exec Summary/차트/종목별/커스텀/부록)
+- `prompts/earnings_parse.txt` — 입력 파싱 (모드/티커/분기/커스텀 질문)
+- `prompts/earnings_synthesis.txt` — Executive Summary 합성 (산업 분위기 + 비교)
+- `prompts/earnings_custom.txt` — 커스텀 질문 답변 합성
+
+### 데이터 소스
+- 어닝콜 전문: perplexity/sonar-pro (IDEA_RESEARCH_MODEL 공유) 웹검색 → 구조화 JSON
+- 재무: SEC EDGAR XBRL US-GAAP 태그 (FY 10-K, 6년치)
+  · CapEx: PaymentsToAcquirePropertyPlantAndEquipment
+  · OCF: NetCashProvidedByUsedInOperatingActivities
+  · FCF: OCF − CapEx (derived), OCF/CapEx 비율 = 캐시 머신 vs 캐펙스 burden 신호
+
+### 파이프라인 (6단계)
+0. parse (summary tier) — 입력 → mode/tickers/fiscal_period/custom_question
+1. (criteria 모드) 조건 → 티커 확장 (research tier, perplexity)
+2. 종목별 어닝콜 전문 fetch (research tier) → 텔레그램 즉시 발송
+3. SEC EDGAR로 6년치 재무 (rate limit 보호)
+4. Executive Summary 합성 (synthesis tier, 한국어, ticker bracket 출처)
+5. 커스텀 질문 답변 합성 (있는 경우만)
+6. PDF 빌드 + 텔레그램 발송
+
+### 환경변수
+- `EARNINGS_BOT_TOKEN` — 텔레그램 봇 토큰
+- `EARNINGS_ALLOWED_CHAT_IDS` — 인가 chat_ids (콤마)
+- `EARNINGS_CHAT_ID` — self-test fallback
+- `SEC_EDGAR_USER_AGENT` — "name email@example.com" (SEC 정책상 필수)
+- `EARNINGS_TEST_PROMPT` — self-test용 (부팅 후 1회 실행)
+- 모델: `OPENROUTER_MODEL` / `IDEA_RESEARCH_MODEL` / `IDEA_SYNTHESIS_MODEL`
+  (idea_bot envs 공유)
+
+### 제약
+- 미국 상장사 한정. 한국 종목 요청 시 reject.
+- 최대 8개 기업 (4-6개 권장 — 차트 가독성).
+- 어닝콜 발표 직후 24-48h는 perplexity 인덱스에 미수록 가능.
