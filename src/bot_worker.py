@@ -152,24 +152,152 @@ async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """슬래시 없는 자유 입력: 종목명/티커만 보내면 /deepdive + /report 둘 다 실행.
+    """자유 텍스트 진입점 — intent_router로 인텐트 분석 → 핸들러 라우팅.
 
-    명시적으로 /report 또는 /deepdive 명령을 쓰면 각각만 실행 (이 핸들러는
-    filters.TEXT & ~filters.COMMAND 로 등록되어 슬래시 명령은 안 들어옴).
+    지원 인텐트:
+      research  — 단일 종목 → deep_research.run (8-15분, $0.15)
+      compare   — N종목 비교 → comparator.run_compare (30-60분, $0.45-0.65, PDF)
+      theme     — 테마 발굴 → IdeaBot 안내 (다른 봇)
+      question  — 일반 질문 → LLM 답변
+      unknown   — 명확화 요청
+
+    명시 명령 (/research, /curate, /deepdive, /report)은 슬래시 핸들러로 별도 실행.
     """
     if not is_authorized(update):
         await deny_message(update, "종목봇")
         return
     text = (update.message.text or "").strip()
+    if not text:
+        return
+    bot = context.bot
+    chat_id = str(update.effective_chat.id)
+
+    # 인텐트 분석 (haiku, ~2초)
+    try:
+        from src.intent_router import Intent, classify, resolve_tickers
+    except Exception:
+        logging.exception("intent_router import 실패 — legacy text_handler 폴백")
+        await _legacy_text_handler(update, context, text)
+        return
+
+    intent = await classify(text)
+    logging.info("[intent_router] '%s' → %s (conf=%.2f, names=%s, aspect=%s)",
+                 text[:50], intent.intent, intent.confidence,
+                 intent.ticker_names, intent.aspect)
+
+    if intent.intent == "research":
+        if not intent.ticker_names:
+            await update.message.reply_text("종목명을 못 찾았어요. `/research 삼성전자` 형태로 다시 보내주세요.")
+            return
+        # 첫 번째 종목명 → resolve → deep_research
+        pairs, unresolved = await resolve_tickers(intent.ticker_names[:1])
+        if unresolved:
+            await update.message.reply_text(
+                f"'{unresolved[0]}'이(가) 어떤 종목인지 모르겠어요. 정확한 종목명 또는 6자리 ticker로 다시 보내주세요."
+            )
+            return
+        from src.deep_research import run as deep_research_run
+        name, ticker = pairs[0]
+        asyncio.create_task(
+            deep_research_run(bot, chat_id, ticker),
+            name=f"research:{ticker}",
+        ).add_done_callback(_log_task_exception)
+        return
+
+    if intent.intent == "compare":
+        if not intent.ticker_names or len(intent.ticker_names) < 2:
+            await update.message.reply_text("비교는 2종목 이상 필요해요. 예: `삼성전자 SK하이닉스 capex 비교`", parse_mode=ParseMode.MARKDOWN)
+            return
+        pairs, unresolved = await resolve_tickers(intent.ticker_names[:5])
+        if unresolved:
+            await update.message.reply_text(
+                f"매칭 실패 종목: *{', '.join(unresolved)}* — 정확한 종목명 또는 ticker로 다시 보내주세요.",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            return
+        if len(pairs) < 2:
+            await update.message.reply_text("비교 불가 — 2종목 이상 매칭되어야 합니다.")
+            return
+        from src.comparator import run_compare
+        asyncio.create_task(
+            run_compare(bot, chat_id, pairs, intent.aspect or "전반"),
+            name=f"compare:{','.join(t for _, t in pairs)}",
+        ).add_done_callback(_log_task_exception)
+        return
+
+    if intent.intent == "theme":
+        await update.message.reply_text(
+            f"테마 발굴은 IdeaBot에서: t.me/AnselmsSlave6bot\n명령: `/idea {intent.theme or text}`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    if intent.intent == "question":
+        await _answer_question(update, intent.raw_question or text)
+        return
+
+    # unknown
+    await update.message.reply_text(
+        intent.clarification or
+        f"입력 의도를 못 잡았어요. 예시:\n"
+        f"  • `삼성전자` (단일 분석)\n"
+        f"  • `삼성전자 SK하이닉스 capex 비교` (비교)\n"
+        f"  • `/curate` (Top10 큐레이션)\n"
+        f"  • `/help` 전체 명령",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
+async def _legacy_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
+    """intent_router import 실패 시 폴백 — 기존 단순 종목명 매칭."""
     parts = text.split()
     parsed = _parse_args(parts) or await _parse_args_with_lookup(update, parts)
     if not parsed:
         await update.message.reply_text(
-            "잘 모르겠어요. `/help` 또는 `종목명` (자동 매핑) / `종목명 6자리티커` 형식으로 보내주세요.",
+            "잘 모르겠어요. `/help` 또는 `종목명` 형식으로 보내주세요.",
             parse_mode=ParseMode.MARKDOWN,
         )
         return
     await _enqueue_combined(update, context, *parsed)
+
+
+async def _answer_question(update: Update, question: str) -> None:
+    """일반 질문 답변 — claude-sonnet 호출. 한국 주식·시장 맥락 우선."""
+    from src.summarizer import OpenRouterCreditExhausted, chat_with_retry, get_client
+    try:
+        client = get_client()
+    except Exception:
+        await update.message.reply_text("⚠️ LLM 초기화 실패 — 명시 명령(/research 등) 사용해 주세요.")
+        return
+    model = os.getenv("IDEA_SYNTHESIS_MODEL") or "anthropic/claude-sonnet-4.5"
+    prompt = (
+        "당신은 한국 주식·금융 시장 전문가다. 다음 질문에 한국어로 답하라.\n"
+        "구체·실용 우선, 추상 표현 금지. 1000자 이내.\n\n"
+        f"질문: {question}"
+    )
+    loop = asyncio.get_running_loop()
+    try:
+        ans = await loop.run_in_executor(
+            None,
+            lambda: chat_with_retry(
+                client,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=1500,
+                model=model,
+                temperature=0.3,
+                context=f"question ({question[:30]})",
+            ),
+        )
+    except OpenRouterCreditExhausted:
+        await update.message.reply_text("⚠️ OpenRouter 크레딧 부족")
+        return
+    except Exception:
+        logging.exception("question 답변 실패")
+        await update.message.reply_text("⚠️ 답변 생성 실패 — 로그 확인")
+        return
+    from src.bot_helpers import send_text_chunked
+    await send_text_chunked(update.get_bot(), str(update.effective_chat.id),
+                            ans or "(빈 응답)", parse_mode="Markdown")
 
 
 async def _enqueue_combined(
