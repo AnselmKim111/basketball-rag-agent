@@ -60,17 +60,27 @@ log = logging.getLogger(__name__)
 KST = timezone(timedelta(hours=9))
 
 ALLOWED_ENV = "EARNINGS_ALLOWED_CHAT_IDS"
+# 종목봇(CompanyBot)에 통합되므로 EARNINGS_ALLOWED_CHAT_IDS 미설정 시 종목봇의
+# ALLOWED_CHAT_IDS 로 폴백 — 별도 인가 설정 없이도 종목봇 사용자가 그대로 사용.
+FALLBACK_ALLOWED_ENV = "ALLOWED_CHAT_IDS"
+
+
+def _is_authorized(update: Update) -> bool:
+    """EARNINGS_ALLOWED_CHAT_IDS 우선, 없으면 ALLOWED_CHAT_IDS 폴백."""
+    if os.getenv(ALLOWED_ENV, "").strip():
+        return is_authorized(update, ALLOWED_ENV)
+    return is_authorized(update, FALLBACK_ALLOWED_ENV)
 
 HELP_TEXT = (
-    "📞 *EarningsBot — 미국 기업 어닝콜 분석*\n\n"
+    "📞 *어닝콜 분석 (종목봇 /earnings)*\n\n"
     "*기본 사용:*\n"
-    "  - 슬래시 없이 그냥 입력하거나\n"
-    "  - `/earnings <텍스트>`\n\n"
+    "  `/earnings <텍스트>`\n"
+    "  (종목봇 통합 — 자유 텍스트는 종목봇이 기업명·티커로 먼저 처리)\n\n"
     "*입력 예시:*\n"
-    "  • 회사 직접 지정 — `AAPL MSFT GOOGL NVDA의 2026 1Q 어닝콜`\n"
-    "  • 자연어 조건 — `빅테크 2026 1Q 실적발표`\n"
-    "  • Capex 기준 — `capex 순 상위 6개`\n"
-    "  • 커스텀 질문 — `MSFT GOOGL AMZN META 어닝콜에서 시장에 서프라이즈가 될 수 있는 요인 알려줘`\n\n"
+    "  • 회사 직접 지정 — `/earnings AAPL MSFT GOOGL NVDA의 2026 1Q 어닝콜`\n"
+    "  • 자연어 조건 — `/earnings 빅테크 2026 1Q 실적발표`\n"
+    "  • Capex 기준 — `/earnings capex 순 상위 6개`\n"
+    "  • 커스텀 질문 — `/earnings MSFT GOOGL AMZN META 어닝콜에서 시장에 서프라이즈가 될 수 있는 요인 알려줘`\n\n"
     "*동작 단계:*\n"
     "  🧭 0단계: 입력 파싱 (회사 vs 조건 vs 분석 질문)\n"
     "  🌐 1단계: (조건 입력 시) 조건 → 티커 확장\n"
@@ -95,15 +105,15 @@ _CURRENT_LOCK = asyncio.Lock()
 # 핸들러
 # ------------------------------------------------------------------
 async def _help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_authorized(update, ALLOWED_ENV):
-        await deny_message(update, "어닝콜봇")
+    if not _is_authorized(update):
+        await deny_message(update, "어닝콜 기능")
         return
     await update.message.reply_text(HELP_TEXT, parse_mode=ParseMode.MARKDOWN)
 
 
 async def _cmd_earnings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_authorized(update, ALLOWED_ENV):
-        await deny_message(update, "어닝콜봇")
+    if not _is_authorized(update):
+        await deny_message(update, "어닝콜 기능")
         return
     args = " ".join(context.args or []).strip()
     if not args:
@@ -116,8 +126,8 @@ async def _cmd_earnings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 async def _on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_authorized(update, ALLOWED_ENV):
-        await deny_message(update, "어닝콜봇")
+    if not _is_authorized(update):
+        await deny_message(update, "어닝콜 기능")
         return
     text = (update.message.text or "").strip()
     if not text or len(text) > 1000:
@@ -601,7 +611,9 @@ async def _self_test(app: Application) -> None:
     chat_id = (
         os.getenv("EARNINGS_TEST_CHAT_ID")
         or os.getenv("EARNINGS_CHAT_ID")
+        or os.getenv("TELEGRAM_CHAT_ID")
         or (os.getenv(ALLOWED_ENV, "").split(",") + [""])[0].strip()
+        or (os.getenv(FALLBACK_ALLOWED_ENV, "").split(",") + [""])[0].strip()
     )
     if not chat_id:
         log.warning("[earnings self-test] chat_id 없음 — 스킵")
@@ -648,18 +660,31 @@ async def _self_test(app: Application) -> None:
 
 
 EARNINGS_COMMANDS = [
-    ("earnings", "📞 미국 기업 어닝콜 분석 + PDF 비교 보고서"),
-    ("help", "도움말"),
+    ("earnings", "📞 미국 기업 어닝콜 + 비교 PDF (5-10분)"),
 ]
 
 
+def register_handlers(app: Application) -> None:
+    """기존 봇(CompanyBot 등)의 Application에 /earnings 핸들러를 끼워 넣음.
+
+    deepdive와 동일한 격리 패턴 — 새 봇 토큰 안 만들고 기존 종목봇에서 동작.
+    text_handler가 이미 bot_worker.py에 등록돼 있으므로 자유 텍스트는 사용 안 함.
+    반드시 `/earnings <텍스트>` 명령으로 진입.
+    """
+    app.add_handler(CommandHandler("earnings", _cmd_earnings))
+
+
 def build_earnings_app(token: str) -> Application:
+    """(레거시 — orchestrator에서 더 이상 사용하지 않음.)
+
+    원래는 별도 봇으로 운영하기 위한 builder. 사용자 요청으로 기존 종목봇에 통합돼
+    register_handlers()를 통해 합쳐짐. 코드 호환을 위해 남겨두지만 호출 안 됨.
+    """
     app = Application.builder().token(token).build()
     app.add_handler(CommandHandler(["start", "help"], _help))
     app.add_handler(CommandHandler("earnings", _cmd_earnings))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _on_text))
 
-    # self-test (idea_bot 패턴과 동일)
     try:
         loop = asyncio.get_running_loop()
         loop.create_task(_self_test(app))

@@ -133,7 +133,11 @@
 
 ---
 
-## 7. EarningsBot — 미국 기업 어닝콜 + 비교 PDF (별도 봇)
+## 7. EarningsBot — 미국 기업 어닝콜 + 비교 PDF (종목봇 통합)
+
+기존 종목봇(CompanyBot, `TELEGRAM_BOT_TOKEN`)에 `/earnings` 명령으로 통합. 별도 봇
+토큰·polling 없음. orchestrator에서 `_build_company_app_with_earnings` wrapper가
+`register_handlers(app)`를 호출해 끼워 넣음 (deepdive와 같은 격리 패턴).
 
 미국 상장사 한정. 어닝콜 전문 + 6년치 재무 비교 + 한국어 PDF 보고서.
 
@@ -166,9 +170,8 @@
 6. PDF 빌드 + 텔레그램 발송
 
 ### 환경변수
-- `EARNINGS_BOT_TOKEN` — 텔레그램 봇 토큰
-- `EARNINGS_ALLOWED_CHAT_IDS` — 인가 chat_ids (콤마)
-- `EARNINGS_CHAT_ID` — self-test fallback
+- 봇 토큰: 종목봇의 `TELEGRAM_BOT_TOKEN` 그대로 사용 (별도 토큰 불필요)
+- `EARNINGS_ALLOWED_CHAT_IDS` — 인가 chat_ids (콤마). 미설정 시 `ALLOWED_CHAT_IDS` 폴백.
 - `SEC_EDGAR_USER_AGENT` — "name email@example.com" (SEC 정책상 필수)
 - `EARNINGS_TEST_PROMPT` — self-test용 (부팅 후 1회 실행)
 - 모델: `OPENROUTER_MODEL` / `IDEA_RESEARCH_MODEL` / `IDEA_SYNTHESIS_MODEL`
