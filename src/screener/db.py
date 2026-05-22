@@ -139,6 +139,29 @@ def row_count() -> int:
         return int(cur.fetchone()[0])
 
 
+def ticker_data_lengths() -> dict:
+    """종목별 OHLCV row 수 분포 진단. 52주 신고가 가능 여부(252일+) 점검용.
+
+    반환: {"total_tickers", "ge_252", "ge_240", "ge_60", "median_len", "max_len"}.
+    """
+    ensure_schema()
+    with _conn() as c:
+        cur = c.execute("SELECT ticker, COUNT(*) AS n FROM ohlcv GROUP BY ticker")
+        lengths = sorted(int(r[1]) for r in cur.fetchall())
+    if not lengths:
+        return {"total_tickers": 0, "ge_252": 0, "ge_240": 0, "ge_60": 0,
+                "median_len": 0, "max_len": 0}
+    n = len(lengths)
+    return {
+        "total_tickers": n,
+        "ge_252": sum(1 for x in lengths if x >= 252),
+        "ge_240": sum(1 for x in lengths if x >= 240),
+        "ge_60": sum(1 for x in lengths if x >= 60),
+        "median_len": lengths[n // 2],
+        "max_len": lengths[-1],
+    }
+
+
 def latest_date() -> Optional[str]:
     ensure_schema()
     with _conn() as c:
