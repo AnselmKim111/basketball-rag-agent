@@ -164,7 +164,10 @@
 - `prompts/earnings_custom.txt` — 커스텀 질문 답변 (counter-thesis)
 
 ### 데이터 소스
-- 전문: FMP_API_KEY (1순위) → API_NINJAS_KEY → 웹 스크레이프(httpx+BS4) → perplexity 요약(grounded=False)
+- 전문: **Alpha Vantage(ALPHA_VANTAGE_KEY, 무료·1순위)** → FMP_API_KEY(유료) → API_NINJAS_KEY(유료)
+  → 웹 스크레이프(httpx+BS4) → perplexity 요약(grounded=False)
+  · FMP 무료 키는 transcript 엔드포인트 402/403 (유료 전용). AV 무료가 실측 동작 (25 req/day).
+  · AV는 year+quarter 필수 ("YYYYQN"). 미명시 시 FMP/스크레이프/perplexity로 폴백.
 - 재무: SEC EDGAR XBRL US-GAAP (FY 10-K 6년 + 단일분기 flow, 검증용)
   · CapEx: PaymentsToAcquirePropertyPlantAndEquipment / OCF: NetCashProvidedByUsedInOperatingActivities
   · FCF = OCF − CapEx, OCF/CapEx 비율 = 캐시 머신 vs 캐펙스 burden
@@ -189,7 +192,7 @@
 - 봇 토큰: 종목봇 `TELEGRAM_BOT_TOKEN` 그대로 (별도 토큰 불필요)
 - `EARNINGS_ALLOWED_CHAT_IDS` — 미설정 시 `ALLOWED_CHAT_IDS` 폴백
 - `SEC_EDGAR_USER_AGENT` — "name email@example.com" (SEC 필수)
-- `FMP_API_KEY` / `API_NINJAS_KEY` — 진짜 전문 (최소 1개 권장)
+- `ALPHA_VANTAGE_KEY` — 진짜 전문 (무료·권장). FMP/API Ninjas는 유료 전용.
 - `EARNINGS_EXTRACT_MODEL` / `EARNINGS_SYNTHESIS_MODEL` — 모델 override
 - `EARNINGS_TEST_PROMPT` — self-test
 
