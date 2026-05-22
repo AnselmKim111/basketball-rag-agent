@@ -190,60 +190,52 @@ class CompanyFinancials:
 
 
 def _extract_annual_units(facts: dict, tags: tuple[str, ...], years: int = 6) -> list[AnnualPoint]:
-    """us-gaap facts에서 주어진 태그 중 첫 매칭 → FY 10-K 데이터 추출.
+    """us-gaap facts에서 주어진 태그들을 **병합**해 FY 10-K 데이터 추출.
 
-    SEC company facts: facts['us-gaap'][tag]['units']['USD'] = [
-        {'start': ..., 'end': ..., 'val': ..., 'fy': ..., 'fp': 'FY', 'form': '10-K', ...}, ...
-    ]
+    "첫 태그 우선"이 아니라 모든 태그를 합침 — 기업이 태그를 마이그레이션한 경우
+    (예: MSFT 매출 Revenues → RevenueFromContractWithCustomerExcludingAssessedTax)
+    한 태그만 보면 옛날 데이터만 잡히는 버그를 방지. 같은 FY는 최신 filed 우선.
     """
     usgaap = (facts.get("us-gaap") or {})
+    annuals: dict[int, dict] = {}
     for tag in tags:
         node = usgaap.get(tag)
         if not node:
             continue
-        units = node.get("units") or {}
-        usd = units.get("USD") or []
-        if not usd:
-            continue
-        # FY + 10-K 만 (분기 데이터 제외)
-        annuals: dict[int, dict] = {}
+        usd = (node.get("units") or {}).get("USD") or []
         for entry in usd:
             try:
                 fp = entry.get("fp")
                 form = entry.get("form", "")
                 fy = int(entry.get("fy") or 0)
-                if fy <= 0:
-                    continue
-                if fp != "FY":
+                if fy <= 0 or fp != "FY":
                     continue
                 if not (form.startswith("10-K") or form == "20-F"):
                     continue
-                # 같은 FY 여러 출처 — accn 최신 우선 (사후 amendments)
                 cur = annuals.get(fy)
                 if cur is None or (entry.get("filed") or "") > (cur.get("filed") or ""):
                     annuals[fy] = entry
             except Exception:
                 continue
-        if not annuals:
-            continue
-        # 최근 N년만
-        sorted_fys = sorted(annuals.keys(), reverse=True)[:years]
-        out: list[AnnualPoint] = []
-        for fy in sorted_fys:
-            entry = annuals[fy]
-            try:
-                out.append(
-                    AnnualPoint(
-                        fy=fy,
-                        end=str(entry.get("end") or ""),
-                        val=float(entry.get("val") or 0),
-                    )
+    if not annuals:
+        return []
+    # 최근 N년만
+    sorted_fys = sorted(annuals.keys(), reverse=True)[:years]
+    out: list[AnnualPoint] = []
+    for fy in sorted_fys:
+        entry = annuals[fy]
+        try:
+            out.append(
+                AnnualPoint(
+                    fy=fy,
+                    end=str(entry.get("end") or ""),
+                    val=float(entry.get("val") or 0),
                 )
-            except Exception:
-                continue
-        out.sort(key=lambda p: p.fy)
-        return out
-    return []
+            )
+        except Exception:
+            continue
+    out.sort(key=lambda p: p.fy)
+    return out
 
 
 def _days_between(start: str, end: str) -> int:
@@ -264,14 +256,12 @@ def _extract_quarterly_units(facts: dict, tags: tuple[str, ...], quarters: int =
     start~end가 80~100일인 항목만 단일분기로 채택.
     """
     usgaap = (facts.get("us-gaap") or {})
+    picked: dict[tuple[int, str], dict] = {}
     for tag in tags:
         node = usgaap.get(tag)
         if not node:
             continue
         usd = (node.get("units") or {}).get("USD") or []
-        if not usd:
-            continue
-        picked: dict[tuple[int, str], dict] = {}
         for entry in usd:
             try:
                 fp = entry.get("fp") or ""
@@ -285,19 +275,24 @@ def _extract_quarterly_units(facts: dict, tags: tuple[str, ...], quarters: int =
                     continue
                 key = (fy, fp)
                 cur = picked.get(key)
-                if cur is None or (entry.get("filed") or "") > (cur.get("filed") or ""):
+                # 같은 (fy,fp)에 당기 + 전년동기 비교치가 함께 옴 (둘 다 같은 날 filed).
+                # end 날짜가 최신인 것(당기)을 채택 — 전년 비교치($65B 등) 오선택 방지.
+                if cur is None:
                     picked[key] = entry
+                else:
+                    ce, ne = str(cur.get("end") or ""), str(entry.get("end") or "")
+                    if ne > ce or (ne == ce and (entry.get("filed") or "") > (cur.get("filed") or "")):
+                        picked[key] = entry
             except Exception:
                 continue
-        if not picked:
-            continue
-        pts = [
-            QuarterPoint(fy=fy, fp=fp, end=str(e.get("end") or ""), val=float(e.get("val") or 0))
-            for (fy, fp), e in picked.items()
-        ]
-        pts.sort(key=lambda p: (p.fy, p.fp), reverse=True)
-        return pts[:quarters]
-    return []
+    if not picked:
+        return []
+    pts = [
+        QuarterPoint(fy=fy, fp=fp, end=str(e.get("end") or ""), val=float(e.get("val") or 0))
+        for (fy, fp), e in picked.items()
+    ]
+    pts.sort(key=lambda p: (p.fy, p.fp), reverse=True)
+    return pts[:quarters]
 
 
 def fetch_company_financials(ticker: str, years: int = 6) -> CompanyFinancials | None:
