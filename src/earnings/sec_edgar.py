@@ -124,6 +124,14 @@ class AnnualPoint:
 
 
 @dataclass
+class QuarterPoint:
+    fy: int           # fiscal year
+    fp: str           # fiscal period: "Q1".."Q4"
+    end: str          # period end date YYYY-MM-DD
+    val: float        # USD (single-quarter flow)
+
+
+@dataclass
 class CompanyFinancials:
     ticker: str
     cik: str
@@ -133,6 +141,15 @@ class CompanyFinancials:
     revenue: list[AnnualPoint] = field(default_factory=list)
     rnd: list[AnnualPoint] = field(default_factory=list)
     ni: list[AnnualPoint] = field(default_factory=list)
+    # 분기(단일분기 flow) — 검증 단계용
+    q_revenue: list[QuarterPoint] = field(default_factory=list)
+    q_capex: list[QuarterPoint] = field(default_factory=list)
+
+    def find_quarter(self, points: list[QuarterPoint], year: int, quarter: int) -> QuarterPoint | None:
+        for p in points:
+            if p.fy == year and p.fp == f"Q{quarter}":
+                return p
+        return None
 
     def fcf(self) -> list[AnnualPoint]:
         """FCF = OCF - CapEx (같은 FY로 매칭). CapEx 부호는 SEC가 양수(지출)로 기록."""
@@ -229,6 +246,60 @@ def _extract_annual_units(facts: dict, tags: tuple[str, ...], years: int = 6) ->
     return []
 
 
+def _days_between(start: str, end: str) -> int:
+    """ISO date 차이 (일). 파싱 실패 시 -1."""
+    from datetime import date
+    try:
+        sy, sm, sd = (int(x) for x in start.split("-"))
+        ey, em, ed = (int(x) for x in end.split("-"))
+        return (date(ey, em, ed) - date(sy, sm, sd)).days
+    except Exception:
+        return -1
+
+
+def _extract_quarterly_units(facts: dict, tags: tuple[str, ...], quarters: int = 8) -> list[QuarterPoint]:
+    """단일분기 flow 데이터 추출 (검증용). YTD/누적은 제외 (기간 ~90일만).
+
+    revenue/capex 같은 flow 항목은 10-Q에 YTD(누적)와 단일분기가 섞여 들어옴.
+    start~end가 80~100일인 항목만 단일분기로 채택.
+    """
+    usgaap = (facts.get("us-gaap") or {})
+    for tag in tags:
+        node = usgaap.get(tag)
+        if not node:
+            continue
+        usd = (node.get("units") or {}).get("USD") or []
+        if not usd:
+            continue
+        picked: dict[tuple[int, str], dict] = {}
+        for entry in usd:
+            try:
+                fp = entry.get("fp") or ""
+                fy = int(entry.get("fy") or 0)
+                start = str(entry.get("start") or "")
+                end = str(entry.get("end") or "")
+                if fy <= 0 or not fp.startswith("Q") or not start or not end:
+                    continue
+                dur = _days_between(start, end)
+                if not (80 <= dur <= 100):  # 단일분기만
+                    continue
+                key = (fy, fp)
+                cur = picked.get(key)
+                if cur is None or (entry.get("filed") or "") > (cur.get("filed") or ""):
+                    picked[key] = entry
+            except Exception:
+                continue
+        if not picked:
+            continue
+        pts = [
+            QuarterPoint(fy=fy, fp=fp, end=str(e.get("end") or ""), val=float(e.get("val") or 0))
+            for (fy, fp), e in picked.items()
+        ]
+        pts.sort(key=lambda p: (p.fy, p.fp), reverse=True)
+        return pts[:quarters]
+    return []
+
+
 def fetch_company_financials(ticker: str, years: int = 6) -> CompanyFinancials | None:
     """티커의 최근 N년 연간(FY) CapEx/OCF/Revenue/R&D/NI fetch.
 
@@ -265,6 +336,8 @@ def fetch_company_financials(ticker: str, years: int = 6) -> CompanyFinancials |
         revenue=_extract_annual_units(facts, REV_TAGS, years=years),
         rnd=_extract_annual_units(facts, RND_TAGS, years=years),
         ni=_extract_annual_units(facts, NI_TAGS, years=years),
+        q_revenue=_extract_quarterly_units(facts, REV_TAGS),
+        q_capex=_extract_quarterly_units(facts, CAPEX_TAGS),
     )
 
 

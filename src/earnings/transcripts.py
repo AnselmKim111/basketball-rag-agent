@@ -1,88 +1,23 @@
-"""미국 기업 어닝콜 전문 fetch + 요약.
+"""어닝콜 심층추출 + 조건→티커 확장.
 
-데이터 소스:
-  - perplexity/sonar-pro (research tier, 웹검색) — 1차: 가장 최근 어닝콜 전문 검색·요약
-  - 폴백: kimi (summary tier) — 입력된 URL 추출 텍스트만 요약
+품질 핵심 (딥리서치급):
+  1) transcript_source.fetch_full_transcript 로 진짜 전문 텍스트 확보 (grounding)
+  2) 그 전문 전체를 sonnet이 읽어 심층 구조화 노트 추출 (prompts/earnings_extract.txt)
+     — 얕은 단일 perplexity 요약 대신 verbatim 인용 + 전체 Q&A + segment까지.
 
-format:
-  1) 어닝콜 메타데이터: ticker, 분기, 일자, 참석자
-  2) Management Discussion (CEO/CFO 핵심 발언 5-10개 quote)
-  3) Q&A 핵심 질문 5-7개 + 답변
-  4) 가이던스 (다음 분기/연간)
-  5) 주요 숫자 (revenue beat/miss, EPS, margin, capex guidance)
+폴백: 전문 확보 실패 시 transcript_source가 perplexity 요약(grounded=False)을 주고,
+deep extract는 그 위에서라도 동작 (보고서에 "비grounding" 경고 표기).
 """
 from __future__ import annotations
 
 import logging
 import os
-from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 log = logging.getLogger(__name__)
 
 RESEARCH_MODEL = os.getenv("IDEA_RESEARCH_MODEL", "perplexity/sonar-pro")
-SUMMARY_MODEL_FALLBACK = os.getenv("OPENROUTER_MODEL", "moonshotai/kimi-k2.6")
-
-
-TRANSCRIPT_SYSTEM = """You are a senior US equity research analyst specializing in earnings call transcripts.
-
-Given a US-listed company ticker and target fiscal quarter, find the company's most recent earnings call transcript matching the quarter (search web sources: company IR site, Seeking Alpha, Motley Fool, transcript aggregators, SEC 8-K filings).
-
-Return a STRUCTURED JSON response. Output JSON only, no prose.
-
-Schema:
-{
-  "ticker": "AAPL",
-  "company_name": "Apple Inc.",
-  "fiscal_period": "Q1 FY2026",  // as reported by the company
-  "call_date": "2026-02-01",
-  "found": true,
-  "source_urls": ["https://...", "..."],
-  "participants": {
-    "company": ["Tim Cook - CEO", "Luca Maestri - CFO"],
-    "analysts": ["Amit Daryanani - Evercore", "..."]
-  },
-  "headline_numbers": {
-    "revenue_actual": "$124.3B",
-    "revenue_yoy": "+4%",
-    "revenue_consensus": "$121.7B",
-    "eps_actual": "$2.40",
-    "eps_consensus": "$2.35",
-    "operating_margin": "30.5%",
-    "fcf_quarter": "$28B",
-    "buyback_quarter": "$25B"
-  },
-  "management_discussion": [
-    {"speaker": "Tim Cook", "topic": "AI/Services", "quote": "verbatim or close-paraphrase 2-4 sentence quote"},
-    ...  // 6-10 highlights covering: top line drivers, margin commentary, capex/AI spend, segments, geographies
-  ],
-  "guidance": {
-    "next_quarter_revenue": "low double-digit growth",
-    "fy_revenue": "...",
-    "capex_fy": "$130B+ (raised from $120B)",
-    "opex": "...",
-    "tax_rate": "...",
-    "fx_impact": "..."
-  },
-  "qa_highlights": [
-    {"analyst": "Amit Daryanani", "question": "Can you elaborate on AI infrastructure capex...", "answer_summary": "Cook responded that capex is being raised again to support generative AI demand..."},
-    ...  // 5-7 most consequential Q&A
-  ],
-  "surprises_and_risks": [
-    "Capex guidance raised 25% — heaviest signal so far for AI build-out",
-    "China revenue declined 8% YoY — first contraction in 3 quarters",
-    ...  // 3-5 items flagged as market-moving or non-consensus
-  ],
-  "analyst_sentiment": "Mixed — beat on top line but capex hike spooked some PMs",
-  "stock_reaction_postcall": "Up 3% in after-hours / Down 5% next day"
-}
-
-Rules:
-- If no transcript found for the requested quarter, set "found": false and explain in "source_urls" what was searched.
-- Use verbatim or close-paraphrase quotes — do NOT fabricate numbers.
-- Quotes should reflect actual emphasis from the call (capex, AI, margin, guidance).
-- Output JSON only. No markdown fences.
-"""
 
 
 CRITERIA_TO_TICKERS_SYSTEM = """You are a US equity research assistant. Given a user's natural-language criteria
@@ -108,59 +43,29 @@ Rules:
 - Output JSON only. No prose.
 """
 
+_PROMPTS_DIR = Path(__file__).resolve().parent.parent.parent / "prompts"
 
-def fetch_transcript(client, ticker: str, fiscal_period: str | None) -> dict[str, Any] | None:
-    """단일 종목 어닝콜 전문 fetch (perplexity 웹검색).
 
-    fiscal_period: "Q1 FY2026", "Q4 CY2025" 등 자연어. None이면 "the most recent reported quarter".
-    실패 시 None.
-    """
-    target = fiscal_period or "the most recent reported quarter"
-    user_msg = (
-        f"Find {ticker}'s earnings call transcript for {target}. "
-        f"Return the structured JSON with all sections filled. "
-        f"If no transcript matches that period, return the latest available with 'found': true."
-    )
+def _load_prompt(name: str, default: str = "Output JSON only.") -> str:
     try:
-        resp = client.chat.completions.create(
-            model=RESEARCH_MODEL,
-            messages=[
-                {"role": "system", "content": TRANSCRIPT_SYSTEM},
-                {"role": "user", "content": user_msg},
-            ],
-            temperature=0.2,
-            max_tokens=6000,
-        )
+        return (_PROMPTS_DIR / f"{name}.txt").read_text(encoding="utf-8").strip()
     except Exception:
-        log.exception("transcript fetch 실패 (%s)", ticker)
-        return None
-
-    content = ""
-    try:
-        content = (resp.choices[0].message.content or "").strip()
-    except (IndexError, AttributeError):
-        log.warning("transcript LLM 응답 구조 비정상 (%s)", ticker)
-        return None
-
-    if not content:
-        log.warning("transcript LLM 빈 응답 (%s)", ticker)
-        return None
-
-    from src.idea_bot import _parse_json  # 재사용: tolerant JSON parser
-    parsed = _parse_json(content)
-    if parsed is None:
-        log.warning("transcript JSON 파싱 실패 (%s) — raw head: %r", ticker, content[:300])
-        return None
-    parsed.setdefault("ticker", ticker.upper())
-    return parsed
+        log.warning("프롬프트 로드 실패: %s", name)
+        return default
 
 
+# ------------------------------------------------------------------
+# 1) 조건 → 티커 확장 (research tier)
+# ------------------------------------------------------------------
 def expand_criteria_to_tickers(client, criteria: str) -> dict[str, Any] | None:
     """자연어 조건 → 미국 티커 리스트. 실패 시 None."""
     if not criteria:
         return None
+    from src import summarizer
+    from src.idea_bot import _parse_json
     try:
-        resp = client.chat.completions.create(
+        content = summarizer.chat_with_retry(
+            client,
             model=RESEARCH_MODEL,
             messages=[
                 {"role": "system", "content": CRITERIA_TO_TICKERS_SYSTEM},
@@ -168,60 +73,130 @@ def expand_criteria_to_tickers(client, criteria: str) -> dict[str, Any] | None:
             ],
             temperature=0.3,
             max_tokens=2000,
+            context="earnings-criteria",
         )
     except Exception:
         log.exception("criteria→tickers 호출 실패")
         return None
-    content = ""
-    try:
-        content = (resp.choices[0].message.content or "").strip()
-    except (IndexError, AttributeError):
-        return None
     if not content:
         return None
-    from src.idea_bot import _parse_json
     return _parse_json(content)
 
 
 # ------------------------------------------------------------------
-# 텔레그램 요약용 (transcript dict → 사람이 읽기 쉬운 메시지)
+# 2) grounded 전문 확보 → 3) 심층추출
+# ------------------------------------------------------------------
+def fetch_and_extract(
+    client,
+    ticker: str,
+    year: int | None,
+    quarter: int | None,
+    *,
+    extract_model: str,
+    fiscal_label: str = "",
+) -> dict[str, Any] | None:
+    """진짜 전문 확보 후 sonnet으로 심층추출. 실패 시 None.
+
+    반환 dict: earnings_extract 스키마 + grounding 메타
+      (grounded, source, source_urls, transcript_chars).
+    """
+    from src import summarizer
+    from src.idea_bot import _parse_json
+    from src.earnings import transcript_source as ts
+
+    doc = ts.fetch_full_transcript(client, ticker, year, quarter)
+    if doc is None:
+        return None
+
+    system = _load_prompt("earnings_extract")
+    user_msg = (
+        f"Company ticker: {ticker.upper()}\n"
+        f"Requested period: {fiscal_label or doc.fiscal_period or 'most recent'}\n"
+        f"grounded (real transcript text): {doc.grounded}\n"
+        f"source: {doc.source}\n\n"
+        f"=== TRANSCRIPT TEXT START ===\n{doc.trimmed_text()}\n=== TRANSCRIPT TEXT END ==="
+    )
+
+    try:
+        content = summarizer.chat_with_retry(
+            client,
+            model=extract_model,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user_msg},
+            ],
+            temperature=0.2,
+            max_tokens=8000,
+            context=f"earnings-extract:{ticker}",
+        )
+    except Exception:
+        log.exception("심층추출 실패 (%s)", ticker)
+        content = ""
+
+    parsed = _parse_json(content) if content else None
+    if parsed is None:
+        # 추출 실패해도 최소한의 grounding 메타는 보존 — 합성 단계가 빈손이 안 되게
+        log.warning("심층추출 JSON 파싱 실패 (%s) — 메타만 반환", ticker)
+        parsed = {"ticker": ticker.upper(), "extract_failed": True}
+
+    parsed.setdefault("ticker", ticker.upper())
+    parsed.setdefault("fiscal_period", doc.fiscal_period or fiscal_label)
+    parsed.setdefault("call_date", doc.call_date)
+    # grounding 메타 주입 (합성·검증·PDF에서 사용)
+    parsed["grounded"] = doc.grounded
+    parsed["source"] = doc.source
+    parsed["source_urls"] = doc.source_urls
+    parsed["transcript_chars"] = len(doc.full_text)
+    return parsed
+
+
+# ------------------------------------------------------------------
+# 텔레그램 발송용 포맷
 # ------------------------------------------------------------------
 def format_transcript_text(tr: dict[str, Any]) -> str:
-    """transcript JSON → 텔레그램 발송용 한국어 마크다운.
-
-    너무 길지 않게 4000자 안쪽 1청크에 들어가는 것을 목표 (긴 경우는 send_text_chunked가 알아서 분할).
-    """
+    """심층추출 dict → 텔레그램 발송용 한국어 텍스트 (긴 경우 send_text_chunked가 분할)."""
     if not tr:
         return "어닝콜 데이터를 가져오지 못했습니다."
-
-    if not tr.get("found", True):
-        return (
-            f"⚠️ {tr.get('ticker', '?')} — 어닝콜 전문을 찾지 못함\n"
-            f"검색 시도: {tr.get('source_urls', [])}\n"
-        )
 
     lines: list[str] = []
     ticker = tr.get("ticker", "?")
     name = tr.get("company_name", "")
     period = tr.get("fiscal_period", "?")
     call_date = tr.get("call_date", "?")
+    grounded = tr.get("grounded", False)
+    source = tr.get("source", "?")
 
+    badge = "✅ 전문 기반" if grounded else "⚠️ 전문 비근거(요약)"
     lines.append(f"📞 {ticker} — {name}")
-    lines.append(f"  {period} · 콜 일자 {call_date}")
+    lines.append(f"  {period} · 콜 {call_date} · {badge} · 출처 {source}")
     lines.append("")
+
+    if tr.get("extract_failed"):
+        lines.append("⚠️ 심층추출 실패 — 원문 확보됐으나 구조화 실패. 재시도 권장.")
+        return "\n".join(lines)
 
     hn = tr.get("headline_numbers") or {}
     if hn:
-        lines.append("📊 헤드라인 숫자")
+        lines.append("📊 헤드라인")
         for k, v in hn.items():
             if v:
                 lines.append(f"  · {k}: {v}")
         lines.append("")
 
+    seg = tr.get("segment_performance") or []
+    if seg:
+        lines.append("🧩 세그먼트")
+        for item in seg[:8]:
+            s = (item.get("segment") or "?").strip()
+            mtr = (item.get("metric") or "").strip()
+            det = (item.get("detail") or "").strip()
+            lines.append(f"  · {s}: {mtr} — {det}")
+        lines.append("")
+
     md = tr.get("management_discussion") or []
     if md:
-        lines.append("🎤 경영진 발언 (highlights)")
-        for item in md[:10]:
+        lines.append("🎤 경영진 발언")
+        for item in md[:12]:
             sp = (item.get("speaker") or "?").strip()
             tp = (item.get("topic") or "").strip()
             qt = (item.get("quote") or "").strip()
@@ -240,8 +215,8 @@ def format_transcript_text(tr: dict[str, Any]) -> str:
 
     qa = tr.get("qa_highlights") or []
     if qa:
-        lines.append("❓ Q&A 핵심")
-        for item in qa[:7]:
+        lines.append("❓ Q&A")
+        for item in qa[:10]:
             a = (item.get("analyst") or "?").strip()
             q = (item.get("question") or "").strip()
             ans = (item.get("answer_summary") or "").strip()
@@ -249,18 +224,25 @@ def format_transcript_text(tr: dict[str, Any]) -> str:
             lines.append(f"  A: {ans}")
         lines.append("")
 
+    cap = tr.get("capital_allocation")
+    if cap:
+        lines.append(f"💰 자본배분: {cap}")
+    tone = tr.get("management_tone")
+    if tone:
+        lines.append(f"🎚️ 톤: {tone}")
+
     sr = tr.get("surprises_and_risks") or []
     if sr:
-        lines.append("⚡ 서프라이즈 / 리스크")
+        lines.append("")
+        lines.append("⚡ 서프라이즈/리스크")
         for item in sr:
             lines.append(f"  · {item}")
-        lines.append("")
 
-    sent = tr.get("analyst_sentiment")
-    if sent:
-        lines.append(f"💬 애널리스트 톤: {sent}")
-    react = tr.get("stock_reaction_postcall")
-    if react:
-        lines.append(f"📈 주가 반응: {react}")
+    nv = tr.get("notable_verbatim") or []
+    if nv:
+        lines.append("")
+        lines.append("🗣️ 핵심 verbatim")
+        for item in nv[:5]:
+            lines.append(f"  \"{item}\"")
 
     return "\n".join(lines)

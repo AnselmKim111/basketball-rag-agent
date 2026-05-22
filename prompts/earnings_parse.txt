@@ -4,10 +4,17 @@
   "mode": "tickers" | "criteria" | "custom_only",
   "tickers": ["AAPL", "MSFT", ...],          // mode가 "tickers"일 때만. 1-8개. 미국 상장사 ticker.
   "criteria": "...",                          // mode가 "criteria"일 때 자연어 조건 그대로 (이후 단계에서 ticker로 확장)
-  "fiscal_period": "Q1 FY2026",               // 사용자가 명시한 분기. 미명시 시 null.
+  "fiscal_period": "Q1 FY2026",               // 사용자가 명시한 분기 (사람이 읽는 형태). 미명시 시 null.
+  "fiscal_year": 2026,                         // transcript API용 정수 연도. 미명시 시 null.
+  "fiscal_quarter": 1,                         // transcript API용 정수 분기 1-4. 미명시 시 null.
   "custom_question": "...",                    // 사용자가 추가 분석을 요청한 경우 그 질문. 없으면 null.
   "language": "ko"                             // 보고서 언어 (기본 한국어)
 }
+
+fiscal_year/fiscal_quarter 규칙:
+- "2026 1Q", "2026년 1분기", "1Q26", "Q1 2026" → fiscal_year=2026, fiscal_quarter=1.
+- "최근", "최신", "지난 분기" 또는 미명시 → fiscal_year=null, fiscal_quarter=null.
+- 연도만 있고 분기 없으면 fiscal_quarter=null (반대도 동일).
 
 판정 규칙:
 - 사용자가 회사 이름이나 ticker를 명시 → mode = "tickers". 회사명만 있으면 ticker로 변환.

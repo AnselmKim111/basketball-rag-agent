@@ -161,6 +161,8 @@ async def _run_pipeline(
     mode = parsed.get("mode") or "custom_only"
     fiscal_period = parsed.get("fiscal_period")
     custom_question = (parsed.get("custom_question") or "").strip()
+    fiscal_year = parsed.get("fiscal_year")
+    fiscal_quarter = parsed.get("fiscal_quarter")
 
     tickers: list[str] = []
     if mode == "tickers":
@@ -212,69 +214,100 @@ async def _run_pipeline(
         await _safe_send(bot, chat_id, "⚠️ 분석 대상 티커가 없습니다.")
         return
 
-    fiscal_period = fiscal_period or "the most recent reported quarter"
+    # 분기 정수 정규화 — parse가 못 줬으면 fiscal_period 문자열에서 추출
+    if not fiscal_year or not fiscal_quarter:
+        from src.earnings.transcript_source import resolve_year_quarter
+        ry, rq = resolve_year_quarter(fiscal_period)
+        fiscal_year = fiscal_year or ry
+        fiscal_quarter = fiscal_quarter or rq
+    fiscal_label = fiscal_period or (
+        f"Q{fiscal_quarter} {fiscal_year}" if (fiscal_year and fiscal_quarter) else "the most recent reported quarter"
+    )
 
-    # 2) 종목별 어닝콜 전문 fetch
+    # 3) SEC EDGAR 재무 (검증·차트·페이로드 모두에서 쓰이므로 먼저 수집)
+    await _safe_send(bot, chat_id, "📊 SEC EDGAR로 6년치 + 분기 재무 수집 중 …")
+    financials = await _step_fetch_financials(tickers)
+    if not financials:
+        await _safe_send(bot, chat_id, "⚠️ SEC EDGAR 데이터를 못 가져왔습니다 — 차트·검증 제한됩니다.")
+
+    # 2+3) 종목별: 진짜 전문 확보 → 심층추출 → 숫자 교차검증
     transcripts: dict[str, dict] = {}
-    await _safe_send(bot, chat_id, f"📞 2단계: 어닝콜 전문 fetch 시작 ({len(tickers)}개)…")
+    verify_by_ticker: dict[str, list] = {}
+    await _safe_send(
+        bot, chat_id,
+        f"📞 어닝콜 전문 확보 + 심층추출 시작 ({len(tickers)}개, {fiscal_label})\n"
+        f"  진짜 전문에 grounding → 종목별 deep read (종목당 1-2분)",
+    )
     for t in tickers:
-        await _safe_send(bot, chat_id, f"  ⏳ {t} 어닝콜 검색 중 (perplexity)…")
-        tr = await _step_fetch_transcript(t, fiscal_period)
+        await _safe_send(bot, chat_id, f"  ⏳ {t} 전문 확보 + 심층 분석 중 …")
+        tr = await _step_deep_extract(t, fiscal_year, fiscal_quarter, fiscal_label)
         if tr is None:
-            await _safe_send(bot, chat_id, f"  ⚠️ {t} 어닝콜 fetch 실패 — 스킵")
+            await _safe_send(bot, chat_id, f"  ⚠️ {t} 전문 확보 실패 — 스킵")
             continue
+        # 숫자 교차검증 (SEC와 대조)
+        vres = await _step_verify(tr, financials.get(t), fiscal_year, fiscal_quarter)
+        verify_by_ticker[t] = vres
+        tr["_verify"] = [v.message for v in vres]
         transcripts[t] = tr
-        # 즉시 텔레그램 발송 (사용자가 PDF 기다리는 동안 읽을 수 있게)
+        # 즉시 텔레그램 발송 (전문 심층요약 + 검증결과)
         from src.earnings.transcripts import format_transcript_text
+        from src.earnings.verify import format_results
         body = format_transcript_text(tr)
+        vtext = format_results(vres)
+        if vtext:
+            body += "\n\n" + vtext
         await send_text_chunked(bot, chat_id, body)
 
     if not transcripts:
-        await _safe_send(bot, chat_id, "⚠️ 모든 종목의 어닝콜 fetch 실패. 잠시 후 재시도 권장.")
+        await _safe_send(bot, chat_id, "⚠️ 모든 종목의 전문 확보 실패. 잠시 후 재시도 권장.")
         return
 
-    # 3) SEC EDGAR 재무
-    await _safe_send(bot, chat_id, "📊 3단계: SEC EDGAR로 6년치 재무 수집 …")
-    financials = await _step_fetch_financials(tickers)
-    if not financials:
-        await _safe_send(bot, chat_id, "⚠️ SEC EDGAR 데이터를 못 가져왔습니다 — 차트 생략됩니다.")
+    grounded_n = sum(1 for tr in transcripts.values() if tr.get("grounded"))
+    await _safe_send(
+        bot, chat_id,
+        f"  ✅ {len(transcripts)}개 분석 완료 (전문 grounding {grounded_n}/{len(transcripts)})",
+    )
 
-    # 4) Executive Summary 합성
-    await _safe_send(bot, chat_id, "🧠 4단계: 산업 분위기 + 비교 인사이트 합성 (sonnet)…")
-    industry_summary = await _step_synthesize_industry(transcripts, financials, fiscal_period)
+    # 6) 비교 합성 (Opus, 딥리서치급)
+    await _safe_send(bot, chat_id, "🧠 비교 합성 중 (Opus, 인용·시나리오 기반 8000자+)…")
+    industry_summary = await _step_synthesize_industry(
+        transcripts, financials, fiscal_label, verify_by_ticker,
+    )
     if industry_summary:
-        # 텔레그램에도 발송
-        await send_text_chunked(bot, chat_id, "📈 *Executive Summary*\n\n" + industry_summary, parse_mode=ParseMode.MARKDOWN)
+        # 합성 결과엔 [TICKER] 인용·표·# 헤더가 있어 텔레그램 Markdown 파싱이 깨짐 → 평문 발송
+        await send_text_chunked(bot, chat_id, industry_summary)
     else:
-        industry_summary = "(Executive Summary 합성 실패 — PDF에는 차트만 포함)"
+        industry_summary = "(비교 합성 실패 — PDF에는 차트·전문만 포함)"
 
-    # 5) 커스텀 분석 (있을 때)
+    # 7) 커스텀 분석 (있을 때, Opus)
     custom_answer = ""
     if custom_question:
-        await _safe_send(bot, chat_id, f"🧠 5단계: 커스텀 질문 답변 합성 — {custom_question[:80]}")
+        await _safe_send(bot, chat_id, f"🎯 커스텀 질문 심층 답변 중 (Opus) — {custom_question[:80]}")
         custom_answer = await _step_synthesize_custom(
-            custom_question, transcripts, financials, fiscal_period,
+            custom_question, transcripts, financials, fiscal_label, verify_by_ticker,
         ) or ""
         if custom_answer:
-            await send_text_chunked(bot, chat_id, "🎯 *커스텀 분석*\n\n" + custom_answer, parse_mode=ParseMode.MARKDOWN)
+            await send_text_chunked(bot, chat_id, "🎯 커스텀 분석\n\n" + custom_answer)
 
-    # 6) PDF 빌드
-    await _safe_send(bot, chat_id, "📄 6단계: PDF 보고서 생성 중 …")
+    # 8) PDF 빌드 + 발송
+    await _safe_send(bot, chat_id, "📄 PDF 보고서 생성 중 …")
     pdf_path = await _step_build_pdf(
         tickers=list(transcripts.keys()),
-        fiscal_period=fiscal_period,
+        fiscal_period=fiscal_label,
         transcripts=transcripts,
         financials=financials,
         industry_summary=industry_summary,
         custom_question=custom_question,
         custom_answer=custom_answer,
+        verify_by_ticker=verify_by_ticker,
     )
     if pdf_path and pdf_path.exists():
         await send_pdf(
             bot, chat_id, pdf_path,
-            caption=f"📄 어닝콜 분석 — {', '.join(tickers[:6])} · {fiscal_period}",
+            caption=f"📄 어닝콜 비교 분석 — {', '.join(tickers[:6])} · {fiscal_label}",
         )
-        log.info("[earnings: send_results 완료] PDF=%s tickers=%s", pdf_path.name, tickers)
+        log.info("[earnings: send_results 완료] PDF=%s tickers=%s grounded=%d/%d",
+                 pdf_path.name, tickers, grounded_n, len(transcripts))
     else:
         await _safe_send(bot, chat_id, "⚠️ PDF 생성 실패 — 텔레그램 텍스트만 확인해 주세요.")
         log.warning("[earnings: PDF 실패] tickers=%s", tickers)
@@ -287,16 +320,14 @@ async def _step_parse(user_text: str) -> dict | None:
     """0단계: 사용자 입력 → 모드/티커/분기/커스텀 질문 JSON."""
     from src import summarizer
     from src.idea_bot import _parse_json
-    from src import idea_prompts
 
-    # 전용 프롬프트 로드 (없으면 default)
     system = _load_prompt("earnings_parse")
-
     loop = asyncio.get_running_loop()
 
     def _call():
         client = summarizer.get_client()
-        return client.chat.completions.create(
+        return summarizer.chat_with_retry(
+            client,
             model=_summary_model(),
             messages=[
                 {"role": "system", "content": system},
@@ -304,17 +335,13 @@ async def _step_parse(user_text: str) -> dict | None:
             ],
             temperature=0.1,
             max_tokens=1500,
+            context="earnings-parse",
         )
 
     try:
-        resp = await loop.run_in_executor(None, _call)
+        content = await loop.run_in_executor(None, _call)
     except Exception:
         log.exception("parse LLM 호출 실패")
-        return None
-
-    try:
-        content = (resp.choices[0].message.content or "").strip()
-    except (IndexError, AttributeError):
         return None
     if not content:
         return None
@@ -338,25 +365,45 @@ async def _step_expand_criteria(criteria: str) -> dict | None:
         return None
 
 
-async def _step_fetch_transcript(ticker: str, fiscal_period: str | None) -> dict | None:
-    """2단계: 단일 종목 어닝콜 전문 fetch."""
+async def _step_deep_extract(
+    ticker: str, year: int | None, quarter: int | None, fiscal_label: str
+) -> dict | None:
+    """2+3단계: 진짜 전문 확보 → sonnet 심층추출."""
     from src import summarizer
     from src.earnings import transcripts as trans
     loop = asyncio.get_running_loop()
 
     def _call():
         client = summarizer.get_client()
-        return trans.fetch_transcript(client, ticker, fiscal_period)
+        return trans.fetch_and_extract(
+            client, ticker, year, quarter,
+            extract_model=_extract_model(), fiscal_label=fiscal_label,
+        )
 
     try:
         return await loop.run_in_executor(None, _call)
     except Exception:
-        log.exception("transcript fetch 실패 (%s)", ticker)
+        log.exception("deep extract 실패 (%s)", ticker)
         return None
 
 
+async def _step_verify(extract: dict, financials, year: int | None, quarter: int | None) -> list:
+    """검증 단계: 추출 숫자 ↔ SEC 교차검증. list[VerifyResult]."""
+    from src.earnings import verify
+    loop = asyncio.get_running_loop()
+
+    def _call():
+        return verify.cross_check(extract, financials, year, quarter)
+
+    try:
+        return await loop.run_in_executor(None, _call)
+    except Exception:
+        log.exception("검증 실패 (%s)", extract.get("ticker"))
+        return []
+
+
 async def _step_fetch_financials(tickers: list[str]) -> dict[str, Any]:
-    """3단계: 모든 티커의 SEC EDGAR 재무. {ticker: CompanyFinancials}."""
+    """SEC EDGAR 재무 (FY 6년 + 분기). {ticker: CompanyFinancials}."""
     from src.earnings import sec_edgar
     loop = asyncio.get_running_loop()
     out: dict[str, Any] = {}
@@ -375,34 +422,32 @@ async def _step_synthesize_industry(
     transcripts: dict[str, dict],
     financials: dict[str, Any],
     fiscal_period: str,
+    verify_by_ticker: dict[str, list],
 ) -> str | None:
-    """4단계: Executive Summary 합성 (synthesis tier)."""
+    """비교 합성 (Opus, 딥리서치급)."""
     from src import summarizer
     system = _load_prompt("earnings_synthesis")
-    user_payload = _build_synthesis_payload(transcripts, financials, fiscal_period)
-
+    user_payload = _build_synthesis_payload(transcripts, financials, fiscal_period, verify_by_ticker)
     loop = asyncio.get_running_loop()
 
     def _call():
         client = summarizer.get_client()
-        return client.chat.completions.create(
+        return summarizer.chat_with_retry(
+            client,
             model=_synthesis_model(),
             messages=[
                 {"role": "system", "content": system},
                 {"role": "user", "content": user_payload},
             ],
             temperature=0.3,
-            max_tokens=6500,
+            max_tokens=12000,
+            context="earnings-synthesis",
         )
 
     try:
-        resp = await loop.run_in_executor(None, _call)
+        content = await loop.run_in_executor(None, _call)
     except Exception:
-        log.exception("Executive Summary 합성 실패")
-        return None
-    try:
-        content = (resp.choices[0].message.content or "").strip()
-    except (IndexError, AttributeError):
+        log.exception("비교 합성 실패")
         return None
     return content or None
 
@@ -412,37 +457,35 @@ async def _step_synthesize_custom(
     transcripts: dict[str, dict],
     financials: dict[str, Any],
     fiscal_period: str,
+    verify_by_ticker: dict[str, list],
 ) -> str | None:
-    """5단계: 커스텀 분석 답변 합성."""
+    """커스텀 분석 답변 합성 (Opus)."""
     from src import summarizer
     system = _load_prompt("earnings_custom")
     user_payload = (
         f"# 사용자 질문\n{question}\n\n"
-        + _build_synthesis_payload(transcripts, financials, fiscal_period)
+        + _build_synthesis_payload(transcripts, financials, fiscal_period, verify_by_ticker)
     )
-
     loop = asyncio.get_running_loop()
 
     def _call():
         client = summarizer.get_client()
-        return client.chat.completions.create(
+        return summarizer.chat_with_retry(
+            client,
             model=_synthesis_model(),
             messages=[
                 {"role": "system", "content": system},
                 {"role": "user", "content": user_payload},
             ],
             temperature=0.4,
-            max_tokens=6500,
+            max_tokens=10000,
+            context="earnings-custom",
         )
 
     try:
-        resp = await loop.run_in_executor(None, _call)
+        content = await loop.run_in_executor(None, _call)
     except Exception:
         log.exception("커스텀 분석 합성 실패")
-        return None
-    try:
-        content = (resp.choices[0].message.content or "").strip()
-    except (IndexError, AttributeError):
         return None
     return content or None
 
@@ -456,9 +499,11 @@ async def _step_build_pdf(
     industry_summary: str,
     custom_question: str,
     custom_answer: str,
+    verify_by_ticker: dict[str, list],
 ) -> Path | None:
-    """6단계: PDF 빌드 (blocking → run_in_executor)."""
+    """PDF 빌드 (blocking → run_in_executor)."""
     from src.earnings import pdf_report
+    from src.earnings import verify as verify_mod
     loop = asyncio.get_running_loop()
 
     out_dir = download_root_for("earnings")
@@ -466,6 +511,13 @@ async def _step_build_pdf(
     stamp = datetime.now(KST).strftime("%Y%m%d_%H%M%S")
     safe_tag = safe_dirname("_".join(tickers[:4]) or "earnings")
     out_path = out_dir / f"earnings_{safe_tag}_{stamp}.pdf"
+
+    # 검증 결과를 텍스트로 평탄화 (PDF에 표시)
+    verify_lines: list[str] = []
+    for t in tickers:
+        res = verify_by_ticker.get(t) or []
+        for r in res:
+            verify_lines.append(r.message)
 
     def _build():
         return pdf_report.build_pdf(
@@ -477,6 +529,7 @@ async def _step_build_pdf(
             industry_summary_kr=industry_summary,
             custom_question=custom_question,
             custom_answer_kr=custom_answer,
+            verify_lines=verify_lines,
         )
 
     try:
@@ -493,41 +546,56 @@ def _build_synthesis_payload(
     transcripts: dict[str, dict],
     financials: dict[str, Any],
     fiscal_period: str,
+    verify_by_ticker: dict[str, list] | None = None,
 ) -> str:
-    """LLM에 넘길 유저 메시지 구성. transcript 핵심 + 재무 raw 6년치."""
+    """LLM에 넘길 유저 메시지. 종목별 심층추출 + 재무 6년치 + 검증결과."""
     from src.earnings.sec_edgar import fmt_usd
+    verify_by_ticker = verify_by_ticker or {}
     parts: list[str] = []
     parts.append(f"# 분기: {fiscal_period}")
     parts.append(f"# 분석 기업: {', '.join(transcripts.keys())}")
+    grounded_n = sum(1 for tr in transcripts.values() if tr.get("grounded"))
+    parts.append(f"# 전문 grounding: {grounded_n}/{len(transcripts)} (grounded=True인 종목만 verbatim 신뢰)")
     parts.append("")
 
-    # 어닝콜 핵심 (JSON 압축)
-    parts.append("## 어닝콜 핵심 (종목별)")
+    # 어닝콜 심층추출 (종목별)
+    parts.append("## 어닝콜 심층추출 (종목별)")
     for t, tr in transcripts.items():
-        parts.append(f"### {t} — {tr.get('company_name', '')}")
+        gflag = "grounded" if tr.get("grounded") else "⚠️요약(비grounding)"
+        parts.append(f"### {t} — {tr.get('company_name', '')} [{gflag}, 출처 {tr.get('source','?')}]")
         hn = tr.get("headline_numbers") or {}
         if hn:
             parts.append("Headline: " + ", ".join(f"{k}={v}" for k, v in hn.items() if v))
+        seg = tr.get("segment_performance") or []
+        for item in seg[:8]:
+            parts.append(f"Segment [{item.get('segment','?')}]: {item.get('metric','')} — {item.get('detail','')}")
         md = tr.get("management_discussion") or []
-        for item in md[:8]:
+        for item in md[:12]:
             sp = item.get("speaker") or "?"
             tp = item.get("topic") or ""
             qt = item.get("quote") or ""
-            parts.append(f"- [{sp} / {tp}] {qt}")
+            parts.append(f"- [{sp} / {tp}] \"{qt}\"")
         g = tr.get("guidance") or {}
         if g:
             parts.append("Guidance: " + ", ".join(f"{k}={v}" for k, v in g.items() if v))
         qa = tr.get("qa_highlights") or []
-        for item in qa[:5]:
+        for item in qa[:10]:
             parts.append(f"Q ({item.get('analyst', '?')}): {item.get('question', '')}")
             parts.append(f"A: {item.get('answer_summary', '')}")
+        if tr.get("capital_allocation"):
+            parts.append(f"CapitalAllocation: {tr.get('capital_allocation')}")
+        if tr.get("management_tone"):
+            parts.append(f"Tone: {tr.get('management_tone')}")
         sr = tr.get("surprises_and_risks") or []
         for item in sr:
             parts.append(f"⚡ {item}")
-        if tr.get("analyst_sentiment"):
-            parts.append(f"Sentiment: {tr.get('analyst_sentiment')}")
-        if tr.get("stock_reaction_postcall"):
-            parts.append(f"Stock reaction: {tr.get('stock_reaction_postcall')}")
+        nv = tr.get("notable_verbatim") or []
+        for item in nv[:5]:
+            parts.append(f"Verbatim: \"{item}\"")
+        # 검증 결과
+        vres = verify_by_ticker.get(t) or []
+        for r in vres:
+            parts.append(f"[verify] {r.message}")
         parts.append("")
 
     # 재무 6년치
@@ -566,14 +634,32 @@ def _build_synthesis_payload(
 # 모델 티어 / 프롬프트 / 메시지 헬퍼
 # ------------------------------------------------------------------
 def _summary_model() -> str:
+    """0단계 parse — 갓성비 (kimi)."""
     return os.getenv("OPENROUTER_MODEL") or "moonshotai/kimi-k2.6"
 
 
+def _extract_model() -> str:
+    """종목별 전문 심층추출 — sonnet (긴 입력 정밀 읽기, 비용 절충).
+
+    EARNINGS_EXTRACT_MODEL > IDEA_NARROW_MODEL > sonnet 기본.
+    """
+    return (
+        os.getenv("EARNINGS_EXTRACT_MODEL")
+        or os.getenv("IDEA_NARROW_MODEL")
+        or "anthropic/claude-sonnet-4.5"
+    )
+
+
 def _synthesis_model() -> str:
-    explicit = os.getenv("IDEA_SYNTHESIS_MODEL")
-    if explicit:
-        return explicit
-    return os.getenv("OPENROUTER_MODEL") or "anthropic/claude-sonnet-4.5"
+    """최종 비교 합성 + 커스텀 분석 — Opus (딥리서치급 추론).
+
+    EARNINGS_SYNTHESIS_MODEL > IDEA_SYNTHESIS_MODEL > opus 기본.
+    """
+    return (
+        os.getenv("EARNINGS_SYNTHESIS_MODEL")
+        or os.getenv("IDEA_SYNTHESIS_MODEL")
+        or "anthropic/claude-opus-4.7"
+    )
 
 
 def _load_prompt(name: str) -> str:

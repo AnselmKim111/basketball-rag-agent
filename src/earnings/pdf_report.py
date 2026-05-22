@@ -250,6 +250,7 @@ def build_pdf(
     industry_summary_kr: str,
     custom_question: str = "",
     custom_answer_kr: str = "",
+    verify_lines: list[str] | None = None,
 ) -> Path | None:
     """전체 PDF 빌드. 성공 시 output_path 반환, 실패 None."""
     try:
@@ -268,13 +269,22 @@ def build_pdf(
             # 1. 표지
             _draw_cover(pdf, tickers, fiscal_period, custom_question)
 
-            # 2. Industry Summary (한국어)
+            # 2. 비교 합성 (Opus, 딥리서치급)
             if industry_summary_kr:
                 _draw_long_text_pages(
                     pdf,
-                    "Executive Summary — 산업 분위기 & 비교 인사이트",
+                    "비교 분석 — 산업 분위기 & 인사이트 (Opus)",
                     industry_summary_kr,
-                    footer_prefix="Industry Summary",
+                    footer_prefix="Comparison",
+                )
+
+            # 2.5 숫자 교차검증 (콜 ↔ SEC)
+            if verify_lines:
+                _draw_long_text_pages(
+                    pdf,
+                    "숫자 교차검증 — 어닝콜 ↔ SEC EDGAR",
+                    "\n".join(verify_lines),
+                    footer_prefix="Verify",
                 )
 
             # 3. 차트 (재무 데이터가 있는 경우만)
