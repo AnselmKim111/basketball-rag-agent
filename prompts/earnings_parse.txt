@@ -1,0 +1,39 @@
+사용자의 어닝콜 분석 요청 텍스트를 다음 JSON 스키마로 파싱하라. JSON만 출력 (마크다운 펜스/설명 금지).
+
+{
+  "mode": "tickers" | "criteria" | "custom_only",
+  "tickers": ["AAPL", "MSFT", ...],          // mode가 "tickers"일 때만. 1-8개. 미국 상장사 ticker.
+  "criteria": "...",                          // mode가 "criteria"일 때 자연어 조건 그대로 (이후 단계에서 ticker로 확장)
+  "fiscal_period": "Q1 FY2026",               // 사용자가 명시한 분기 (사람이 읽는 형태). 미명시 시 null.
+  "fiscal_year": 2026,                         // transcript API용 정수 연도. 미명시 시 null.
+  "fiscal_quarter": 1,                         // transcript API용 정수 분기 1-4. 미명시 시 null.
+  "custom_question": "...",                    // 사용자가 추가 분석을 요청한 경우 그 질문. 없으면 null.
+  "language": "ko"                             // 보고서 언어 (기본 한국어)
+}
+
+fiscal_year/fiscal_quarter 규칙:
+- "2026 1Q", "2026년 1분기", "1Q26", "Q1 2026" → fiscal_year=2026, fiscal_quarter=1.
+- "최근", "최신", "지난 분기" 또는 미명시 → fiscal_year=null, fiscal_quarter=null.
+- 연도만 있고 분기 없으면 fiscal_quarter=null (반대도 동일).
+
+판정 규칙:
+- 사용자가 회사 이름이나 ticker를 명시 → mode = "tickers". 회사명만 있으면 ticker로 변환.
+  (예: "애플 마이크로소프트" → ["AAPL", "MSFT"])
+- 사용자가 조건(빅테크, 하이퍼스케일러, capex 상위 N, AI 반도체 등) → mode = "criteria".
+- 사용자가 회사 명시 없이 분석 질문만 던지면 → mode = "custom_only". criteria도 비움.
+- "빅테크 2026 1Q 실적발표" → mode="criteria", criteria="big tech 2026 Q1 earnings",
+  fiscal_period="Q1 CY2026".
+- "capex 순 상위 6개" → mode="criteria", criteria="top 6 US-listed companies by capex".
+- "MSFT GOOGL AMZN META의 capex 추이와 시장 서프라이즈 요인" → mode="tickers",
+  tickers=["MSFT","GOOGL","AMZN","META"], custom_question="capex 추이와 시장 서프라이즈 요인".
+- 사용자가 한국 종목을 요청하면 (예: 삼성전자) → mode="criteria", criteria 그대로 두되 후속 단계에서
+  "어닝콜봇은 미국 상장사 한정"으로 reject.
+
+분기 표현 변환:
+- "2026 1Q", "2026년 1분기", "1Q26", "Q1 2026" → "Q1 CY2026" (캘린더 기준) 또는 회사 fiscal 기준
+  unclear하면 "Q1 FY2026" 사용.
+- "최근", "최신", "지난 분기" → fiscal_period = null (later step will resolve to "most recent reported").
+
+커스텀 분석 신호 (custom_question에 넣을 키워드):
+- "시장에 서프라이즈가 될 수 있는 요인", "buy/sell signal", "투자 결정에 영향",
+  "산업 전망", "비교 인사이트", "리스크 요인"

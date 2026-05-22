@@ -130,3 +130,74 @@
 시뮬레이션 환경에서 외부 KRX/Naver/FDR 데이터에 lag/forward-fill 가능성. 따라서
 이중확인 구조가 핵심. 단일 소스만 신뢰하면 잘못된 chg_pct 발생 — 사용자에게 검증된 사례
 존재 (예: 첫 self-test에서 삼성E&A +21.5% 잘못 표시 → fix 후 -3.11% 정확).
+
+---
+
+## 7. EarningsBot — 미국 기업 어닝콜 + 비교 PDF (종목봇 통합)
+
+기존 종목봇(CompanyBot, `TELEGRAM_BOT_TOKEN`)에 `/earnings` 명령으로 통합. 별도 봇
+토큰·polling 없음. orchestrator에서 `_build_company_app_with_earnings` wrapper가
+`register_handlers(app)`를 호출해 끼워 넣음 (deepdive와 같은 격리 패턴).
+
+미국 상장사 한정. **진짜 전문(full transcript) grounding → 종목별 심층추출 → 숫자 교차검증
+→ Opus 비교합성**의 딥리서치급 파이프라인. deep_research.py 수준(인용·정량·시나리오, 8000자+) 목표.
+
+### 품질 설계 (왜 이렇게)
+이전 버전은 perplexity "찾아서 요약" 단일 호출이라 전문 비근거·환각·얕음. 그래서:
+1. **grounding**: 진짜 전문 텍스트 확보 (FMP→API Ninjas→스크레이프→perplexity요약 폴백).
+   `grounded` 플래그로 신뢰도 추적, 비근거 시 보고서에 ⚠️ 경고.
+2. **심층추출**: 전문 전체를 sonnet이 읽어 verbatim 인용 + 전체 Q&A + segment 구조화.
+3. **교차검증**: 추출 숫자(rev/capex) ↔ SEC 분기 데이터 대조, 불일치 flag (스크리너 철학).
+4. **Opus 합성**: 인용강제 + 시나리오(bull/bear/base) + 표, 8섹션.
+
+### 핵심 파일
+- `src/earnings_bot.py` — 봇 entrypoint, `_run_pipeline` (8단계), `_self_test`
+- `src/earnings/transcript_source.py` — **진짜 전문 확보** (프로바이더 체인 + `resolve_year_quarter`)
+- `src/earnings/transcripts.py` — `fetch_and_extract` (grounded 전문 위 sonnet 심층추출) + `expand_criteria_to_tickers`
+- `src/earnings/sec_edgar.py` — SEC EDGAR Company Facts (FY 6년 + 분기 flow). ticker→CIK 캐시, rate limit 6.6 req/s
+- `src/earnings/verify.py` — 숫자 교차검증 (콜 ↔ SEC)
+- `src/earnings/charts.py` — matplotlib 차트 6종
+- `src/earnings/pdf_report.py` — PdfPages PDF (표지/비교합성/검증/차트/종목별/커스텀/부록)
+- `prompts/earnings_parse.txt` — 입력 파싱 (mode/tickers/fiscal_year+quarter/custom)
+- `prompts/earnings_extract.txt` — 전문 심층추출 (verbatim·전체 Q&A·segment)
+- `prompts/earnings_synthesis.txt` — Opus 비교합성 (8섹션·인용강제·시나리오)
+- `prompts/earnings_custom.txt` — 커스텀 질문 답변 (counter-thesis)
+
+### 데이터 소스
+- 전문: **Alpha Vantage(ALPHA_VANTAGE_KEY, 무료·1순위)** → FMP_API_KEY(유료) → API_NINJAS_KEY(유료)
+  → 웹 스크레이프(httpx+BS4) → perplexity 요약(grounded=False)
+  · FMP 무료 키는 transcript 엔드포인트 402/403 (유료 전용). AV 무료가 실측 동작 (25 req/day).
+  · AV는 year+quarter 필수 ("YYYYQN"). 미명시 시 FMP/스크레이프/perplexity로 폴백.
+- 재무: SEC EDGAR XBRL US-GAAP (FY 10-K 6년 + 단일분기 flow, 검증용)
+  · CapEx: PaymentsToAcquirePropertyPlantAndEquipment / OCF: NetCashProvidedByUsedInOperatingActivities
+  · FCF = OCF − CapEx, OCF/CapEx 비율 = 캐시 머신 vs 캐펙스 burden
+
+### 파이프라인 (8단계)
+0. parse (summary/kimi) → mode/tickers/fiscal_year+quarter/custom
+1. (criteria) 조건 → 티커 확장 (research/perplexity)
+2+3. 종목별: 진짜 전문 확보 → sonnet 심층추출 → 즉시 텔레그램 발송
+4. SEC EDGAR 재무 (FY+분기) — 2단계 전에 먼저 수집
+5. 숫자 교차검증 (콜 ↔ SEC), 종목별 flag
+6. 비교 합성 (**Opus**, 인용·시나리오 8000자+)
+7. 커스텀 질문 답변 (**Opus**, 있는 경우)
+8. PDF 빌드 + 발송
+
+### 모델 티어
+- parse: `OPENROUTER_MODEL` (kimi)
+- 전문 심층추출: `EARNINGS_EXTRACT_MODEL` > `IDEA_NARROW_MODEL` > sonnet
+- 비교합성/커스텀: `EARNINGS_SYNTHESIS_MODEL` > `IDEA_SYNTHESIS_MODEL` > **opus**
+- 모든 LLM 호출은 `summarizer.chat_with_retry` (재시도+폴백)
+
+### 환경변수
+- 봇 토큰: 종목봇 `TELEGRAM_BOT_TOKEN` 그대로 (별도 토큰 불필요)
+- `EARNINGS_ALLOWED_CHAT_IDS` — 미설정 시 `ALLOWED_CHAT_IDS` 폴백
+- `SEC_EDGAR_USER_AGENT` — "name email@example.com" (SEC 필수)
+- `ALPHA_VANTAGE_KEY` — 진짜 전문 (무료·권장). FMP/API Ninjas는 유료 전용.
+- `EARNINGS_EXTRACT_MODEL` / `EARNINGS_SYNTHESIS_MODEL` — 모델 override
+- `EARNINGS_TEST_PROMPT` — self-test
+
+### 제약
+- 미국 상장사 한정. 한국 종목 reject.
+- 최대 8개 기업 (4-6 권장). 종목당 1-2분 (전문 확보+심층추출).
+- transcript 키 없으면 grounding 실패 → 요약 폴백(환각 위험, ⚠️ 표기). 최소 FMP 키 권장.
+- 어닝콜 직후 24-48h는 transcript 소스 미수록 가능.
