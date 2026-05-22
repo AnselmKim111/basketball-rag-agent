@@ -385,14 +385,28 @@ async def screener_daily_job(bot: Bot, override_chat_id: str | None = None) -> N
             except Exception:
                 log.exception("[scheduled] 시총 갱신 실패 — 신호 계산은 진행")
 
-        # DB 비었으면 백필
+        # 데이터 충분성 진단 (52주 신고가는 252일+ 필요)
+        lengths = await loop.run_in_executor(None, db.ticker_data_lengths)
+        log.info("[scheduled] ticker_data_lengths: %s", lengths)
+
+        # 백필 트리거 조건:
+        #   - DB 비었음 (첫 실행)
+        #   - 강제 (SCREENER_FORCE_BACKFILL=1)
+        #   - 252일+ 종목이 활성 universe의 30% 미만 (52주 신고가 산출 불가 상태)
+        #     단 naver_backfill_done flag 있으면 중복 방지 (force 제외)
         force = os.getenv("SCREENER_FORCE_BACKFILL", "0") == "1"
         rc = await loop.run_in_executor(None, db.row_count)
-        if rc == 0 or force:
+        ge_252 = lengths.get("ge_252", 0)
+        total_t = lengths.get("total_tickers", 0) or 1
+        insufficient = (ge_252 / total_t) < 0.30
+        backfill_done = await loop.run_in_executor(None, lambda: db.meta_get("naver_backfill_done"))
+        need_backfill = (rc == 0) or force or (insufficient and not backfill_done)
+
+        if need_backfill:
+            reason = "첫 실행" if rc == 0 else ("강제" if force else f"252일+ 종목 부족 ({ge_252}/{total_t})")
             await send_text_chunked(
                 bot, chat_id,
-                "📥 첫 실행 — 1년치 백필 시작 (약 10분 소요)" if rc == 0
-                else "📥 강제 재백필 시작",
+                f"📥 1년치 백필 시작 ({reason}, Naver 기반 ~6-15분)",
             )
 
             def _progress(done: int, total: int, success: int) -> None:
@@ -412,8 +426,12 @@ async def screener_daily_job(bot: Bot, override_chat_id: str | None = None) -> N
             )
             await send_text_chunked(
                 bot, chat_id,
-                f"✅ 백필 완료: success={result['success']} fail={result['fail']} rows={result['rows']}",
+                f"✅ 백필 완료: mode={result.get('mode')} success={result['success']} "
+                f"fail={result['fail']} rows={result['rows']}",
             )
+            # 백필 후 데이터 길이 재진단
+            lengths2 = await loop.run_in_executor(None, db.ticker_data_lengths)
+            log.info("[scheduled] 백필 후 ticker_data_lengths: %s", lengths2)
 
         # 증분 (오늘 1일치) — KRX 16:30 이전 미발행 대비 retry
         # SCREENER_RETRY_INTERVAL_S(기본 300=5분), SCREENER_RETRY_MAX(기본 6회 → 최대 30분)

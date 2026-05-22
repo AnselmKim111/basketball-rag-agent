@@ -1,8 +1,11 @@
-"""1회성 1년치 백필 — date-batch 우선, ticker-batch 자동 폴백.
+"""1회성 1년치 백필 — Naver ticker-batch 1순위, pykrx/FDR 폴백.
 
-기본 모드: pykrx.get_market_ohlcv(date, market="ALL")로 그 날짜의 전 종목을 한 번에 받아옴
-(252영업일 × 1 req). 단 pykrx가 KRX endpoint 차단/변경으로 일관 실패하면
-FDR 기반 ticker-batch로 자동 전환 (종목별 1년치 fetch).
+기본 모드 (1순위): Naver Finance siseJson API로 종목별 1년치를 단일 요청에 받음
+(시총 desc 정렬, ~1200종목). incremental·validator에서 검증된 1순위 소스로,
+시뮬레이션 환경에서도 정확한 정규장 종가를 반환.
+
+폴백: pykrx.get_market_ohlcv(date, market="ALL") date-batch → FDR ticker-batch.
+이 환경에서 pykrx/FDR은 일관 실패하지만 운영 환경 대비 보존.
 
 호출은 blocking이므로 봇 핸들러에서 run_in_executor로 감쌀 것.
 """
@@ -10,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Callable, Optional
@@ -26,6 +30,13 @@ SLEEP_BETWEEN_TICKERS_S = 0.3
 DATE_BATCH_FAIL_THRESHOLD = 5
 
 
+def _int_env(key: str, default: int) -> int:
+    try:
+        return int(os.getenv(key, "") or default)
+    except ValueError:
+        return default
+
+
 def run_full_backfill(
     days: int = DEFAULT_DAYS,
     progress_cb: Optional[Callable[[int, int, int], None]] = None,
@@ -33,6 +44,7 @@ def run_full_backfill(
     """전체 백필. 반환: {"success": int, "fail": int, "rows": int, "skipped_existing": int, "mode": str}.
 
     progress_cb(done, total, success) — 주기적으로 호출. None이면 로그만.
+    데이터 소스 우선순위: Naver ticker-batch → pykrx date-batch → FDR ticker-batch.
     """
     db.ensure_schema()
     # universe 먼저 보장
@@ -41,6 +53,12 @@ def run_full_backfill(
         universe.refresh_universe()
 
     active_set = {t["ticker"] for t in db.get_active_tickers()}
+
+    # 0순위: Naver ticker-batch (1년치 단일 요청)
+    naver_result = _run_naver_batch_backfill(days=days, progress_cb=progress_cb)
+    if naver_result["rows"] > 0:
+        return naver_result
+    log.warning("[backfill] Naver 백필 빈 결과 → pykrx date-batch 폴백 시도")
 
     today = datetime.now(KST).date()
     target_dates = data_source.last_n_business_days(today, days)
@@ -115,6 +133,85 @@ def run_full_backfill(
     return {
         "success": success, "fail": fail, "rows": total_rows,
         "skipped_existing": skipped, "mode": "date-batch",
+    }
+
+
+def _run_naver_batch_backfill(
+    days: int,
+    progress_cb: Optional[Callable[[int, int, int], None]],
+) -> dict:
+    """Naver Finance 종목별 1년치 fetch (1순위). 단일 요청에 full history.
+
+    시총 desc 정렬 (대형주 우선). cap/timeout으로 보호:
+      - SCREENER_BACKFILL_NAVER_CAP (기본 1300)
+      - SCREENER_BACKFILL_NAVER_TIMEOUT_S (기본 900=15분)
+    """
+    db.ensure_schema()
+    cap = _int_env("SCREENER_BACKFILL_NAVER_CAP", 1300)
+    timeout_s = _int_env("SCREENER_BACKFILL_NAVER_TIMEOUT_S", 900)
+
+    # 시총 desc 정렬 (대형주 우선 — timeout 시 소형주만 누락)
+    all_tickers = db.get_active_tickers()
+    all_tickers.sort(key=lambda t: -(t.get("market_cap") or 0))
+    tickers = [t["ticker"] for t in all_tickers][:cap]
+
+    today = datetime.now(KST).date()
+    start_iso = (today - timedelta(days=int(days * 1.5) + 15)).strftime("%Y-%m-%d")
+    end_iso = today.strftime("%Y-%m-%d")
+    log.info(
+        "[backfill] Naver 시작: %d종목 (%s ~ %s, cap=%d, timeout=%ds)",
+        len(tickers), start_iso, end_iso, cap, timeout_s,
+    )
+
+    success = fail = total_rows = 0
+    t0 = time.monotonic()
+    for i, ticker in enumerate(tickers, 1):
+        if time.monotonic() - t0 > timeout_s:
+            log.warning("[backfill] Naver timeout %ds 초과 → %d/%d에서 중단", timeout_s, i - 1, len(tickers))
+            break
+        try:
+            rows = data_source.fetch_ohlcv_by_ticker_via_naver(ticker, start_iso, end_iso)
+            if rows:
+                inserted = db.upsert_ohlcv_bulk(rows)
+                total_rows += inserted
+                success += 1
+            else:
+                fail += 1
+        except Exception:
+            fail += 1
+            log.exception("[backfill] Naver %s 실패", ticker)
+
+        if i % 100 == 0 or i == len(tickers):
+            log.info(
+                "[backfill] Naver 진행 %d/%d success=%d fail=%d rows=%d",
+                i, len(tickers), success, fail, total_rows,
+            )
+            if progress_cb:
+                try:
+                    progress_cb(i, len(tickers), success)
+                except Exception:
+                    log.exception("[backfill] progress_cb 실패")
+
+    db.meta_set(
+        "backfill_summary",
+        json.dumps(
+            {
+                "success": success, "fail": fail, "rows": total_rows,
+                "skipped_existing": 0, "mode": "naver-ticker-batch",
+                "completed_at": datetime.now(KST).isoformat(),
+            },
+            ensure_ascii=False,
+        ),
+    )
+    if total_rows > 0:
+        db.meta_set("naver_backfill_done", datetime.now(KST).isoformat())
+    log.info(
+        "[backfill] 완료 (Naver) success=%d fail=%d rows=%d",
+        success, fail, total_rows,
+    )
+    return {
+        "success": success, "fail": fail, "rows": total_rows,
+        "skipped_existing": 0, "mode": "naver-ticker-batch",
     }
 
 
