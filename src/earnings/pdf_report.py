@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -21,12 +22,29 @@ from typing import Any
 log = logging.getLogger(__name__)
 KST = timezone(timedelta(hours=9))
 
+# 이모지/픽토그램 — Noto Sans CJK에 글리프 없어 tofu 박스로 깨짐 → 렌더 전 제거
+_EMOJI_RE = re.compile(
+    "["
+    "\U0001F300-\U0001FAFF"
+    "\U00002600-\U000027BF"
+    "\U0001F1E6-\U0001F1FF"
+    "\U0000FE00-\U0000FE0F"
+    "\U00002190-\U000021FF"
+    "\U00002B00-\U00002BFF"
+    "]"
+)
+
+
+def _strip_emoji(s: str) -> str:
+    return _EMOJI_RE.sub("", s or "").strip()
+
 
 def _wrap_text(text: str, width: int = 95) -> list[str]:
-    """단순 단어 단위 wrap (영문/한글 혼합 OK)."""
+    """단순 단어 단위 wrap (영문/한글 혼합 OK). 이모지 제거."""
     import textwrap
     out: list[str] = []
     for line in (text or "").splitlines():
+        line = _EMOJI_RE.sub("", line)
         if not line.strip():
             out.append("")
             continue
@@ -65,7 +83,7 @@ def _draw_text_page(pdf, title: str, body: str, *, footer: str = "") -> None:
 
     # 타이틀
     ax.text(
-        0.0, 0.97, title,
+        0.0, 0.97, _strip_emoji(title),
         fontsize=16, fontweight="bold", va="top", ha="left", color="#1a1a1a",
     )
     ax.axhline(y=0.945, xmin=0.0, xmax=1.0, color="#888", linewidth=0.6)
@@ -261,6 +279,9 @@ def build_pdf(
 
         from src.earnings import charts
 
+        # 텍스트의 '$'를 LaTeX 수식으로 파싱하지 않음 — "$28B" 등 달러 기호가
+        # mathtext ParseException을 일으키는 것을 방지 (matplotlib ≥3.7).
+        plt.rcParams["text.parse_math"] = False
         _setup_korean_font()
         output_path = Path(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)

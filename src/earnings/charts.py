@@ -29,6 +29,8 @@ def _setup_matplotlib():
     plt.rcParams["figure.dpi"] = 110
     plt.rcParams["savefig.dpi"] = 110
     plt.rcParams["font.size"] = 10
+    # "$1.5B" 같은 축 라벨의 '$'가 LaTeX 수식으로 파싱되지 않게 (matplotlib ≥3.7)
+    plt.rcParams["text.parse_math"] = False
     return plt
 
 
