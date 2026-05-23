@@ -144,6 +144,25 @@ class WisereportClient:
             raise RuntimeError("WisereportClient must be used as a context manager.")
         return self._page
 
+    def _goto(self, url: str, *, retries: int = 2, timeout: int = 30_000) -> None:
+        """networkidle 대신 domcontentloaded로 navigate + 재시도.
+
+        wisereport(ASP.NET + 광고/추적 polling)는 networkidle(500ms 무요청)에
+        도달하지 못해 30초 타임아웃이 잦았다. domcontentloaded 후 호출부의
+        명시적 wait_for_selector/wait_for_function/URL 체크가 페이지 준비를 보장.
+        """
+        last: PlaywrightTimeoutError | None = None
+        for attempt in range(retries + 1):
+            try:
+                self.page.goto(url, wait_until="domcontentloaded", timeout=timeout)
+                return
+            except PlaywrightTimeoutError as e:
+                last = e
+                log.warning("goto 타임아웃 (%d/%d): %s", attempt + 1, retries + 1, url)
+                self.page.wait_for_timeout(1000 * (attempt + 1))
+        assert last is not None
+        raise last
+
     # ------------------------------------------------------------------
     # 로그인
     # ------------------------------------------------------------------
@@ -155,7 +174,7 @@ class WisereportClient:
         로그인은 항상 깨끗한 세션에서 시작.
         """
         if self.state_file and self.state_file.exists():
-            self.page.goto(REPORT_LIST_URL, wait_until="networkidle")
+            self._goto(REPORT_LIST_URL)
             if "ReportList" in self.page.url and "returnUrl" not in self.page.url:
                 log.info("기존 세션 재사용")
                 self.page.wait_for_timeout(1500)
@@ -170,7 +189,7 @@ class WisereportClient:
 
     def login(self) -> None:
         log.info("로그인 시도")
-        self.page.goto(BASE_URL + "/", wait_until="networkidle")
+        self._goto(BASE_URL + "/")
         self.page.wait_for_selector("#UsrID", state="attached", timeout=15_000)
         # JS handler 바인딩 완료 대기
         self.page.wait_for_function(
@@ -199,7 +218,7 @@ class WisereportClient:
         # 로그인 후 networkidle 대기. URL 매칭으로는 returnUrl이 포함된 redirect
         # ('/?returnUrl=...ReportList.aspx')와 진짜 LoginProcess.aspx를 구분 못함.
         try:
-            self.page.wait_for_load_state("networkidle", timeout=20_000)
+            self.page.wait_for_load_state("load", timeout=20_000)
         except PlaywrightTimeoutError:
             pass
         log.debug("login Enter 후 URL=%s", self.page.url)
@@ -209,7 +228,7 @@ class WisereportClient:
             log.info("중복 로그인 감지 → 강제 로그인")
             self.page.click("#popup_ok")
             try:
-                self.page.wait_for_load_state("networkidle", timeout=20_000)
+                self.page.wait_for_load_state("load", timeout=20_000)
             except PlaywrightTimeoutError:
                 pass
             log.debug("popup_ok 후 URL=%s", self.page.url)
@@ -218,7 +237,7 @@ class WisereportClient:
         self.page.wait_for_timeout(1500)
 
         # 검증 - ReportList 직접 접근
-        self.page.goto(REPORT_LIST_URL, wait_until="networkidle")
+        self._goto(REPORT_LIST_URL)
         if "ReportList" not in self.page.url or "returnUrl" in self.page.url:
             # 마지막 디버그 정보
             body_snip = ""
@@ -245,7 +264,7 @@ class WisereportClient:
         팝업 내에서 첫 결과의 종목코드를 추출.
         """
         log.info("ticker 룩업: %s", company_name)
-        self.page.goto(REPORT_LIST_URL, wait_until="networkidle")
+        self._goto(REPORT_LIST_URL)
         self.page.wait_for_timeout(1500)
 
         # 검색 텍스트와 cocode 모드 설정
@@ -266,7 +285,7 @@ class WisereportClient:
             self.page.evaluate("typeof na_search_lookup === 'function' && na_search_lookup(1)")
         try:
             popup = popup_info.value
-            popup.wait_for_load_state("networkidle", timeout=10_000)
+            popup.wait_for_load_state("load", timeout=10_000)
             popup_html = popup.content()
             popup.close()
         except Exception as e:
@@ -304,7 +323,7 @@ class WisereportClient:
         """
         log.info("리포트 목록 AJAX: ticker=%s (top %d)", ticker, limit)
         if "ReportList" not in self.page.url:
-            self.page.goto(REPORT_LIST_URL, wait_until="networkidle")
+            self._goto(REPORT_LIST_URL)
         # jQuery + #hiddenUserID 가 준비될 때까지 대기 (세션 재사용 경로 보호)
         try:
             self.page.wait_for_function(
@@ -411,7 +430,7 @@ class WisereportClient:
 
         # TopHits 페이지로 이동 (세션 쿠키 + JS context 보장)
         if "TopHits" not in self.page.url:
-            self.page.goto(TOPHITS_URL, wait_until="networkidle")
+            self._goto(TOPHITS_URL)
         try:
             self.page.wait_for_function(
                 "() => document.getElementById('hiddenUserID') !== null",
@@ -520,7 +539,7 @@ class WisereportClient:
         """
         log.info("산업 코드 룩업: %s", industry_name)
         if "ReportList" not in self.page.url:
-            self.page.goto(REPORT_LIST_URL, wait_until="networkidle")
+            self._goto(REPORT_LIST_URL)
             self.page.wait_for_timeout(1500)
 
         # 검색 텍스트와 gicscode 모드 활성화
@@ -539,7 +558,7 @@ class WisereportClient:
             with self.page.expect_popup(timeout=10_000) as popup_info:
                 self.page.evaluate("typeof na_search_lookup === 'function' && na_search_lookup(1)")
             popup = popup_info.value
-            popup.wait_for_load_state("networkidle", timeout=10_000)
+            popup.wait_for_load_state("load", timeout=10_000)
             popup_html = popup.content()
             popup.close()
         except Exception as e:
@@ -595,7 +614,7 @@ class WisereportClient:
         )
         body_page = self._context.new_page()  # type: ignore[union-attr]
         try:
-            body_page.goto(body_url, wait_until="networkidle")
+            body_page.goto(body_url, wait_until="load")
             body_html = body_page.content()
         finally:
             body_page.close()
