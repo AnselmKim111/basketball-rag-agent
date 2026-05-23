@@ -30,26 +30,37 @@ def write_report(
     macro_summary: dict,
     korea_summary: dict,
     news: list[dict] | None = None,
+    theme_momentum: dict | None = None,
+    deltas: dict | None = None,
+    breadth: dict | None = None,
+    highlights: list[dict] | None = None,
 ) -> str:
-    """LLM으로 전체 Markdown 리포트 생성.
+    """LLM으로 전체 Markdown 리포트 생성 (8섹션 + 전일 대비 팔로업).
 
-    chart_list: [{"filename","title","caption_hint"}], signals: MarketSignal dicts,
-    macro_summary/korea_summary: 요약 dict, news: [{title,source,url,published_at}].
+    chart_list: [{"filename","title","caption_hint","section"}], signals: MarketSignal dicts,
+    macro_summary/korea_summary: 요약 dict, theme_momentum: {buckets,hot,cold},
+    deltas: 전일 대비 변화, breadth: 시장 폭, highlights: 개별주 [{label,chg,note}].
     실패 시 규칙 기반 fallback markdown 반환.
     """
     payload = {
         "date": date_iso,
         "market_color": market_color,
+        "deltas_vs_yesterday": deltas or {},
+        "breadth": breadth or {},
+        "theme_momentum": theme_momentum or {},
         "charts": chart_list,
         "signals": signals[:60],
         "macro": macro_summary,
         "korea": korea_summary,
+        "highlights": highlights or [],
         "news": (news or [])[:15],
     }
     user_msg = (
-        "다음은 오늘 시장 데이터와 생성된 차트 목록이다. 이를 바탕으로 시스템 규칙에 따라 "
-        "한국어 Markdown 시황 리포트를 작성하라. 차트는 반드시 ![](images/파일명)으로 본문에 "
-        "삽입하고 각 차트에 관찰/해석/체크 3줄을 붙여라.\n\n"
+        "다음은 오늘 시장 데이터·전일 대비 변화(deltas_vs_yesterday)·생성된 차트 목록이다. "
+        "시스템 규칙(8섹션 + 전일 대비 팔로업)에 따라 한국어 Markdown 시황 리포트를 작성하라. "
+        "맨 앞에 '📍 어제 대비 변화' 블록과 Executive Summary(3~4줄)를 두고, 각 차트는 반드시 "
+        "![](images/파일명)으로 본문에 삽입하며, 각 섹션 끝에 '한 줄 takeaway'를 붙여라. "
+        "데이터 미확보는 '데이터 미수집'으로, 가설은 '가설'로 표기하라.\n\n"
         + json.dumps(payload, ensure_ascii=False, indent=2)
     )
     try:
@@ -74,16 +85,20 @@ def write_report(
         log.warning("[report.writer] LLM 짧은 응답 → fallback")
     except Exception:
         log.exception("[report.writer] LLM 실패 → fallback")
-    return _fallback_markdown(date_iso, market_color, chart_list, signals)
+    return _fallback_markdown(date_iso, market_color, chart_list, signals, deltas)
 
 
-def _fallback_markdown(date_iso, market_color, chart_list, signals) -> str:
+def _fallback_markdown(date_iso, market_color, chart_list, signals, deltas=None) -> str:
     """LLM 실패 시 차트+신호만으로 최소 리포트."""
     lines = [
-        f"# {date_iso} 시장 색깔 리포트 (자동 생성 — LLM 미작동 fallback)",
+        f"# [Daily Macro] {market_color.get('market_color','Mixed')} ({date_iso})",
         f"\n**오늘의 시장 색깔: {market_color.get('market_color','Mixed')}** "
         f"({', '.join(market_color.get('evidence', []))})\n",
     ]
+    if deltas and deltas.get("notes"):
+        lines.append("\n## 📍 어제 대비 변화")
+        for note in deltas["notes"]:
+            lines.append(f"- {note}")
     for ch in chart_list:
         lines.append(f"\n## {ch.get('title','')}")
         lines.append(f"![]({'images/' + ch['filename']})")

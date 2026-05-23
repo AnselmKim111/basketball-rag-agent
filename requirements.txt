@@ -16,3 +16,5 @@ pykrx>=1.0.45
 pandas>=2.2
 numpy>=1.26
 finance-datareader>=0.9.0
+# 버터대디봇 리포트 (트리맵 히트맵)
+squarify>=0.4

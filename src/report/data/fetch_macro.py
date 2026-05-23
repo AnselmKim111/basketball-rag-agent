@@ -31,12 +31,53 @@ MACRO_SYMBOLS = {
 
 def fetch_macro(days: int = 180) -> dict[str, object]:
     """매크로 지표 {label: DataFrame}. 미확보 심볼은 자동 제외."""
-    out: dict[str, object] = {}
-    for label, sym in MACRO_SYMBOLS.items():
-        df = fetch_ohlcv(sym, days=days)
-        if df is not None and len(df) > 5:
-            out[label] = df
-        else:
-            log.info("[report.macro] %s(%s) 미확보 — 생략", label, sym)
+    from src.report.data.fetch_prices import fetch_many
+    out = fetch_many(MACRO_SYMBOLS, days=days)
     log.info("[report.macro] %d/%d 지표 확보", len(out), len(MACRO_SYMBOLS))
+    return out
+
+
+# FRED 시계열 (API 키 없이 fredgraph.csv 직접). 미국 egress 불확실 → best-effort.
+FRED_SERIES = {
+    "미시간 1년 기대인플레": "MICH",
+    "신규 실업수당청구(주)": "ICSA",
+}
+
+
+def fetch_fred(series_id: str, days: int = 1825):
+    """FRED fredgraph.csv → DataFrame(Date index, Close). 실패 시 None."""
+    import io
+    from datetime import date, timedelta
+    try:
+        import httpx
+        import pandas as pd
+        start = (date.today() - timedelta(days=days)).strftime("%Y-%m-%d")
+        url = (f"https://fred.stlouisfed.org/graph/fredgraph.csv"
+               f"?id={series_id}&cosd={start}")
+        r = httpx.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+        r.raise_for_status()
+        df = pd.read_csv(io.StringIO(r.text))
+        # 컬럼: observation_date(또는 DATE), <series_id>
+        date_col = df.columns[0]
+        val_col = df.columns[1]
+        df[val_col] = pd.to_numeric(df[val_col], errors="coerce")
+        df = df.dropna(subset=[val_col])
+        df.index = pd.to_datetime(df[date_col])
+        out = df[[val_col]].rename(columns={val_col: "Close"})
+        if len(out) < 2:
+            return None
+        return out
+    except Exception as e:
+        log.info("[report.macro] FRED %s 미확보: %s", series_id, e)
+        return None
+
+
+def fetch_fred_many() -> dict[str, object]:
+    """FRED_SERIES 일괄 fetch. 미확보 자동 제외."""
+    out: dict[str, object] = {}
+    for label, sid in FRED_SERIES.items():
+        df = fetch_fred(sid)
+        if df is not None:
+            out[label] = df
+    log.info("[report.macro] FRED %d/%d 확보", len(out), len(FRED_SERIES))
     return out

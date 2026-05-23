@@ -71,3 +71,52 @@ COLOR_UP = "#d62728"      # 상승(빨강 — 한국 관습)
 COLOR_DOWN = "#1f77b4"    # 하락(파랑)
 COLOR_MA = ["#888888", "#ff7f0e", "#2ca02c", "#9467bd"]  # 10/20/50/200
 COLOR_NEUTRAL = "#333333"
+
+
+def stamp(ax, date_iso: str | None) -> None:
+    """차트 우하단에 데이터 기준일 워터마크."""
+    if not date_iso:
+        return
+    try:
+        ax.annotate(f"기준 {date_iso}", xy=(1.0, -0.02), xycoords="axes fraction",
+                    ha="right", va="top", fontsize=7, color="#999999")
+    except Exception:
+        pass
+
+
+def candlestick(ax, df, width: float = 0.6, n: int | None = None) -> None:
+    """OHLC 캔들 그리기 (날짜 정수 인덱스 기반). 상승=빨강/하락=파랑.
+
+    n 지정 시 최근 n봉만. x축은 0..len-1 정수 (라벨은 호출측에서 set).
+    """
+    import numpy as np
+    sub = df.iloc[-n:] if n else df
+    o = sub["Open"].values if "Open" in sub else sub["Close"].values
+    h = sub["High"].values if "High" in sub else sub["Close"].values
+    low = sub["Low"].values if "Low" in sub else sub["Close"].values
+    c = sub["Close"].values
+    x = np.arange(len(sub))
+    for i in range(len(sub)):
+        up = c[i] >= o[i]
+        col = COLOR_UP if up else COLOR_DOWN
+        ax.vlines(x[i], low[i], h[i], color=col, linewidth=0.7, alpha=0.9)
+        lo_b, hi_b = (o[i], c[i]) if up else (c[i], o[i])
+        ax.add_patch(__import__("matplotlib").patches.Rectangle(
+            (x[i] - width / 2, lo_b), width, max(hi_b - lo_b, (hi_b + lo_b) * 1e-5 or 1e-6),
+            facecolor=col, edgecolor=col, linewidth=0.4, alpha=0.9))
+    ax.set_xlim(-1, len(sub))
+
+
+def date_xticks(ax, index, n: int | None = None, count: int = 6) -> None:
+    """정수 x축에 날짜 라벨 count개 분산 배치."""
+    import numpy as np
+    idx = index[-n:] if n else index
+    if len(idx) == 0:
+        return
+    pos = np.linspace(0, len(idx) - 1, min(count, len(idx))).astype(int)
+    ax.set_xticks(pos)
+    try:
+        labels = [idx[p].strftime("%y/%m") for p in pos]
+    except Exception:
+        labels = [str(idx[p]) for p in pos]
+    ax.set_xticklabels(labels, fontsize=7)

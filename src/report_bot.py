@@ -111,11 +111,17 @@ async def report_daily_job(bot: Bot, override_chat_id: str | None = None) -> Non
 
 
 def _build_report():
-    """동기 빌드 (run_in_executor). 반환: (md_path, pdf_path, key_chart_paths, headline)."""
-    from src.report.data import fetch_prices, fetch_macro, fetch_korea_flows
-    from src.report.charts import index_charts, volatility_chart, korea_flow_chart, heatmap_chart
-    from src.report.analysis import technical_signals, rotation_classifier
+    """동기 빌드 (run_in_executor). 8섹션 + 전일 대비 팔로업.
+
+    반환: (md_path, pdf_path, key_chart_paths, headline).
+    """
+    from src.report.data import fetch_prices as fp, fetch_macro, fetch_korea_flows
+    from src.report.charts import (index_charts, volatility_chart, korea_flow_chart,
+                                   heatmap_chart, signal_charts, rotation_charts,
+                                   flow_charts, stock_highlights)
+    from src.report.analysis import technical_signals, rotation_classifier, theme_momentum
     from src.report.writer import report_writer
+    from src.report import state
 
     today = datetime.now(KST).date()
     date_iso = today.strftime("%Y-%m-%d")
@@ -127,80 +133,151 @@ def _build_report():
     key_charts: list[str] = []
     signals: list[dict] = []
 
-    # 1) 미국 지수
-    us_idx = fetch_prices.fetch_many(fetch_prices.US_INDICES, days=180)
-    log.info("[report] 미국 지수 %d개", len(us_idx))
-    if us_idx:
-        fn = index_charts.us_indices_grid(us_idx, img_dir)
+    def add(fn, title, hint, section, key=False):
         if fn:
-            chart_list.append({"filename": fn, "title": "미국 4대 지수", "caption_hint": "4대 지수 등락과 내부 색깔"})
-            key_charts.append(str(img_dir / fn))
-        for label, df in us_idx.items():
-            signals += technical_signals.detect_signals(df, label)
+            chart_list.append({"filename": fn, "title": title, "caption_hint": hint, "section": section})
+            if key:
+                key_charts.append(str(img_dir / fn))
 
-    # 2) 미국 ETF (섹터 로테이션 판단)
-    us_etf = fetch_prices.fetch_many(fetch_prices.US_ETFS, days=300)
-    log.info("[report] 미국 ETF %d개", len(us_etf))
-    rotation = rotation_classifier.classify(us_etf)
-    for i, (label, df) in enumerate(us_etf.items(), 1):
-        fn = index_charts.etf_chart(df, label, img_dir, f"10_etf_{i:02d}_{label}.png")
-        if fn:
-            chart_list.append({"filename": fn, "title": f"{label} ETF", "caption_hint": f"{label} 추세/MA/52주 위치"})
+    # ---------- 데이터 fetch (병렬) ----------
+    us_idx = fp.fetch_many(fp.US_INDICES, days=365)
+    deconc = fp.fetch_many(fp.DECONCENTRATION, days=365)
+    sector_etfs = fp.fetch_many(fp.US_SECTOR_ETFS, days=365)
+    theme_etfs = fp.fetch_many(fp.US_THEME_ETFS, days=365)
+    region_etfs = fp.fetch_many(fp.REGION_ETFS, days=365)
+    fx = fp.fetch_many(fp.FX_SYMBOLS, days=365)
+    highlights_df = fp.fetch_many(fp.HIGHLIGHT_STOCKS, days=365)
+    macro = fetch_macro.fetch_macro(days=365)
+    fred = fetch_macro.fetch_fred_many()
+    kr_sizes = fetch_korea_flows.fetch_size_index_ohlcv(days=365)
+    kr_flows = fetch_korea_flows.fetch_investor_flows(days=120)
+    log.info("[report] fetch: idx=%d deconc=%d sector=%d theme=%d region=%d fx=%d hl=%d macro=%d fred=%d kr_size=%d kr_flow=%d",
+             len(us_idx), len(deconc), len(sector_etfs), len(theme_etfs), len(region_etfs),
+             len(fx), len(highlights_df), len(macro), len(fred), len(kr_sizes), len(kr_flows))
+
+    # 테마 모멘텀 (섹터 + 테마 통합)
+    combined_themes = {**sector_etfs, **theme_etfs}
+    theme_rows = theme_momentum.compute(combined_themes)
+    theme_summary = theme_momentum.summarize(theme_rows)
+    log.info("[report] 테마 모멘텀 %d개 (hot=%s)", len(theme_rows), theme_summary.get("hot"))
+
+    for label, df in us_idx.items():
         signals += technical_signals.detect_signals(df, label)
 
-    # 3) 매크로
-    macro = fetch_macro.fetch_macro(days=180)
+    # ---------- §1 매크로 ----------
+    add(index_charts.us_indices_grid(us_idx, img_dir, date_iso=date_iso),
+        "미국 4대 지수", "4대 지수 등락", "1. 매크로 컨텍스트")
+    add(index_charts.indices_normalized(us_idx, img_dir, date_iso=date_iso),
+        "미국 4대 지수 (1Y 리베이스)", "상대 강도", "1. 매크로 컨텍스트")
     if macro:
-        fn = volatility_chart.macro_grid(macro, img_dir)
-        if fn:
-            chart_list.append({"filename": fn, "title": "매크로 대시보드", "caption_hint": "금리·유가·달러·VIX 흐름과 시장 반응"})
-            key_charts.append(str(img_dir / fn))
-    macro_summary = {k: round(float(v["Close"].iloc[-1]), 2) for k, v in macro.items()}
+        add(volatility_chart.macro_grid(macro, img_dir),
+            "매크로 대시보드", "금리·유가·달러·VIX·BTC", "1. 매크로 컨텍스트", key=True)
+    for i, (label, df) in enumerate(fred.items(), 1):
+        add(volatility_chart.macro_line(df, label, img_dir, f"04_fred_{i:02d}.png"),
+            label, "FRED 매크로", "1. 매크로 컨텍스트")
 
-    # 4) 히트맵 (시총 상위 — 시간 절약 위해 cap 작게)
+    # ---------- §2 쏠림 둔화 시그널 (메인) ----------
+    add(signal_charts.deconcentration_signal(deconc, img_dir, date_iso=date_iso),
+        "쏠림 둔화 시그널", "RSP(동일가중) vs SPY/QQQ/M7", "2. 쏠림 둔화 시그널", key=True)
+    if deconc.get("RSP") is not None and deconc.get("SPY") is not None:
+        add(signal_charts.rsp_spy_ratio(deconc["RSP"], deconc["SPY"], img_dir, date_iso=date_iso),
+            "RSP/SPY 비율", "동일가중 우위 여부", "2. 쏠림 둔화 시그널", key=True)
+    rsp_new_high = bool(technical_signals.analyze(deconc.get("RSP")).get("is_new_high")) if deconc.get("RSP") is not None else False
+
+    # ---------- §3 섹터 로테이션 맵 (+ S&P500 히트맵) ----------
+    add(heatmap_chart.theme_rotation_heatmap(theme_rows, img_dir, date_iso=date_iso),
+        "테마 로테이션 히트맵", "5일 모멘텀 — 돈이 어디로", "3. 섹터 로테이션 맵", key=True)
+    add(rotation_charts.sector_return_bars(theme_rows, img_dir, date_iso=date_iso),
+        "섹터·테마 상대강도", "1M/3M 정렬", "3. 섹터 로테이션 맵")
+    add(rotation_charts.region_compare(region_etfs, img_dir, date_iso=date_iso),
+        "글로벌 지역 비교", "지역 디커플링", "3. 섹터 로테이션 맵")
+    for i, r in enumerate(theme_rows[:8], 1):
+        lbl = r["label"]
+        add(index_charts.theme_chart(combined_themes.get(lbl), lbl, img_dir,
+            f"12_theme_{i:02d}.png", date_iso=date_iso), lbl, "캔들+MA+추세", "3. 섹터 로테이션 맵")
+
+    breadth: dict = {}
     try:
         from src.us_screener import data_source as us_ds
         caps = us_ds.fetch_market_caps()
         sectors = us_ds.fetch_sectors()
-        # 상위 50종목 당일 등락
-        top = sorted(caps, key=lambda s: -caps[s])[:50]
+        top = sorted(caps, key=lambda s: -caps[s])[:120]
+        top_dfs = fp.fetch_many({s: s for s in top}, days=10, workers=12)
         changes = {}
-        for s in top:
-            df = fetch_prices.fetch_ohlcv(s, days=10)
-            if df is not None and len(df) >= 2:
-                changes[s] = (float(df["Close"].iloc[-1]) / float(df["Close"].iloc[-2]) - 1) * 100
+        for s, df in top_dfs.items():
+            dc = fp.day_change(df)
+            if dc is not None:
+                changes[s] = dc
         if changes:
-            fn = heatmap_chart.sp500_heatmap(caps, changes, sectors, img_dir)
-            if fn:
-                chart_list.append({"filename": fn, "title": "S&P500 히트맵", "caption_hint": "시총 가중 히트맵 — 시장 폭 판단"})
-                key_charts.append(str(img_dir / fn))
+            add(heatmap_chart.sp500_heatmap(caps, changes, sectors, img_dir, date_iso=date_iso),
+                "S&P500 히트맵", "시총 가중 — 시장 폭", "3. 섹터 로테이션 맵", key=True)
+            adv = sum(1 for v in changes.values() if v > 0)
+            breadth["advancers"] = adv
+            breadth["total"] = len(changes)
     except Exception:
-        log.exception("[report] 히트맵 실패 — 생략")
+        log.exception("[report] S&P500 히트맵 실패 — 생략")
+    # 200일선 위 테마 비율 (breadth proxy)
+    if theme_rows:
+        above = sum(1 for r in theme_rows if r.get("above_ma200"))
+        breadth["pct_above_200ma"] = round(above / len(theme_rows) * 100, 1)
 
-    # 5) 한국 수급 멀티패널
-    kr_sizes = fetch_korea_flows.fetch_size_index_ohlcv(days=300)
-    kr_flows = fetch_korea_flows.fetch_investor_flows(days=120)
-    korea_summary = {}
+    # ---------- §4 IPO·환전 임팩트 ----------
+    ewy = region_etfs.get("한국(EWY)")
+    if fx.get("USD/KRW") is not None and ewy is not None:
+        add(flow_charts.usdkrw_ewy_dual(fx["USD/KRW"], ewy, img_dir, date_iso=date_iso),
+            "USD/KRW ↔ EWY", "환전 압력 (가설)", "4. IPO·환전 임팩트", key=False)
+
+    # ---------- §6 개별 종목 하이라이트 ----------
+    add(stock_highlights.highlight_grid(highlights_df, img_dir, date_iso=date_iso),
+        "개별 종목 하이라이트", "스토리 종목", "6. 개별 종목")
+    highlights_meta = []
+    for label, df in highlights_df.items():
+        dc = fp.day_change(df)
+        if dc is not None:
+            highlights_meta.append({"label": label, "chg": round(dc, 2)})
+
+    # ---------- §7 한국시장 자금흐름 ----------
+    korea_summary: dict = {}
     for i, (label, price_df) in enumerate(kr_sizes.items(), 1):
-        # 매핑: 대형/중형/소형 → KOSPI flows, KOSDAQ → KOSDAQ flows
         flows_df = kr_flows.get("KOSDAQ") if "KOSDAQ" in label else kr_flows.get("KOSPI")
-        fn = korea_flow_chart.flow_multipanel(price_df, flows_df, label, img_dir, f"30_kr_{i:02d}_{label}.png")
-        if fn:
-            chart_list.append({"filename": fn, "title": f"한국 {label} 수급", "caption_hint": f"{label} 가격·이격·기관·외국인·개인 누적순매수"})
-            if "대형" in label or "KOSDAQ" in label:
-                key_charts.append(str(img_dir / fn))
-    if kr_flows:
-        for mkt, fdf in kr_flows.items():
-            korea_summary[mkt] = {inv: round(float(fdf[inv].iloc[-20:].sum()), 0)
-                                  for inv in fdf.columns}
+        fn = korea_flow_chart.flow_multipanel(price_df, flows_df, label, img_dir, f"32_kr_{i:02d}.png")
+        add(fn, f"한국 {label} 수급", "가격·이격·기관·외국인·개인 누적순매수", "7. 한국시장 자금흐름",
+            key=("대형" in label or "KOSDAQ" in label))
+    add(heatmap_chart.korea_flow_heatmap(kr_flows, img_dir, date_iso=date_iso),
+        "한국 수급 히트맵", "투자자 방향 (20일)", "7. 한국시장 자금흐름")
+    for mkt, fdf in (kr_flows or {}).items():
+        korea_summary[mkt] = {inv: round(float(fdf[inv].iloc[-20:].sum()), 0) for inv in fdf.columns}
+
+    # ---------- §8 종합 자금흐름 다이어그램 ----------
+    src_ep, dst_ep = theme_momentum.flow_endpoints(theme_rows)
+    add(flow_charts.capital_flow_diagram(src_ep, dst_ep, img_dir, date_iso=date_iso),
+        "종합 자금흐름 다이어그램", "이탈 → 유입", "8. 종합 자금흐름", key=False)
 
     if not chart_list:
         log.error("[report] 차트 0개 — 데이터 전부 미확보")
         return None, None, [], ""
 
-    # 6) LLM 작성
+    # ---------- 시장 색깔 + 전일 대비 deltas ----------
+    classify_input = {"QQQ": deconc.get("QQQ"), "SPY": deconc.get("SPY"),
+                      "RSP": deconc.get("RSP"), "IWM": us_idx.get("Russell2000")}
+    rotation = rotation_classifier.classify({k: v for k, v in classify_input.items() if v is not None},
+                                            breadth=breadth)
+    macro_summary = {k: round(float(v["Close"].iloc[-1]), 2) for k, v in macro.items()}
+    if fx.get("USD/KRW") is not None:
+        macro_summary["USD/KRW"] = round(float(fx["USD/KRW"]["Close"].iloc[-1]), 2)
+
+    snapshot = state.build_snapshot(date_iso, rotation, theme_summary, theme_rows,
+                                    macro_summary, breadth, korea_summary, rsp_new_high)
+    prev = state.load_previous(date_iso)
+    deltas = state.compute_deltas(snapshot, prev)
+    state.save_snapshot(date_iso, snapshot)
+    log.info("[report] deltas 계산 (baseline=%s, notes=%d)", deltas.get("baseline"), len(deltas.get("notes", [])))
+
+    # ---------- LLM 작성 (8섹션 + 팔로업) ----------
     log.info("[report] 차트 %d개, 신호 %d개 → LLM 작성", len(chart_list), len(signals))
-    md = report_writer.write_report(date_iso, rotation, chart_list, signals, macro_summary, korea_summary)
+    md = report_writer.write_report(date_iso, rotation, chart_list, signals, macro_summary,
+                                    korea_summary, theme_momentum=theme_summary, deltas=deltas,
+                                    breadth=breadth, highlights=highlights_meta)
 
     # headline 추출 (첫 # 라인)
     headline = next((ln.lstrip("# ").strip() for ln in md.splitlines() if ln.startswith("#")), f"{date_iso} 시장 리포트")
@@ -222,6 +299,22 @@ def _build_report():
             log.info("[report] PDF 생성: %s", pdf_path)
     except Exception:
         log.exception("[report] PDF 생성 실패 — markdown만")
+
+    # 8) HTML 부가 산출 (모바일 열람용 — images/ 상대경로 유지)
+    try:
+        import markdown as _md
+        html_body = _md.markdown(md, extensions=["tables", "fenced_code"])
+        html = (f"<!doctype html><meta charset='utf-8'>"
+                f"<title>{headline}</title>"
+                "<style>body{max-width:880px;margin:24px auto;padding:0 16px;"
+                "font-family:-apple-system,'Apple SD Gothic Neo','Noto Sans KR',sans-serif;"
+                "line-height:1.6;color:#1a1a1a}img{max-width:100%;height:auto;margin:8px 0;"
+                "border:1px solid #eee;border-radius:6px}h1{font-size:1.5rem}h2{font-size:1.2rem;"
+                "margin-top:1.6em;border-top:1px solid #eee;padding-top:.6em}</style>"
+                f"<body>{html_body}</body>")
+        (base / "report.html").write_text(html, encoding="utf-8")
+    except Exception:
+        log.exception("[report] HTML 생성 실패 — 생략")
 
     return str(md_path), pdf_path, key_charts, headline
 

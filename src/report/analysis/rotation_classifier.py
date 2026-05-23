@@ -18,8 +18,11 @@ from src.report.analysis.technical_signals import analyze
 log = logging.getLogger(__name__)
 
 
-def classify(etf_dfs: dict[str, object]) -> dict:
-    """{label: DataFrame} (QQQ/SPY/RSP/IWM 등) → {market_color, evidence, detail}."""
+def classify(etf_dfs: dict[str, object], breadth: dict | None = None) -> dict:
+    """{label: DataFrame} (QQQ/SPY/RSP/IWM 등) → {market_color, evidence, detail}.
+
+    breadth: {"pct_above_200ma": float, "advancers": int, "total": int} (선택).
+    """
     states = {k: analyze(v) for k, v in etf_dfs.items() if v is not None}
 
     def chg(label):
@@ -54,6 +57,20 @@ def classify(etf_dfs: dict[str, object]) -> dict:
     else:
         color = "Rotation"
         evidence = ["지수 혼조 — 내부 순환 가능성"]
+
+    # breadth 보강 (% > 200MA, 상승종목 비율)
+    if breadth:
+        pct200 = breadth.get("pct_above_200ma")
+        adv, tot = breadth.get("advancers"), breadth.get("total")
+        if isinstance(pct200, (int, float)):
+            evidence.append(f"200일선 위 {pct200:.0f}%")
+            if pct200 >= 60 and color in ("Rotation", "Mixed"):
+                color = "Broadening"
+        if isinstance(adv, int) and isinstance(tot, int) and tot:
+            ratio = adv / tot * 100
+            evidence.append(f"상승 {adv}/{tot}({ratio:.0f}%)")
+            if ratio >= 60 and color == "Crowding":
+                color = "De-crowding"
 
     detail = {k: round(states.get(k, {}).get("chg_pct", 0.0), 2)
               for k in ("QQQ", "SPY", "RSP", "IWM")}
