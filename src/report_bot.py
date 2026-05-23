@@ -286,13 +286,26 @@ def _build_report():
     pdf_path = None
     try:
         from src import pdf_export
-        # 차트 이미지 절대경로로 치환 (PDF 렌더용)
-        md_for_pdf = md.replace("](images/", f"]({img_dir.resolve()}/")
+        # 차트 이미지를 base64 data URI로 인라인.
+        # Playwright set_content는 about:blank origin이라 로컬 파일 경로(/app/.. 나 file://)를
+        # 로드하지 못함 → 이미지가 통째로 안 박힘. 자기완결 HTML로 만들어 확실히 렌더.
+        import base64
+        import re as _re
+
+        def _inline_img(m):
+            p = img_dir / m.group(1)
+            if not p.exists():
+                return ""
+            return "](data:image/png;base64," + base64.b64encode(p.read_bytes()).decode("ascii") + ")"
+
+        md_for_pdf = _re.sub(r"\]\(images/([^)\s]+)\)", _inline_img, md)
         out_pdf = base / "report.pdf"
+        n_imgs = md_for_pdf.count("data:image/png;base64,")
         result = asyncio.run(pdf_export.markdown_to_pdf(md_for_pdf, out_pdf, headline))
         if result:
             pdf_path = str(out_pdf)
-            log.info("[report] PDF 생성: %s", pdf_path)
+            size_mb = out_pdf.stat().st_size / 1_048_576
+            log.info("[report] PDF 생성: %s (%.2f MB, 인라인 차트 %d개)", pdf_path, size_mb, n_imgs)
     except Exception:
         log.exception("[report] PDF 생성 실패 — markdown만")
 
