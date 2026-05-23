@@ -386,18 +386,30 @@ async def us_screener_daily_job(bot: Bot, override_chat_id: str | None = None) -
         # 백필 트리거 조건:
         #   - DB 비었음 (첫 실행)
         #   - 강제 (US_SCREENER_FORCE_BACKFILL=1)
-        #   - 252일+ 종목이 활성 universe의 30% 미만 (52주 신고가 산출 불가 상태)
-        #     단 naver_backfill_done flag 있으면 중복 방지 (force 제외)
+        #   - 252일+ 종목이 ohlcv 보유 종목의 30% 미만 (52주 신고가 산출 불가)
+        #   - active universe 대비 ohlcv 60일+ 미보유 종목 10개 초과 (신규 종목 — NASDAQ100
+        #     추가분 등 — 데이터 backfill 필요). backfill_done flag 무관하게 트리거.
         force = os.getenv("US_SCREENER_FORCE_BACKFILL", "0") == "1"
         rc = await loop.run_in_executor(None, db.row_count)
         ge_252 = lengths.get("ge_252", 0)
+        ge_60 = lengths.get("ge_60", 0)
         total_t = lengths.get("total_tickers", 0) or 1
+        total_active = await loop.run_in_executor(None, lambda: len(db.get_active_tickers()))
         insufficient = (ge_252 / total_t) < 0.30
+        missing = total_active - ge_60  # ohlcv 60일+ 미보유 active 종목 (신규 상장/추가분)
         backfill_done = await loop.run_in_executor(None, lambda: db.meta_get("naver_backfill_done"))
-        need_backfill = (rc == 0) or force or (insufficient and not backfill_done)
+        need_backfill = (
+            (rc == 0) or force
+            or (insufficient and not backfill_done)
+            or (missing > 10)
+        )
 
         if need_backfill:
-            reason = "첫 실행" if rc == 0 else ("강제" if force else f"252일+ 종목 부족 ({ge_252}/{total_t})")
+            reason = (
+                "첫 실행" if rc == 0 else ("강제" if force
+                else (f"신규 종목 {missing}개 데이터 부족" if missing > 10
+                      else f"252일+ 종목 부족 ({ge_252}/{total_t})"))
+            )
             await send_text_chunked(
                 bot, chat_id,
                 f"📥 1년치 백필 시작 ({reason}, Naver 기반 ~6-15분)",
