@@ -75,6 +75,12 @@ def ensure_schema() -> None:
               payload   TEXT NOT NULL,
               PRIMARY KEY (date, ticker, signal)
             );
+            CREATE TABLE IF NOT EXISTS fundamentals (
+              ticker     TEXT PRIMARY KEY,
+              eps_yoy    REAL,
+              eps_asof   TEXT,
+              updated_at TEXT NOT NULL
+            );
             """
         )
         # market_cap, sector 컬럼 추가 (기존 DB 호환). SQLite ALTER는 IF NOT EXISTS 미지원.
@@ -277,6 +283,44 @@ def get_ticker_name(ticker: str) -> Optional[str]:
         cur = c.execute("SELECT name FROM tickers WHERE ticker=?", (ticker,))
         row = cur.fetchone()
     return row[0] if row else None
+
+
+# ------------------------------------------------------------------
+# Fundamentals 캐시 (EPS YoY) — SEC EDGAR 호출 부하 최소화
+# ------------------------------------------------------------------
+def fundamentals_get(ticker: str, max_age_days: int = 7) -> Optional[dict]:
+    """캐시된 {eps_yoy, eps_asof}. 없거나 max_age_days 초과면 None."""
+    ensure_schema()
+    with _conn() as c:
+        cur = c.execute(
+            "SELECT eps_yoy, eps_asof, updated_at FROM fundamentals WHERE ticker=?", (ticker,)
+        )
+        row = cur.fetchone()
+    if not row:
+        return None
+    try:
+        from datetime import datetime, timezone
+        upd = datetime.fromisoformat(row[2])
+        if upd.tzinfo is None:
+            upd = upd.replace(tzinfo=timezone.utc)
+        age = (datetime.now(timezone.utc) - upd).total_seconds()
+        if age > max_age_days * 86400:
+            return None
+    except Exception:
+        return None
+    return {"eps_yoy": row[0], "eps_asof": row[1]}
+
+
+def fundamentals_put(ticker: str, eps_yoy: Optional[float], eps_asof: Optional[str]) -> None:
+    ensure_schema()
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc).isoformat()
+    with _conn() as c:
+        c.execute(
+            "INSERT OR REPLACE INTO fundamentals (ticker, eps_yoy, eps_asof, updated_at) "
+            "VALUES (?, ?, ?, ?)",
+            (ticker, eps_yoy, eps_asof, now),
+        )
 
 
 # ------------------------------------------------------------------

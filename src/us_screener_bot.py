@@ -322,6 +322,120 @@ def _parse_chat_ids(*env_keys: str) -> list[str]:
     return out
 
 
+_BADGE = {
+    "high_all": "💥 역사적 신고가 돌파",
+    "high_52w": "📈 52주 신고가",
+    "vcp_breakout": "💎 VCP 돌파",
+    "volume_breakout": "🔥 거래량 돌파",
+    "near_breakout_52w": "🎯 52주 돌파 직전",
+}
+
+
+def _fmt_usd(v) -> str:
+    if not isinstance(v, (int, float)) or v <= 0:
+        return "N/A"
+    if v >= 1e9:
+        return f"${v / 1e9:.1f}B"
+    if v >= 1e6:
+        return f"${v / 1e6:.0f}M"
+    return f"${v:,.0f}"
+
+
+def _fmt_pct(v) -> str:
+    return f"{v:+.1f}%" if isinstance(v, (int, float)) else "N/A"
+
+
+def _permalink(channel: str, message_id: int) -> str | None:
+    """채널 게시물 영구 링크. @username → 공개, -100… → 비공개 /c/ 형식."""
+    if channel.startswith("@"):
+        return f"https://t.me/{channel.lstrip('@')}/{message_id}"
+    cid = channel.lstrip()
+    if cid.startswith("-100"):
+        return f"https://t.me/c/{cid[4:]}/{message_id}"
+    return None
+
+
+def _chart_caption(ticker: str, item: dict, cats: list[str], rows: list[dict],
+                   ytd, eps) -> str:
+    from src.us_screener import fundamentals
+    name = item.get("name") or ticker
+    chg = item.get("chg_pct") or 0.0
+    turnover = fundamentals.turnover_usd(rows[-1]) if rows else 0
+    badge = " ".join(_BADGE[c] for c in cats if c in _BADGE)
+    lines = [
+        f"🇺🇸 {ticker} ({chg:+.1f}%)",
+        badge,
+        "",
+        f"✝ 종목명 : {name}",
+        f"✝ 시가총액 : {_fmt_usd(item.get('market_cap'))}",
+        f"✝ 거래대금 : {_fmt_usd(turnover)}",
+        f"✝ 연초대비 상승률 : {_fmt_pct(ytd)}",
+        f"✝ 최근분기 EPS YoY : {_fmt_pct(eps)}",
+        f"✝ [최신 종목 뉴스 조회](https://finviz.com/quote.ashx?t={ticker})",
+    ]
+    return "\n".join(lines)
+
+
+async def _post_charts_and_meta(results: dict, max_tickers: int = 120) -> tuple[dict, dict]:
+    """신호 티커별 (1) 채널 차트 게시 → permalink, (2) ytd·eps 메타 산출.
+
+    채널 토큰/ID 미설정이면 게시는 건너뛰고 메타(ytd·eps)만 계산(4열 포맷 enrich).
+    반환: (links: {ticker: url}, extra: {ticker: {ytd, eps_yoy}}).
+    """
+    from src.us_screener import chart, db, fundamentals
+
+    # 카테고리 dedupe + 티커별 badge
+    by_ticker: dict[str, dict] = {}
+    badges: dict[str, list] = {}
+    for cat, items in results.items():
+        for it in items:
+            t = it.get("ticker")
+            if not t:
+                continue
+            by_ticker.setdefault(t, it)
+            badges.setdefault(t, []).append(cat)
+
+    token = os.getenv("US_SCREENER_CHART_BOT_TOKEN", "").strip()
+    channel = os.getenv("US_SCREENER_CHART_CHANNEL_ID", "").strip()
+    chart_bot = None
+    if token and channel:
+        try:
+            chart_bot = Bot(token=token)
+        except Exception:
+            log.exception("[us_screener] 차트봇 생성 실패 — 게시 생략")
+    else:
+        log.info("[us_screener] 차트 채널 미설정 — 링크 없이 메타만 계산")
+
+    links: dict[str, str] = {}
+    extra: dict[str, dict] = {}
+    loop = asyncio.get_event_loop()
+    posted = 0
+    for t, it in list(by_ticker.items())[:max_tickers]:
+        try:
+            rows = await loop.run_in_executor(None, lambda t=t: db.load_ohlcv(t, days=260))
+            ytd = fundamentals.ytd_pct(rows)
+            eps = await loop.run_in_executor(None, lambda t=t: fundamentals.eps_yoy(t))
+            extra[t] = {"ytd": ytd, "eps_yoy": eps}
+            if chart_bot and rows:
+                png = await loop.run_in_executor(
+                    None, lambda t=t, rows=rows, it=it: chart.render_candle_volume(
+                        t, rows, title=f"{t} — {it.get('name', '')}"))
+                if png:
+                    cap = _chart_caption(t, it, badges[t], rows, ytd, eps)
+                    msg = await chart_bot.send_photo(chat_id=channel, photo=png, caption=cap,
+                                                     parse_mode=ParseMode.MARKDOWN)
+                    url = _permalink(channel, msg.message_id)
+                    if url:
+                        links[t] = url
+                    posted += 1
+                    await asyncio.sleep(1.2)  # 채널 레이트리밋
+        except Exception:
+            log.exception("[us_screener] 티커 처리 실패 %s", t)
+    log.info("[us_screener] 채널 게시 %d건 · 메타 %d종목 (links=%d)",
+             posted, len(extra), len(links))
+    return links, extra
+
+
 async def us_screener_daily_job(bot: Bot, override_chat_id: str | None = None) -> None:
     """매일 16:00 cron 또는 /screen 즉시 실행.
 
@@ -509,15 +623,23 @@ async def us_screener_daily_job(bot: Bot, override_chat_id: str | None = None) -
         except Exception:
             log.exception("signal 히스토리 저장 실패")
 
-        # 발송 — formatter에 base_date + stats 명시적으로 전달
+        # 티커별 채널 차트 게시 + ytd/eps 메타 (채널 미설정 시 메타만)
+        try:
+            links, extra = await _post_charts_and_meta(results)
+        except Exception:
+            log.exception("[scheduled] 차트 게시/메타 실패 — 링크 없이 발송")
+            links, extra = {}, {}
+
+        # 발송 — formatter에 base_date + stats + links + extra 전달 (4열 하이퍼링크)
         text = formatter.format_results(
-            results, datetime.now(KST), base_date=base_date, stats=stats
+            results, datetime.now(KST), base_date=base_date, stats=stats,
+            links=links, extra=extra,
         )
         # 모든 대상자에게 broadcast (한 번 계산 → N번 발송)
         sent_count = 0
         for cid in target_chat_ids:
             try:
-                await send_text_chunked(bot, cid, text)
+                await send_text_chunked(bot, cid, text, parse_mode=ParseMode.MARKDOWN)
                 sent_count += 1
             except Exception:
                 log.exception("[scheduled] 발송 실패 cid=%s", cid)
