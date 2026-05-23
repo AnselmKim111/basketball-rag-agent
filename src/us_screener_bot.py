@@ -454,28 +454,15 @@ async def us_screener_daily_job(bot: Bot, override_chat_id: str | None = None) -
             ensured = await loop.run_in_executor(None, incremental.ensure_recent_business_day_data)
             log.info("[scheduled] ensure_recent_business_day 결과: %s", ensured)
 
-        # 진단: 사용자 메시지에 나온 종목들의 last 7일치 close 출력 (DB값과 실제 비교 위함)
-        # 삼성E&A(028050), 가온전선(000500), 한솔테크닉스(004710), 두산에너빌리티(034020),
-        # 삼성E&A는 사용자가 -3.11%로 검증, 우리 메시지는 +21.5% — 어느 ticker가 잘못됐는지 진단
+        # 진단: 대표 미국 종목 last 7일치 close 출력 (cent 단위 → /100 = $)
         try:
-            for diag_t in ("005930", "000660", "028050", "000500", "004710", "034020", "001120", "021820"):
+            for diag_t in ("AAPL", "MSFT", "NVDA", "BRKB", "BFB"):
                 rows_diag = await loop.run_in_executor(None, lambda t=diag_t: db.load_ohlcv(t, days=7))
-                tinfo = await loop.run_in_executor(None, lambda t=diag_t: db.get_ticker_name(t))
                 if rows_diag:
-                    snap = [(r["date"], r["close"]) for r in rows_diag]
-                    log.warning("[scheduled] DIAG %s(%s) last7=%s", diag_t, tinfo, snap)
+                    snap = [(r["date"], round(r["close"] / 100, 2)) for r in rows_diag]
+                    log.warning("[scheduled] DIAG %s last7($)=%s", diag_t, snap)
                 else:
-                    log.warning("[scheduled] DIAG %s(%s) NO DATA in DB", diag_t, tinfo)
-            # name으로도 검색: '삼성E' 또는 '삼성엔지니어링' 들어간 ticker 모두 출력
-            from src.us_screener import db as _db
-            with _db._conn() as c:
-                cur = c.execute(
-                    "SELECT ticker, name, market FROM tickers "
-                    "WHERE name LIKE '%삼성E%' OR name LIKE '%삼성엔지%' OR name LIKE '%E&A%' "
-                    "ORDER BY ticker"
-                )
-                for row in cur.fetchall():
-                    log.warning("[scheduled] DIAG name match: ticker=%s name=%s market=%s", *row)
+                    log.warning("[scheduled] DIAG %s NO DATA in DB", diag_t)
         except Exception:
             log.exception("[scheduled] DIAG load_ohlcv 실패")
 

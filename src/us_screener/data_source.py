@@ -19,6 +19,12 @@ log = logging.getLogger(__name__)
 
 DEFAULT_RETRIES = 3
 
+# 클래스 주식 심볼 매핑 (FDR StockListing 형식 → Yahoo 형식)
+_SYMBOL_FIX = {
+    "BRKB": "BRK-B",  # Berkshire Hathaway B
+    "BFB": "BF-B",    # Brown-Forman B
+}
+
 
 def _import_fdr():
     import FinanceDataReader as fdr  # type: ignore
@@ -33,9 +39,11 @@ def fetch_ohlcv_by_ticker_via_fdr(ticker: str, start_iso: str, end_iso: str) -> 
 
     반환: (ticker, date_iso, o, h, l, c, v, value=None) — 한국과 동일 형식.
     """
+    # 클래스 주식 심볼 정규화 → Yahoo 형식 (BRKB/BFB는 점도 없이 와서 특수 매핑)
+    fetch_sym = _SYMBOL_FIX.get(ticker, ticker.replace(".", "-"))
     try:
         fdr = _import_fdr()
-        df = fdr.DataReader(ticker, start_iso, end_iso)
+        df = fdr.DataReader(fetch_sym, start_iso, end_iso)
     except Exception as e:
         log.warning("[us_data] FDR fetch %s 실패: %s", ticker, e)
         return []
@@ -133,47 +141,67 @@ def _fdr_listing(name: str):
         return None
 
 
+# NASDAQ100 종목 (2025 기준). FDR StockListing('NASDAQ100') 미지원 환경 대비 하드코딩.
+# S&P500과 합집합 → 중복 자동 제거. 대부분 S&P500 포함, 고유 종목(외국계 ADR 등) 보강.
+_NASDAQ100 = [
+    "AAPL", "ABNB", "ADBE", "ADI", "ADP", "ADSK", "AEP", "AMAT", "AMD", "AMGN",
+    "AMZN", "ANSS", "APP", "ARM", "ASML", "AVGO", "AZN", "BIIB", "BKNG", "BKR",
+    "CCEP", "CDNS", "CDW", "CEG", "CHTR", "CMCSA", "COST", "CPRT", "CRWD", "CSCO",
+    "CSGP", "CSX", "CTAS", "CTSH", "DASH", "DDOG", "DLTR", "DXCM", "EA", "EXC",
+    "FANG", "FAST", "FTNT", "GEHC", "GFS", "GILD", "GOOG", "GOOGL", "HON", "IDXX",
+    "ILMN", "INTC", "INTU", "ISRG", "KDP", "KHC", "KLAC", "LIN", "LRCX", "LULU",
+    "MAR", "MCHP", "MDB", "MDLZ", "MELI", "META", "MNST", "MRVL", "MSFT", "MU",
+    "NFLX", "NVDA", "NXPI", "ODFL", "ON", "ORLY", "PANW", "PAYX", "PCAR", "PDD",
+    "PEP", "PYPL", "QCOM", "REGN", "ROP", "ROST", "SBUX", "SNPS", "TEAM", "TMUS",
+    "TSLA", "TTD", "TTWO", "TXN", "VRSK", "VRTX", "WBD", "WDAY", "XEL", "ZS",
+]
+
+
 def fetch_us_tickers() -> list[tuple]:
-    """S&P500 + Nasdaq100 합집합. 반환: (symbol, name, index_label).
+    """S&P500(FDR) + Nasdaq100(하드코딩) 합집합. 반환: (symbol, name, index_label).
 
     index_label = 'S&P500' | 'NASDAQ100' (둘 다면 S&P500 우선).
     """
     out: dict[str, tuple] = {}
-    for idx_name, label in (("S&P500", "S&P500"), ("NASDAQ100", "NASDAQ100")):
-        df = _fdr_listing(idx_name)
-        if df is None or df.empty:
-            continue
+    # 1) S&P500 — FDR StockListing
+    df = _fdr_listing("S&P500")
+    if df is not None and not df.empty:
         cols = list(df.columns)
+        log.info("[us_data] S&P500 StockListing 컬럼: %s", cols)  # 시총 컬럼명 진단
         sym_c = next((c for c in ("Symbol", "Code", "Ticker") if c in cols), None)
         name_c = next((c for c in ("Name", "name") if c in cols), None)
-        if not sym_c:
-            log.warning("[us_data] %s 심볼 컬럼 없음: %s", idx_name, cols)
-            continue
-        for _, row in df.iterrows():
-            try:
-                sym = str(row[sym_c]).strip().upper()
-                nm = str(row[name_c]).strip() if name_c else sym
-            except Exception:
-                continue
-            if not sym or sym == "NAN":
-                continue
-            if sym not in out:  # S&P500 우선 (먼저 등록)
-                out[sym] = (sym, nm, label)
-    log.info("[us_data] 유니버스 fetch: %d종목 (S&P500+NASDAQ100)", len(out))
+        if sym_c:
+            for _, row in df.iterrows():
+                try:
+                    sym = str(row[sym_c]).strip().upper()
+                    nm = str(row[name_c]).strip() if name_c else sym
+                except Exception:
+                    continue
+                if sym and sym != "NAN" and sym not in out:
+                    out[sym] = (sym, nm, "S&P500")
+    # 2) NASDAQ100 — 하드코딩 (S&P500 미포함 종목만 추가)
+    for sym in _NASDAQ100:
+        if sym not in out:
+            out[sym] = (sym, sym, "NASDAQ100")
+    log.info("[us_data] 유니버스 fetch: %d종목 (S&P500 FDR + NASDAQ100 하드코딩)", len(out))
     return list(out.values())
 
 
 def fetch_market_caps() -> dict[str, int]:
     """{symbol: market_cap(USD)} — FDR StockListing의 시총 컬럼."""
     out: dict[str, int] = {}
-    for idx_name in ("S&P500", "NASDAQ100"):
+    for idx_name in ("S&P500",):  # NASDAQ100 StockListing 미지원 → S&P500만
         df = _fdr_listing(idx_name)
         if df is None or df.empty:
             continue
         cols = list(df.columns)
         sym_c = next((c for c in ("Symbol", "Code", "Ticker") if c in cols), None)
-        cap_c = next((c for c in ("MarketCap", "Marcap", "market_cap") if c in cols), None)
+        cap_c = next(
+            (c for c in ("MarketCap", "Marcap", "market_cap", "Market Cap", "Cap", "marketcap")
+             if c in cols), None
+        )
         if not sym_c or not cap_c:
+            log.warning("[us_data] 시총 컬럼 없음 — cols=%s", cols)
             continue
         for _, row in df.iterrows():
             try:
@@ -191,7 +219,7 @@ def fetch_market_caps() -> dict[str, int]:
 def fetch_sectors() -> dict[str, str]:
     """{symbol: sector} — FDR StockListing의 Sector/Industry 컬럼 (미국은 GICS 제공)."""
     out: dict[str, str] = {}
-    for idx_name in ("S&P500", "NASDAQ100"):
+    for idx_name in ("S&P500",):  # NASDAQ100 StockListing 미지원 → S&P500만
         df = _fdr_listing(idx_name)
         if df is None or df.empty:
             continue
