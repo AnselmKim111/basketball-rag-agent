@@ -756,8 +756,15 @@ def register_handlers(app: Application) -> None:
     deepdive와 동일한 격리 패턴 — 새 봇 토큰 안 만들고 기존 종목봇에서 동작.
     text_handler가 이미 bot_worker.py에 등록돼 있으므로 자유 텍스트는 사용 안 함.
     반드시 `/earnings <텍스트>` 명령으로 진입.
+
+    EARNINGS_TEST_PROMPT env가 있으면 부팅 후 1회 self-test 자동 실행 (CLAUDE.md 검증 의무).
     """
     app.add_handler(CommandHandler("earnings", _cmd_earnings))
+    try:
+        loop = asyncio.get_running_loop()
+        loop.create_task(_self_test(app))
+    except RuntimeError:
+        pass
 
 
 def build_earnings_app(token: str) -> Application:
