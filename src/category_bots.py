@@ -160,7 +160,15 @@ async def _process_and_send_category(
             sent_pairs = [(it.rpt_id, it.title) for it in items[: len(saved_paths)]]
             return saved_paths, summaries, sent_pairs
 
-        saved_paths, summaries, sent_pairs = await loop.run_in_executor(None, _blocking)
+        try:
+            saved_paths, summaries, sent_pairs = await loop.run_in_executor(None, _blocking)
+        except Exception:
+            log.exception("[%s] wisereport 파이프라인 실패", label)
+            await _send_text(
+                bot, chat_id,
+                f"⚠️ {label}: wisereport 접속 실패 (사이트 응답 지연) — 잠시 후 자동 재시도",
+            )
+            return 0
 
         if not saved_paths:
             await _send_text(bot, chat_id, f"📭 {label}: 새 리포트 없음")
