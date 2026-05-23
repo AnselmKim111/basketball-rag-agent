@@ -21,7 +21,7 @@ import os
 from datetime import datetime, timedelta, timezone
 from typing import Iterable, Optional
 
-from src.screener import db, universe
+from src.us_screener import db, universe
 
 log = logging.getLogger(__name__)
 KST = timezone(timedelta(hours=9))
@@ -30,8 +30,8 @@ KST = timezone(timedelta(hours=9))
 DEFAULT_VOL_BREAKOUT_RATIO = 2.0
 DEFAULT_NEAR_BREAKOUT_LOWER = 0.95
 DEFAULT_NEAR_BREAKOUT_UPPER = 0.99
-# 시가총액 필터 (원). 기본 3000억 — 사용자 요구사항.
-DEFAULT_MIN_MARKET_CAP = 300_000_000_000
+# 시가총액 필터 (USD). 기본 $1B (미국 — S&P500+Nasdaq100 안전장치).
+DEFAULT_MIN_MARKET_CAP = 1_000_000_000
 
 
 def _get_float_env(key: str, default: float) -> float:
@@ -330,8 +330,8 @@ def compute_all(base_date: str | None = None) -> tuple[dict[str, list[dict]], di
     }
     log.info(
         "[signals] base_date=%s processed=%d skipped_cap=%d skipped_no_base=%d "
-        "(min=%.1f억) categories=%s",
-        base_date, processed, skipped_cap, skipped_no_base, min_cap / 1e8,
+        "(min=$%.0fM) categories=%s",
+        base_date, processed, skipped_cap, skipped_no_base, min_cap / 1e6,
         {k: len(v) for k, v in by_cat.items()},
     )
     return by_cat, stats

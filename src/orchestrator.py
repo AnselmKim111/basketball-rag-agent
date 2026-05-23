@@ -52,6 +52,7 @@ from src.disclosure_bot import DISCLOSURE_COMMANDS, build_disclosure_app, disclo
 from src.earnings_bot import EARNINGS_COMMANDS, build_earnings_app
 from src.idea_bot import IDEA_COMMANDS, build_idea_app
 from src.screener_bot import SCREENER_COMMANDS, build_screener_app, screener_daily_job
+from src.us_screener_bot import US_SCREENER_COMMANDS, build_us_screener_app, us_screener_daily_job
 
 KST = timezone(timedelta(hours=9))
 
@@ -173,6 +174,20 @@ BOT_SPECS: list[BotSpec] = [
                 job_id="screener_daily",
                 cron={"hour": 16, "minute": 0},
                 description="한국 주식 기술적 신호 — 매일 16:00 KST (15:30 종가 기준)",
+            ),
+        ],
+    ),
+    BotSpec(
+        name="us_screener",
+        token_env="US_SCREENER_BOT_TOKEN",
+        builder=build_us_screener_app,
+        commands=US_SCREENER_COMMANDS,
+        jobs=[
+            ScheduledJob(
+                func=us_screener_daily_job,
+                job_id="us_screener_daily",
+                cron={"hour": 7, "minute": 0},
+                description="미국 기술적 신호 — 매일 07:00 KST (미국 4PM ET 종가)",
             ),
         ],
     ),
