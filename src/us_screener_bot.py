@@ -370,20 +370,14 @@ async def us_screener_daily_job(bot: Bot, override_chat_id: str | None = None) -
     chat_id = progress_chat  # 기존 코드 변수명 유지 (진행 메시지용)
 
     try:
-        # universe 보장
+        # universe 보장 — 미국은 S&P500+Nasdaq100 ~550종목으로 fetch 빠름(~2초).
+        # 매번 refresh_universe (upsert) 호출해 NASDAQ100 신규 종목·섹터 항상 반영.
         await loop.run_in_executor(None, db.ensure_schema)
-        if not await loop.run_in_executor(None, lambda: bool(db.get_active_tickers())):
-            await send_text_chunked(bot, chat_id, "🌐 종목 유니버스 빌드 중...")
+        try:
             count = await loop.run_in_executor(None, universe.refresh_universe)
-            await send_text_chunked(bot, chat_id, f"🌐 활성 종목 {count}개")
-        else:
-            # 시총 갱신 (시장 변동 반영 + 기존 DB의 NULL 시총 채우기)
-            try:
-                updated = await loop.run_in_executor(None, universe.refresh_market_caps)
-                if updated:
-                    log.info("[scheduled] 시총 갱신 %d종목", updated)
-            except Exception:
-                log.exception("[scheduled] 시총 갱신 실패 — 신호 계산은 진행")
+            log.info("[scheduled] universe 갱신 %d종목", count)
+        except Exception:
+            log.exception("[scheduled] universe 갱신 실패 — 신호 계산은 진행")
 
         # 데이터 충분성 진단 (52주 신고가는 252일+ 필요)
         lengths = await loop.run_in_executor(None, db.ticker_data_lengths)
