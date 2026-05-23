@@ -48,7 +48,7 @@ def _calendar(start_d: "date", end_d: "date", key: str, step_days: int = 14) -> 
     return out
 
 
-def fetch_earnings_momentum(days_back: int = 35, days_fwd: int = 12,
+def fetch_earnings_momentum(days_back: int = 21, days_fwd: int = 12,
                             min_rev: float = 2e9) -> dict | None:
     """어닝 모멘텀 요약 dict. FMP 키 없거나 전부 실패면 None."""
     key = os.getenv("FMP_API_KEY")
