@@ -14,6 +14,10 @@
  ├─ IndustryBot     (INDUSTRY_BOT_TOKEN)        src/category_bots.py
  ├─ MarketBot       (MARKET_BOT_TOKEN)          src/category_bots.py
  ├─ GlobalBot       (GLOBAL_BOT_TOKEN)          src/category_bots.py
+ ├─ IdeaBot         (IDEA_BOT_TOKEN)            src/idea_bot.py
+ ├─ DisclosureBot   (DISCLOSURE_BOT_TOKEN)      src/disclosure_bot.py
+ ├─ ScreenerBot     (SCREENER_BOT_TOKEN)        src/screener_bot.py
+ ├─ EarningsBot     (EARNINGS_BOT_TOKEN)        src/earnings_bot.py   (미국 어닝콜 + 비교 PDF)
  └─ <YourBot>       (<YOUR_BOT_TOKEN>)          src/<your_bot>.py    ← 추가하려는 것
                                                                        
 공유 자원

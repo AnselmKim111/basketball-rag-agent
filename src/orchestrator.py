@@ -5,6 +5,10 @@
   - IndustryBot (INDUSTRY_BOT_TOKEN): 산업 리포트 (매일 9시 + on-demand)
   - MarketBot (MARKET_BOT_TOKEN): 투자전략/시황 (매일 9시)
   - GlobalBot (GLOBAL_BOT_TOKEN): 글로벌 Top10 (매주 토 9시)
+  - IdeaBot (IDEA_BOT_TOKEN): 종목 아이디어 발굴 (on-demand)
+  - DisclosureBot (DISCLOSURE_BOT_TOKEN): DART 공시 폴링 (5분)
+  - ScreenerBot (SCREENER_BOT_TOKEN): 한국 주식 기술적 신호 (매일 16시)
+  - EarningsBot (EARNINGS_BOT_TOKEN): 미국 어닝콜 + 비교 PDF (on-demand)
 
 새 봇 추가 절차는 BOTS.md 참조. 핵심: 아래 BOT_SPECS list에 항목 1개 append.
 
@@ -45,7 +49,7 @@ from src.category_bots import (
     market_daily_job,
 )
 from src.disclosure_bot import DISCLOSURE_COMMANDS, build_disclosure_app, disclosure_poll_job
-from src.earnings_bot import EARNINGS_COMMANDS, register_handlers as register_earnings_handlers
+from src.earnings_bot import EARNINGS_COMMANDS, build_earnings_app
 from src.idea_bot import IDEA_COMMANDS, build_idea_app
 from src.screener_bot import SCREENER_COMMANDS, build_screener_app, screener_daily_job
 
@@ -79,28 +83,12 @@ class BotSpec:
     optional: bool = True                           # False면 토큰 없을 때 systemexit
 
 
-def _build_company_app_with_earnings(token: str) -> Application:
-    """CompanyBot에 EarningsBot의 /earnings 핸들러를 통합 등록.
-
-    BOTS.md 규약(기존 봇 파일 무수정)을 지키기 위해 builder를 wrap. 사용자 요청에 따라
-    별도 EarningsBot 토큰·polling을 만들지 않고 기존 종목봇(TELEGRAM_BOT_TOKEN)에서 동작.
-    earnings 등록 실패해도 기존 CompanyBot 기능은 정상 가동 (격리).
-    """
-    app = build_company_app(token)
-    try:
-        register_earnings_handlers(app)
-    except Exception:
-        import logging as _lg
-        _lg.exception("[orchestrator] earnings 핸들러 등록 실패 — CompanyBot은 정상 가동")
-    return app
-
-
 BOT_SPECS: list[BotSpec] = [
     BotSpec(
         name="company",
         token_env="TELEGRAM_BOT_TOKEN",
-        builder=_build_company_app_with_earnings,
-        commands=COMPANY_COMMANDS + EARNINGS_COMMANDS,
+        builder=build_company_app,
+        commands=COMPANY_COMMANDS,
         jobs=[],  # 스케줄 없음 (사용자 명령 기반)
     ),
     BotSpec(
@@ -150,6 +138,13 @@ BOT_SPECS: list[BotSpec] = [
         token_env="IDEA_BOT_TOKEN",
         builder=build_idea_app,
         commands=IDEA_COMMANDS,
+        jobs=[],  # 사용자 입력 기반, 스케줄 없음
+    ),
+    BotSpec(
+        name="earnings",
+        token_env="EARNINGS_BOT_TOKEN",
+        builder=build_earnings_app,
+        commands=EARNINGS_COMMANDS,
         jobs=[],  # 사용자 입력 기반, 스케줄 없음
     ),
     BotSpec(
