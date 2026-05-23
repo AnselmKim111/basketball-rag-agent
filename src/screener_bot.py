@@ -392,15 +392,21 @@ async def screener_daily_job(bot: Bot, override_chat_id: str | None = None) -> N
         # 백필 트리거 조건:
         #   - DB 비었음 (첫 실행)
         #   - 강제 (SCREENER_FORCE_BACKFILL=1)
-        #   - 252일+ 종목이 활성 universe의 30% 미만 (52주 신고가 산출 불가 상태)
-        #     단 naver_backfill_done flag 있으면 중복 방지 (force 제외)
+        #   - 252일+ 종목이 ohlcv 보유의 30% 미만 (52주 신고가 산출 불가)
+        #   - max_len < 1000 (5년 데이터 미확보 — 역사적 신고가 ATH 계산 불가). flag 무관.
+        #     5년 backfill 1회 성공 후 max_len≈1260 → 다음부터 skip.
         force = os.getenv("SCREENER_FORCE_BACKFILL", "0") == "1"
         rc = await loop.run_in_executor(None, db.row_count)
         ge_252 = lengths.get("ge_252", 0)
         total_t = lengths.get("total_tickers", 0) or 1
+        max_len = lengths.get("max_len", 0)
         insufficient = (ge_252 / total_t) < 0.30
         backfill_done = await loop.run_in_executor(None, lambda: db.meta_get("naver_backfill_done"))
-        need_backfill = (rc == 0) or force or (insufficient and not backfill_done)
+        need_backfill = (
+            (rc == 0) or force
+            or (insufficient and not backfill_done)
+            or (max_len < 1000)
+        )
 
         if need_backfill:
             reason = "첫 실행" if rc == 0 else ("강제" if force else f"252일+ 종목 부족 ({ge_252}/{total_t})")

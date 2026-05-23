@@ -18,8 +18,8 @@ from src.us_screener import data_source, db, universe
 log = logging.getLogger(__name__)
 KST = timezone(timedelta(hours=9))
 
-# 252거래일 + 여유 28일 = 280일치만 보관
-RETENTION_DAYS = 280
+# 5년(1260거래일) + 여유 = 1400일치 보관 (역사적 신고가 ATH 계산용)
+RETENTION_DAYS = 1400
 
 
 def _int_env(key: str, default: int) -> int:

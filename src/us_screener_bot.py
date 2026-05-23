@@ -389,11 +389,13 @@ async def us_screener_daily_job(bot: Bot, override_chat_id: str | None = None) -
         #   - 252일+ 종목이 ohlcv 보유 종목의 30% 미만 (52주 신고가 산출 불가)
         #   - active universe 대비 ohlcv 60일+ 미보유 종목 10개 초과 (신규 종목 — NASDAQ100
         #     추가분 등 — 데이터 backfill 필요). backfill_done flag 무관하게 트리거.
+        #   - max_len < 1000 (5년 데이터 미확보 — 역사적 신고가 ATH 계산 불가). flag 무관.
         force = os.getenv("US_SCREENER_FORCE_BACKFILL", "0") == "1"
         rc = await loop.run_in_executor(None, db.row_count)
         ge_252 = lengths.get("ge_252", 0)
         ge_60 = lengths.get("ge_60", 0)
         total_t = lengths.get("total_tickers", 0) or 1
+        max_len = lengths.get("max_len", 0)
         total_active = await loop.run_in_executor(None, lambda: len(db.get_active_tickers()))
         insufficient = (ge_252 / total_t) < 0.30
         missing = total_active - ge_60  # ohlcv 60일+ 미보유 active 종목 (신규 상장/추가분)
@@ -402,6 +404,7 @@ async def us_screener_daily_job(bot: Bot, override_chat_id: str | None = None) -
             (rc == 0) or force
             or (insufficient and not backfill_done)
             or (missing > 10)
+            or (max_len < 1000)
         )
 
         if need_backfill:

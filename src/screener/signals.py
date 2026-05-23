@@ -288,7 +288,7 @@ def compute_all(base_date: str | None = None) -> tuple[dict[str, list[dict]], di
         if cap is not None and cap < min_cap:
             skipped_cap += 1
             continue
-        rows = db.load_ohlcv(ticker, days=300)
+        rows = db.load_ohlcv(ticker, days=1300)
         if len(rows) < 60:
             continue
         # base_date row 보유 여부 검증
