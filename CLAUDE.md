@@ -133,11 +133,12 @@
 
 ---
 
-## 7. EarningsBot — 미국 기업 어닝콜 + 비교 PDF (종목봇 통합)
+## 7. EarningsBot — 미국 기업 어닝콜 + 비교 PDF (전용 봇)
 
-기존 종목봇(CompanyBot, `TELEGRAM_BOT_TOKEN`)에 `/earnings` 명령으로 통합. 별도 봇
-토큰·polling 없음. orchestrator에서 `_build_company_app_with_earnings` wrapper가
-`register_handlers(app)`를 호출해 끼워 넣음 (deepdive와 같은 격리 패턴).
+**전용 텔레그램 봇** (`EARNINGS_BOT_TOKEN`, @AnselmsSlave11bot). orchestrator
+`BOT_SPECS`에 항목 1개로 등록 — 자체 polling. 진입: 자유 텍스트 또는 `/earnings`.
+(이전엔 종목봇에 `register_handlers`로 통합했으나, 자연어 라우터 간섭·메뉴 혼선 때문에
+독립 봇으로 분리. `build_earnings_app(token)`이 start·help·earnings·자유텍스트 핸들러 등록.)
 
 미국 상장사 한정. **진짜 전문(full transcript) grounding → 종목별 심층추출 → 숫자 교차검증
 → Opus 비교합성**의 딥리서치급 파이프라인. deep_research.py 수준(인용·정량·시나리오, 8000자+) 목표.
@@ -189,8 +190,8 @@
 - 모든 LLM 호출은 `summarizer.chat_with_retry` (재시도+폴백)
 
 ### 환경변수
-- 봇 토큰: 종목봇 `TELEGRAM_BOT_TOKEN` 그대로 (별도 토큰 불필요)
-- `EARNINGS_ALLOWED_CHAT_IDS` — 미설정 시 `ALLOWED_CHAT_IDS` 폴백
+- `EARNINGS_BOT_TOKEN` — 전용 봇 토큰 (@AnselmsSlave11bot). 미설정 시 봇 스킵.
+- `EARNINGS_ALLOWED_CHAT_IDS` — 미설정 시 `ALLOWED_CHAT_IDS` 폴백. 전체 공개는 `*`.
 - `SEC_EDGAR_USER_AGENT` — "name email@example.com" (SEC 필수)
 - `ALPHA_VANTAGE_KEY` — 진짜 전문 (무료·권장). FMP/API Ninjas는 유료 전용.
 - `EARNINGS_EXTRACT_MODEL` / `EARNINGS_SYNTHESIS_MODEL` — 모델 override

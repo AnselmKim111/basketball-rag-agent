@@ -60,8 +60,8 @@ log = logging.getLogger(__name__)
 KST = timezone(timedelta(hours=9))
 
 ALLOWED_ENV = "EARNINGS_ALLOWED_CHAT_IDS"
-# 종목봇(CompanyBot)에 통합되므로 EARNINGS_ALLOWED_CHAT_IDS 미설정 시 종목봇의
-# ALLOWED_CHAT_IDS 로 폴백 — 별도 인가 설정 없이도 종목봇 사용자가 그대로 사용.
+# 전용 봇이지만 EARNINGS_ALLOWED_CHAT_IDS 미설정 시 종목봇의 ALLOWED_CHAT_IDS 로 폴백
+# — 별도 인가 설정 없이도 기존 사용자가 그대로 사용. (전체 공개는 둘 중 하나를 '*'로.)
 FALLBACK_ALLOWED_ENV = "ALLOWED_CHAT_IDS"
 
 
@@ -72,10 +72,10 @@ def _is_authorized(update: Update) -> bool:
     return is_authorized(update, FALLBACK_ALLOWED_ENV)
 
 HELP_TEXT = (
-    "📞 *어닝콜 분석 (종목봇 /earnings)*\n\n"
+    "📞 *어닝콜 분석 봇*\n\n"
     "*기본 사용:*\n"
-    "  `/earnings <텍스트>`\n"
-    "  (종목봇 통합 — 자유 텍스트는 종목봇이 기업명·티커로 먼저 처리)\n\n"
+    "  • 그냥 텍스트를 입력하면 바로 분석 시작\n"
+    "  • 또는 `/earnings <텍스트>`\n\n"
     "*입력 예시:*\n"
     "  • 회사 직접 지정 — `/earnings AAPL MSFT GOOGL NVDA의 2026 1Q 어닝콜`\n"
     "  • 자연어 조건 — `/earnings 빅테크 2026 1Q 실적발표`\n"
@@ -747,31 +747,15 @@ async def _self_test(app: Application) -> None:
 
 EARNINGS_COMMANDS = [
     ("earnings", "📞 미국 기업 어닝콜 + 비교 PDF (5-10분)"),
+    ("help", "ℹ️ 사용법"),
 ]
 
 
-def register_handlers(app: Application) -> None:
-    """기존 봇(CompanyBot 등)의 Application에 /earnings 핸들러를 끼워 넣음.
-
-    deepdive와 동일한 격리 패턴 — 새 봇 토큰 안 만들고 기존 종목봇에서 동작.
-    text_handler가 이미 bot_worker.py에 등록돼 있으므로 자유 텍스트는 사용 안 함.
-    반드시 `/earnings <텍스트>` 명령으로 진입.
-
-    EARNINGS_TEST_PROMPT env가 있으면 부팅 후 1회 self-test 자동 실행 (CLAUDE.md 검증 의무).
-    """
-    app.add_handler(CommandHandler("earnings", _cmd_earnings))
-    try:
-        loop = asyncio.get_running_loop()
-        loop.create_task(_self_test(app))
-    except RuntimeError:
-        pass
-
-
 def build_earnings_app(token: str) -> Application:
-    """(레거시 — orchestrator에서 더 이상 사용하지 않음.)
+    """전용 EarningsBot Application 빌더 (orchestrator BOT_SPECS에서 호출).
 
-    원래는 별도 봇으로 운영하기 위한 builder. 사용자 요청으로 기존 종목봇에 통합돼
-    register_handlers()를 통해 합쳐짐. 코드 호환을 위해 남겨두지만 호출 안 됨.
+    핸들러: /start·/help · /earnings · 자유 텍스트(_on_text)로도 바로 진입.
+    EARNINGS_TEST_PROMPT env가 있으면 부팅 후 1회 self-test 자동 실행 (CLAUDE.md 검증 의무).
     """
     app = Application.builder().token(token).build()
     app.add_handler(CommandHandler(["start", "help"], _help))
