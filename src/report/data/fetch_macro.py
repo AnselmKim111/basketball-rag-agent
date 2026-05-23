@@ -45,31 +45,40 @@ FRED_SERIES = {
 
 
 def fetch_fred(series_id: str, days: int = 1825):
-    """FRED fredgraph.csv → DataFrame(Date index, Close). 실패 시 None."""
+    """FRED fredgraph.csv → DataFrame(Date index, Close). 실패 시 None.
+
+    egress가 느릴 수 있어 타임아웃 30s + 재시도(backoff).
+    """
     import io
+    import time
     from datetime import date, timedelta
-    try:
-        import httpx
-        import pandas as pd
-        start = (date.today() - timedelta(days=days)).strftime("%Y-%m-%d")
-        url = (f"https://fred.stlouisfed.org/graph/fredgraph.csv"
-               f"?id={series_id}&cosd={start}")
-        r = httpx.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
-        r.raise_for_status()
-        df = pd.read_csv(io.StringIO(r.text))
-        # 컬럼: observation_date(또는 DATE), <series_id>
-        date_col = df.columns[0]
-        val_col = df.columns[1]
-        df[val_col] = pd.to_numeric(df[val_col], errors="coerce")
-        df = df.dropna(subset=[val_col])
-        df.index = pd.to_datetime(df[date_col])
-        out = df[[val_col]].rename(columns={val_col: "Close"})
-        if len(out) < 2:
-            return None
-        return out
-    except Exception as e:
-        log.info("[report.macro] FRED %s 미확보: %s", series_id, e)
-        return None
+    last_err = None
+    for attempt in range(3):
+        try:
+            import httpx
+            import pandas as pd
+            start = (date.today() - timedelta(days=days)).strftime("%Y-%m-%d")
+            url = (f"https://fred.stlouisfed.org/graph/fredgraph.csv"
+                   f"?id={series_id}&cosd={start}")
+            r = httpx.get(url, timeout=30, headers={"User-Agent": "Mozilla/5.0"})
+            r.raise_for_status()
+            df = pd.read_csv(io.StringIO(r.text))
+            # 컬럼: observation_date(또는 DATE), <series_id>
+            date_col = df.columns[0]
+            val_col = df.columns[1]
+            df[val_col] = pd.to_numeric(df[val_col], errors="coerce")
+            df = df.dropna(subset=[val_col])
+            df.index = pd.to_datetime(df[date_col])
+            out = df[[val_col]].rename(columns={val_col: "Close"})
+            if len(out) < 2:
+                return None
+            return out
+        except Exception as e:
+            last_err = e
+            if attempt < 2:
+                time.sleep(2 * (attempt + 1))
+    log.info("[report.macro] FRED %s 미확보: %s", series_id, last_err)
+    return None
 
 
 def fetch_fred_many() -> dict[str, object]:

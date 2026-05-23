@@ -34,6 +34,8 @@ def write_report(
     deltas: dict | None = None,
     breadth: dict | None = None,
     highlights: list[dict] | None = None,
+    earnings: dict | None = None,
+    stale: list[dict] | None = None,
 ) -> str:
     """LLM으로 전체 Markdown 리포트 생성 (8섹션 + 전일 대비 팔로업).
 
@@ -54,12 +56,17 @@ def write_report(
         "korea": korea_summary,
         "highlights": highlights or [],
         "news": (news or [])[:15],
+        "earnings": earnings or {},
+        "stale_data": stale or [],
     }
     user_msg = (
         "다음은 오늘 시장 데이터·전일 대비 변화(deltas_vs_yesterday)·생성된 차트 목록이다. "
         "시스템 규칙(8섹션 + 전일 대비 팔로업)에 따라 한국어 Markdown 시황 리포트를 작성하라. "
         "맨 앞에 '📍 어제 대비 변화' 블록과 Executive Summary(3~4줄)를 두고, 각 차트는 반드시 "
         "![](images/파일명)으로 본문에 삽입하며, 각 섹션 끝에 '한 줄 takeaway'를 붙여라. "
+        "§5 어닝 모멘텀은 earnings(최근 beat율·평균 서프라이즈·top beats/misses·다가올 일정)로 작성하라. "
+        "news의 헤드라인은 관련 섹션 내러티브에 자연스럽게 인용하고 (출처 url) 형태로 표기하라. "
+        "stale_data에 있는 카테고리는 '⚠ 전일자 데이터(asof)'로 명시하라. "
         "데이터 미확보는 '데이터 미수집'으로, 가설은 '가설'로 표기하라.\n\n"
         + json.dumps(payload, ensure_ascii=False, indent=2)
     )

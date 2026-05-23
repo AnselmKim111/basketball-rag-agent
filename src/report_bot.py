@@ -109,7 +109,8 @@ def _build_report():
 
     반환: (md_path, pdf_path, key_chart_paths, headline).
     """
-    from src.report.data import fetch_prices as fp, fetch_macro, fetch_korea_flows
+    from src.report.data import (fetch_prices as fp, fetch_macro, fetch_korea_flows,
+                                  fetch_news, fetch_earnings, cache)
     from src.report.charts import (index_charts, volatility_chart, korea_flow_chart,
                                    heatmap_chart, signal_charts, rotation_charts,
                                    flow_charts, stock_highlights)
@@ -133,21 +134,29 @@ def _build_report():
             if key:
                 key_charts.append(str(img_dir / fn))
 
-    # ---------- 데이터 fetch (병렬) ----------
-    us_idx = fp.fetch_many(fp.US_INDICES, days=365)
-    deconc = fp.fetch_many(fp.DECONCENTRATION, days=365)
-    sector_etfs = fp.fetch_many(fp.US_SECTOR_ETFS, days=365)
-    theme_etfs = fp.fetch_many(fp.US_THEME_ETFS, days=365)
-    region_etfs = fp.fetch_many(fp.REGION_ETFS, days=365)
-    fx = fp.fetch_many(fp.FX_SYMBOLS, days=365)
-    highlights_df = fp.fetch_many(fp.HIGHLIGHT_STOCKS, days=365)
-    macro = fetch_macro.fetch_macro(days=365)
-    fred = fetch_macro.fetch_fred_many()
-    kr_sizes = fetch_korea_flows.fetch_size_index_ohlcv(days=365)
-    kr_flows = fetch_korea_flows.fetch_investor_flows(days=120)
-    log.info("[report] fetch: idx=%d deconc=%d sector=%d theme=%d region=%d fx=%d hl=%d macro=%d fred=%d kr_size=%d kr_flow=%d",
+    # ---------- 데이터 fetch (단일소스 실패 시 전일 캐시 재사용) ----------
+    stale: list[dict] = []
+    def foc(key, fn):
+        return cache.fetch_or_cache(key, fn, date_iso, stale=stale)
+    us_idx = foc("idx", lambda: fp.fetch_many(fp.US_INDICES, days=365))
+    deconc = foc("deconc", lambda: fp.fetch_many(fp.DECONCENTRATION, days=365))
+    sector_etfs = foc("sector", lambda: fp.fetch_many(fp.US_SECTOR_ETFS, days=365))
+    theme_etfs = foc("theme", lambda: fp.fetch_many(fp.US_THEME_ETFS, days=365))
+    region_etfs = foc("region", lambda: fp.fetch_many(fp.REGION_ETFS, days=365))
+    fx = foc("fx", lambda: fp.fetch_many(fp.FX_SYMBOLS, days=365))
+    highlights_df = foc("highlights", lambda: fp.fetch_many(fp.HIGHLIGHT_STOCKS, days=365))
+    macro = foc("macro", lambda: fetch_macro.fetch_macro(days=365))
+    fred = foc("macro_fred", lambda: fetch_macro.fetch_fred_many())
+    kr_sizes = foc("kr_size", lambda: fetch_korea_flows.fetch_size_index_ohlcv(days=365))
+    kr_flows = foc("kr_flow", lambda: fetch_korea_flows.fetch_investor_flows(days=120))
+    news = foc("news", lambda: fetch_news.fetch_market_news())
+    earnings = cache.fetch_or_cache("earnings", lambda: fetch_earnings.fetch_earnings_momentum(),
+                                    date_iso, stale=stale,
+                                    is_empty=lambda o: not o or not o.get("recent"))
+    log.info("[report] fetch: idx=%d deconc=%d sector=%d theme=%d region=%d fx=%d hl=%d macro=%d fred=%d kr_size=%d kr_flow=%d news=%d earn=%s stale=%s",
              len(us_idx), len(deconc), len(sector_etfs), len(theme_etfs), len(region_etfs),
-             len(fx), len(highlights_df), len(macro), len(fred), len(kr_sizes), len(kr_flows))
+             len(fx), len(highlights_df), len(macro), len(fred), len(kr_sizes), len(kr_flows),
+             len(news or []), bool(earnings), [s["key"] for s in stale])
 
     # 테마 모멘텀 (섹터 + 테마 통합)
     combined_themes = {**sector_etfs, **theme_etfs}
@@ -272,8 +281,9 @@ def _build_report():
     # ---------- LLM 작성 (8섹션 + 팔로업) ----------
     log.info("[report] 차트 %d개, 신호 %d개 → LLM 작성", len(chart_list), len(signals))
     md = report_writer.write_report(date_iso, rotation, chart_list, signals, macro_summary,
-                                    korea_summary, theme_momentum=theme_summary, deltas=deltas,
-                                    breadth=breadth, highlights=highlights_meta)
+                                    korea_summary, news=news, theme_momentum=theme_summary,
+                                    deltas=deltas, breadth=breadth, highlights=highlights_meta,
+                                    earnings=earnings, stale=stale)
 
     # headline 추출 (첫 # 라인)
     headline = next((ln.lstrip("# ").strip() for ln in md.splitlines() if ln.startswith("#")), f"{date_iso} 시장 리포트")
