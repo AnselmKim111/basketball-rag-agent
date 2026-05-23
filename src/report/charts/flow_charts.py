@@ -98,3 +98,80 @@ def capital_flow_diagram(sources: list[tuple], destinations: list[tuple], out_di
     theme.stamp(ax, date_iso)
     fig.tight_layout()
     return theme.save_fig(fig, out_dir, filename)
+
+
+# 미국 테마(키워드) → 한국 수혜주 매핑 (레퍼런스 + 일반 대응)
+US_KR_LINKAGE = {
+    "반도체": ["삼성전자", "SK하이닉스", "한미반도체"],
+    "우주": ["한화에어로스페이스", "한국항공우주", "컨텍", "인텔리안테크"],
+    "연료전지": ["두산퓨얼셀", "에스퓨얼셀", "범한퓨얼셀"],
+    "수소": ["두산퓨얼셀", "에스퓨얼셀"],
+    "방산": ["LIG넥스원", "한화에어로스페이스", "현대로템"],
+    "사이버": ["안랩", "윈스", "샌즈랩"],
+    "양자": ["우리로", "엑스게이트", "코위버"],
+    "로봇": ["레인보우로보틱스", "두산로보틱스", "에스피지"],
+    "AI": ["레인보우로보틱스", "두산로보틱스"],
+    "태양광": ["OCI홀딩스", "한화솔루션", "HD현대에너지솔루션"],
+    "신재생": ["한화솔루션", "씨에스윈드"],
+    "원전": ["두산에너빌리티", "한전기술", "우진"],
+    "우라늄": ["두산에너빌리티", "한전기술"],
+    "리튬": ["에코프로비엠", "포스코퓨처엠", "LG에너지솔루션"],
+    "2차전지": ["에코프로비엠", "삼성SDI", "포스코퓨처엠"],
+    "바이오": ["알테오젠", "HLB", "리가켐바이오", "디앤디파마텍", "펩트론"],
+}
+
+
+def us_korea_linkage(theme_rows: list[dict], out_dir: Path, filename: str = "33_us_kr_linkage.png",
+                     top_n: int = 9, date_iso: str | None = None) -> str | None:
+    """미국 테마 강도(5D) → 한국 수혜주 연결 다이어그램. 강한 테마=굵은/진한 화살표."""
+    theme.setup()
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import FancyArrowPatch, FancyBboxPatch
+    from matplotlib import colors
+    import numpy as np
+
+    def _match(label: str):
+        for kw, names in US_KR_LINKAGE.items():
+            if kw in label:
+                return kw, names
+        return None, None
+
+    mapped = []
+    for r in theme_rows:
+        kw, names = _match(r["label"])
+        if kw and r.get("r5d") is not None:
+            mapped.append((r["label"], r["r5d"], names))
+    if not mapped:
+        return None
+    # 5D 모멘텀 절대값 큰 순 (강하게 움직이는 테마 우선)
+    mapped = sorted(mapped, key=lambda m: -abs(m[1]))[:top_n]
+    mapped = sorted(mapped, key=lambda m: -m[1])  # 표시는 강세 위→약세 아래
+
+    norm = colors.Normalize(vmin=-6, vmax=6)
+    cmap = colors.LinearSegmentedColormap.from_list("krrb", ["#1f77b4", "#cfd8dc", "#d62728"])
+    mx = max(abs(m[1]) for m in mapped) or 1.0
+
+    fig, ax = plt.subplots(figsize=(13, max(5.5, 0.95 * len(mapped) + 1.5)))
+    ax.set_xlim(0, 10); ax.set_ylim(0, len(mapped)); ax.axis("off")
+    for i, (label, r5d, names) in enumerate(mapped):
+        y = len(mapped) - i - 0.5
+        col = cmap(norm(max(-6, min(6, r5d))))
+        # 미국 테마 박스 (좌)
+        ax.add_patch(FancyBboxPatch((0.2, y - 0.36), 3.4, 0.72, boxstyle="round,pad=0.05",
+                     facecolor=col, edgecolor="#666", linewidth=0.6))
+        ax.text(1.9, y, f"{label}\n5D {r5d:+.1f}%", ha="center", va="center", fontsize=8,
+                color="white" if abs(r5d) > 3 else "#111")
+        # 화살표
+        w = 0.8 + 4 * (abs(r5d) / mx)
+        ax.add_patch(FancyArrowPatch((3.7, y), (5.9, y), arrowstyle="-|>", mutation_scale=14,
+                     linewidth=w, color=col, alpha=0.7))
+        # 한국 수혜주 박스 (우)
+        ax.add_patch(FancyBboxPatch((6.0, y - 0.36), 3.8, 0.72, boxstyle="round,pad=0.05",
+                     facecolor="#fafafa", edgecolor=col, linewidth=1.2))
+        ax.text(7.9, y, ", ".join(names[:3]), ha="center", va="center", fontsize=8, color="#111")
+    ax.text(1.9, len(mapped) + 0.05, "미국 테마 (5D 강도)", ha="center", fontsize=10, fontweight="bold")
+    ax.text(7.9, len(mapped) + 0.05, "한국 수혜주", ha="center", fontsize=10, fontweight="bold")
+    ax.set_title("미국 → 한국 자금흐름 연결 — 강한 테마가 끌고 갈 국내 수혜주", fontsize=13)
+    theme.stamp(ax, date_iso)
+    fig.tight_layout()
+    return theme.save_fig(fig, out_dir, filename)

@@ -245,6 +245,8 @@ def _build_report():
             key=("대형" in label or "KOSDAQ" in label))
     add(heatmap_chart.korea_flow_heatmap(kr_flows, img_dir, date_iso=date_iso),
         "한국 수급 히트맵", "투자자 방향 (20일)", "7. 한국시장 자금흐름")
+    add(flow_charts.us_korea_linkage(theme_rows, img_dir, date_iso=date_iso),
+        "미국→한국 연결 흐름", "강한 미국 테마 → 국내 수혜주", "7. 한국시장 자금흐름", key=True)
     for mkt, fdf in (kr_flows or {}).items():
         korea_summary[mkt] = {inv: round(float(fdf[inv].iloc[-20:].sum()), 0) for inv in fdf.columns}
 
