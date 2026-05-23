@@ -44,16 +44,34 @@ def fetch_size_index_ohlcv(days: int = 365) -> dict[str, object]:
     end = date.today()
     start = end - timedelta(days=int(days * 1.5) + 10)
     for label, code in KR_SIZE_INDICES.items():
-        try:
-            df = stock.get_index_ohlcv(_ymd(start), _ymd(end), code)
-            if df is not None and not df.empty:
-                # 컬럼 한글 → 표준
-                ren = {"시가": "Open", "고가": "High", "저가": "Low", "종가": "Close", "거래량": "Volume"}
-                df = df.rename(columns={k: v for k, v in ren.items() if k in df.columns})
+        df = None
+        # pykrx 여러 시그니처 시도 (환경별 함수명 차이)
+        for attempt in (
+            lambda: stock.get_index_ohlcv(_ymd(start), _ymd(end), code),
+            lambda: stock.get_index_ohlcv_by_date(_ymd(start), _ymd(end), code),
+        ):
+            try:
+                df = attempt()
+                if df is not None and not df.empty:
+                    break
+            except Exception:
+                df = None
+        if df is not None and not df.empty:
+            ren = {"시가": "Open", "고가": "High", "저가": "Low", "종가": "Close", "거래량": "Volume"}
+            df = df.rename(columns={k: v for k, v in ren.items() if k in df.columns})
+            out[label] = df
+        else:
+            log.warning("[kr_flows] 지수 %s(%s) pykrx 실패", label, code)
+
+    # pykrx 전부 실패 시 FDR 폴백 (KOSPI/KOSDAQ 종합지수만 — 규모별은 FDR 미지원)
+    if not out:
+        log.warning("[kr_flows] pykrx 규모별 지수 전부 실패 → FDR KOSPI/KOSDAQ 폴백")
+        from src.report.data.fetch_prices import fetch_ohlcv
+        for label, sym in (("KOSPI", "KS11"), ("KOSDAQ", "KQ11")):
+            df = fetch_ohlcv(sym, days=days)
+            if df is not None and len(df) > 5:
                 out[label] = df
-        except Exception:
-            log.warning("[kr_flows] 지수 %s(%s) 실패", label, code)
-    log.info("[kr_flows] 규모별 지수 %d개 확보", len(out))
+    log.info("[kr_flows] 규모별/종합 지수 %d개 확보", len(out))
     return out
 
 

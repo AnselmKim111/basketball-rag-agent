@@ -62,8 +62,8 @@ def write_report(
         model = os.getenv("REPORT_SYNTHESIS_MODEL") or os.getenv("IDEA_SYNTHESIS_MODEL") or "anthropic/claude-sonnet-4.5"
         md = summarizer.chat_with_retry(
             client,
-            [{"role": "system", "content": _system_prompt()},
-             {"role": "user", "content": user_msg}],
+            messages=[{"role": "system", "content": _system_prompt()},
+                      {"role": "user", "content": user_msg}],
             max_tokens=8000,
             model=model,
             temperature=0.4,
