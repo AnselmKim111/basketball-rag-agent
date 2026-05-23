@@ -10,6 +10,7 @@ pykrx 버전별 시그니처 차이를 try/except로 방어. 시뮬레이션 환
 from __future__ import annotations
 
 import logging
+import re
 from datetime import date, timedelta
 
 log = logging.getLogger(__name__)
@@ -122,5 +123,91 @@ def fetch_investor_flows(days: int = 120) -> dict[str, object]:
             log.warning("[kr_flows] %s 투자자 컬럼 인식 실패: %s", market, list(df.columns))
             continue
         out[market] = sub[keep]
-        log.info("[kr_flows] %s 투자자 순매수 %d일 확보 (cols=%s)", market, len(sub), keep)
+        log.info("[kr_flows] %s 투자자 순매수 %d일 확보 (cols=%s, pykrx)", market, len(sub), keep)
+
+    # pykrx 실패한 시장은 Naver 투자자 매매동향 폴백
+    for market in ("KOSPI", "KOSDAQ"):
+        if market in out:
+            continue
+        nv = _fetch_naver_investor_flows(market, days=days)
+        if nv is not None and len(nv) > 5:
+            out[market] = nv
+            log.info("[kr_flows] %s 투자자 순매수 %d일 확보 (Naver 폴백)", market, len(nv))
     return out
+
+
+def _fetch_naver_investor_flows(market: str, days: int = 120):
+    """Naver 투자자 매매동향(investorDealTrendDay) HTML 파싱 → 일별 순매수 DataFrame.
+
+    컬럼: 기관/외국인/개인 (순매수, 백만원 단위). 페이지당 ~20일 → bizdate로 과거 반복.
+    반환: pandas.DataFrame (날짜 index asc) 또는 None.
+    """
+    import requests
+    from bs4 import BeautifulSoup
+    import pandas as pd
+    from datetime import date as _date, timedelta as _td
+
+    sosok = "01" if market == "KOSPI" else "02"
+    rows: dict[str, dict] = {}  # iso_date -> {기관,외국인,개인}
+    bizdate = _date.today()
+    pages = days // 18 + 2
+    first_diag = True
+    for _ in range(pages):
+        ymd = bizdate.strftime("%Y%m%d")
+        url = (f"https://finance.naver.com/sise/investorDealTrendDay.naver"
+               f"?bizdate={ymd}&sosok={sosok}")
+        try:
+            resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+            resp.encoding = "euc-kr"
+            soup = BeautifulSoup(resp.text, "html.parser")
+        except Exception as e:
+            log.warning("[kr_flows] Naver 투자자 %s fetch 실패: %s", market, e)
+            break
+        table = soup.find("table", {"class": "type_1"})
+        if table is None:
+            break
+        oldest = None
+        for tr in table.find_all("tr"):
+            tds = [td.get_text(strip=True).replace(",", "") for td in tr.find_all("td")]
+            if len(tds) < 4:
+                continue
+            # 첫 칸: 날짜 (YY.MM.DD 또는 YYYY.MM.DD)
+            datestr = tds[0]
+            mdt = re.match(r"(\d{2,4})\.(\d{1,2})\.(\d{1,2})", datestr)
+            if not mdt:
+                continue
+            y, mo, dd = mdt.groups()
+            if len(y) == 2:
+                y = "20" + y
+            iso = f"{y}-{int(mo):02d}-{int(dd):02d}"
+            # 컬럼 순서: 날짜, 개인, 외국인, 기관계, ... (Naver 표준)
+            def _num(x):
+                try:
+                    return float(x)
+                except Exception:
+                    return None
+            vals = [_num(t) for t in tds[1:4]]
+            if first_diag:
+                log.warning("[kr_flows] DIAG Naver(%s) 첫행 tds=%s", market, tds[:6])
+                first_diag = False
+            if any(v is None for v in vals):
+                continue
+            indiv, foreign, inst = vals  # 개인, 외국인, 기관계
+            rows[iso] = {"개인": indiv, "외국인": foreign, "기관": inst}
+            oldest = iso
+        if oldest is None:
+            break
+        # 다음 페이지: 가장 오래된 날짜 하루 전
+        try:
+            od = _date.fromisoformat(oldest) - _td(days=1)
+            bizdate = od
+        except Exception:
+            break
+        if len(rows) >= days:
+            break
+    if not rows:
+        return None
+    df = pd.DataFrame.from_dict(rows, orient="index")
+    df.index = pd.to_datetime(df.index)
+    df = df.sort_index()
+    return df[["기관", "외국인", "개인"]]
