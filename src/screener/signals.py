@@ -156,11 +156,12 @@ def compute_signals_for_ticker(rows: list[dict], base_date: str | None = None) -
                             }
 
     # 5) VCP 상방 돌파 (Volatility Contraction Pattern)
-    # 정의 (단순화된 미네르비니 휴리스틱):
-    #   (a) base 형성: 최근 50일 박스권 (high/low 비율 ≤ 1.20)
-    #   (b) 변동성 수축: 최근 20일 ATR < 50일 ATR × 0.7 (ATR 30% 이상 감소)
-    #   (c) 거래량 dry-up: 최근 10일 vol_avg < 50일 vol_avg × 0.85
-    #   (d) 돌파: 종가 > 50일 박스권 high(=base ceiling) AND 거래량 ≥ 20일 평균 × 1.5
+    # 정의 (단순화된 미네르비니 휴리스틱) — 임계값은 env로 조절 가능:
+    #   (a) base 형성: 50일 박스권 (high/low ≤ SCREENER_VCP_BASE_MAX, 기본 1.25)
+    #   (b) 변동성 수축: 20일 ATR ≤ 50일 ATR × SCREENER_VCP_ATR_MAX (기본 0.75)
+    #   (c) 거래량 dry-up: 10일 vol ≤ 50일 vol × SCREENER_VCP_DRYUP_MAX (기본 0.90)
+    #   (d) 돌파: 종가 > 50일 박스권 high AND 거래량 ≥ 20일평균 × SCREENER_VCP_VOL_MIN (기본 1.4)
+    # 4중 AND라 본질적으로 희소 (시장에 매일 0~5개). 완화하려면 env 상향.
     if len(df) >= 50:
         try:
             recent50 = df.iloc[-50:]
@@ -183,13 +184,17 @@ def compute_signals_for_ticker(rows: list[dict], base_date: str | None = None) -
                 float(today["volume"]) / float(vol_ma20) if (pd.notna(vol_ma20) and vol_ma20 > 0) else 0
             )
 
-            # 모든 조건
-            is_base = base_ratio <= 1.20
-            is_contracted = atr_contraction <= 0.70
-            is_dryup = vol_dryup <= 0.85
+            # 모든 조건 (env로 조절 가능 — 재배포 없이 미세조정)
+            vcp_base_max = _get_float_env("SCREENER_VCP_BASE_MAX", 1.25)
+            vcp_atr_max = _get_float_env("SCREENER_VCP_ATR_MAX", 0.75)
+            vcp_dryup_max = _get_float_env("SCREENER_VCP_DRYUP_MAX", 0.90)
+            vcp_vol_min = _get_float_env("SCREENER_VCP_VOL_MIN", 1.4)
+            is_base = base_ratio <= vcp_base_max
+            is_contracted = atr_contraction <= vcp_atr_max
+            is_dryup = vol_dryup <= vcp_dryup_max
             is_breakout = (
                 today["close"] > recent50_high
-                and today_vol_ratio >= 1.5
+                and today_vol_ratio >= vcp_vol_min
                 and chg_pct > 0
             )
 
