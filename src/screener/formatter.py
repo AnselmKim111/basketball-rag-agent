@@ -1,7 +1,7 @@
 """신호 결과 → 텔레그램 메시지.
 
 미미 스타일 포맷 (https://t.me/mimi_ATH 참고):
-  - 각 신호 카테고리(역사적 신고가/52주 신고가/거래량 돌파/52주 돌파 직전)
+  - 각 신호 카테고리(역사적 신고가/52주 신고가/VCP 돌파/52주 돌파 직전)
     안에서 섹터별로 그룹핑
   - 라인: "(섹터명) 종목명1(+5.2%), 종목명2(+3.1%), ..."
   - 시총·구름상단·거래량배수 등 디테일은 헤더 1줄로만 안내
@@ -153,7 +153,6 @@ def format_results(
     parts.append(_format_section(results.get("high_all", []), "🚀", "역사적 신고가"))
     parts.append(_format_section(results.get("high_52w", []), "📈", "52주 신고가"))
     parts.append(_format_section(results.get("vcp_breakout", []), "💎", "VCP 돌파 (최근 2주 이내)"))
-    parts.append(_format_section(results.get("volume_breakout", []), "🔥", "거래량 돌파 ≥2배"))
     parts.append(_format_section(results.get("near_breakout_52w", []), "🎯", "52주 돌파 직전 95-99%"))
 
     total = sum(len(v) for v in results.values())

@@ -3,10 +3,11 @@
 신호 (사용자 요청 — 노이즈 적은 핵심만):
   1. 52주 신고가 — 종가가 과거 252영업일(1년) 최고가 초과
   2. 역사적 신고가 — 종가가 보유 데이터 전체(280일) 최고가 초과
-  3. 거래량 돌파 — 오늘 거래량 ≥ 20일 평균 × ratio AND 종가 상승
-  4. 52주 돌파 직전 — 종가가 52주 고점 95-99% AND 5일 거래량 증가 추세
+  3. 52주 돌파 직전 — 종가가 52주 고점 95-99% AND 5일 거래량 증가 추세
+  4. VCP 돌파 — 변동성 수축 base 형성 후 박스권 상단 돌파
 
 제거됨:
+  - 거래량 돌파 ≥2배 (노이즈 다수 — 사용자 요청 제거)
   - 일목구름 상방 돌파 (노이즈 다수)
   - 20일/60일 신고가 (단기 노이즈)
 
@@ -27,7 +28,6 @@ log = logging.getLogger(__name__)
 KST = timezone(timedelta(hours=9))
 
 # 임계값 — env 오버라이드 가능
-DEFAULT_VOL_BREAKOUT_RATIO = 2.0
 DEFAULT_NEAR_BREAKOUT_LOWER = 0.95
 DEFAULT_NEAR_BREAKOUT_UPPER = 0.99
 # 시가총액 필터 (USD). 기본 $1B (미국 — S&P500+Nasdaq100 안전장치).
@@ -113,23 +113,7 @@ def compute_signals_for_ticker(rows: list[dict], base_date: str | None = None) -
             "history_days": int(len(df)),
         }
 
-    # 3) 거래량 돌파
-    vol_ratio_threshold = _get_float_env(
-        "SCREENER_VOL_BREAKOUT_RATIO", DEFAULT_VOL_BREAKOUT_RATIO
-    )
-    if len(df) >= 22:
-        vol_ma20 = df["volume"].rolling(20).mean().iloc[-2]
-        if pd.notna(vol_ma20) and vol_ma20 > 0 and prev["close"] > 0:
-            vol_ratio = float(today["volume"] / vol_ma20)
-            if vol_ratio >= vol_ratio_threshold and chg_pct > 0:
-                out["volume_breakout"] = {
-                    "close": int(today["close"]),
-                    "vol_ratio": vol_ratio,
-                    "chg_pct": chg_pct,
-                    "volume": int(today["volume"]),
-                }
-
-    # 4) 52주 돌파 직전 (95-99%)
+    # 3) 52주 돌파 직전 (95-99%)
     near_lo = _get_float_env(
         "SCREENER_NEAR_BREAKOUT_LOWER", DEFAULT_NEAR_BREAKOUT_LOWER
     )
@@ -155,7 +139,7 @@ def compute_signals_for_ticker(rows: list[dict], base_date: str | None = None) -
                                 "chg_pct": chg_pct,
                             }
 
-    # 5) VCP 돌파 (최근 2주 이내 — 러프 버전)
+    # 4) VCP 돌파 (최근 2주 이내 — 러프 버전)
     # "오늘 돌파"만 잡던 4중 AND를 완화: 변동성 수축 base 형성 후 최근 N영업일
     # (SCREENER_VCP_WINDOW, 기본 10=2주) 중 박스권 상단을 돌파한 종목.
     #   (a) base: 돌파 window 직전 50일 박스권 (high/low ≤ SCREENER_VCP_BASE_MAX, 1.25)
@@ -207,7 +191,6 @@ CATEGORIES = [
     "high_all",
     "high_52w",
     "vcp_breakout",
-    "volume_breakout",
     "near_breakout_52w",
 ]
 
