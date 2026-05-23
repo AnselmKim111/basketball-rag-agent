@@ -152,7 +152,7 @@ def format_results(
 
     parts.append(_format_section(results.get("high_all", []), "🚀", "역사적 신고가"))
     parts.append(_format_section(results.get("high_52w", []), "📈", "52주 신고가"))
-    parts.append(_format_section(results.get("vcp_breakout", []), "💎", "VCP 돌파 (변동성 수축 후 돌파)"))
+    parts.append(_format_section(results.get("vcp_breakout", []), "💎", "VCP 돌파 (최근 2주 이내)"))
     parts.append(_format_section(results.get("volume_breakout", []), "🔥", "거래량 돌파 ≥2배"))
     parts.append(_format_section(results.get("near_breakout_52w", []), "🎯", "52주 돌파 직전 95-99%"))
 
