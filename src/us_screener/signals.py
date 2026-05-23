@@ -176,8 +176,8 @@ def compute_signals_for_ticker(rows: list[dict], base_date: str | None = None) -
             atr_base = float(tr.iloc[-(vcp_window + 50):-(vcp_window + 20)].mean())
             atr_contraction = (atr_recent / atr_base) if atr_base > 0 else 999
 
-            vcp_base_max = _get_float_env("SCREENER_VCP_BASE_MAX", 1.25)
-            vcp_atr_max = _get_float_env("SCREENER_VCP_ATR_MAX", 0.75)
+            vcp_base_max = _get_float_env("SCREENER_VCP_BASE_MAX", 1.40)
+            vcp_atr_max = _get_float_env("SCREENER_VCP_ATR_MAX", 1.00)
 
             # 최근 window일 중 종가가 base 박스권 상단 돌파한 날
             recent = df.iloc[-vcp_window:]
