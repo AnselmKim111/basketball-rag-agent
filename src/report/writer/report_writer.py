@@ -81,11 +81,80 @@ def write_report(
             context="report_writer",
         )
         if md and len(md.strip()) > 200:
-            return md.strip()
+            return _ensure_all_charts(md.strip(), chart_list)
         log.warning("[report.writer] LLM 짧은 응답 → fallback")
     except Exception:
         log.exception("[report.writer] LLM 실패 → fallback")
-    return _fallback_markdown(date_iso, market_color, chart_list, signals, deltas)
+    return _ensure_all_charts(_fallback_markdown(date_iso, market_color, chart_list, signals, deltas),
+                              chart_list)
+
+
+def _ensure_all_charts(md: str, chart_list: list[dict]) -> str:
+    """LLM이 일부 차트를 빠뜨리거나 없는 파일명을 적어도, 모든 차트가 제 섹션 맥락에
+    정확히 1회씩 들어가도록 보정. PDF 단일 파일에 전 차트가 빠짐없이 박히게 하는 핵심.
+
+    1) 전체를 감싼 코드펜스 제거
+    2) chart_list에 없는(환각) 이미지 참조 제거
+    3) 본문에 안 들어간 차트를 그 section 헤딩 아래(없으면 말미 부록)에 삽입
+    """
+    import re
+    if not chart_list:
+        return md
+    s = md.strip()
+    if s.startswith("```"):
+        s = re.sub(r"^```[a-zA-Z]*\n", "", s)
+        s = re.sub(r"\n```\s*$", "", s).strip()
+    md = s
+
+    valid = {c["filename"] for c in chart_list}
+
+    # 2) 환각 이미지 참조 제거 (filename이 chart_list에 없으면 삭제)
+    def _drop(m):
+        return m.group(0) if m.group(1) in valid else ""
+    md = re.sub(r"!\[[^\]]*\]\(images/([^)\s]+)\)", _drop, md)
+
+    referenced = {f for f in re.findall(r"images/([^)\s]+)", md) if f in valid}
+    missing = [c for c in chart_list if c["filename"] not in referenced]
+    if not missing:
+        return md
+
+    lines = md.split("\n")
+
+    def _section_key(sec: str) -> str:
+        return re.sub(r"^\s*\d+\.?\s*", "", sec or "").strip()
+
+    from collections import OrderedDict
+    by_sec: "OrderedDict[str, list]" = OrderedDict()
+    for c in missing:
+        by_sec.setdefault(c.get("section", ""), []).append(c)
+
+    appendix: list[dict] = []
+    for sec, charts in by_sec.items():
+        key = _section_key(sec)
+        tokens = [t for t in key.split() if len(t) >= 2]
+        target = None
+        for i, ln in enumerate(lines):
+            if ln.lstrip().startswith("#") and ((key and key in ln) or (tokens and tokens[0] in ln)):
+                target = i
+                break
+        if target is None:
+            appendix.extend(charts)
+            continue
+        block: list[str] = []
+        for c in charts:
+            block.append(f"\n![](images/{c['filename']})")
+            if c.get("caption_hint"):
+                block.append(f"*{c['caption_hint']}*")
+        lines[target + 1:target + 1] = block
+    md = "\n".join(lines)
+
+    if appendix:
+        md += "\n\n## 📎 추가 차트\n"
+        for c in appendix:
+            md += f"\n![](images/{c['filename']})\n"
+            if c.get("caption_hint"):
+                md += f"*{c['caption_hint']}*\n"
+    return md
 
 
 def _fallback_markdown(date_iso, market_color, chart_list, signals, deltas=None) -> str:

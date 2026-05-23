@@ -90,24 +90,18 @@ async def report_daily_job(bot: Bot, override_chat_id: str | None = None) -> Non
             await send_text_chunked(bot, cid, "⚠️ 리포트 데이터 미확보 — 생성 중단")
         return
 
-    # 발송: 헤드라인 + 핵심 차트 3개 + PDF + (md 본문 청크)
+    # 발송: 모든 차트가 맥락에 박힌 PDF "한 개"만. (PDF 실패 시에만 텍스트 폴백)
     md_text = Path(md_path).read_text(encoding="utf-8")
     for cid in targets:
         try:
-            await send_text_chunked(bot, cid, f"📊 {headline}")
-            for ch in key_charts[:3]:
-                try:
-                    with open(ch, "rb") as f:
-                        await bot.send_photo(chat_id=cid, photo=f)
-                except Exception:
-                    log.exception("[report] 차트 발송 실패 %s", ch)
             if pdf_path and Path(pdf_path).exists():
-                await send_pdf(bot, cid, Path(pdf_path), caption=headline[:200])
+                await send_pdf(bot, cid, Path(pdf_path), caption=f"📊 {headline}"[:1000])
             else:
+                await send_text_chunked(bot, cid, f"📊 {headline}")
                 await send_text_chunked(bot, cid, md_text)
         except Exception:
             log.exception("[report] 발송 실패 cid=%s", cid)
-    log.info("[report] 발송 완료 (%d명)", len(targets))
+    log.info("[report] 발송 완료 (%d명, 단일 PDF)", len(targets))
 
 
 def _build_report():
