@@ -64,21 +64,33 @@ def _group_by_sector(items: list[dict]) -> list[tuple[str, list[dict]]]:
     return [(s, groups[s]) for s in sorted_secs]
 
 
-def _format_section(items: list[dict], emoji: str, title: str) -> str:
-    """미미 스타일 섹션: 섹터별 그룹 + 종목명(등락률) 콤마 나열."""
+def _fmt_pct_or_na(v) -> str:
+    return _fmt_pct(v) if isinstance(v, (int, float)) else "N/A"
+
+
+def _format_section(items: list[dict], emoji: str, title: str,
+                    links: dict | None = None, extra: dict | None = None) -> str:
+    """4열 평면 포맷 (종목 / 당일 / 연초대비 / EPS YoY). 종목명은 채널 게시물로 하이퍼링크."""
+    links = links or {}
+    extra = extra or {}
     head = f"━━━ {emoji} {title} ({len(items)}) ━━━"
     if not items:
         return head + "\n해당 없음\n"
-
     cap = _per_category_top()
-    items_capped = items[:cap]
-    rest = len(items) - cap
-
-    sector_groups = _group_by_sector(items_capped)
-    lines = [head]
-    for sec, sec_items in sector_groups:
-        names = ", ".join(_fmt_label_compact(it) for it in sec_items)
-        lines.append(f"({sec}) {names}")
+    items_sorted = sorted(items, key=lambda it: -(it.get("chg_pct") or 0.0))
+    items_capped = items_sorted[:cap]
+    rest = len(items) - len(items_capped)
+    lines = [head, "(종목 / 당일 / 연초대비 / EPS YoY)"]
+    for it in items_capped:
+        tkr = it.get("ticker", "")
+        name = it.get("name") or tkr
+        chg = _fmt_pct(it.get("chg_pct", 0.0))
+        ex = extra.get(tkr, {})
+        ytd = _fmt_pct_or_na(ex.get("ytd"))
+        eps = _fmt_pct_or_na(ex.get("eps_yoy"))
+        url = links.get(tkr)
+        name_disp = f"[{name}]({url})" if url else name
+        lines.append(f"{name_disp} / {chg} / {ytd} / {eps}")
     if rest > 0:
         lines.append(f"... 외 {rest}종목")
     return "\n".join(lines) + "\n"
@@ -111,6 +123,8 @@ def format_results(
     as_of: datetime,
     base_date: str | None = None,
     stats: dict | None = None,
+    links: dict | None = None,
+    extra: dict | None = None,
 ) -> str:
     """미미 스타일 메시지 포맷.
 
@@ -140,7 +154,7 @@ def format_results(
                 v_line += f" · {rejected}종목 불일치/누락 제외"
             verify_lines.append(v_line)
         parts.append("\n".join(verify_lines))
-    parts.append("(KOSPI/KOSDAQ · 섹터별 분류 · 시총·상승률 복합 정렬)\n")
+    parts.append("(종목 클릭 → 채널의 1년 일봉 차트·상세) · 당일 등락 내림차순\n")
 
     # 전체 신호 통합 섹터 요약
     all_signals: list[dict] = []
@@ -150,11 +164,11 @@ def format_results(
     if sec_summary:
         parts.append(f"🏷️ 주요 섹터: {sec_summary}\n")
 
-    parts.append(_format_section(results.get("high_all", []), "🚀", "역사적 신고가"))
-    parts.append(_format_section(results.get("high_52w", []), "📈", "52주 신고가"))
-    parts.append(_format_section(results.get("vcp_breakout", []), "💎", "VCP 돌파 (최근 2주 이내)"))
-    parts.append(_format_section(results.get("volume_breakout", []), "🔥", "거래량 돌파 ≥2배"))
-    parts.append(_format_section(results.get("near_breakout_52w", []), "🎯", "52주 돌파 직전 95-99%"))
+    parts.append(_format_section(results.get("high_all", []), "🚀", "역사적 신고가", links, extra))
+    parts.append(_format_section(results.get("high_52w", []), "📈", "52주 신고가", links, extra))
+    parts.append(_format_section(results.get("vcp_breakout", []), "💎", "VCP 돌파 (최근 2주 이내)", links, extra))
+    parts.append(_format_section(results.get("volume_breakout", []), "🔥", "거래량 돌파 ≥2배", links, extra))
+    parts.append(_format_section(results.get("near_breakout_52w", []), "🎯", "52주 돌파 직전 95-99%", links, extra))
 
     total = sum(len(v) for v in results.values())
     if total == 0:
