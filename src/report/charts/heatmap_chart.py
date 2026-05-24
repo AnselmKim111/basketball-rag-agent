@@ -122,15 +122,18 @@ def sp500_heatmap(
     def draw_stock(s, r):
         col = cmap(norm(max(-6, min(6, changes[s]))))
         ax.add_patch(plt.Rectangle((r["x"], r["y"]), r["dx"], r["dy"],
-                     facecolor=col, edgecolor=_TV_BG, linewidth=0.8))
-        if r["dx"] > 2.3 and r["dy"] > 1.7:
-            fs = max(5, min(15, int(min(r["dx"] * 0.9, r["dy"] * 1.6))))
-            ax.text(r["x"] + r["dx"] / 2, r["y"] + r["dy"] / 2 + r["dy"] * 0.12, s,
-                    ha="center", va="center", fontsize=fs, color="white", fontweight="bold")
-            if r["dy"] > 2.6:
-                ax.text(r["x"] + r["dx"] / 2, r["y"] + r["dy"] / 2 - r["dy"] * 0.26,
+                     facecolor=col, edgecolor=_TV_BG, linewidth=1.0))
+        if r["dx"] > 1.8 and r["dy"] > 1.4:
+            # 종목명·등락이 한눈에 보이도록 타일 크기에 비례해 큼직하게
+            fs = max(8, min(46, int(min(r["dx"] * 1.55, r["dy"] * 2.1))))
+            show_pct = r["dy"] > 2.0
+            ty = r["y"] + r["dy"] / 2 + (r["dy"] * 0.14 if show_pct else 0)
+            ax.text(r["x"] + r["dx"] / 2, ty, s, ha="center", va="center",
+                    fontsize=fs, color="white", fontweight="bold")
+            if show_pct:
+                ax.text(r["x"] + r["dx"] / 2, r["y"] + r["dy"] / 2 - r["dy"] * 0.28,
                         f"{changes[s]:+.2f}%", ha="center", va="center",
-                        fontsize=max(4, int(fs * 0.62)), color="white")
+                        fontsize=max(6, int(fs * 0.62)), color="white")
 
     try:
         import squarify
@@ -164,11 +167,11 @@ def sp500_heatmap(
                 for s, r in zip(ist, st_rects):
                     draw_stock(s, r)
                 if ihdr:
-                    ax.text(irect["x"] + 0.22, irect["y"] + irect["dy"] - 0.18, ind.upper()[:28],
-                            ha="left", va="top", fontsize=6.3, color="#9aa0ab", alpha=0.85)
+                    ax.text(irect["x"] + 0.25, irect["y"] + irect["dy"] - 0.2, ind.upper()[:26],
+                            ha="left", va="top", fontsize=8.5, color="#aab0bb", alpha=0.9)
             if hdr:
-                ax.text(rect["x"] + 0.4, rect["y"] + rect["dy"] - 0.3, sec.upper(),
-                        ha="left", va="top", fontsize=10, color="#d6dae3", alpha=0.95,
+                ax.text(rect["x"] + 0.45, rect["y"] + rect["dy"] - 0.32, sec.upper(),
+                        ha="left", va="top", fontsize=13, color="#e2e6ee", alpha=0.97,
                         fontweight="bold")
     except Exception:
         log.warning("[heatmap] squarify 미사용 → grid fallback", exc_info=True)
@@ -223,17 +226,20 @@ def theme_rotation_heatmap(rows: list[dict], out_dir: Path, filename: str = "03_
             col = cmap(norm(max(-6, min(6, v5))))
             ax.add_patch(plt.Rectangle((rect["x"], rect["y"]), rect["dx"], rect["dy"],
                          facecolor=col, edgecolor=_TV_BG, linewidth=1.4))
-            if rect["dx"] > 6 and rect["dy"] > 4.5:
-                fs = max(7, min(13, int(rect["dx"] * 0.42)))
+            if rect["dx"] > 5 and rect["dy"] > 3.5:
+                fs = max(10, min(26, int(min(rect["dx"] * 0.62, rect["dy"] * 1.4))))
                 v1 = r.get("r1d"); v1m = r.get("r1m")
-                ax.text(rect["x"] + rect["dx"] / 2, rect["y"] + rect["dy"] / 2 + rect["dy"] * 0.16,
+                ax.text(rect["x"] + rect["dx"] / 2, rect["y"] + rect["dy"] / 2 + rect["dy"] * 0.17,
                         r["label"], ha="center", va="center", fontsize=fs,
                         color="white", fontweight="bold")
                 v1s = f"{v1:+.1f}" if v1 is not None else "—"
                 v1ms = f"{v1m:+.1f}" if v1m is not None else "—"
-                ax.text(rect["x"] + rect["dx"] / 2, rect["y"] + rect["dy"] / 2 - rect["dy"] * 0.20,
-                        f"1D {v1s} · 5D {v5:+.1f} · 1M {v1ms}", ha="center", va="center",
-                        fontsize=max(6, int(fs * 0.6)), color="white")
+                # 좁은 타일은 5D만(라벨 오버플로 방지), 넓은 타일은 1D·5D·1M 전체
+                sub = (f"1D {v1s} · 5D {v5:+.1f} · 1M {v1ms}" if rect["dx"] > 12
+                       else f"5D {v5:+.1f}%")
+                ax.text(rect["x"] + rect["dx"] / 2, rect["y"] + rect["dy"] / 2 - rect["dy"] * 0.22,
+                        sub, ha="center", va="center",
+                        fontsize=max(8, int(fs * 0.55)), color="white")
         drawn = True
     except Exception:
         log.warning("[heatmap] theme squarify 미사용 → grid fallback", exc_info=True)

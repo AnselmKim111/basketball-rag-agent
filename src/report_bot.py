@@ -195,7 +195,25 @@ def _build_report():
             "RSP/SPY 비율", "동일가중 우위 여부", "2. 쏠림 둔화 시그널", key=True)
     rsp_new_high = bool(technical_signals.analyze(deconc.get("RSP")).get("is_new_high")) if deconc.get("RSP") is not None else False
 
-    # ---------- §3 섹터 로테이션 맵 (+ S&P500 히트맵) ----------
+    # ---------- §3 섹터 로테이션 맵 (S&P500 개별종목 히트맵 우선 + 테마 로테이션) ----------
+    breadth: dict = {}
+    try:
+        from src.report.data import fetch_us_breadth
+        caps, changes, sectors, industries = fetch_us_breadth.load_us_market_map(top_n=120)
+        log.info("[report] S&P500 맵: caps=%d sectors=%d industries=%d changes=%d",
+                 len(caps), len(sectors), len(industries), len(changes))
+        if changes:  # TradingView식 개별 종목 시총 트리맵 — §3 최상단(시그니처)
+            add(heatmap_chart.sp500_heatmap(caps, changes, sectors, img_dir,
+                date_iso=date_iso, industries=industries),
+                "S&P500 히트맵", "개별 종목 시총 가중 — 종목명·당일등락 (녹=상승)", "3. 섹터 로테이션 맵", key=True)
+            adv = sum(1 for v in changes.values() if v > 0)
+            breadth["advancers"] = adv
+            breadth["total"] = len(changes)
+        else:
+            log.warning("[report] S&P500 히트맵 등락 0개 — 생략")
+    except Exception:
+        log.exception("[report] S&P500 히트맵 실패 — 생략")
+
     add(heatmap_chart.theme_rotation_heatmap(theme_rows, img_dir, date_iso=date_iso),
         "테마 로테이션 히트맵", "5일 모멘텀 — 돈이 어디로", "3. 섹터 로테이션 맵", key=True)
     add(rotation_charts.sector_return_bars(theme_rows, img_dir, date_iso=date_iso),
@@ -207,23 +225,6 @@ def _build_report():
         add(index_charts.theme_chart(combined_themes.get(lbl), lbl, img_dir,
             f"12_theme_{i:02d}.png", date_iso=date_iso), lbl, "캔들+MA+거래량", "3. 섹터 로테이션 맵")
 
-    breadth: dict = {}
-    try:
-        from src.report.data import fetch_us_breadth
-        caps, changes, sectors, industries = fetch_us_breadth.load_us_market_map(top_n=500)
-        log.info("[report] S&P500 맵: caps=%d sectors=%d industries=%d changes=%d",
-                 len(caps), len(sectors), len(industries), len(changes))
-        if changes:  # 개별 종목 시총 트리맵 (TradingView식)
-            add(heatmap_chart.sp500_heatmap(caps, changes, sectors, img_dir,
-                date_iso=date_iso, industries=industries),
-                "S&P500 히트맵", "개별 종목 시총 가중 — 시장 폭 (녹=상승)", "3. 섹터 로테이션 맵", key=True)
-            adv = sum(1 for v in changes.values() if v > 0)
-            breadth["advancers"] = adv
-            breadth["total"] = len(changes)
-        else:
-            log.warning("[report] S&P500 히트맵 등락 0개 — 생략")
-    except Exception:
-        log.exception("[report] S&P500 히트맵 실패 — 생략")
     # 200일선 위 테마 비율 (breadth proxy)
     if theme_rows:
         above = sum(1 for r in theme_rows if r.get("above_ma200"))
