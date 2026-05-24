@@ -413,6 +413,7 @@ async def _post_charts_and_meta(results: dict, max_tickers: int = 120) -> tuple[
     extra: dict[str, dict] = {}
     loop = asyncio.get_event_loop()
     posted = 0
+    mcap_n = 0
     for t, it in list(by_ticker.items())[:max_tickers]:
         try:
             rows = await loop.run_in_executor(None, lambda t=t: db.load_ohlcv(t, days=260))
@@ -424,6 +425,8 @@ async def _post_charts_and_meta(results: dict, max_tickers: int = 120) -> tuple[
             mcap = it.get("market_cap")
             if not mcap and rows and f.get("shares"):
                 mcap = (rows[-1]["close"] / 100.0) * f["shares"]
+            if mcap:
+                mcap_n += 1
             if chart_bot and rows:
                 png = await loop.run_in_executor(
                     None, lambda t=t, rows=rows, it=it: chart.render_candle_volume(
@@ -440,8 +443,8 @@ async def _post_charts_and_meta(results: dict, max_tickers: int = 120) -> tuple[
                     await asyncio.sleep(3.0)  # 채널 ~20건/분 한도 → 게시 간 간격 (성공/실패 무관 페이싱)
         except Exception:
             log.exception("[us_screener] 티커 처리 실패 %s", t)
-    log.info("[us_screener] 채널 게시 %d건 · 메타 %d종목 (links=%d)",
-             posted, len(extra), len(links))
+    log.info("[us_screener] 채널 게시 %d건 · 메타 %d종목 (links=%d, 시총확보=%d)",
+             posted, len(extra), len(links), mcap_n)
     return links, extra
 
 
