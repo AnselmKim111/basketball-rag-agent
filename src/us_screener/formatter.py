@@ -57,15 +57,23 @@ def _fmt_pct_or_na(v) -> str:
 
 
 def _format_section(items: list[dict], emoji: str, title: str,
-                    links: dict | None = None, extra: dict | None = None) -> str:
-    """4열 평면 포맷 (티커 / 당일 / 연초대비 / EPS YoY). 티커는 채널 게시물로 하이퍼링크."""
+                    links: dict | None = None, extra: dict | None = None,
+                    seen: set | None = None) -> str:
+    """4열 평면 포맷 (티커 / 당일 / 연초대비 / EPS YoY). 티커는 채널 게시물로 하이퍼링크.
+
+    seen: 앞 섹션에서 이미 표시된 티커 집합 — 중복 제거(앞에 나온 종목은 뒷 섹션서 제외).
+    """
     links = links or {}
     extra = extra or {}
+    seen = seen if seen is not None else set()
+    items = [it for it in items if it.get("ticker") not in seen]
     head = f"━━━ {emoji} {title} ({len(items)}) ━━━"
     if not items:
         return head + "\n해당 없음\n"
     cap = _per_category_top()
     items_sorted = sorted(items, key=lambda it: -(it.get("chg_pct") or 0.0))
+    for it in items_sorted:
+        seen.add(it.get("ticker"))
     items_capped = items_sorted[:cap]
     rest = len(items) - len(items_capped)
     lines = [head, "(티커 / 당일 / 연초대비 / EPS YoY)"]
@@ -122,33 +130,20 @@ def format_results(
     if stats:
         proc = stats.get("processed", 0)
         skipped_no_base = stats.get("skipped_no_base", 0)
-        validated = stats.get("validated", -1)
-        rejected = stats.get("rejected", -1)
-        verify_lines = [f"✓ {proc}종목 신호 계산 (시총 $1B+)"]
+        line = f"✓ {proc}종목 신호 계산 (시총 $1B+)"
         if skipped_no_base > 0:
-            verify_lines[-1] += f" · {skipped_no_base}종목 base_date 데이터 누락"
-        if validated >= 0:
-            v_line = f"✓ 이중확인: 재 fetch로 {validated}종목 정합성 통과"
-            if rejected > 0:
-                v_line += f" · {rejected}종목 불일치/누락 제외"
-            verify_lines.append(v_line)
-        parts.append("\n".join(verify_lines))
-    parts.append("(티커 클릭 → 채널의 1년 일봉 차트·상세) · 당일 등락 내림차순\n")
+            line += f" · {skipped_no_base}종목 base_date 데이터 누락"
+        parts.append(line)
 
-    all_signals: list[dict] = []
-    for v in results.values():
-        all_signals.extend(v)
-    sec_summary = _sector_summary(all_signals)
-    if sec_summary:
-        parts.append(f"🏷️ 주요 섹터: {sec_summary}\n")
+    # 앞에 나온 종목은 뒷 섹션서 제외 (역사적 신고가 → 52주 신고가 순으로 dedup)
+    seen: set = set()
+    parts.append(_format_section(results.get("high_all", []), "🚀", "역사적 신고가", links, extra, seen))
+    parts.append(_format_section(results.get("high_52w", []), "📈", "52주 신고가", links, extra, seen))
+    parts.append(_format_section(results.get("vcp_breakout", []), "💎", "VCP 돌파 (최근 2주 이내)", links, extra, seen))
+    parts.append(_format_section(results.get("near_breakout_52w", []), "🎯", "52주 돌파 직전 95-99%", links, extra, seen))
 
-    parts.append(_format_section(results.get("high_all", []), "🚀", "역사적 신고가", links, extra))
-    parts.append(_format_section(results.get("high_52w", []), "📈", "52주 신고가", links, extra))
-    parts.append(_format_section(results.get("vcp_breakout", []), "💎", "VCP 돌파 (최근 2주 이내)", links, extra))
-    parts.append(_format_section(results.get("volume_breakout", []), "🔥", "거래량 돌파 ≥2배", links, extra))
-    parts.append(_format_section(results.get("near_breakout_52w", []), "🎯", "52주 돌파 직전 95-99%", links, extra))
-
-    total = sum(len(v) for v in results.values())
+    total = sum(len(results.get(k, [])) for k in
+                ("high_all", "high_52w", "vcp_breakout", "near_breakout_52w"))
     if total == 0:
         parts.append("\n오늘은 신호 발생 종목이 없습니다.")
 
