@@ -71,13 +71,31 @@ def _quarterly_eps(facts: dict) -> list[dict]:
     return []
 
 
-def eps_yoy(ticker: str, use_cache: bool = True) -> float | None:
-    """최근분기 diluted EPS YoY %. 데이터 부족/전년 음수기준이면 None. 결과는 캐시."""
+def _latest_shares(facts: dict) -> float | None:
+    """발행주식수 — dei:EntityCommonStockSharesOutstanding 최신값. 폴백 us-gaap 가중평균."""
+    root = facts.get("facts", facts)
+    for ns, tag in (("dei", "EntityCommonStockSharesOutstanding"),
+                    ("us-gaap", "WeightedAverageNumberOfDilutedSharesOutstanding"),
+                    ("us-gaap", "CommonStockSharesOutstanding")):
+        node = (root.get(ns) or {}).get(tag)
+        if not node:
+            continue
+        arr = (node.get("units") or {}).get("shares") or []
+        vals = [e for e in arr if e.get("val") and e.get("end")]
+        if vals:
+            vals.sort(key=lambda e: str(e.get("end")))
+            return float(vals[-1]["val"])
+    return None
+
+
+def ticker_fundamentals(ticker: str, use_cache: bool = True) -> dict:
+    """{eps_yoy, shares, eps_asof}. companyfacts 1회 fetch로 EPS+발행주식수 동시 추출, 캐시."""
     if use_cache:
         c = db.fundamentals_get(ticker)
         if c is not None:
-            return c.get("eps_yoy")
-    val: float | None = None
+            return c
+    eps_val: float | None = None
+    shares: float | None = None
     asof: str | None = None
     try:
         from src.earnings import sec_edgar
@@ -90,13 +108,26 @@ def eps_yoy(ticker: str, use_cache: bool = True) -> float | None:
                     latest = pts[-1]
                     prior = next((p for p in reversed(pts)
                                   if p["fp"] == latest["fp"] and p["fy"] == latest["fy"] - 1), None)
-                    if prior and prior["val"] > 1e-6:  # 전년 양수기준만 (YoY 의미 보존)
-                        val = round((latest["val"] - prior["val"]) / abs(prior["val"]) * 100, 1)
+                    if prior and prior["val"] > 1e-6:
+                        eps_val = round((latest["val"] - prior["val"]) / abs(prior["val"]) * 100, 1)
                         asof = latest["end"]
+                shares = _latest_shares(facts)
     except Exception:
-        log.warning("[fundamentals] %s EPS YoY 실패", ticker)
-    db.fundamentals_put(ticker, val, asof)  # None도 캐시 (재호출 방지)
-    return val
+        log.warning("[fundamentals] %s 펀더멘털 실패", ticker)
+    db.fundamentals_put(ticker, eps_val, asof, shares)  # None도 캐시(재호출 방지)
+    return {"eps_yoy": eps_val, "shares": shares, "eps_asof": asof}
+
+
+def eps_yoy(ticker: str, use_cache: bool = True) -> float | None:
+    return ticker_fundamentals(ticker, use_cache).get("eps_yoy")
+
+
+def market_cap_usd(ticker: str, close_dollars: float, use_cache: bool = True) -> float | None:
+    """시가총액(USD) = 발행주식수(SEC) × 종가($). 발행주식수 없으면 None."""
+    sh = ticker_fundamentals(ticker, use_cache).get("shares")
+    if sh and close_dollars:
+        return sh * close_dollars
+    return None
 
 
 def ytd_pct(rows: list[dict]) -> float | None:
