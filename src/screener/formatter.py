@@ -81,9 +81,10 @@ def _format_section(items: list[dict], emoji: str, title: str,
     items_capped = items_sorted[:cap]
     rest = len(items) - len(items_capped)
     lines = [head, "(종목 / 당일 / 연초대비 / EPS YoY)"]
+    from src.bot_helpers import md_escape
     for it in items_capped:
         tkr = it.get("ticker", "")
-        name = it.get("name") or tkr
+        name = md_escape(it.get("name") or tkr)
         chg = _fmt_pct(it.get("chg_pct", 0.0))
         ex = extra.get(tkr, {})
         ytd = _fmt_pct_or_na(ex.get("ytd"))

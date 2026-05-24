@@ -358,7 +358,8 @@ def _permalink(channel: str, message_id: int) -> str | None:
 
 def _chart_caption(ticker: str, item: dict, cats: list[str], rows: list[dict], ytd, eps) -> str:
     from src.screener import fundamentals
-    name = item.get("name") or ticker
+    from src.bot_helpers import md_escape
+    name = md_escape(item.get("name") or ticker)
     chg = item.get("chg_pct") or 0.0
     turnover = fundamentals.turnover_won(rows[-1]) if rows else 0
     badge = " ".join(_BADGE[c] for c in cats if c in _BADGE)
