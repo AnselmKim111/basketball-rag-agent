@@ -194,10 +194,10 @@ def _build_report():
         "섹터·테마 상대강도", "1M/3M 정렬", "3. 섹터 로테이션 맵")
     add(rotation_charts.region_compare(region_etfs, img_dir, date_iso=date_iso),
         "글로벌 지역 비교", "지역 디커플링", "3. 섹터 로테이션 맵")
-    for i, r in enumerate(theme_rows[:8], 1):
+    for i, r in enumerate(theme_rows[:16], 1):
         lbl = r["label"]
         add(index_charts.theme_chart(combined_themes.get(lbl), lbl, img_dir,
-            f"12_theme_{i:02d}.png", date_iso=date_iso), lbl, "캔들+MA+추세", "3. 섹터 로테이션 맵")
+            f"12_theme_{i:02d}.png", date_iso=date_iso), lbl, "캔들+MA+거래량", "3. 섹터 로테이션 맵")
 
     breadth: dict = {}
     try:
