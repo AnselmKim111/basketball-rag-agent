@@ -17,23 +17,26 @@ def us_indices_grid(dfs: dict[str, object], out_dir: Path, filename: str = "01_u
     items = [(k, dfs[k]) for k in ("DOW", "NASDAQ", "S&P500", "Russell2000") if k in dfs]
     if not items:
         return None
-    fig, axes = plt.subplots(2, 2, figsize=(13, 7.3))
+    import numpy as np
+    fig, axes = plt.subplots(2, 2, figsize=(13, 7.6))
     axes = axes.flatten()
     for i, (label, df) in enumerate(items[:4]):
         ax = axes[i]
-        close = df["Close"].iloc[-120:]
+        n = min(120, len(df))
+        close = df["Close"]
         last = float(close.iloc[-1]); prev = float(close.iloc[-2]) if len(close) > 1 else last
         chg = (last / prev - 1) * 100 if prev else 0
         color = theme.COLOR_UP if chg >= 0 else theme.COLOR_DOWN
-        ax.plot(close.index, close.values, color=color, linewidth=1.6)
-        if len(df) >= 20:
-            ma20 = df["Close"].iloc[-120:].rolling(20).mean()
-            ax.plot(ma20.index, ma20.values, color=theme.COLOR_MA[1], linewidth=0.9, alpha=0.8, label="20MA")
+        theme.candlestick(ax, df, n=n)
+        if len(close) >= 20:
+            ma20 = close.rolling(20).mean().iloc[-n:].values
+            ax.plot(np.arange(n), ma20, color=theme.COLOR_MA[1], linewidth=0.9, alpha=0.85, label="20MA")
         ax.set_title(f"{label}  {last:,.0f}  ({chg:+.2f}%)", fontsize=12, color=color)
-        ax.tick_params(labelsize=8)
+        ax.tick_params(labelsize=7)
+        theme.date_xticks(ax, df.index, n=n, count=5)
     for j in range(len(items), 4):
         axes[j].set_axis_off()
-    fig.suptitle("미국 4대 지수 (최근 120일)", fontsize=13)
+    fig.suptitle("미국 4대 지수 (일봉, 최근 120일)", fontsize=13)
     theme.stamp(axes[min(len(items), 4) - 1], date_iso)
     fig.tight_layout()
     return theme.save_fig(fig, out_dir, filename)

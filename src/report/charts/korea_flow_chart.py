@@ -31,6 +31,7 @@ def flow_multipanel(
     """
     theme.setup()
     import matplotlib.pyplot as plt
+    import numpy as np
     if price_df is None or len(price_df) < 20:
         return None
 
@@ -42,19 +43,22 @@ def flow_multipanel(
     if n_panels == 1:
         axes = [axes]
 
-    close = price_df["Close"].iloc[-180:]
-    # 1단: 가격 + MA
+    n = min(180, len(price_df))
+    close = price_df["Close"]
+    # 1단: 일봉 캔들 + MA
     ax = axes[0]
-    ax.plot(close.index, close.values, color=theme.COLOR_NEUTRAL, linewidth=1.5, label="종가")
+    theme.candlestick(ax, price_df, n=n)
+    x = np.arange(n)
     for w, c in ((10, theme.COLOR_MA[0]), (20, theme.COLOR_MA[1]), (50, theme.COLOR_MA[2]), (200, theme.COLOR_MA[3])):
-        if len(price_df["Close"]) >= w:
-            ma = price_df["Close"].rolling(w).mean().iloc[-180:]
-            ax.plot(ma.index, ma.values, color=c, linewidth=0.9, alpha=0.8, label=f"{w}MA")
+        if len(close) >= w:
+            ma = close.rolling(w).mean().iloc[-n:].values
+            ax.plot(x, ma, color=c, linewidth=0.9, alpha=0.85, label=f"{w}MA")
     last = float(close.iloc[-1]); prev = float(close.iloc[-2])
     chg = (last / prev - 1) * 100 if prev else 0
     ax.set_title(f"{title}  {last:,.1f} ({chg:+.2f}%)", fontsize=12)
     ax.legend(fontsize=7, loc="upper left", ncol=5)
     ax.tick_params(labelsize=7)
+    theme.date_xticks(ax, price_df.index, n=n, count=6)
 
     # 2단: 이격도 (종가/20MA - 1)
     ax = axes[1]

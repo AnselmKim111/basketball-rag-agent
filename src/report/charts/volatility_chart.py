@@ -41,6 +41,18 @@ def _pick(macro: dict[str, object], *needles: str):
     return None, None
 
 
+def _pick_df(macro: dict[str, object], *needles: str):
+    """라벨에 needle 포함된 첫 OHLC DataFrame 반환 (최근 180일). 없으면 (None, None)."""
+    for k, v in macro.items():
+        if any(nd in k for nd in needles):
+            try:
+                if v is not None and len(v) >= 5:
+                    return k, v.iloc[-180:]
+            except Exception:
+                continue
+    return None, None
+
+
 def _chg(s) -> float:
     last = float(s.iloc[-1]); prev = float(s.iloc[-2]) if len(s) > 1 else last
     return (last / prev - 1) * 100 if prev else 0.0
@@ -136,19 +148,29 @@ def vol_chart(macro: dict[str, object], out_dir: Path,
 
 def single_macro(macro: dict[str, object], out_dir: Path, filename: str,
                  *needles: str, date_iso: str | None = None) -> str | None:
-    """단일 매크로 지표 큰 라인 차트 (달러 인덱스·비트코인 등)."""
+    """단일 매크로 지표 큰 일봉 캔들 차트 (달러 인덱스·비트코인 등). OHLC 없으면 라인 폴백."""
     theme.setup()
     import matplotlib.pyplot as plt
-    k, s = _pick(macro, *needles)
-    if s is None:
+    import numpy as np
+    k, df = _pick_df(macro, *needles)
+    if df is None:
         return None
-    chg = _chg(s)
+    close = df["Close"]
+    chg = _chg(close)
     color = theme.COLOR_UP if chg >= 0 else theme.COLOR_DOWN
-    fig, ax = plt.subplots(figsize=(13, 4.5))
-    ax.plot(s.index, s.values, color=color, linewidth=1.8)
-    ax.fill_between(s.index, s.values, float(s.min()), color=color, alpha=0.06)
-    ax.scatter([s.index[-1]], [float(s.iloc[-1])], color=color, s=28, zorder=5)
-    ax.set_title(f"{k}  {float(s.iloc[-1]):,.2f}  ({chg:+.2f}%)", fontsize=13, color=color)
+    fig, ax = plt.subplots(figsize=(13, 4.6))
+    n = len(df)
+    has_ohlc = all(c in df.columns for c in ("Open", "High", "Low"))
+    if has_ohlc:
+        theme.candlestick(ax, df, n=n)
+        if n >= 20:
+            ax.plot(np.arange(n), close.rolling(20).mean().iloc[-n:].values,
+                    color=theme.COLOR_MA[1], linewidth=1.0, alpha=0.85, label="20MA")
+        theme.date_xticks(ax, df.index, n=n)
+    else:
+        ax.plot(close.index, close.values, color=color, linewidth=1.8)
+        ax.fill_between(close.index, close.values, float(close.min()), color=color, alpha=0.06)
+    ax.set_title(f"{k}  {float(close.iloc[-1]):,.2f}  ({chg:+.2f}%)", fontsize=13, color=color)
     ax.tick_params(labelsize=9)
     theme.stamp(ax, date_iso)
     fig.tight_layout()

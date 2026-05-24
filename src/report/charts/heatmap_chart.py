@@ -24,12 +24,28 @@ _TV_EDGE = "#131722"      # 타일 경계(배경색 → 얇은 간격 효과)
 
 
 def _tv_norm_cmap(vmin: float = -3.0, vmax: float = 3.0):
-    """TradingView식 디버징 컬러맵 — 적(하락)↔다크그레이(보합)↔녹(상승)."""
+    """TradingView 히트맵 팔레트 — 적(하락)↔다크슬레이트(보합)↔녹(상승). 녹=상승."""
     from matplotlib import colors
     cmap = colors.LinearSegmentedColormap.from_list(
         "tvheat",
-        ["#f23645", "#922a33", "#5c2a30", "#2b2f3a", "#1f6b54", "#22a06b", "#16c784"])
+        ["#f7525f", "#a93b40", "#2a2e39", "#2f7d63", "#22ab94"])
     return colors.Normalize(vmin=vmin, vmax=vmax), cmap
+
+
+def _tv_legend(fig, cmap, vmin: float, vmax: float, label: str = "Performance %"):
+    """TradingView식 하단 컬러 범례 스트립 (그라데이션 + % 눈금)."""
+    import numpy as np
+    cax = fig.add_axes([0.355, 0.022, 0.29, 0.016])
+    grad = np.linspace(vmin, vmax, 256).reshape(1, -1)
+    cax.imshow(grad, aspect="auto", cmap=cmap, extent=[vmin, vmax, 0, 1])
+    cax.set_yticks([])
+    ticks = [vmin, vmin / 2, 0, vmax / 2, vmax]
+    cax.set_xticks(ticks)
+    cax.set_xticklabels([f"{t:+.0f}%" if t else "0%" for t in ticks], fontsize=7, color=_TV_FG)
+    cax.tick_params(length=0, pad=2)
+    for s in cax.spines.values():
+        s.set_visible(False)
+    cax.set_title(label, fontsize=7.5, color=_TV_FG, pad=2)
 
 
 def _diverging(vmin=-3.0, vmax=3.0):
@@ -95,8 +111,9 @@ def sp500_heatmap(
     sec_order = sorted(groups, key=lambda sec: -sum(size_of(s) for s in groups[sec]))
 
     W, H = 100.0, 60.0
-    fig, ax = plt.subplots(figsize=(16, 9.6))
+    fig = plt.figure(figsize=(16, 9.6))
     fig.patch.set_facecolor(_TV_BG)
+    ax = fig.add_axes([0.004, 0.065, 0.992, 0.90])  # 캔버스 거의 전체 채움
     ax.set_facecolor(_TV_BG)
     ax.set_xlim(0, W); ax.set_ylim(0, H); ax.axis("off")
 
@@ -107,27 +124,29 @@ def sp500_heatmap(
         sec_rects = squarify.squarify(sec_sizes, 0, 0, W, H)
         for sec, rect in zip(sec_order, sec_rects):
             stocks = sorted(groups[sec], key=lambda s: -size_of(s))
-            pad = 0.35
-            x0, y0 = rect["x"] + pad, rect["y"] + pad
-            dx = max(rect["dx"] - 2 * pad, 0.1); dy = max(rect["dy"] - 2 * pad, 0.1)
+            hdr = 1.4 if rect["dy"] > 6 else 0.0  # 섹터 헤더 공간
+            pad = 0.18
+            x0 = rect["x"] + pad; y0 = rect["y"] + pad
+            dx = max(rect["dx"] - 2 * pad, 0.1); dy = max(rect["dy"] - hdr - 2 * pad, 0.1)
             st_sizes = squarify.normalize_sizes([size_of(s) for s in stocks], dx, dy)
             st_rects = squarify.squarify(st_sizes, x0, y0, dx, dy)
             for s, r in zip(stocks, st_rects):
                 col = cmap(norm(max(-6, min(6, changes[s]))))
                 ax.add_patch(plt.Rectangle((r["x"], r["y"]), r["dx"], r["dy"],
-                             facecolor=col, edgecolor=_TV_EDGE, linewidth=1.0))
-                if r["dx"] > 3.6 and r["dy"] > 2.6:
-                    fs_t = max(6, min(15, int(min(r["dx"] * 0.95, r["dy"] * 1.6))))
-                    ax.text(r["x"] + r["dx"] / 2, r["y"] + r["dy"] / 2 + r["dy"] * 0.10,
+                             facecolor=col, edgecolor=_TV_BG, linewidth=1.4))
+                if r["dx"] > 3.2 and r["dy"] > 2.4:
+                    fs_t = max(6, min(16, int(min(r["dx"] * 0.95, r["dy"] * 1.7))))
+                    ax.text(r["x"] + r["dx"] / 2, r["y"] + r["dy"] / 2 + r["dy"] * 0.11,
                             s, ha="center", va="center", fontsize=fs_t,
                             color="white", fontweight="bold")
-                    ax.text(r["x"] + r["dx"] / 2, r["y"] + r["dy"] / 2 - r["dy"] * 0.22,
-                            f"{changes[s]:+.1f}%", ha="center", va="center",
-                            fontsize=max(5, int(fs_t * 0.62)), color="white")
-            # 섹터 라벨
-            ax.text(rect["x"] + 0.5, rect["y"] + rect["dy"] - 0.3, sec,
-                    ha="left", va="top", fontsize=8.5, color=_TV_FG, alpha=0.85,
-                    fontweight="bold")
+                    ax.text(r["x"] + r["dx"] / 2, r["y"] + r["dy"] / 2 - r["dy"] * 0.24,
+                            f"{changes[s]:+.2f}%", ha="center", va="center",
+                            fontsize=max(5, int(fs_t * 0.6)), color="white")
+            # 섹터 헤더 (TradingView식 대문자 그레이)
+            if hdr:
+                ax.text(rect["x"] + 0.5, rect["y"] + rect["dy"] - 0.35, sec.upper(),
+                        ha="left", va="top", fontsize=9, color="#c9cdd6", alpha=0.9,
+                        fontweight="bold")
     except Exception:
         log.warning("[heatmap] squarify 미사용 → grid fallback", exc_info=True)
         cols = int(math.ceil(math.sqrt(len(syms))))
@@ -137,7 +156,7 @@ def sp500_heatmap(
             r, c = divmod(i, cols)
             col = cmap(norm(max(-6, min(6, changes[s]))))
             ax.add_patch(plt.Rectangle((c, rows - r - 1), 0.95, 0.95,
-                         facecolor=col, edgecolor=_TV_EDGE, linewidth=1.0))
+                         facecolor=col, edgecolor=_TV_BG, linewidth=1.4))
             ax.text(c + 0.47, rows - r - 0.4, s, ha="center", va="center",
                     fontsize=7, color="white", fontweight="bold")
             ax.text(c + 0.47, rows - r - 0.65, f"{changes[s]:+.1f}%",
@@ -145,10 +164,10 @@ def sp500_heatmap(
 
     up = sum(1 for s in syms if changes[s] > 0)
     weight_txt = "시총 가중" if cap_weighted else "당일 등락(균등)"
-    title = (f"S&P500 히트맵 — {weight_txt}  ·  녹=상승  ·  상승 {up}/{len(syms)}"
+    title = (f"S&P500 히트맵 — {weight_txt}  ·  상승 {up}/{len(syms)}"
              + (f"  ·  기준 {date_iso}" if date_iso else ""))
-    fig.suptitle(title, fontsize=14, color="white", fontweight="bold")
-    fig.tight_layout()
+    fig.suptitle(title, fontsize=14, color="white", fontweight="bold", y=0.985)
+    _tv_legend(fig, cmap, -3, 3, label="당일 등락 % (녹=상승)")
     return theme.save_fig(fig, out_dir, filename)
 
 
@@ -168,8 +187,9 @@ def theme_rotation_heatmap(rows: list[dict], out_dir: Path, filename: str = "03_
         return base + 2.0  # 최소 크기 보장(작은 테마도 보이게)
 
     W, H = 100.0, 58.0
-    fig, ax = plt.subplots(figsize=(15, 8.8))
+    fig = plt.figure(figsize=(15, 8.8))
     fig.patch.set_facecolor(_TV_BG)
+    ax = fig.add_axes([0.004, 0.07, 0.992, 0.89])
     ax.set_facecolor(_TV_BG)
     ax.set_xlim(0, W); ax.set_ylim(0, H); ax.axis("off")
 
@@ -182,7 +202,7 @@ def theme_rotation_heatmap(rows: list[dict], out_dir: Path, filename: str = "03_
             v5 = r["r5d"]
             col = cmap(norm(max(-6, min(6, v5))))
             ax.add_patch(plt.Rectangle((rect["x"], rect["y"]), rect["dx"], rect["dy"],
-                         facecolor=col, edgecolor=_TV_EDGE, linewidth=1.2))
+                         facecolor=col, edgecolor=_TV_BG, linewidth=1.4))
             if rect["dx"] > 6 and rect["dy"] > 4.5:
                 fs = max(7, min(13, int(rect["dx"] * 0.42)))
                 v1 = r.get("r1d"); v1m = r.get("r1m")
@@ -215,10 +235,10 @@ def theme_rotation_heatmap(rows: list[dict], out_dir: Path, filename: str = "03_
             ax.text(cc + 0.48, rws - rr - 0.64, f"1D {v1s} · 5D {v5:+.1f}%",
                     ha="center", va="center", fontsize=7, color="white")
 
-    title = ("테마·섹터 로테이션 — 크기=1M 강도, 색=5D 모멘텀  ·  녹=상승"
+    title = ("테마·섹터 로테이션 — 크기=1M 강도, 색=5D 모멘텀"
              + (f"  ·  기준 {date_iso}" if date_iso else ""))
-    fig.suptitle(title, fontsize=14, color="white", fontweight="bold")
-    fig.tight_layout()
+    fig.suptitle(title, fontsize=14, color="white", fontweight="bold", y=0.985)
+    _tv_legend(fig, cmap, -6, 6, label="5D 모멘텀 % (녹=상승)")
     return theme.save_fig(fig, out_dir, filename)
 
 
