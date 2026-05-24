@@ -356,7 +356,7 @@ def _permalink(channel: str, message_id: int) -> str | None:
 
 
 def _chart_caption(ticker: str, item: dict, cats: list[str], rows: list[dict],
-                   ytd, eps) -> str:
+                   ytd, eps, market_cap=None) -> str:
     from src.us_screener import fundamentals
     name = item.get("name") or ticker
     chg = item.get("chg_pct") or 0.0
@@ -367,7 +367,7 @@ def _chart_caption(ticker: str, item: dict, cats: list[str], rows: list[dict],
         badge,
         "",
         f"✝ 종목명 : {name}",
-        f"✝ 시가총액 : {_fmt_usd(item.get('market_cap'))}",
+        f"✝ 시가총액 : {_fmt_usd(market_cap)}",
         f"✝ 거래대금 : {_fmt_usd(turnover)}",
         f"✝ 연초대비 상승률 : {_fmt_pct(ytd)}",
         f"✝ 최근분기 EPS YoY : {_fmt_pct(eps)}",
@@ -414,14 +414,19 @@ async def _post_charts_and_meta(results: dict, max_tickers: int = 120) -> tuple[
         try:
             rows = await loop.run_in_executor(None, lambda t=t: db.load_ohlcv(t, days=260))
             ytd = fundamentals.ytd_pct(rows)
-            eps = await loop.run_in_executor(None, lambda t=t: fundamentals.eps_yoy(t))
+            f = await loop.run_in_executor(None, lambda t=t: fundamentals.ticker_fundamentals(t))
+            eps = f.get("eps_yoy")
             extra[t] = {"ytd": ytd, "eps_yoy": eps}
+            # 시가총액: DB값 우선, 없으면 SEC 발행주식수 × 종가($)
+            mcap = it.get("market_cap")
+            if not mcap and rows and f.get("shares"):
+                mcap = (rows[-1]["close"] / 100.0) * f["shares"]
             if chart_bot and rows:
                 png = await loop.run_in_executor(
                     None, lambda t=t, rows=rows, it=it: chart.render_candle_volume(
                         t, rows, title=f"{t} — {it.get('name', '')}"))
                 if png:
-                    cap = _chart_caption(t, it, badges[t], rows, ytd, eps)
+                    cap = _chart_caption(t, it, badges[t], rows, ytd, eps, market_cap=mcap)
                     msg = await chart_bot.send_photo(chat_id=channel, photo=png, caption=cap,
                                                      parse_mode=ParseMode.MARKDOWN)
                     url = _permalink(channel, msg.message_id)
