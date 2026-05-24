@@ -173,8 +173,16 @@ def _build_report():
     add(index_charts.indices_normalized(us_idx, img_dir, date_iso=date_iso),
         "미국 4대 지수 (1Y 리베이스)", "상대 강도", "1. 매크로 컨텍스트")
     if macro:
-        add(volatility_chart.macro_grid(macro, img_dir),
-            "매크로 대시보드", "금리·유가·달러·VIX·BTC", "1. 매크로 컨텍스트", key=True)
+        add(volatility_chart.rates_curve(macro, img_dir, date_iso=date_iso),
+            "미국 국채 금리 곡선", "3M·10Y·30Y + 장단기 스프레드", "1. 매크로 컨텍스트", key=True)
+        add(volatility_chart.oil_chart(macro, img_dir, date_iso=date_iso),
+            "국제 유가", "WTI·Brent", "1. 매크로 컨텍스트")
+        add(volatility_chart.single_macro(macro, img_dir, "23_macro_dxy.png", "달러 인덱스", date_iso=date_iso),
+            "달러 인덱스", "DXY — 위험선호 척도", "1. 매크로 컨텍스트")
+        add(volatility_chart.vol_chart(macro, img_dir, date_iso=date_iso),
+            "변동성 게이지", "VIX·OVX", "1. 매크로 컨텍스트", key=True)
+        add(volatility_chart.single_macro(macro, img_dir, "24_macro_btc.png", "비트코인", date_iso=date_iso),
+            "비트코인", "위험선호 자산", "1. 매크로 컨텍스트")
     for i, (label, df) in enumerate(fred.items(), 1):
         add(volatility_chart.macro_line(df, label, img_dir, f"04_fred_{i:02d}.png"),
             label, "FRED 매크로", "1. 매크로 컨텍스트")
