@@ -210,11 +210,13 @@ def _build_report():
     breadth: dict = {}
     try:
         from src.report.data import fetch_us_breadth
-        caps, changes, sectors = fetch_us_breadth.load_us_market_map(top_n=140)
-        log.info("[report] S&P500 맵: caps=%d sectors=%d changes=%d", len(caps), len(sectors), len(changes))
-        if changes:  # 등락만 있어도 트리맵은 (caps 비면 균등으로) 항상 렌더
-            add(heatmap_chart.sp500_heatmap(caps, changes, sectors, img_dir, date_iso=date_iso),
-                "S&P500 히트맵", "시총 가중 — 시장 폭 (녹=상승)", "3. 섹터 로테이션 맵", key=True)
+        caps, changes, sectors, industries = fetch_us_breadth.load_us_market_map(top_n=500)
+        log.info("[report] S&P500 맵: caps=%d sectors=%d industries=%d changes=%d",
+                 len(caps), len(sectors), len(industries), len(changes))
+        if changes:  # 개별 종목 시총 트리맵 (TradingView식)
+            add(heatmap_chart.sp500_heatmap(caps, changes, sectors, img_dir,
+                date_iso=date_iso, industries=industries),
+                "S&P500 히트맵", "개별 종목 시총 가중 — 시장 폭 (녹=상승)", "3. 섹터 로테이션 맵", key=True)
             adv = sum(1 for v in changes.values() if v > 0)
             breadth["advancers"] = adv
             breadth["total"] = len(changes)

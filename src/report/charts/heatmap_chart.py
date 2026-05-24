@@ -79,17 +79,19 @@ def sp500_heatmap(
     sectors: dict[str, str],
     out_dir: Path,
     filename: str = "02_sp500_heatmap.png",
-    top_n: int = 140,
+    top_n: int = 500,
     date_iso: str | None = None,
+    industries: dict[str, str] | None = None,
 ) -> str | None:
-    """시총 가중 트리맵 (TradingView 룩). 크기=시총, 색=당일 등락(녹=상승).
+    """TradingView식 개별 종목 히트맵 — 시총 상위 top_n 종목을 섹터→세부산업으로 묶어
+    크기=시총·색=당일등락(녹=상승)으로 트리맵. 수백 종목을 한눈에.
 
-    caps가 비어도 changes만 있으면 |등락| 기반 균등 트리맵으로 렌더 — 절대 빈 화면 없음.
+    caps가 비어도 changes만 있으면 |등락| 기반 균등 트리맵으로 렌더(빈 화면 없음).
     """
     theme.setup()
     import matplotlib.pyplot as plt
+    industries = industries or {}
 
-    # 색을 입히려면 등락이 필요 → changes 보유 종목만
     syms = [s for s in changes]
     if not syms:
         log.warning("[heatmap] sp500: 등락 데이터 0개 — 스킵")
@@ -99,53 +101,73 @@ def sp500_heatmap(
     def size_of(s: str) -> float:
         if cap_weighted and caps.get(s):
             return float(caps[s])
-        return abs(changes[s]) + 0.4  # 균등에 가깝되 큰 변동이 약간 큼
+        return abs(changes[s]) + 0.4
 
     syms = sorted(syms, key=lambda s: -size_of(s))[:top_n]
     norm, cmap = _tv_norm_cmap()
 
-    groups: dict[str, list[str]] = {}
+    sec_groups: dict[str, list[str]] = {}
     for s in syms:
-        sec = (sectors.get(s) or "기타").strip()
-        groups.setdefault(sec, []).append(s)
-    sec_order = sorted(groups, key=lambda sec: -sum(size_of(s) for s in groups[sec]))
+        sec_groups.setdefault((sectors.get(s) or "기타").strip(), []).append(s)
+    sec_order = sorted(sec_groups, key=lambda k: -sum(size_of(s) for s in sec_groups[k]))
 
-    W, H = 100.0, 60.0
-    fig = plt.figure(figsize=(16, 9.6))
+    W, H = 100.0, 62.0
+    fig = plt.figure(figsize=(17, 10))
     fig.patch.set_facecolor(_TV_BG)
-    ax = fig.add_axes([0.004, 0.065, 0.992, 0.90])  # 캔버스 거의 전체 채움
+    ax = fig.add_axes([0.004, 0.06, 0.992, 0.905])
     ax.set_facecolor(_TV_BG)
     ax.set_xlim(0, W); ax.set_ylim(0, H); ax.axis("off")
+
+    def draw_stock(s, r):
+        col = cmap(norm(max(-6, min(6, changes[s]))))
+        ax.add_patch(plt.Rectangle((r["x"], r["y"]), r["dx"], r["dy"],
+                     facecolor=col, edgecolor=_TV_BG, linewidth=0.8))
+        if r["dx"] > 2.3 and r["dy"] > 1.7:
+            fs = max(5, min(15, int(min(r["dx"] * 0.9, r["dy"] * 1.6))))
+            ax.text(r["x"] + r["dx"] / 2, r["y"] + r["dy"] / 2 + r["dy"] * 0.12, s,
+                    ha="center", va="center", fontsize=fs, color="white", fontweight="bold")
+            if r["dy"] > 2.6:
+                ax.text(r["x"] + r["dx"] / 2, r["y"] + r["dy"] / 2 - r["dy"] * 0.26,
+                        f"{changes[s]:+.2f}%", ha="center", va="center",
+                        fontsize=max(4, int(fs * 0.62)), color="white")
 
     try:
         import squarify
         sec_sizes = squarify.normalize_sizes(
-            [sum(size_of(s) for s in groups[sec]) for sec in sec_order], W, H)
+            [sum(size_of(s) for s in sec_groups[k]) for k in sec_order], W, H)
         sec_rects = squarify.squarify(sec_sizes, 0, 0, W, H)
         for sec, rect in zip(sec_order, sec_rects):
-            stocks = sorted(groups[sec], key=lambda s: -size_of(s))
-            hdr = 1.4 if rect["dy"] > 6 else 0.0  # 섹터 헤더 공간
-            pad = 0.18
-            x0 = rect["x"] + pad; y0 = rect["y"] + pad
-            dx = max(rect["dx"] - 2 * pad, 0.1); dy = max(rect["dy"] - hdr - 2 * pad, 0.1)
-            st_sizes = squarify.normalize_sizes([size_of(s) for s in stocks], dx, dy)
-            st_rects = squarify.squarify(st_sizes, x0, y0, dx, dy)
-            for s, r in zip(stocks, st_rects):
-                col = cmap(norm(max(-6, min(6, changes[s]))))
-                ax.add_patch(plt.Rectangle((r["x"], r["y"]), r["dx"], r["dy"],
-                             facecolor=col, edgecolor=_TV_BG, linewidth=1.4))
-                if r["dx"] > 3.2 and r["dy"] > 2.4:
-                    fs_t = max(6, min(16, int(min(r["dx"] * 0.95, r["dy"] * 1.7))))
-                    ax.text(r["x"] + r["dx"] / 2, r["y"] + r["dy"] / 2 + r["dy"] * 0.11,
-                            s, ha="center", va="center", fontsize=fs_t,
-                            color="white", fontweight="bold")
-                    ax.text(r["x"] + r["dx"] / 2, r["y"] + r["dy"] / 2 - r["dy"] * 0.24,
-                            f"{changes[s]:+.2f}%", ha="center", va="center",
-                            fontsize=max(5, int(fs_t * 0.6)), color="white")
-            # 섹터 헤더 (TradingView식 대문자 그레이)
+            hdr = 1.5 if rect["dy"] > 7 else 0.0
+            pad = 0.12
+            sx = rect["x"] + pad; sy = rect["y"] + pad
+            sdx = max(rect["dx"] - 2 * pad, 0.1); sdy = max(rect["dy"] - hdr - 2 * pad, 0.1)
+            stocks = sec_groups[sec]
+            if industries:
+                ind_groups: dict[str, list[str]] = {}
+                for s in stocks:
+                    ind_groups.setdefault((industries.get(s) or sec).strip(), []).append(s)
+                ind_order = sorted(ind_groups, key=lambda k: -sum(size_of(s) for s in ind_groups[k]))
+            else:
+                ind_groups = {sec: stocks}; ind_order = [sec]
+            ind_sizes = squarify.normalize_sizes(
+                [sum(size_of(s) for s in ind_groups[k]) for k in ind_order], sdx, sdy)
+            ind_rects = squarify.squarify(ind_sizes, sx, sy, sdx, sdy)
+            for ind, irect in zip(ind_order, ind_rects):
+                ihdr = 0.85 if (industries and irect["dy"] > 4 and irect["dx"] > 10) else 0.0
+                ip = 0.08
+                ix = irect["x"] + ip; iy = irect["y"] + ip
+                idx = max(irect["dx"] - 2 * ip, 0.1); idy = max(irect["dy"] - ihdr - 2 * ip, 0.1)
+                ist = sorted(ind_groups[ind], key=lambda s: -size_of(s))
+                st_sizes = squarify.normalize_sizes([size_of(s) for s in ist], idx, idy)
+                st_rects = squarify.squarify(st_sizes, ix, iy, idx, idy)
+                for s, r in zip(ist, st_rects):
+                    draw_stock(s, r)
+                if ihdr:
+                    ax.text(irect["x"] + 0.22, irect["y"] + irect["dy"] - 0.18, ind.upper()[:28],
+                            ha="left", va="top", fontsize=6.3, color="#9aa0ab", alpha=0.85)
             if hdr:
-                ax.text(rect["x"] + 0.5, rect["y"] + rect["dy"] - 0.35, sec.upper(),
-                        ha="left", va="top", fontsize=9, color="#c9cdd6", alpha=0.9,
+                ax.text(rect["x"] + 0.4, rect["y"] + rect["dy"] - 0.3, sec.upper(),
+                        ha="left", va="top", fontsize=10, color="#d6dae3", alpha=0.95,
                         fontweight="bold")
     except Exception:
         log.warning("[heatmap] squarify 미사용 → grid fallback", exc_info=True)
@@ -156,17 +178,14 @@ def sp500_heatmap(
             r, c = divmod(i, cols)
             col = cmap(norm(max(-6, min(6, changes[s]))))
             ax.add_patch(plt.Rectangle((c, rows - r - 1), 0.95, 0.95,
-                         facecolor=col, edgecolor=_TV_BG, linewidth=1.4))
-            ax.text(c + 0.47, rows - r - 0.4, s, ha="center", va="center",
-                    fontsize=7, color="white", fontweight="bold")
-            ax.text(c + 0.47, rows - r - 0.65, f"{changes[s]:+.1f}%",
-                    ha="center", va="center", fontsize=6, color="white")
+                         facecolor=col, edgecolor=_TV_BG, linewidth=0.8))
+            ax.text(c + 0.47, rows - r - 0.5, s, ha="center", va="center",
+                    fontsize=6, color="white", fontweight="bold")
 
     up = sum(1 for s in syms if changes[s] > 0)
-    weight_txt = "시총 가중" if cap_weighted else "당일 등락(균등)"
-    title = (f"S&P500 히트맵 — {weight_txt}  ·  상승 {up}/{len(syms)}"
+    title = (f"S&P500 히트맵 — 개별 종목 시총 가중 ({len(syms)}종목)  ·  상승 {up}/{len(syms)}"
              + (f"  ·  기준 {date_iso}" if date_iso else ""))
-    fig.suptitle(title, fontsize=14, color="white", fontweight="bold", y=0.985)
+    fig.suptitle(title, fontsize=14, color="white", fontweight="bold", y=0.987)
     _tv_legend(fig, cmap, -3, 3, label="당일 등락 % (녹=상승)")
     return theme.save_fig(fig, out_dir, filename)
 
