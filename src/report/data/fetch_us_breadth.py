@@ -14,6 +14,15 @@ import logging
 
 log = logging.getLogger(__name__)
 
+# FDR 리스팅은 점-클래스 티커를 무구분("BRKB")으로 줌 → Yahoo/SEC 형식으로 정규화
+_TICKER_NORM = {"BRKB": "BRK-B", "BFB": "BF-B"}
+# 버크셔는 A+B 이중클래스라 SEC 단일 주식수×종가로 시총 산출 불가 → 크기용 근사 시총 폴백
+_CAP_FALLBACK = {"BRK-B": 1_050_000_000_000}
+
+
+def _norm_ticker(s: str) -> str:
+    return _TICKER_NORM.get(s, s)
+
 
 def load_us_market_map(top_n: int = 500, universe_limit: int = 520):
     """(caps, changes, sectors, industries). 시총 상위 top_n 개별 종목.
@@ -54,7 +63,7 @@ def _sector_industry_map():
             return {}, {}
         for _, row in df.iterrows():
             try:
-                sym = str(row[sym_c]).strip().upper()
+                sym = _norm_ticker(str(row[sym_c]).strip().upper())
             except Exception:
                 continue
             if not sym or sym == "NAN":
@@ -116,5 +125,9 @@ def _caps_changes(sectors: dict, limit: int):
                 changes[s] = dc
         except Exception:
             continue
+    # SEC로 시총 산출 불가한 이중클래스(버크셔 등)는 SEC값이 틀리므로 근사 시총으로 덮어씀
+    for s, mc in _CAP_FALLBACK.items():
+        if s in changes:
+            caps[s] = mc
     log.info("[us_breadth] SEC 폴백 시총 %d개·등락 %d개", len(caps), len(changes))
     return caps, changes

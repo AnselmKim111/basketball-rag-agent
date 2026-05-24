@@ -92,11 +92,12 @@ def sp500_heatmap(
     import matplotlib.pyplot as plt
     industries = industries or {}
 
-    syms = [s for s in changes]
-    if not syms:
+    if not changes:
         log.warning("[heatmap] sp500: 등락 데이터 0개 — 스킵")
         return None
-    cap_weighted = bool(caps) and sum(1 for s in syms if caps.get(s)) >= max(10, len(syms) // 3)
+    cap_weighted = bool(caps) and sum(1 for s in changes if caps.get(s)) >= max(10, len(changes) // 3)
+    # 시총 가중 모드면 시총 있는 종목만 (시총 없는 종목이 작게 잘못 표시되는 것 방지)
+    syms = [s for s in changes if caps.get(s)] if cap_weighted else list(changes.keys())
 
     def size_of(s: str) -> float:
         if cap_weighted and caps.get(s):
