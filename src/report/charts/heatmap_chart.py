@@ -124,16 +124,18 @@ def sp500_heatmap(
         ax.add_patch(plt.Rectangle((r["x"], r["y"]), r["dx"], r["dy"],
                      facecolor=col, edgecolor=_TV_BG, linewidth=1.0))
         if r["dx"] > 1.8 and r["dy"] > 1.4:
-            # 종목명·등락이 한눈에 보이도록 타일 크기에 비례해 큼직하게
-            fs = max(8, min(46, int(min(r["dx"] * 1.55, r["dy"] * 2.1))))
-            show_pct = r["dy"] > 2.0
-            ty = r["y"] + r["dy"] / 2 + (r["dy"] * 0.14 if show_pct else 0)
-            ax.text(r["x"] + r["dx"] / 2, ty, s, ha="center", va="center",
-                    fontsize=fs, color="white", fontweight="bold")
+            # 종목명 살짝 더 크게. 등락 %는 종목명과 동일 크기·볼드.
+            fs = max(9, min(50, int(min(r["dx"] * 1.7, r["dy"] * 2.3))))
+            cx = r["x"] + r["dx"] / 2; cy = r["y"] + r["dy"] / 2
+            show_pct = r["dy"] > 2.3
             if show_pct:
-                ax.text(r["x"] + r["dx"] / 2, r["y"] + r["dy"] / 2 - r["dy"] * 0.28,
-                        f"{changes[s]:+.2f}%", ha="center", va="center",
-                        fontsize=max(6, int(fs * 0.62)), color="white")
+                ax.text(cx, cy + r["dy"] * 0.18, s, ha="center", va="center",
+                        fontsize=fs, color="white", fontweight="bold")
+                ax.text(cx, cy - r["dy"] * 0.20, f"{changes[s]:+.2f}%", ha="center", va="center",
+                        fontsize=fs, color="white", fontweight="bold")
+            else:
+                ax.text(cx, cy, s, ha="center", va="center",
+                        fontsize=fs, color="white", fontweight="bold")
 
     try:
         import squarify
