@@ -429,14 +429,15 @@ async def _post_charts_and_meta(results: dict, max_tickers: int = 120) -> tuple[
                     None, lambda t=t, rows=rows, it=it: chart.render_candle_volume(
                         t, rows, title=f"{t} — {it.get('name', '')}"))
                 if png:
+                    from src.bot_helpers import send_channel_photo
                     cap = _chart_caption(t, it, badges[t], rows, ytd, eps, market_cap=mcap)
-                    msg = await chart_bot.send_photo(chat_id=channel, photo=png, caption=cap,
-                                                     parse_mode=ParseMode.MARKDOWN)
-                    url = _permalink(channel, msg.message_id)
-                    if url:
-                        links[t] = url
-                    posted += 1
-                    await asyncio.sleep(1.2)  # 채널 레이트리밋
+                    msg = await send_channel_photo(chart_bot, channel, png, cap, ParseMode.MARKDOWN)
+                    if msg:
+                        url = _permalink(channel, msg.message_id)
+                        if url:
+                            links[t] = url
+                        posted += 1
+                    await asyncio.sleep(3.0)  # 채널 ~20건/분 한도 → 게시 간 간격 (성공/실패 무관 페이싱)
         except Exception:
             log.exception("[us_screener] 티커 처리 실패 %s", t)
     log.info("[us_screener] 채널 게시 %d건 · 메타 %d종목 (links=%d)",

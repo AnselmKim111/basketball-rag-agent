@@ -139,7 +139,7 @@ def format_results(
     seen: set = set()
     parts.append(_format_section(results.get("high_all", []), "🚀", "역사적 신고가", links, extra, seen))
     parts.append(_format_section(results.get("high_52w", []), "📈", "52주 신고가", links, extra, seen))
-    parts.append(_format_section(results.get("vcp_breakout", []), "💎", "VCP 돌파 (최근 2주 이내)", links, extra, seen))
+    parts.append(_format_section(results.get("vcp_breakout", []), "💎", "VCP 돌파 (최근 1주 이내)", links, extra, seen))
     parts.append(_format_section(results.get("near_breakout_52w", []), "🎯", "52주 돌파 직전 95-99%", links, extra, seen))
 
     total = sum(len(results.get(k, [])) for k in

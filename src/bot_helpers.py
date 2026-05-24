@@ -40,6 +40,27 @@ def md_escape(s: str) -> str:
     return s
 
 
+async def send_channel_photo(bot, chat_id, photo, caption=None, parse_mode=None, attempts: int = 4):
+    """채널에 사진 게시 — RetryAfter(flood control) 자동 대기·재시도.
+
+    성공 시 Message, 실패 시 None. 채널은 ~20건/분 한도라 호출측에서 간격(>=3s)도 둘 것.
+    """
+    import asyncio
+    from telegram.error import RetryAfter
+    for i in range(attempts):
+        try:
+            return await bot.send_photo(chat_id=chat_id, photo=photo, caption=caption,
+                                        parse_mode=parse_mode)
+        except RetryAfter as e:
+            wait = int(getattr(e, "retry_after", 5)) + 1
+            log.warning("send_channel_photo RetryAfter %ds (try %d/%d)", wait, i + 1, attempts)
+            await asyncio.sleep(wait)
+        except Exception:
+            log.exception("send_channel_photo 실패 (chat_id=%s)", chat_id)
+            return None
+    return None
+
+
 # ------------------------------------------------------------------
 # 인가 (chat_id allowlist)
 # ------------------------------------------------------------------
