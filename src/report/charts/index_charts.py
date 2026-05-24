@@ -74,9 +74,9 @@ def indices_normalized(dfs: dict[str, object], out_dir: Path, filename: str = "0
 
 def theme_chart(df, label: str, out_dir: Path, filename: str, date_iso: str | None = None,
                 days: int = 252) -> str | None:
-    """테마/ETF 캔들 차트 — 캔들 + 20/50/200MA + 52주고점선 + 자동 주석.
+    """테마/ETF 캔들 차트 — 캔들 + 20/50/200MA + 52주고점선 + 거래량 서브패널 + 자동 주석.
 
-    자동 주석: 신고가 / 정배열 / 52주 위치 / 일변화 배지.
+    자동 주석: 신고가 / 정배열 / 52주 위치 / 일변화 배지 + 신고가 돌파 화살표.
     """
     theme.setup()
     import matplotlib.pyplot as plt
@@ -84,14 +84,20 @@ def theme_chart(df, label: str, out_dir: Path, filename: str, date_iso: str | No
         return None
     from src.report.analysis.technical_signals import analyze
     a = analyze(df)
+    import numpy as np
 
-    fig, ax = plt.subplots(figsize=(12, 5.5))
     n = min(days, len(df))
+    has_vol = "Volume" in df and float(df["Volume"].iloc[-n:].fillna(0).abs().sum()) > 0
+    if has_vol:
+        fig, (ax, axv) = plt.subplots(
+            2, 1, figsize=(12, 6.2), sharex=True,
+            gridspec_kw={"height_ratios": [4, 1], "hspace": 0.05})
+    else:
+        fig, ax = plt.subplots(figsize=(12, 5.5)); axv = None
+
     theme.candlestick(ax, df, n=n)
-    theme.date_xticks(ax, df.index, n=n)
 
     close = df["Close"]
-    import numpy as np
     x = np.arange(n)
     for w, c, name in ((20, theme.COLOR_MA[1], "20"), (50, theme.COLOR_MA[2], "50"), (200, theme.COLOR_MA[3], "200")):
         if len(close) >= w:
@@ -100,6 +106,30 @@ def theme_chart(df, label: str, out_dir: Path, filename: str, date_iso: str | No
     hi = a.get("high_52w")
     if hi:
         ax.axhline(hi, color=theme.COLOR_UP, linestyle="--", linewidth=0.7, alpha=0.5)
+    # 신고가 돌파 화살표 (마지막 봉)
+    if a.get("is_new_high"):
+        last_px = float(close.iloc[-1])
+        ax.annotate("돌파", xy=(n - 1, last_px), xytext=(n - 1 - max(n // 12, 3), last_px * 1.04),
+                    fontsize=8, color=theme.COLOR_UP, ha="center",
+                    arrowprops=dict(arrowstyle="->", color=theme.COLOR_UP, lw=1.2))
+
+    # 거래량 서브패널 (상승=빨강/하락=파랑) + 20일 평균선
+    if axv is not None:
+        sub = df.iloc[-n:]
+        vol = sub["Volume"].fillna(0).values
+        o = sub["Open"].values if "Open" in sub else sub["Close"].values
+        cvals = sub["Close"].values
+        vcolors = [theme.COLOR_UP if cvals[i] >= o[i] else theme.COLOR_DOWN for i in range(len(sub))]
+        axv.bar(x, vol, width=0.7, color=vcolors, alpha=0.6)
+        if len(df) >= 20:
+            vma = df["Volume"].rolling(20).mean().iloc[-n:].values
+            axv.plot(x, vma, color="#555555", linewidth=0.8, alpha=0.8)
+        axv.set_ylabel("거래량", fontsize=7)
+        axv.tick_params(labelsize=6)
+        axv.grid(True, alpha=0.15)
+        theme.date_xticks(axv, df.index, n=n)
+    else:
+        theme.date_xticks(ax, df.index, n=n)
 
     # 주석 배지
     tags = []
@@ -116,7 +146,7 @@ def theme_chart(df, label: str, out_dir: Path, filename: str, date_iso: str | No
     ax.set_title(f"{label}   {last:,.2f}  ({chg:+.2f}%)   [{badge}]", fontsize=12, color=color)
     ax.legend(fontsize=7, loc="upper left", ncol=3)
     ax.tick_params(labelsize=7)
-    theme.stamp(ax, date_iso)
+    theme.stamp(axv if axv is not None else ax, date_iso)
     fig.tight_layout()
     return theme.save_fig(fig, out_dir, filename)
 

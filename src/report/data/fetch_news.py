@@ -41,8 +41,12 @@ def _parse_json_array(text: str) -> list[dict]:
         return []
 
 
-def fetch_market_news(max_items: int = 15) -> list[dict]:
-    """오늘의 시장 견인 뉴스 list[dict]. 실패 시 빈 리스트."""
+def fetch_market_news(max_items: int = 18) -> list[dict]:
+    """오늘의 시장 견인 뉴스 list[dict]. 실패 시 빈 리스트.
+
+    각 항목: title·summary·tickers·theme·source. URL은 부정확하므로 수집/사용하지 않음
+    (모델이 url을 넣어도 여기서 제거 — 가짜 인용 방지).
+    """
     api_key = os.getenv("OPENROUTER_API_KEY")
     if not api_key:
         log.info("[report.news] OPENROUTER_API_KEY 없음 — 스킵")
@@ -59,13 +63,18 @@ def fetch_market_news(max_items: int = 15) -> list[dict]:
                 {"role": "system", "content": "You are a precise financial research assistant. Output JSON only."},
                 {"role": "user", "content": _prompt()},
             ],
-            max_tokens=3000,
+            max_tokens=4000,
             model=model,
             temperature=0.2,
             context="report_news",
         )
         items = _parse_json_array(text or "")
-        clean = [it for it in items if isinstance(it, dict) and it.get("title")]
+        clean = []
+        for it in items:
+            if not isinstance(it, dict) or not it.get("title"):
+                continue
+            it.pop("url", None)  # 부정확한 URL 차단 (가짜 인용 방지)
+            clean.append(it)
         log.info("[report.news] %d건 확보 (model=%s)", len(clean), model)
         return clean[:max_items]
     except Exception:
