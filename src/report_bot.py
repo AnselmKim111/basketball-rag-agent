@@ -209,22 +209,17 @@ def _build_report():
 
     breadth: dict = {}
     try:
-        from src.us_screener import data_source as us_ds
-        caps = us_ds.fetch_market_caps()
-        sectors = us_ds.fetch_sectors()
-        top = sorted(caps, key=lambda s: -caps[s])[:120]
-        top_dfs = fp.fetch_many({s: s for s in top}, days=10, workers=12)
-        changes = {}
-        for s, df in top_dfs.items():
-            dc = fp.day_change(df)
-            if dc is not None:
-                changes[s] = dc
-        if changes:
+        from src.report.data import fetch_us_breadth
+        caps, changes, sectors = fetch_us_breadth.load_us_market_map(top_n=140)
+        log.info("[report] S&P500 맵: caps=%d sectors=%d changes=%d", len(caps), len(sectors), len(changes))
+        if changes:  # 등락만 있어도 트리맵은 (caps 비면 균등으로) 항상 렌더
             add(heatmap_chart.sp500_heatmap(caps, changes, sectors, img_dir, date_iso=date_iso),
-                "S&P500 히트맵", "시총 가중 — 시장 폭", "3. 섹터 로테이션 맵", key=True)
+                "S&P500 히트맵", "시총 가중 — 시장 폭 (녹=상승)", "3. 섹터 로테이션 맵", key=True)
             adv = sum(1 for v in changes.values() if v > 0)
             breadth["advancers"] = adv
             breadth["total"] = len(changes)
+        else:
+            log.warning("[report] S&P500 히트맵 등락 0개 — 생략")
     except Exception:
         log.exception("[report] S&P500 히트맵 실패 — 생략")
     # 200일선 위 테마 비율 (breadth proxy)
