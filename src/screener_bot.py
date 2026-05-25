@@ -358,8 +358,8 @@ def _permalink(channel: str, message_id: int) -> str | None:
 
 def _chart_caption(ticker: str, item: dict, cats: list[str], rows: list[dict], ytd, eps) -> str:
     from src.screener import fundamentals
-    from src.bot_helpers import md_escape
-    name = md_escape(item.get("name") or ticker)
+    from src.bot_helpers import html_escape
+    name = html_escape(item.get("name") or ticker)
     chg = item.get("chg_pct") or 0.0
     turnover = fundamentals.turnover_won(rows[-1]) if rows else 0
     badge = " ".join(_BADGE[c] for c in cats if c in _BADGE)
@@ -367,12 +367,12 @@ def _chart_caption(ticker: str, item: dict, cats: list[str], rows: list[dict], y
         f"🇰🇷 {name} ({chg:+.1f}%)",
         badge,
         "",
-        f"✝ 종목명 : {name} ({ticker})",
+        f"✝ 종목명 : {name} ({html_escape(ticker)})",
         f"✝ 시가총액 : {_fmt_won(item.get('market_cap'))}",
         f"✝ 거래대금 : {_fmt_won(turnover)}",
         f"✝ 연초대비 상승률 : {_fmt_pct(ytd)}",
         f"✝ 최근 EPS YoY : {_fmt_pct(eps)}",
-        f"✝ [최신 종목 뉴스 조회](https://finance.naver.com/item/news.naver?code={ticker})",
+        f'✝ <a href="https://finance.naver.com/item/news.naver?code={ticker}">최신 종목 뉴스 조회</a>',
     ]
     return "\n".join(lines)
 
@@ -432,7 +432,7 @@ async def _post_charts_and_meta(results: dict, base_date: str,
                 if png:
                     from src.bot_helpers import send_channel_photo
                     cap = _chart_caption(t, it, badges[t], rows, ytd, eps)
-                    msg = await send_channel_photo(chart_bot, channel, png, cap, ParseMode.MARKDOWN)
+                    msg = await send_channel_photo(chart_bot, channel, png, cap, ParseMode.HTML)
                     if msg:
                         url = _permalink(channel, msg.message_id)
                         if url:
@@ -677,7 +677,7 @@ async def screener_daily_job(bot: Bot, override_chat_id: str | None = None) -> N
         sent_count = 0
         for cid in target_chat_ids:
             try:
-                await send_text_chunked(bot, cid, text, parse_mode=ParseMode.MARKDOWN)
+                await send_text_chunked(bot, cid, text, parse_mode=ParseMode.HTML)
                 sent_count += 1
             except Exception:
                 log.exception("[scheduled] 발송 실패 cid=%s", cid)
