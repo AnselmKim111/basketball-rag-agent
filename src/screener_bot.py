@@ -225,7 +225,7 @@ async def _cmd_screen(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
         return
     try:
-        await update.message.reply_text("🔄 스크리닝 즉시 실행 중... (~2-3분 소요)")
+        await update.message.reply_text("🔄 스크리닝 즉시 실행 중... (Naver 재수집 ~10분 소요)")
     except Exception:
         log.exception("screen 안내 실패")
     try:
@@ -568,7 +568,10 @@ async def screener_daily_job(bot: Bot, override_chat_id: str | None = None) -> N
         retry_max = int(os.getenv("SCREENER_RETRY_MAX", "6"))
         inc = await loop.run_in_executor(None, incremental.update_today)
         attempt = 1
-        while inc.get("empty") and inc.get("is_business_day") and attempt < retry_max:
+        # 수동 /screen(override)은 오늘 데이터 대기 불필요 → 재시도 스킵, 즉시 최근 영업일로 진행.
+        # 재시도 루프는 16:00 cron(override 없음)에서만 (KRX 정산 대기 용도).
+        while (override_chat_id is None and inc.get("empty")
+               and inc.get("is_business_day") and attempt < retry_max):
             log.info(
                 "[scheduled] today fetch 미발행 → %d초 후 재시도 (%d/%d)",
                 retry_interval, attempt, retry_max,
