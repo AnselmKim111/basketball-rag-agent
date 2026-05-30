@@ -27,10 +27,12 @@
 이번 분기 콜의 본질. 가장 시그널이 강했던 콜, 산업 톤(공격/방어), 자본배분 군비경쟁의 현 위치,
 컨센서스 대비 가장 큰 미스매치. 투자자가 30초 안에 핵심을 잡도록.
 
-## 1. 핵심 수치 비교표
+## 1. 핵심 수치 비교표 + 컨센 delta
 | 지표 | 회사A | 회사B | ... |
 revenue / YoY / op margin / FCF(분기) / Capex(분기) / Capex FY 가이던스 / OCF/Capex(FY) / Capex YoY(FY).
+**컨센서스가 있는 종목은 추가 행으로 "Revenue 컨센 delta(%bps)", "EPS 컨센 delta(%bps)" 명시 — [consensus_delta] 라인을 직접 인용**.
 각 셀에 출처. 표 아래 1-2문단으로 표가 말해주는 비대칭 포인트 해석.
+표 아래 마지막 문단에 "이 분기 sell-side가 가장 크게 미스한/오버슛한 비대칭"을 1-2개 콕 짚기.
 
 ## 2. 어닝콜 메시지 비교 (종목별 1문단씩)
 각 종목의 prepared remarks + Q&A에서 읽히는 전략 의도. capex를 왜 늘리/줄이는지, 수요 톤,
@@ -40,8 +42,14 @@ revenue / YoY / op margin / FCF(분기) / Capex(분기) / Capex FY 가이던스 
 6년치 Capex 절대/YoY + OCF/Capex 비율 추세로 본 위계. 누가 "캐시 머신"이고 누가
 "AI 투자가 본업 캐시를 잠식"하기 시작했는지. OCF/Capex가 1배에 근접하는 종목 경고.
 
-## 4. 시장 서프라이즈 후보 (3-5개)
-컨센서스 vs 실제, 또는 콜에서 강조됐지만 sell-side가 덜 반영한 비대칭 시그널.
+## 4. 시장 서프라이즈 후보 (3-5개) — 정성 + 정량
+**정량**: [consensus_delta] (Revenue·EPS) + 가이던스 vs next-quarter consensus.
+**정성**: payload의 `Deal:`(named_deals), `SupplyChain[...]`, `Competitor[...]`, `Macro[...]`,
+`GeoMix[...]` 라인에서 sell-side가 덜 반영한 비대칭을 콕 짚는다.
+- **명명된 새 계약/이탈/확장**: 거래처·규모·기간 verbatim 인용. "프리어 미멘션"(`prior=new`) 표기되면 신규 시그널 강조.
+- **공급망 톤 시프트**: constrained→improving 같은 변화가 마진/가이던스에 어떻게 작용할지.
+- **경쟁사 직접 언급**: payload의 `Competitor[...]` 행을 인용해 "share 이동" 시그널.
+- **매크로/정책 신규 멘션**: 관세·수출통제·환율 멘션이 처음 등장했거나 톤이 바뀌었으면 강조.
 각 항목: 무엇이/왜 서프라이즈인지 + 정량 근거 + buy/sell 방향성.
 
 ## 5. 시나리오별 매력도

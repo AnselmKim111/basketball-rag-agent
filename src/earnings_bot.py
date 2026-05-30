@@ -238,15 +238,22 @@ async def _run_pipeline(
         f"Q{fiscal_quarter} {fiscal_year}" if (fiscal_year and fiscal_quarter) else "the most recent reported quarter"
     )
 
-    # 3) SEC EDGAR 재무 (검증·차트·페이로드 모두에서 쓰이므로 먼저 수집)
-    await _safe_send(bot, chat_id, "📊 SEC EDGAR로 6년치 + 분기 재무 수집 중 …")
-    financials = await _step_fetch_financials(tickers)
+    # 3) SEC EDGAR 재무 + sell-side 컨센서스 (검증·차트·페이로드 모두에서 쓰이므로 먼저 병렬 수집)
+    await _safe_send(bot, chat_id, "📊 SEC EDGAR + sell-side 컨센서스 수집 중 …")
+    financials, consensus_by_ticker = await asyncio.gather(
+        _step_fetch_financials(tickers),
+        _step_fetch_consensus(tickers, fiscal_label),
+    )
     if not financials:
         await _safe_send(bot, chat_id, "⚠️ SEC EDGAR 데이터를 못 가져왔습니다 — 차트·검증 제한됩니다.")
+    if consensus_by_ticker:
+        got = sum(1 for v in consensus_by_ticker.values() if v is not None)
+        await _safe_send(bot, chat_id, f"  📐 컨센서스 {got}/{len(tickers)} 종목 확보")
 
-    # 2+3) 종목별: 진짜 전문 확보 → 심층추출 → 숫자 교차검증
+    # 2+3) 종목별: 진짜 전문 확보 → 심층추출 → 숫자 교차검증 + 컨센서스 delta
     transcripts: dict[str, dict] = {}
     verify_by_ticker: dict[str, list] = {}
+    consensus_delta_by_ticker: dict[str, list] = {}
     await _safe_send(
         bot, chat_id,
         f"📞 어닝콜 전문 확보 + 심층추출 시작 ({len(tickers)}개, {fiscal_label})\n"
@@ -262,14 +269,28 @@ async def _run_pipeline(
         vres = await _step_verify(tr, financials.get(t), fiscal_year, fiscal_quarter)
         verify_by_ticker[t] = vres
         tr["_verify"] = [v.message for v in vres]
+        # 컨센서스 delta (beat/miss/inline)
+        snap = (consensus_by_ticker or {}).get(t)
+        if snap is not None:
+            from src.earnings.verify import compute_consensus_delta
+            deltas = compute_consensus_delta(tr, snap)
+            consensus_delta_by_ticker[t] = deltas
+            tr["_consensus_deltas"] = [d.message for d in deltas]
+            tr["_consensus_snap"] = snap   # synthesis payload용 (직렬화는 따로)
         transcripts[t] = tr
-        # 즉시 텔레그램 발송 (전문 심층요약 + 검증결과)
+        # 즉시 텔레그램 발송 (전문 심층요약 + 검증결과 + 컨센 delta + 컨센 snapshot)
         from src.earnings.transcripts import format_transcript_text
-        from src.earnings.verify import format_results
+        from src.earnings.verify import format_results, format_consensus_deltas
+        from src.earnings.consensus import fmt_consensus_text
         body = format_transcript_text(tr)
         vtext = format_results(vres)
         if vtext:
             body += "\n\n" + vtext
+        if snap is not None:
+            ctext = format_consensus_deltas(consensus_delta_by_ticker.get(t) or [])
+            if ctext:
+                body += "\n\n" + ctext
+            body += "\n\n" + fmt_consensus_text(snap)
         await send_text_chunked(bot, chat_id, body)
 
     if not transcripts:
@@ -282,10 +303,11 @@ async def _run_pipeline(
         f"  ✅ {len(transcripts)}개 분석 완료 (전문 grounding {grounded_n}/{len(transcripts)})",
     )
 
-    # 6) 비교 합성 (Opus, 딥리서치급)
+    # 6) 비교 합성 (Opus, 딥리서치급 — 컨센서스 delta·정성 서프라이즈 강제 인용)
     await _safe_send(bot, chat_id, "🧠 비교 합성 중 (Opus, 인용·시나리오 기반 8000자+)…")
     industry_summary = await _step_synthesize_industry(
         transcripts, financials, fiscal_label, verify_by_ticker,
+        consensus_by_ticker, consensus_delta_by_ticker,
     )
     if industry_summary:
         # 합성 결과엔 [TICKER] 인용·표·# 헤더가 있어 텔레그램 Markdown 파싱이 깨짐 → 평문 발송
@@ -299,6 +321,7 @@ async def _run_pipeline(
         await _safe_send(bot, chat_id, f"🎯 커스텀 질문 심층 답변 중 (Opus) — {custom_question[:80]}")
         custom_answer = await _step_synthesize_custom(
             custom_question, transcripts, financials, fiscal_label, verify_by_ticker,
+            consensus_by_ticker, consensus_delta_by_ticker,
         ) or ""
         if custom_answer:
             await send_text_chunked(bot, chat_id, "🎯 커스텀 분석\n\n" + custom_answer)
@@ -437,16 +460,43 @@ async def _step_fetch_financials(tickers: list[str]) -> dict[str, Any]:
     return out
 
 
+async def _step_fetch_consensus(tickers: list[str], fiscal_label: str | None = None) -> dict[str, Any]:
+    """sell-side 컨센서스 병렬 fetch — Yahoo Finance → perplexity 폴백.
+
+    {ticker: ConsensusSnapshot | None}. Yahoo는 자체 cookie+crumb dance + 1회/일 정도면
+    무료. 실패는 graceful — 그 종목의 컨센 delta가 unavailable로 표시됨.
+    """
+    from src.earnings import consensus
+    loop = asyncio.get_running_loop()
+    results = await asyncio.gather(
+        *[loop.run_in_executor(None, consensus.fetch_consensus, t, fiscal_label) for t in tickers],
+        return_exceptions=True,
+    )
+    out: dict[str, Any] = {}
+    for t, snap in zip(tickers, results):
+        if isinstance(snap, Exception):
+            log.warning("consensus fetch 실패 (%s): %s", t, snap)
+            out[t] = None
+            continue
+        out[t] = snap
+    return out
+
+
 async def _step_synthesize_industry(
     transcripts: dict[str, dict],
     financials: dict[str, Any],
     fiscal_period: str,
     verify_by_ticker: dict[str, list],
+    consensus_by_ticker: dict[str, Any] | None = None,
+    consensus_delta_by_ticker: dict[str, list] | None = None,
 ) -> str | None:
-    """비교 합성 (Opus, 딥리서치급)."""
+    """비교 합성 (Opus, 딥리서치급). 컨센서스 데이터가 있으면 payload에 포함."""
     from src import summarizer
     system = _load_prompt("earnings_synthesis")
-    user_payload = _build_synthesis_payload(transcripts, financials, fiscal_period, verify_by_ticker)
+    user_payload = _build_synthesis_payload(
+        transcripts, financials, fiscal_period, verify_by_ticker,
+        consensus_by_ticker, consensus_delta_by_ticker,
+    )
     loop = asyncio.get_running_loop()
 
     def _call():
@@ -477,13 +527,18 @@ async def _step_synthesize_custom(
     financials: dict[str, Any],
     fiscal_period: str,
     verify_by_ticker: dict[str, list],
+    consensus_by_ticker: dict[str, Any] | None = None,
+    consensus_delta_by_ticker: dict[str, list] | None = None,
 ) -> str | None:
-    """커스텀 분석 답변 합성 (Opus)."""
+    """커스텀 분석 답변 합성 (Opus). 컨센서스가 있으면 PM-grade로 활용."""
     from src import summarizer
     system = _load_prompt("earnings_custom")
     user_payload = (
         f"# 사용자 질문\n{question}\n\n"
-        + _build_synthesis_payload(transcripts, financials, fiscal_period, verify_by_ticker)
+        + _build_synthesis_payload(
+            transcripts, financials, fiscal_period, verify_by_ticker,
+            consensus_by_ticker, consensus_delta_by_ticker,
+        )
     )
     loop = asyncio.get_running_loop()
 
@@ -566,15 +621,26 @@ def _build_synthesis_payload(
     financials: dict[str, Any],
     fiscal_period: str,
     verify_by_ticker: dict[str, list] | None = None,
+    consensus_by_ticker: dict[str, Any] | None = None,
+    consensus_delta_by_ticker: dict[str, list] | None = None,
 ) -> str:
-    """LLM에 넘길 유저 메시지. 종목별 심층추출 + 재무 6년치 + 검증결과."""
+    """LLM에 넘길 유저 메시지. 종목별 심층추출 + 재무 6년치 + 검증결과 + sell-side 컨센서스."""
     from src.earnings.sec_edgar import fmt_usd
+    from src.earnings.consensus import consensus_payload_block
     verify_by_ticker = verify_by_ticker or {}
+    consensus_by_ticker = consensus_by_ticker or {}
+    consensus_delta_by_ticker = consensus_delta_by_ticker or {}
     parts: list[str] = []
     parts.append(f"# 분기: {fiscal_period}")
     parts.append(f"# 분석 기업: {', '.join(transcripts.keys())}")
     grounded_n = sum(1 for tr in transcripts.values() if tr.get("grounded"))
     parts.append(f"# 전문 grounding: {grounded_n}/{len(transcripts)} (grounded=True인 종목만 verbatim 신뢰)")
+    consensus_n = sum(1 for v in consensus_by_ticker.values() if v is not None)
+    if consensus_by_ticker:
+        parts.append(
+            f"# 컨센서스 grounding: {consensus_n}/{len(transcripts)} "
+            "(sell-side avg estimates from Yahoo Finance / perplexity)"
+        )
     parts.append("")
 
     # 어닝콜 심층추출 (종목별)
@@ -608,6 +674,33 @@ def _build_synthesis_payload(
         sr = tr.get("surprises_and_risks") or []
         for item in sr:
             parts.append(f"⚡ {item}")
+        # 정성 서프라이즈 (Track A 신규 — synthesis가 §1~§4에 강제 인용해야 할 1차 재료)
+        deals = tr.get("named_deals") or []
+        for d in deals:
+            cp = d.get("counterparty", "?")
+            mag = d.get("magnitude", "—")
+            ten = d.get("tenure") or "—"
+            stat = d.get("status", "?")
+            prior = d.get("prior_quarter_mentioned")
+            prior_tag = "new" if prior is False else ("continuation" if prior is True else "?")
+            qv = d.get("verbatim") or ""
+            parts.append(f"Deal: counterparty={cp}, size={mag}, tenure={ten}, status={stat}, prior={prior_tag}; \"{qv}\"")
+        sc = tr.get("supply_chain_signals") or []
+        for s in sc:
+            parts.append(f"SupplyChain[{s.get('signal_type','?')}] {s.get('vendor_or_component','?')}: \"{s.get('verbatim','')}\"")
+        cc = tr.get("competitor_callouts") or []
+        for c in cc:
+            parts.append(f"Competitor[{c.get('competitor','?')}/{c.get('dimension','?')}/{c.get('implied_direction','?')}]: \"{c.get('verbatim','')}\"")
+        mp = tr.get("macro_policy_mentions") or []
+        for m in mp:
+            parts.append(f"Macro[{m.get('theme','?')}/{m.get('region','?')}/{m.get('impact_direction','?')}]: \"{m.get('verbatim','')}\"")
+        sgm = tr.get("segment_geo_mix") or []
+        for item in sgm:
+            sr_name = item.get('segment_or_region','?')
+            share = item.get('share_pct') or '—'
+            yoy = item.get('yoy') or '—'
+            call = item.get('callout') or ''
+            parts.append(f"GeoMix[{sr_name}]: share={share}, yoy={yoy} — {call}")
         nv = tr.get("notable_verbatim") or []
         for item in nv[:5]:
             parts.append(f"Verbatim: \"{item}\"")
@@ -615,6 +708,14 @@ def _build_synthesis_payload(
         vres = verify_by_ticker.get(t) or []
         for r in vres:
             parts.append(f"[verify] {r.message}")
+        # 컨센서스 delta (beat/miss 정량)
+        cdres = consensus_delta_by_ticker.get(t) or []
+        for d in cdres:
+            parts.append(f"[consensus_delta] {d.message}")
+        # sell-side 컨센서스 snapshot (synthesis가 §1·§4·§8에서 인용 강제)
+        snap = consensus_by_ticker.get(t)
+        if snap is not None:
+            parts.append(consensus_payload_block(snap))
         parts.append("")
 
     # 재무 6년치

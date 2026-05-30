@@ -238,6 +238,75 @@ def format_transcript_text(tr: dict[str, Any]) -> str:
         for item in sr:
             lines.append(f"  · {item}")
 
+    deals = tr.get("named_deals") or []
+    if deals:
+        lines.append("")
+        lines.append("🤝 명명된 계약·파트너십")
+        for d in deals:
+            cp = (d.get("counterparty") or "?").strip()
+            mag = (d.get("magnitude") or "—").strip()
+            ten = (d.get("tenure") or "—").strip()
+            stat = (d.get("status") or "?").strip()
+            prior = d.get("prior_quarter_mentioned")
+            prior_tag = " [신규]" if prior is False else (" [기존 연장]" if prior is True else "")
+            lines.append(f"  · {cp} — {mag} · {ten} · {stat}{prior_tag}")
+            qv = (d.get("verbatim") or "").strip()
+            if qv:
+                lines.append(f"    \"{qv}\"")
+
+    sc = tr.get("supply_chain_signals") or []
+    if sc:
+        lines.append("")
+        lines.append("⛓️ 공급망 시그널")
+        for s in sc:
+            vc = (s.get("vendor_or_component") or "?").strip()
+            st = (s.get("signal_type") or "?").strip()
+            qv = (s.get("verbatim") or "").strip()
+            lines.append(f"  · {vc} — {st}")
+            if qv:
+                lines.append(f"    \"{qv}\"")
+
+    cc = tr.get("competitor_callouts") or []
+    if cc:
+        lines.append("")
+        lines.append("⚔️ 경쟁사 직접 언급")
+        for c in cc:
+            comp = (c.get("competitor") or "?").strip()
+            dim = (c.get("dimension") or "?").strip()
+            direction = (c.get("implied_direction") or "?").strip()
+            qv = (c.get("verbatim") or "").strip()
+            lines.append(f"  · {comp} ({dim}, {direction})")
+            if qv:
+                lines.append(f"    \"{qv}\"")
+
+    mp = tr.get("macro_policy_mentions") or []
+    if mp:
+        lines.append("")
+        lines.append("🌐 매크로·정책 멘션")
+        for m in mp:
+            th = (m.get("theme") or "?").strip()
+            rg = (m.get("region") or "?").strip()
+            di = (m.get("impact_direction") or "?").strip()
+            qv = (m.get("verbatim") or "").strip()
+            lines.append(f"  · {th} ({rg}, {di})")
+            if qv:
+                lines.append(f"    \"{qv}\"")
+
+    sg = tr.get("segment_geo_mix") or []
+    if sg:
+        lines.append("")
+        lines.append("📍 세그먼트·지역 mix")
+        for item in sg:
+            seg_r = (item.get("segment_or_region") or "?").strip()
+            share = item.get("share_pct")
+            yoy = item.get("yoy")
+            call = (item.get("callout") or "").strip()
+            bits = []
+            if share: bits.append(f"share {share}")
+            if yoy: bits.append(f"yoy {yoy}")
+            tail = f" — {call}" if call else ""
+            lines.append(f"  · {seg_r}: {', '.join(bits) or '—'}{tail}")
+
     nv = tr.get("notable_verbatim") or []
     if nv:
         lines.append("")
