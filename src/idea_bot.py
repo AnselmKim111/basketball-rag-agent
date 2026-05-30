@@ -1099,24 +1099,34 @@ async def _run_pipeline(
             await send_text_chunked(bot, chat_id, "❌ 리서치 결과에 산업/후보가 비어있음 — 종료")
             return
 
-        # ---- (1.5) 중요도 평가 (graceful — 실패해도 계속)
-        await send_text_chunked(bot, chat_id, "⚖️ 1.5단계: 현상의 중요도 비판적 검증")
-        importance = await _evaluate_importance(idea_text, research)
+        # ---- (1.5 + 2) 중요도 평가 LLM + 산업 리포트 wisereport — 동시 진행.
+        # 둘은 research 결과에만 의존하고 서로 독립. importance는 synthesis(5단계)에서만
+        # 쓰이므로 narrow(3단계) 전에만 끝나면 됨. asyncio.gather로 1-2분 절약.
+        await send_text_chunked(
+            bot, chat_id,
+            f"⚖️ 1.5단계 + 📊 2단계 *동시 진행*: 중요도 평가 + 산업 리포트 {len(industries)}개",
+        )
+        importance_res, industry_res = await asyncio.gather(
+            _evaluate_importance(idea_text, research),
+            _collect_industry_reports(industries, download_root / "industry"),
+            return_exceptions=True,
+        )
+        if isinstance(importance_res, BaseException):
+            log.exception("중요도 평가 예외 — synthesis는 계속", exc_info=importance_res)
+            importance = {}
+        else:
+            importance = importance_res or {}
         if importance:
             await _send_importance_summary(bot, chat_id, importance)
         else:
             await send_text_chunked(
-                bot, chat_id, "ℹ️ 중요도 평가 단계 실패 — Top 5 분석은 계속 진행",
+                bot, chat_id, "ℹ️ 중요도 평가 빈 응답 — Top 5 분석은 계속",
             )
-            importance = {}  # 빈 dict로 placeholder, synthesis에 전달 가능
-
-        # ---- (2) 산업 리포트 수집
-        await send_text_chunked(
-            bot, chat_id, f"📊 2단계: 산업 리포트 다운로드 ({len(industries)}개 산업)",
-        )
-        industry_pdfs, industry_texts = await _collect_industry_reports(
-            industries, download_root / "industry",
-        )
+        if isinstance(industry_res, BaseException):
+            log.exception("산업 리포트 수집 예외 — 빈 텍스트로 진행", exc_info=industry_res)
+            industry_pdfs, industry_texts = [], {}
+        else:
+            industry_pdfs, industry_texts = industry_res
         await send_text_chunked(
             bot, chat_id, f"  ✅ 산업 리포트 {len(industry_pdfs)}건 수집",
         )
