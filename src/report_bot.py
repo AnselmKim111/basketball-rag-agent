@@ -27,11 +27,22 @@ KST = timezone(timedelta(hours=9))
 ALLOWED_ENV = "REPORT_ALLOWED_CHAT_IDS"
 CHAT_ID_ENV = "REPORT_CHAT_ID"
 
+WELCOME_TEXT = (
+    "📊 *버터대디봇 가입 완료* — 매일 08:00 KST 자동 발송\n\n"
+    "내용: 미국 4대 지수·히트맵·매크로·ETF + 한국 수급 멀티패널 + LLM 시황 내러티브.\n\n"
+    "명령:\n"
+    "  /report — 지금 즉시 리포트 (~3-7분)\n"
+    "  /stop — 자동 발송 탈퇴\n"
+    "  /help — 도움말\n"
+)
+
 HELP_TEXT = (
     "📊 *버터대디봇* — 차트 기반 시장 색깔 진단 리포트\n\n"
     "매일 08:00 KST 자동 발송 (미국 직전 거래일 마감 + 한국 당일).\n"
     "내용: 미국 4대 지수·히트맵·매크로·ETF + 한국 수급 멀티패널 + LLM 시황 내러티브.\n\n"
     "명령:\n"
+    "  /start — 가입 (자동 발송 활성화)\n"
+    "  /stop — 탈퇴\n"
     "  /report — 지금 즉시 리포트 생성 (~3-7분)\n"
     "  /help — 도움말\n"
 )
@@ -48,11 +59,144 @@ def _parse_chat_ids(*env_keys: str) -> list[str]:
     return out
 
 
+def _is_admin(update: Update) -> bool:
+    """ALLOWED_ENV / CHAT_ID_ENV에 등록된 numeric chat_id만 admin."""
+    cid = str(update.effective_chat.id) if update.effective_chat else ""
+    return cid in set(_parse_chat_ids(ALLOWED_ENV, CHAT_ID_ENV))
+
+
 async def _help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         await update.message.reply_text(HELP_TEXT, parse_mode=ParseMode.MARKDOWN)
     except Exception:
         log.exception("help 실패")
+
+
+async def _cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/start — 누구나 가입. 차단된 chat_id는 거부. admin에게 신규 가입 알림."""
+    from src.report import subscribers as subs
+
+    chat_id = str(update.effective_chat.id)
+    user = update.effective_user
+    username = user.username if user else None
+    full_name = user.full_name if user else None
+    loop = asyncio.get_running_loop()
+    try:
+        is_new = await loop.run_in_executor(
+            None, lambda: subs.subscribe(chat_id, username, full_name)
+        )
+    except Exception:
+        log.exception("[start] subscribe 실패")
+        try:
+            await update.message.reply_text("⚠️ 가입 실패 — 관리자에게 문의해 주세요.")
+        except Exception:
+            pass
+        return
+
+    try:
+        await update.message.reply_text(WELCOME_TEXT, parse_mode=ParseMode.MARKDOWN)
+    except Exception:
+        log.exception("[start] welcome 발송 실패")
+
+    if is_new:
+        try:
+            admin_ids = _parse_chat_ids(ALLOWED_ENV, CHAT_ID_ENV)
+            for aid in admin_ids:
+                if aid == chat_id:
+                    continue
+                try:
+                    await context.bot.send_message(
+                        chat_id=aid,
+                        text=(
+                            f"🆕 버터대디봇 신규 가입자\n"
+                            f"  chat_id: {chat_id}\n"
+                            f"  username: @{username or '(없음)'}\n"
+                            f"  name: {full_name or '(없음)'}\n\n"
+                            f"차단하려면: /block {chat_id}"
+                        ),
+                    )
+                except Exception:
+                    log.exception("admin 알림 실패 aid=%s", aid)
+        except Exception:
+            log.exception("[start] admin 알림 절차 실패")
+
+
+async def _cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/stop — 자가 탈퇴."""
+    from src.report import subscribers as subs
+
+    chat_id = str(update.effective_chat.id)
+    loop = asyncio.get_running_loop()
+    try:
+        ok = await loop.run_in_executor(None, lambda: subs.unsubscribe(chat_id))
+    except Exception:
+        log.exception("[stop] unsubscribe 실패")
+        ok = False
+    try:
+        await update.message.reply_text(
+            "👋 탈퇴 완료. 자동 발송이 중단됩니다." if ok
+            else "ℹ️ 가입되어 있지 않습니다."
+        )
+    except Exception:
+        pass
+
+
+async def _cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/list — admin 전용. 가입자 목록."""
+    from src.report import subscribers as subs
+
+    if not _is_admin(update):
+        await update.message.reply_text("🔒 관리자 전용 명령입니다.")
+        return
+    loop = asyncio.get_running_loop()
+    try:
+        items = await loop.run_in_executor(None, subs.list_all)
+    except Exception:
+        log.exception("[list] 실패")
+        items = []
+    if not items:
+        await update.message.reply_text("📭 가입자 없음")
+        return
+    lines = [f"👥 가입자 {len(items)}명:"]
+    for it in items:
+        flag = "🚫" if it["is_blocked"] else "✓"
+        lines.append(
+            f"{flag} {it['chat_id']} @{it['username'] or '?'} ({it['full_name'] or '?'}) "
+            f"— {it['subscribed_at'][:10]}"
+        )
+    await send_text_chunked(context.bot, str(update.effective_chat.id), "\n".join(lines))
+
+
+async def _cmd_block(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    from src.report import subscribers as subs
+
+    if not _is_admin(update):
+        await update.message.reply_text("🔒 관리자 전용 명령입니다.")
+        return
+    args = context.args or []
+    if not args:
+        await update.message.reply_text("사용: /block <chat_id>")
+        return
+    target = args[0].strip()
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, lambda: subs.block(target))
+    await update.message.reply_text(f"🚫 차단 완료: {target}")
+
+
+async def _cmd_unblock(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    from src.report import subscribers as subs
+
+    if not _is_admin(update):
+        await update.message.reply_text("🔒 관리자 전용 명령입니다.")
+        return
+    args = context.args or []
+    if not args:
+        await update.message.reply_text("사용: /unblock <chat_id>")
+        return
+    target = args[0].strip()
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, lambda: subs.unblock(target))
+    await update.message.reply_text(f"✓ 차단 해제: {target}")
 
 
 async def _cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -71,7 +215,15 @@ async def report_daily_job(bot: Bot, override_chat_id: str | None = None) -> Non
     if override_chat_id:
         targets = [str(override_chat_id)]
     else:
-        targets = _parse_chat_ids(CHAT_ID_ENV, ALLOWED_ENV)
+        # admin (env) + 가입자 (DB) union, 중복 제거
+        admin_ids = _parse_chat_ids(CHAT_ID_ENV, ALLOWED_ENV)
+        try:
+            from src.report import subscribers as _subs
+            sub_ids = _subs.list_active_chat_ids()
+        except Exception:
+            log.exception("[report] subscribers 조회 실패")
+            sub_ids = []
+        targets = list(dict.fromkeys(admin_ids + sub_ids))
     if not targets:
         log.error("[report] 발송 대상 없음")
         return
@@ -392,8 +544,13 @@ REPORT_COMMANDS = [
 
 def build_report_app(token: str) -> Application:
     app = Application.builder().token(token).build()
-    app.add_handler(CommandHandler(["start", "help"], _help))
+    app.add_handler(CommandHandler("start", _cmd_start))
+    app.add_handler(CommandHandler("help", _help))
+    app.add_handler(CommandHandler("stop", _cmd_stop))
     app.add_handler(CommandHandler("report", _cmd_report))
+    app.add_handler(CommandHandler("list", _cmd_list))
+    app.add_handler(CommandHandler("block", _cmd_block))
+    app.add_handler(CommandHandler("unblock", _cmd_unblock))
     if os.getenv("REPORT_TEST_MODE", "0") == "1":
         try:
             loop = asyncio.get_running_loop()
