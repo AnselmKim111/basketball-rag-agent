@@ -37,6 +37,9 @@ revenue / YoY / op margin / FCF(분기) / Capex(분기) / Capex FY 가이던스 
 ## 2. 어닝콜 메시지 비교 (종목별 1문단씩)
 각 종목의 prepared remarks + Q&A에서 읽히는 전략 의도. capex를 왜 늘리/줄이는지, 수요 톤,
 마진 코멘트. verbatim 핵심 인용 1개씩 포함.
+**payload에 `### {TICKER} quarter-over-quarter diff` 블록이 있으면 반드시 인용**:
+톤 시프트(자신감→방어 등), 가이던스 사이클(raised/maintained/lowered), 신규/이탈 거래처,
+신규 테마 등에서 PM이 주목할 inflection 1가지를 콕 짚는다.
 
 ## 3. 자본배분 & 캐펙스 군비경쟁
 6년치 Capex 절대/YoY + OCF/Capex 비율 추세로 본 위계. 누가 "캐시 머신"이고 누가

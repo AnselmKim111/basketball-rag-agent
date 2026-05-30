@@ -250,10 +250,11 @@ async def _run_pipeline(
         got = sum(1 for v in consensus_by_ticker.values() if v is not None)
         await _safe_send(bot, chat_id, f"  📐 컨센서스 {got}/{len(tickers)} 종목 확보")
 
-    # 2+3) 종목별: 진짜 전문 확보 → 심층추출 → 숫자 교차검증 + 컨센서스 delta
+    # 2+3) 종목별: 진짜 전문 확보 → 심층추출 → 숫자 교차검증 + 컨센서스 delta + 분기간 diff
     transcripts: dict[str, dict] = {}
     verify_by_ticker: dict[str, list] = {}
     consensus_delta_by_ticker: dict[str, list] = {}
+    diff_by_ticker: dict[str, dict] = {}
     await _safe_send(
         bot, chat_id,
         f"📞 어닝콜 전문 확보 + 심층추출 시작 ({len(tickers)}개, {fiscal_label})\n"
@@ -278,7 +279,12 @@ async def _run_pipeline(
             tr["_consensus_deltas"] = [d.message for d in deltas]
             tr["_consensus_snap"] = snap   # synthesis payload용 (직렬화는 따로)
         transcripts[t] = tr
-        # 즉시 텔레그램 발송 (전문 심층요약 + 검증결과 + 컨센 delta + 컨센 snapshot)
+        # 분기간 diff (Track C — history에 이전 분기 있을 때만)
+        diff = await _step_compute_diff(t, tr, fiscal_year, fiscal_quarter, prior_n=4)
+        if diff:
+            diff_by_ticker[t] = diff
+            tr["_diff"] = diff
+        # 즉시 텔레그램 발송 (전문 심층요약 + 검증결과 + 컨센 delta + 컨센 snapshot + diff 요약)
         from src.earnings.transcripts import format_transcript_text
         from src.earnings.verify import format_results, format_consensus_deltas
         from src.earnings.consensus import fmt_consensus_text
@@ -291,6 +297,8 @@ async def _run_pipeline(
             if ctext:
                 body += "\n\n" + ctext
             body += "\n\n" + fmt_consensus_text(snap)
+        if diff:
+            body += "\n\n" + _format_diff_text(diff)
         await send_text_chunked(bot, chat_id, body)
 
     if not transcripts:
@@ -307,7 +315,7 @@ async def _run_pipeline(
     await _safe_send(bot, chat_id, "🧠 비교 합성 중 (Opus, 인용·시나리오 기반 8000자+)…")
     industry_summary = await _step_synthesize_industry(
         transcripts, financials, fiscal_label, verify_by_ticker,
-        consensus_by_ticker, consensus_delta_by_ticker,
+        consensus_by_ticker, consensus_delta_by_ticker, diff_by_ticker,
     )
     if industry_summary:
         # 합성 결과엔 [TICKER] 인용·표·# 헤더가 있어 텔레그램 Markdown 파싱이 깨짐 → 평문 발송
@@ -315,13 +323,44 @@ async def _run_pipeline(
     else:
         industry_summary = "(비교 합성 실패 — PDF에는 차트·전문만 포함)"
 
+    # 6.5) Counter-thesis 자동 합성 (Track E) — 동일 payload + opus 1회 추가
+    await _safe_send(bot, chat_id, "🛡️ Counter-thesis 자동 반박 합성 중 (Opus)…")
+    counter_summary = await _step_synthesize_counter(
+        transcripts, financials, fiscal_label, verify_by_ticker,
+        consensus_by_ticker, consensus_delta_by_ticker, diff_by_ticker,
+    )
+    if counter_summary:
+        await send_text_chunked(bot, chat_id, counter_summary)
+    else:
+        counter_summary = ""
+
+    # 6.6) longitudinal history 영속화 (Track C) — 합성·counter 끝난 시점에 1회.
+    if fiscal_year and fiscal_quarter:
+        from src.earnings import history
+        for t, tr in transcripts.items():
+            try:
+                history.save_call(
+                    ticker=t,
+                    year=fiscal_year,
+                    quarter=fiscal_quarter,
+                    fiscal_label=fiscal_label,
+                    extract=tr,
+                    consensus=consensus_by_ticker.get(t),
+                    consensus_deltas=consensus_delta_by_ticker.get(t),
+                    verify_results=verify_by_ticker.get(t),
+                    synthesis_excerpt=industry_summary or "",
+                    counter_excerpt=counter_summary,
+                )
+            except Exception:
+                log.exception("[earnings/history] save_call 실패 (%s)", t)
+
     # 7) 커스텀 분석 (있을 때, Opus)
     custom_answer = ""
     if custom_question:
         await _safe_send(bot, chat_id, f"🎯 커스텀 질문 심층 답변 중 (Opus) — {custom_question[:80]}")
         custom_answer = await _step_synthesize_custom(
             custom_question, transcripts, financials, fiscal_label, verify_by_ticker,
-            consensus_by_ticker, consensus_delta_by_ticker,
+            consensus_by_ticker, consensus_delta_by_ticker, diff_by_ticker,
         ) or ""
         if custom_answer:
             await send_text_chunked(bot, chat_id, "🎯 커스텀 분석\n\n" + custom_answer)
@@ -489,13 +528,14 @@ async def _step_synthesize_industry(
     verify_by_ticker: dict[str, list],
     consensus_by_ticker: dict[str, Any] | None = None,
     consensus_delta_by_ticker: dict[str, list] | None = None,
+    diff_by_ticker: dict[str, dict] | None = None,
 ) -> str | None:
-    """비교 합성 (Opus, 딥리서치급). 컨센서스 데이터가 있으면 payload에 포함."""
+    """비교 합성 (Opus, 딥리서치급). 컨센서스·diff 데이터가 있으면 payload에 포함."""
     from src import summarizer
     system = _load_prompt("earnings_synthesis")
     user_payload = _build_synthesis_payload(
         transcripts, financials, fiscal_period, verify_by_ticker,
-        consensus_by_ticker, consensus_delta_by_ticker,
+        consensus_by_ticker, consensus_delta_by_ticker, diff_by_ticker,
     )
     loop = asyncio.get_running_loop()
 
@@ -521,6 +561,196 @@ async def _step_synthesize_industry(
     return content or None
 
 
+def _format_diff_text(diff: dict | None) -> str:
+    """diff JSON → 텔레그램용 한국어 요약 (Track C)."""
+    if not diff:
+        return ""
+    lines = ["🔁 분기간 diff (이전 N분기 vs 이번 분기)"]
+    pq = diff.get("prior_quarters_used") or []
+    if pq:
+        lines.append(f"  · 비교 분기: {', '.join(pq)}")
+    ts = diff.get("tone_shift") or []
+    if ts:
+        lines.append("  · 톤 시계열:")
+        for t in ts[-5:]:
+            lines.append(f"    - {t.get('quarter','?')}: {t.get('tone','?')}")
+    gc = diff.get("guidance_cycle") or []
+    if gc:
+        lines.append("  · 가이던스 사이클:")
+        for g in gc[-5:]:
+            lines.append(f"    - {g.get('quarter','?')} [{g.get('metric','?')}]: {g.get('label','?')}")
+    nec = diff.get("named_entity_churn") or {}
+    new_e = nec.get("new_this_quarter") or []
+    if new_e:
+        lines.append("  · 신규 거래처·파트너:")
+        for e in new_e[:5]:
+            lines.append(f"    - {e.get('counterparty','?')} ({e.get('type','?')})")
+    gone = nec.get("disappeared_since_last_quarter") or []
+    if gone:
+        lines.append("  · 사라진 멘션:")
+        for e in gone[:5]:
+            lines.append(f"    - {e.get('counterparty','?')} (마지막 {e.get('last_seen_quarter','?')})")
+    nt = diff.get("new_themes_this_quarter") or []
+    if nt:
+        lines.append("  · 이번 분기 새 테마:")
+        for x in nt[:5]:
+            lines.append(f"    - {x.get('theme','?')}")
+    rt = diff.get("recurring_themes") or []
+    if rt:
+        lines.append("  · 연속 테마(현황):")
+        for x in rt[:5]:
+            qs = ", ".join(x.get("quarters_seen") or [])
+            lines.append(f"    - {x.get('theme','?')} ({qs}, {x.get('tone_arc','?')})")
+    pm = (diff.get("pm_takeaway") or "").strip()
+    if pm:
+        lines.append(f"  · PM takeaway: {pm}")
+    return "\n".join(lines)
+
+
+async def _step_compute_diff(
+    ticker: str,
+    current_extract: dict,
+    fiscal_year: int | None,
+    fiscal_quarter: int | None,
+    prior_n: int = 4,
+) -> dict | None:
+    """분기간 diff 합성 (sonnet) — 현재 + 이전 N개 분기 history → 구조화 변화 JSON.
+
+    Track C. prior 분기가 0건이면 의미 없으니 None 반환 (synthesis에서 생략).
+    """
+    from src import summarizer
+    from src.earnings import history
+    from src.idea_bot import _parse_json
+
+    exclude = (fiscal_year, fiscal_quarter) if (fiscal_year and fiscal_quarter) else None
+    priors = history.load_recent(ticker, n=prior_n, exclude=exclude)
+    if not priors:
+        return None
+
+    system = _load_prompt("earnings_diff")
+    if not system:
+        log.warning("earnings_diff.txt 로드 실패 — diff 스킵")
+        return None
+
+    # 페이로드: 현재 분기 + 이전 분기들의 extract·consensus만 추려서 LLM에 제출
+    def _shrink(call_payload: dict) -> dict:
+        """저장 페이로드에서 LLM에 필요한 최소 필드만 추림 (토큰 절약)."""
+        ext = call_payload.get("extract") or {}
+        cons = call_payload.get("consensus") or {}
+        return {
+            "fiscal_label": call_payload.get("fiscal_label") or f"FY{call_payload.get('year')}Q{call_payload.get('quarter')}",
+            "headline_numbers": ext.get("headline_numbers") or {},
+            "guidance": ext.get("guidance") or {},
+            "management_tone": ext.get("management_tone") or "",
+            "named_deals": ext.get("named_deals") or [],
+            "supply_chain_signals": ext.get("supply_chain_signals") or [],
+            "competitor_callouts": ext.get("competitor_callouts") or [],
+            "macro_policy_mentions": ext.get("macro_policy_mentions") or [],
+            "segment_geo_mix": ext.get("segment_geo_mix") or [],
+            "notable_verbatim": (ext.get("notable_verbatim") or [])[:3],
+            "consensus_excerpt": {
+                "revenue_est_current_q": cons.get("revenue_est_current_q") if isinstance(cons, dict) else None,
+                "eps_est_current_q": cons.get("eps_est_current_q") if isinstance(cons, dict) else None,
+                "rec_mean": cons.get("rec_mean") if isinstance(cons, dict) else None,
+            },
+        }
+
+    current_payload = {
+        "fiscal_label": current_extract.get("fiscal_period") or (f"FY{fiscal_year}Q{fiscal_quarter}" if fiscal_year else "?"),
+        "headline_numbers": current_extract.get("headline_numbers") or {},
+        "guidance": current_extract.get("guidance") or {},
+        "management_tone": current_extract.get("management_tone") or "",
+        "named_deals": current_extract.get("named_deals") or [],
+        "supply_chain_signals": current_extract.get("supply_chain_signals") or [],
+        "competitor_callouts": current_extract.get("competitor_callouts") or [],
+        "macro_policy_mentions": current_extract.get("macro_policy_mentions") or [],
+        "segment_geo_mix": current_extract.get("segment_geo_mix") or [],
+        "notable_verbatim": (current_extract.get("notable_verbatim") or [])[:3],
+    }
+
+    user_msg = (
+        f"# ticker: {ticker}\n"
+        f"# current_quarter (분석 대상): {current_payload['fiscal_label']}\n"
+        f"# prior_quarters (신규순, {len(priors)}개):\n"
+        + json.dumps([_shrink(p) for p in priors], ensure_ascii=False, indent=2)
+        + f"\n\n# current_quarter_extract:\n"
+        + json.dumps(current_payload, ensure_ascii=False, indent=2)
+        + "\n\n위 데이터로 분기간 변화 JSON을 schema 그대로 출력하세요."
+    )
+
+    loop = asyncio.get_running_loop()
+
+    def _call():
+        client = summarizer.get_client()
+        return summarizer.chat_with_retry(
+            client,
+            model=_extract_model(),  # sonnet — diff는 추론 깊이 필요
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user_msg},
+            ],
+            temperature=0.2,
+            max_tokens=4500,
+            context="earnings-diff",
+        )
+
+    try:
+        content = await loop.run_in_executor(None, _call)
+    except Exception:
+        log.exception("diff 합성 실패 (%s)", ticker)
+        return None
+    if not content:
+        return None
+    return _parse_json(content)
+
+
+async def _step_synthesize_counter(
+    transcripts: dict[str, dict],
+    financials: dict[str, Any],
+    fiscal_period: str,
+    verify_by_ticker: dict[str, list],
+    consensus_by_ticker: dict[str, Any] | None = None,
+    consensus_delta_by_ticker: dict[str, list] | None = None,
+    diff_by_ticker: dict[str, dict] | None = None,
+) -> str | None:
+    """Counter-thesis 합성 (Opus) — 동일 cached payload + 다른 시스템 프롬프트.
+
+    idea_bot.py:376-577 `/contrarian` 패턴 차용. 비용: opus 1회 추가
+    (~$0.05-0.10) — synthesis와 동일한 payload 재사용해서 추출/Yahoo fetch는 0회.
+    """
+    from src import summarizer
+    system = _load_prompt("earnings_contrarian")
+    if not system:
+        log.warning("earnings_contrarian.txt 로드 실패 — counter-thesis 스킵")
+        return None
+    user_payload = _build_synthesis_payload(
+        transcripts, financials, fiscal_period, verify_by_ticker,
+        consensus_by_ticker, consensus_delta_by_ticker, diff_by_ticker,
+    )
+    loop = asyncio.get_running_loop()
+
+    def _call():
+        client = summarizer.get_client()
+        return summarizer.chat_with_retry(
+            client,
+            model=_synthesis_model(),
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user_payload},
+            ],
+            temperature=0.4,
+            max_tokens=8000,
+            context="earnings-counter",
+        )
+
+    try:
+        content = await loop.run_in_executor(None, _call)
+    except Exception:
+        log.exception("counter-thesis 합성 실패")
+        return None
+    return content or None
+
+
 async def _step_synthesize_custom(
     question: str,
     transcripts: dict[str, dict],
@@ -529,6 +759,7 @@ async def _step_synthesize_custom(
     verify_by_ticker: dict[str, list],
     consensus_by_ticker: dict[str, Any] | None = None,
     consensus_delta_by_ticker: dict[str, list] | None = None,
+    diff_by_ticker: dict[str, dict] | None = None,
 ) -> str | None:
     """커스텀 분석 답변 합성 (Opus). 컨센서스가 있으면 PM-grade로 활용."""
     from src import summarizer
@@ -537,7 +768,7 @@ async def _step_synthesize_custom(
         f"# 사용자 질문\n{question}\n\n"
         + _build_synthesis_payload(
             transcripts, financials, fiscal_period, verify_by_ticker,
-            consensus_by_ticker, consensus_delta_by_ticker,
+            consensus_by_ticker, consensus_delta_by_ticker, diff_by_ticker,
         )
     )
     loop = asyncio.get_running_loop()
@@ -623,13 +854,15 @@ def _build_synthesis_payload(
     verify_by_ticker: dict[str, list] | None = None,
     consensus_by_ticker: dict[str, Any] | None = None,
     consensus_delta_by_ticker: dict[str, list] | None = None,
+    diff_by_ticker: dict[str, dict] | None = None,
 ) -> str:
-    """LLM에 넘길 유저 메시지. 종목별 심층추출 + 재무 6년치 + 검증결과 + sell-side 컨센서스."""
+    """LLM에 넘길 유저 메시지. 종목별 심층추출 + 재무 6년치 + 검증 + 컨센서스 + 분기간 diff."""
     from src.earnings.sec_edgar import fmt_usd
     from src.earnings.consensus import consensus_payload_block
     verify_by_ticker = verify_by_ticker or {}
     consensus_by_ticker = consensus_by_ticker or {}
     consensus_delta_by_ticker = consensus_delta_by_ticker or {}
+    diff_by_ticker = diff_by_ticker or {}
     parts: list[str] = []
     parts.append(f"# 분기: {fiscal_period}")
     parts.append(f"# 분석 기업: {', '.join(transcripts.keys())}")
@@ -716,6 +949,11 @@ def _build_synthesis_payload(
         snap = consensus_by_ticker.get(t)
         if snap is not None:
             parts.append(consensus_payload_block(snap))
+        # 분기간 diff (Track C — 이전 N분기와의 톤·가이던스·entity 변화)
+        diff = diff_by_ticker.get(t)
+        if diff:
+            parts.append(f"### {t} quarter-over-quarter diff")
+            parts.append(json.dumps(diff, ensure_ascii=False))
         parts.append("")
 
     # 재무 6년치
