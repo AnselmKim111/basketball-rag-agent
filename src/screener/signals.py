@@ -155,58 +155,47 @@ def compute_signals_for_ticker(rows: list[dict], base_date: str | None = None) -
                                 "chg_pct": chg_pct,
                             }
 
-    # 5) VCP 상방 돌파 (Volatility Contraction Pattern)
-    # 정의 (단순화된 미네르비니 휴리스틱) — 임계값은 env로 조절 가능:
-    #   (a) base 형성: 50일 박스권 (high/low ≤ SCREENER_VCP_BASE_MAX, 기본 1.25)
-    #   (b) 변동성 수축: 20일 ATR ≤ 50일 ATR × SCREENER_VCP_ATR_MAX (기본 0.75)
-    #   (c) 거래량 dry-up: 10일 vol ≤ 50일 vol × SCREENER_VCP_DRYUP_MAX (기본 0.90)
-    #   (d) 돌파: 종가 > 50일 박스권 high AND 거래량 ≥ 20일평균 × SCREENER_VCP_VOL_MIN (기본 1.4)
-    # 4중 AND라 본질적으로 희소 (시장에 매일 0~5개). 완화하려면 env 상향.
-    if len(df) >= 50:
+    # 5) VCP 돌파 (최근 2주 이내 — 러프 버전)
+    # "오늘 돌파"만 잡던 4중 AND를 완화: 변동성 수축 base 형성 후 최근 N영업일
+    # (SCREENER_VCP_WINDOW, 기본 10=2주) 중 박스권 상단을 돌파한 종목.
+    #   (a) base: 돌파 window 직전 50일 박스권 (high/low ≤ SCREENER_VCP_BASE_MAX, 1.25)
+    #   (b) 변동성 수축: base 후반 20일 ATR ≤ 전반 30일 ATR × SCREENER_VCP_ATR_MAX (0.75)
+    #   (c) 돌파: 최근 window일 중 종가가 base 박스권 high 초과한 날 존재 (거래량 조건은 러프하게 생략)
+    vcp_window = int(_get_float_env("SCREENER_VCP_WINDOW", 10))
+    if len(df) >= 50 + vcp_window:
         try:
-            recent50 = df.iloc[-50:]
-            recent50_high = float(recent50["high"].iloc[:-1].max())
-            recent50_low = float(recent50["low"].iloc[:-1].min())
-            base_ratio = recent50_high / recent50_low if recent50_low > 0 else 999
+            # base 구간: 돌파 window 직전 50일
+            base = df.iloc[-(50 + vcp_window):-vcp_window]
+            base_high = float(base["high"].max())
+            base_low = float(base["low"].min())
+            base_ratio = base_high / base_low if base_low > 0 else 999
 
-            # ATR 계산 — high - low의 단순 평균 (TR 근사)
+            # ATR 수축 (base 구간 후반 20일 vs 그 전 30일)
             tr = (df["high"] - df["low"]).astype(float)
-            atr_recent = float(tr.iloc[-21:-1].mean()) if len(tr) >= 21 else 0
-            atr_base = float(tr.iloc[-51:-21].mean()) if len(tr) >= 51 else 0
+            atr_recent = float(tr.iloc[-(vcp_window + 20):-vcp_window].mean())
+            atr_base = float(tr.iloc[-(vcp_window + 50):-(vcp_window + 20)].mean())
             atr_contraction = (atr_recent / atr_base) if atr_base > 0 else 999
 
-            vol_ma20 = df["volume"].rolling(20).mean().iloc[-2]
-            vol_recent10 = df["volume"].iloc[-11:-1].mean()
-            vol_base50 = df["volume"].iloc[-51:-11].mean() if len(df) >= 51 else 0
-            vol_dryup = (float(vol_recent10) / float(vol_base50)) if vol_base50 > 0 else 999
+            vcp_base_max = _get_float_env("SCREENER_VCP_BASE_MAX", 1.40)
+            vcp_atr_max = _get_float_env("SCREENER_VCP_ATR_MAX", 1.00)
 
-            today_vol_ratio = (
-                float(today["volume"]) / float(vol_ma20) if (pd.notna(vol_ma20) and vol_ma20 > 0) else 0
-            )
+            # 최근 window일 중 종가가 base 박스권 상단 돌파한 날
+            recent = df.iloc[-vcp_window:]
+            above = recent[recent["close"] > base_high]
 
-            # 모든 조건 (env로 조절 가능 — 재배포 없이 미세조정)
-            vcp_base_max = _get_float_env("SCREENER_VCP_BASE_MAX", 1.25)
-            vcp_atr_max = _get_float_env("SCREENER_VCP_ATR_MAX", 0.75)
-            vcp_dryup_max = _get_float_env("SCREENER_VCP_DRYUP_MAX", 0.90)
-            vcp_vol_min = _get_float_env("SCREENER_VCP_VOL_MIN", 1.4)
-            is_base = base_ratio <= vcp_base_max
-            is_contracted = atr_contraction <= vcp_atr_max
-            is_dryup = vol_dryup <= vcp_dryup_max
-            is_breakout = (
-                today["close"] > recent50_high
-                and today_vol_ratio >= vcp_vol_min
-                and chg_pct > 0
-            )
-
-            if is_base and is_contracted and is_dryup and is_breakout:
+            if base_ratio <= vcp_base_max and atr_contraction <= vcp_atr_max and len(above) > 0:
+                # 가장 최근 돌파일까지 며칠 전인지 (0 = 오늘/base_date)
+                last_pos = above.index[-1]
+                days_ago = int(df.index[-1] - last_pos)
+                breakout_close = int(above["close"].iloc[-1])
                 out["vcp_breakout"] = {
                     "close": int(today["close"]),
-                    "base_high": int(recent50_high),
-                    "base_low": int(recent50_low),
+                    "base_high": int(base_high),
+                    "base_low": int(base_low),
                     "base_ratio": base_ratio,
                     "atr_contraction": atr_contraction,
-                    "vol_dryup": vol_dryup,
-                    "vol_ratio": today_vol_ratio,
+                    "days_ago": days_ago,
+                    "breakout_close": breakout_close,
                     "chg_pct": chg_pct,
                 }
         except Exception:
@@ -288,7 +277,7 @@ def compute_all(base_date: str | None = None) -> tuple[dict[str, list[dict]], di
         if cap is not None and cap < min_cap:
             skipped_cap += 1
             continue
-        rows = db.load_ohlcv(ticker, days=300)
+        rows = db.load_ohlcv(ticker, days=1300)
         if len(rows) < 60:
             continue
         # base_date row 보유 여부 검증

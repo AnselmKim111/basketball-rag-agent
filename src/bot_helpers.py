@@ -64,12 +64,22 @@ async def send_text_chunked(
     """
     if not text:
         return
-    # 청크 미리 계산 — 페이징 헤더에 총 개수 표기 위해.
+    # 줄 경계 우선 분할 — 마크다운 링크/단어가 청크 경계에서 깨지지 않게.
+    # (한 줄이 MESSAGE_CHUNK보다 길면 그 줄만 하드 분할.)
     chunks: list[str] = []
-    rest = text
-    while rest:
-        chunks.append(rest[:MESSAGE_CHUNK])
-        rest = rest[MESSAGE_CHUNK:]
+    buf = ""
+    for line in text.split("\n"):
+        while len(line) > MESSAGE_CHUNK:
+            if buf:
+                chunks.append(buf); buf = ""
+            chunks.append(line[:MESSAGE_CHUNK]); line = line[MESSAGE_CHUNK:]
+        add = line if not buf else "\n" + line
+        if len(buf) + len(add) > MESSAGE_CHUNK:
+            chunks.append(buf); buf = line
+        else:
+            buf += add
+    if buf:
+        chunks.append(buf)
     total = len(chunks)
     for idx, chunk in enumerate(chunks, start=1):
         body = f"[{idx}/{total}]\n{chunk}" if total >= 2 else chunk

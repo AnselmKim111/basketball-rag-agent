@@ -23,7 +23,7 @@ from src.us_screener import data_source, db, universe
 log = logging.getLogger(__name__)
 KST = timezone(timedelta(hours=9))
 
-DEFAULT_DAYS = 252
+DEFAULT_DAYS = 1260  # 5년 — 역사적 신고가(ATH 근접)와 52주 신고가 차별화
 SLEEP_BETWEEN_DAYS_S = 1.5
 SLEEP_BETWEEN_TICKERS_S = 0.3
 # date-batch가 N영업일 연속 빈 결과면 데이터 소스 다운으로 판단해 ticker-batch로 전환

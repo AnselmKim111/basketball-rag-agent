@@ -53,6 +53,7 @@ from src.earnings_bot import EARNINGS_COMMANDS, build_earnings_app
 from src.idea_bot import IDEA_COMMANDS, build_idea_app
 from src.screener_bot import SCREENER_COMMANDS, build_screener_app, screener_daily_job
 from src.us_screener_bot import US_SCREENER_COMMANDS, build_us_screener_app, us_screener_daily_job
+from src.report_bot import REPORT_COMMANDS, build_report_app, report_daily_job
 
 KST = timezone(timedelta(hours=9))
 
@@ -188,6 +189,20 @@ BOT_SPECS: list[BotSpec] = [
                 job_id="us_screener_daily",
                 cron={"hour": 7, "minute": 0},
                 description="미국 기술적 신호 — 매일 07:00 KST (미국 4PM ET 종가)",
+            ),
+        ],
+    ),
+    BotSpec(
+        name="report",
+        token_env="REPORT_BOT_TOKEN",
+        builder=build_report_app,
+        commands=REPORT_COMMANDS,
+        jobs=[
+            ScheduledJob(
+                func=report_daily_job,
+                job_id="report_daily",
+                cron={"hour": 8, "minute": 0},
+                description="버터대디봇 시황 리포트 — 매일 08:00 KST",
             ),
         ],
     ),

@@ -25,9 +25,12 @@ body { font-family: "Noto Sans CJK KR", "Noto Sans KR", sans-serif;
 h1 { font-size: 20pt; color: #111; border-bottom: 2px solid #333;
      padding-bottom: 6pt; margin-top: 0; }
 h2 { font-size: 15pt; color: #1a4480; margin-top: 18pt;
-     border-left: 4px solid #1a4480; padding-left: 8pt; }
-h3 { font-size: 12pt; color: #333; margin-top: 12pt; }
+     border-left: 4px solid #1a4480; padding-left: 8pt;
+     page-break-after: avoid; }
+h3 { font-size: 12pt; color: #333; margin-top: 12pt; page-break-after: avoid; }
 p { margin: 6pt 0; }
+img { max-width: 100%; height: auto; display: block; margin: 10pt auto;
+      border: 1px solid #eee; border-radius: 4pt; page-break-inside: avoid; }
 ul, ol { margin: 6pt 0; padding-left: 20pt; }
 li { margin: 3pt 0; }
 table { border-collapse: collapse; width: 100%; margin: 10pt 0; font-size: 10pt; }
