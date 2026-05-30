@@ -28,9 +28,19 @@ ALLOWED_ENV = "REPORT_ALLOWED_CHAT_IDS"
 CHAT_ID_ENV = "REPORT_CHAT_ID"
 
 WELCOME_TEXT = (
-    "📊 *버터대디봇 가입 완료* — 매일 08:00 KST 자동 발송\n\n"
-    "내용: 미국 4대 지수·히트맵·매크로·ETF + 한국 수급 멀티패널 + LLM 시황 내러티브.\n\n"
-    "명령:\n"
+    "✅ *가입 완료!*\n\n"
+    "📊 *버터대디봇* — 매일 아침 시장 색깔 진단 PDF\n\n"
+    "내일부터 매일 *08:00 KST* (미국 마감 + 한국 개장 전)에 PDF가 자동으로 도착합니다.\n\n"
+    "내용: 미국 4대 지수·히트맵·매크로·ETF + 한국 수급 멀티패널 + LLM 시황 내러티브\n\n"
+    "*명령*\n"
+    "  /report — 지금 즉시 리포트 생성 (~3-7분)\n"
+    "  /stop — 자동 발송 탈퇴\n"
+    "  /help — 도움말\n"
+)
+
+WELCOME_BACK_TEXT = (
+    "👋 *이미 가입되어 있어요* — 매일 08:00 KST에 자동 발송됩니다.\n\n"
+    "*명령*\n"
     "  /report — 지금 즉시 리포트 (~3-7분)\n"
     "  /stop — 자동 발송 탈퇴\n"
     "  /help — 도움말\n"
@@ -94,7 +104,8 @@ async def _cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
 
     try:
-        await update.message.reply_text(WELCOME_TEXT, parse_mode=ParseMode.MARKDOWN)
+        text = WELCOME_TEXT if is_new else WELCOME_BACK_TEXT
+        await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
     except Exception:
         log.exception("[start] welcome 발송 실패")
 
@@ -537,7 +548,9 @@ async def _self_test(bot: Bot) -> None:
 
 
 REPORT_COMMANDS = [
+    ("start", "✅ 가입 (매일 08:00 KST 자동 발송)"),
     ("report", "📊 즉시 시황 리포트 생성"),
+    ("stop", "🔕 자동 발송 탈퇴"),
     ("help", "도움말"),
 ]
 
