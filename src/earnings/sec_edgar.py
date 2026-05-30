@@ -366,3 +366,103 @@ def sanitize_tickers(raw: str) -> list[str]:
         seen.add(c)
         out.append(c)
     return out
+
+
+# ------------------------------------------------------------------
+# Form 4 인사이더 매매 (Track F)
+# ------------------------------------------------------------------
+@dataclass
+class InsiderTradeSummary:
+    """ticker별 최근 N일 인사이더 매매 요약. 상세 거래는 forms 리스트로."""
+    ticker: str
+    cik: str
+    window_days: int
+    form4_count: int               # 기간 내 Form 4 filing 수
+    forms: list[dict] = field(default_factory=list)  # [{accession, filed, reporter, primary_doc_url}]
+    note: str = ""
+
+
+def fetch_recent_form4(ticker: str, window_days: int = 30) -> InsiderTradeSummary | None:
+    """최근 N일 내 Form 4 (인사이더 매매 신고) 메타데이터 fetch.
+
+    SEC EDGAR submissions endpoint: https://data.sec.gov/submissions/CIK{10}.json
+    이건 재무 facts와 같은 무료 endpoint — 같은 USER_AGENT·throttle 재사용.
+
+    각 거래의 정확한 수량·가격은 Form 4 XML(`primary_doc_url` 안)을 파싱해야 알 수 있어
+    여기선 메타만 수집한다. (synthesis가 "최근 N일 net buy/sell" 같이 정성적으로 활용.)
+    """
+    import json
+    from datetime import datetime as _dt, timedelta as _td
+
+    ticker = (ticker or "").upper().strip()
+    cik = ticker_to_cik(ticker)
+    if not cik:
+        return None
+    url = f"{EDGAR_BASE}/submissions/CIK{cik}.json"
+    try:
+        _throttle()
+        with httpx.Client(timeout=DEFAULT_TIMEOUT) as cli:
+            r = cli.get(url, headers={"User-Agent": USER_AGENT})
+            if r.status_code != 200:
+                log.warning("SEC submissions %s → %s", ticker, r.status_code)
+                return None
+            data = r.json()
+    except Exception as e:
+        log.warning("SEC Form 4 fetch %s 예외: %s", ticker, e)
+        return None
+
+    recent = ((data or {}).get("filings") or {}).get("recent") or {}
+    forms = recent.get("form") or []
+    dates = recent.get("filingDate") or []
+    accns = recent.get("accessionNumber") or []
+    primary = recent.get("primaryDocument") or []
+    reporters = recent.get("reportingOwnerName") or recent.get("name") or []
+
+    cutoff = _dt.utcnow().date() - _td(days=window_days)
+    out: list[dict] = []
+    for i, f in enumerate(forms):
+        if f != "4":
+            continue
+        try:
+            filed = _dt.strptime(dates[i], "%Y-%m-%d").date()
+        except (ValueError, IndexError):
+            continue
+        if filed < cutoff:
+            continue
+        accession = accns[i] if i < len(accns) else None
+        primary_doc = primary[i] if i < len(primary) else None
+        reporter = reporters[i] if i < len(reporters) else None
+        acc_clean = (accession or "").replace("-", "")
+        doc_url = (
+            f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{acc_clean}/{primary_doc}"
+            if accession and primary_doc else None
+        )
+        out.append({
+            "accession": accession,
+            "filed": dates[i] if i < len(dates) else None,
+            "reporter": reporter,
+            "primary_doc_url": doc_url,
+        })
+
+    summary = InsiderTradeSummary(
+        ticker=ticker, cik=cik, window_days=window_days,
+        form4_count=len(out), forms=out,
+        note=f"최근 {window_days}일 내 Form 4 filing {len(out)}건 (메타데이터만, 거래 상세는 XML 파싱 필요)",
+    )
+    return summary
+
+
+def fmt_insider_summary(summary: InsiderTradeSummary | None) -> str:
+    """텔레그램·payload용 짧은 요약."""
+    if summary is None:
+        return ""
+    if summary.form4_count == 0:
+        return f"👥 인사이더({summary.ticker}): 최근 {summary.window_days}일 Form 4 filing 없음"
+    lines = [f"👥 인사이더({summary.ticker}): 최근 {summary.window_days}일 Form 4 {summary.form4_count}건"]
+    for f in summary.forms[:8]:
+        rep = f.get("reporter") or "?"
+        filed = f.get("filed") or "?"
+        lines.append(f"  · {filed} — {rep}")
+    if summary.form4_count > 8:
+        lines.append(f"  · … 외 {summary.form4_count - 8}건")
+    return "\n".join(lines)

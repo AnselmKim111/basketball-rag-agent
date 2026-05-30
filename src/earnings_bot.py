@@ -238,17 +238,26 @@ async def _run_pipeline(
         f"Q{fiscal_quarter} {fiscal_year}" if (fiscal_year and fiscal_quarter) else "the most recent reported quarter"
     )
 
-    # 3) SEC EDGAR 재무 + sell-side 컨센서스 (검증·차트·페이로드 모두에서 쓰이므로 먼저 병렬 수집)
-    await _safe_send(bot, chat_id, "📊 SEC EDGAR + sell-side 컨센서스 수집 중 …")
-    financials, consensus_by_ticker = await asyncio.gather(
+    # 3) SEC EDGAR 재무 + sell-side 컨센서스 + 생태계 맵 + Form 4 인사이더
+    #    (검증·차트·페이로드 모두에서 쓰이므로 먼저 4-track 병렬 수집)
+    await _safe_send(bot, chat_id, "📊 SEC + 컨센서스 + 생태계 맵 + 인사이더 4-track 수집 중 …")
+    financials, consensus_by_ticker, ecosystem_by_ticker, insider_by_ticker = await asyncio.gather(
         _step_fetch_financials(tickers),
         _step_fetch_consensus(tickers, fiscal_label),
+        _step_fetch_ecosystem(tickers),
+        _step_fetch_insider(tickers, window_days=30),
     )
     if not financials:
         await _safe_send(bot, chat_id, "⚠️ SEC EDGAR 데이터를 못 가져왔습니다 — 차트·검증 제한됩니다.")
     if consensus_by_ticker:
-        got = sum(1 for v in consensus_by_ticker.values() if v is not None)
-        await _safe_send(bot, chat_id, f"  📐 컨센서스 {got}/{len(tickers)} 종목 확보")
+        got_c = sum(1 for v in consensus_by_ticker.values() if v is not None)
+        got_e = sum(1 for v in (ecosystem_by_ticker or {}).values() if v is not None)
+        got_i = sum(1 for v in (insider_by_ticker or {}).values() if v is not None)
+        await _safe_send(
+            bot, chat_id,
+            f"  📐 컨센서스 {got_c}/{len(tickers)} · 🌐 생태계 {got_e}/{len(tickers)} · "
+            f"👥 인사이더 {got_i}/{len(tickers)}"
+        )
 
     # 2+3) 종목별: 진짜 전문 확보 → 심층추출 → 숫자 교차검증 + 컨센서스 delta + 분기간 diff
     transcripts: dict[str, dict] = {}
@@ -299,6 +308,18 @@ async def _run_pipeline(
             body += "\n\n" + fmt_consensus_text(snap)
         if diff:
             body += "\n\n" + _format_diff_text(diff)
+        # 생태계 맵 (Track D)
+        eco = (ecosystem_by_ticker or {}).get(t)
+        if eco:
+            from src.earnings.ecosystem import fmt_ecosystem_text
+            body += "\n\n" + fmt_ecosystem_text(t, eco)
+        # 인사이더 매매 (Track F)
+        insider = (insider_by_ticker or {}).get(t)
+        if insider is not None:
+            from src.earnings.sec_edgar import fmt_insider_summary
+            itxt = fmt_insider_summary(insider)
+            if itxt:
+                body += "\n\n" + itxt
         await send_text_chunked(bot, chat_id, body)
 
     if not transcripts:
@@ -316,6 +337,7 @@ async def _run_pipeline(
     industry_summary = await _step_synthesize_industry(
         transcripts, financials, fiscal_label, verify_by_ticker,
         consensus_by_ticker, consensus_delta_by_ticker, diff_by_ticker,
+        ecosystem_by_ticker, insider_by_ticker,
     )
     if industry_summary:
         # 합성 결과엔 [TICKER] 인용·표·# 헤더가 있어 텔레그램 Markdown 파싱이 깨짐 → 평문 발송
@@ -328,6 +350,7 @@ async def _run_pipeline(
     counter_summary = await _step_synthesize_counter(
         transcripts, financials, fiscal_label, verify_by_ticker,
         consensus_by_ticker, consensus_delta_by_ticker, diff_by_ticker,
+        ecosystem_by_ticker, insider_by_ticker,
     )
     if counter_summary:
         await send_text_chunked(bot, chat_id, counter_summary)
@@ -361,6 +384,7 @@ async def _run_pipeline(
         custom_answer = await _step_synthesize_custom(
             custom_question, transcripts, financials, fiscal_label, verify_by_ticker,
             consensus_by_ticker, consensus_delta_by_ticker, diff_by_ticker,
+            ecosystem_by_ticker, insider_by_ticker,
         ) or ""
         if custom_answer:
             await send_text_chunked(bot, chat_id, "🎯 커스텀 분석\n\n" + custom_answer)
@@ -499,6 +523,42 @@ async def _step_fetch_financials(tickers: list[str]) -> dict[str, Any]:
     return out
 
 
+async def _step_fetch_ecosystem(tickers: list[str]) -> dict[str, Any]:
+    """티커별 4-bucket 생태계 맵 (Track D). 캐시 hit이면 instant, miss면 perplexity 1회/종목."""
+    from src.earnings import ecosystem
+    loop = asyncio.get_running_loop()
+    results = await asyncio.gather(
+        *[loop.run_in_executor(None, ecosystem.get_ecosystem, t, True) for t in tickers],
+        return_exceptions=True,
+    )
+    out: dict[str, Any] = {}
+    for t, eco in zip(tickers, results):
+        if isinstance(eco, Exception):
+            log.warning("ecosystem fetch 실패 (%s): %s", t, eco)
+            out[t] = None
+            continue
+        out[t] = eco
+    return out
+
+
+async def _step_fetch_insider(tickers: list[str], window_days: int = 30) -> dict[str, Any]:
+    """티커별 최근 N일 Form 4 인사이더 매매 메타 (Track F). SEC 무료, 같은 USER_AGENT."""
+    from src.earnings import sec_edgar
+    loop = asyncio.get_running_loop()
+    results = await asyncio.gather(
+        *[loop.run_in_executor(None, sec_edgar.fetch_recent_form4, t, window_days) for t in tickers],
+        return_exceptions=True,
+    )
+    out: dict[str, Any] = {}
+    for t, s in zip(tickers, results):
+        if isinstance(s, Exception):
+            log.warning("Form 4 fetch 실패 (%s): %s", t, s)
+            out[t] = None
+            continue
+        out[t] = s
+    return out
+
+
 async def _step_fetch_consensus(tickers: list[str], fiscal_label: str | None = None) -> dict[str, Any]:
     """sell-side 컨센서스 병렬 fetch — Yahoo Finance → perplexity 폴백.
 
@@ -529,13 +589,16 @@ async def _step_synthesize_industry(
     consensus_by_ticker: dict[str, Any] | None = None,
     consensus_delta_by_ticker: dict[str, list] | None = None,
     diff_by_ticker: dict[str, dict] | None = None,
+    ecosystem_by_ticker: dict[str, Any] | None = None,
+    insider_by_ticker: dict[str, Any] | None = None,
 ) -> str | None:
-    """비교 합성 (Opus, 딥리서치급). 컨센서스·diff 데이터가 있으면 payload에 포함."""
+    """비교 합성 (Opus, 딥리서치급). 컨센서스·diff·생태계·인사이더 데이터를 모두 payload에 포함."""
     from src import summarizer
     system = _load_prompt("earnings_synthesis")
     user_payload = _build_synthesis_payload(
         transcripts, financials, fiscal_period, verify_by_ticker,
         consensus_by_ticker, consensus_delta_by_ticker, diff_by_ticker,
+        ecosystem_by_ticker, insider_by_ticker,
     )
     loop = asyncio.get_running_loop()
 
@@ -712,6 +775,8 @@ async def _step_synthesize_counter(
     consensus_by_ticker: dict[str, Any] | None = None,
     consensus_delta_by_ticker: dict[str, list] | None = None,
     diff_by_ticker: dict[str, dict] | None = None,
+    ecosystem_by_ticker: dict[str, Any] | None = None,
+    insider_by_ticker: dict[str, Any] | None = None,
 ) -> str | None:
     """Counter-thesis 합성 (Opus) — 동일 cached payload + 다른 시스템 프롬프트.
 
@@ -726,6 +791,7 @@ async def _step_synthesize_counter(
     user_payload = _build_synthesis_payload(
         transcripts, financials, fiscal_period, verify_by_ticker,
         consensus_by_ticker, consensus_delta_by_ticker, diff_by_ticker,
+        ecosystem_by_ticker, insider_by_ticker,
     )
     loop = asyncio.get_running_loop()
 
@@ -760,6 +826,8 @@ async def _step_synthesize_custom(
     consensus_by_ticker: dict[str, Any] | None = None,
     consensus_delta_by_ticker: dict[str, list] | None = None,
     diff_by_ticker: dict[str, dict] | None = None,
+    ecosystem_by_ticker: dict[str, Any] | None = None,
+    insider_by_ticker: dict[str, Any] | None = None,
 ) -> str | None:
     """커스텀 분석 답변 합성 (Opus). 컨센서스가 있으면 PM-grade로 활용."""
     from src import summarizer
@@ -769,6 +837,7 @@ async def _step_synthesize_custom(
         + _build_synthesis_payload(
             transcripts, financials, fiscal_period, verify_by_ticker,
             consensus_by_ticker, consensus_delta_by_ticker, diff_by_ticker,
+            ecosystem_by_ticker, insider_by_ticker,
         )
     )
     loop = asyncio.get_running_loop()
@@ -855,14 +924,21 @@ def _build_synthesis_payload(
     consensus_by_ticker: dict[str, Any] | None = None,
     consensus_delta_by_ticker: dict[str, list] | None = None,
     diff_by_ticker: dict[str, dict] | None = None,
+    ecosystem_by_ticker: dict[str, Any] | None = None,
+    insider_by_ticker: dict[str, Any] | None = None,
 ) -> str:
-    """LLM에 넘길 유저 메시지. 종목별 심층추출 + 재무 6년치 + 검증 + 컨센서스 + 분기간 diff."""
+    """LLM에 넘길 유저 메시지. 종목별 심층추출 + 재무 6년치 + 검증 + 컨센서스 + diff + 생태계 + 인사이더."""
     from src.earnings.sec_edgar import fmt_usd
     from src.earnings.consensus import consensus_payload_block
+    from src.earnings.ecosystem import ecosystem_payload_block
+    from src.earnings.sec_edgar import fmt_insider_summary
+    from src.earnings import history as _history
     verify_by_ticker = verify_by_ticker or {}
     consensus_by_ticker = consensus_by_ticker or {}
     consensus_delta_by_ticker = consensus_delta_by_ticker or {}
     diff_by_ticker = diff_by_ticker or {}
+    ecosystem_by_ticker = ecosystem_by_ticker or {}
+    insider_by_ticker = insider_by_ticker or {}
     parts: list[str] = []
     parts.append(f"# 분기: {fiscal_period}")
     parts.append(f"# 분석 기업: {', '.join(transcripts.keys())}")
@@ -954,6 +1030,31 @@ def _build_synthesis_payload(
         if diff:
             parts.append(f"### {t} quarter-over-quarter diff")
             parts.append(json.dumps(diff, ensure_ascii=False))
+        # 생태계 맵 (Track D) — 같은 분기 history가 있는 ecosystem ticker는 excerpt 첨부
+        eco = ecosystem_by_ticker.get(t)
+        if eco:
+            related_excerpts: dict[str, dict] = {}
+            related_tickers: list[str] = []
+            for bucket in ("customers", "inputs", "peers", "enablers"):
+                related_tickers.extend((eco.get(bucket) or [])[:3])
+            for rt in dict.fromkeys(related_tickers):  # dedup, preserve order
+                recent = _history.load_recent(rt, n=1)
+                if recent:
+                    excerpt = recent[0].get("extract") or {}
+                    related_excerpts[rt] = {
+                        "fiscal_label": recent[0].get("fiscal_label"),
+                        "management_tone": excerpt.get("management_tone"),
+                        "guidance": excerpt.get("guidance") or {},
+                    }
+            parts.append(ecosystem_payload_block(t, eco, related_excerpts or None))
+        # 인사이더 매매 (Track F — Form 4 최근 30일)
+        insider = insider_by_ticker.get(t)
+        if insider is not None:
+            parts.append(f"### {t} insider activity (last {insider.window_days} days)")
+            parts.append(f"form4_count={insider.form4_count}")
+            for f in (insider.forms or [])[:6]:
+                rep = (f.get("reporter") or "?")
+                parts.append(f"  - {f.get('filed','?')} reporter={rep}")
         parts.append("")
 
     # 재무 6년치
