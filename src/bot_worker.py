@@ -25,10 +25,11 @@ import re
 import sys
 from pathlib import Path
 
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -39,6 +40,11 @@ from src.bot_helpers import (
     allowed_chat_ids,
     deny_message,
     is_authorized as _bh_is_authorized,
+)
+from src.industry_catalog import (
+    Candidate as IndustryCandidate,
+    lookup_by_name as industry_lookup_by_name,
+    resolve_industry,
 )
 from src.pipeline_lock import PIPELINE_LOCK
 
@@ -65,7 +71,9 @@ HELP_TEXT = (
     "  → claude-sonnet 합성 → 8개 섹션 통합 리포트 + 차트 + 참고 PDF\n"
     "  ⏱️ 약 8-15분\n\n"
     "*🎯 AI 큐레이션 (오늘의 주도주):*\n"
-    "  `/curate` — Top 10 종목 리포트 + 각 선별 이유 (5-15분)\n\n"
+    "  `/curate` — 전체 Top 10 종목 리포트 + 각 선별 이유 (5-15분)\n"
+    "  `/curate <산업>` — 산업 한정 (예: `/curate 소부장`, `/curate 2차전지 소재`)\n"
+    "  `/curate <산업> <N>` — 산업 한정 + 개수 (예: `/curate 방산 5`)\n\n"
     "*분리 발송 (부분만 받고 싶을 때):*\n"
     "  `/report 종목명 [6자리티커] [개수]` — 증권사 리포트만\n"
     "  `/deepdive <티커 또는 종목명>` — DART만 (사업보고서·IR·재무차트)\n\n"
@@ -543,36 +551,200 @@ async def cmd_research(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     ).add_done_callback(_log_task_exception)
 
 
-async def cmd_curate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """종목 도메인 AI 큐레이션 — 주도주·학습가치 종목 선별 + Top N 리포트.
+_CURATE_PICK_PREFIX = "ccurate"
+_CURATE_PENDING: dict[str, dict] = {}  # chat_id → {"names": [...], "n": int}
 
-    `/curate [N]`. COMPANY_MODE 사용 (company 카테고리만, 산업·증권사 분포 균형).
+
+def _parse_curate_args(args: list[str]) -> tuple[str | None, int]:
+    """`/curate` args 를 (산업명 or None, N) 으로 파싱.
+
+    형식 (전부 지원):
+      `/curate`              → (None, 10)
+      `/curate 5`            → (None, 5)
+      `/curate 소부장`       → ("소부장", 10)
+      `/curate 소부장 5`     → ("소부장", 5)
+      `/curate 5 소부장`     → ("소부장", 5)
+      `/curate 2차전지 소재` → ("2차전지 소재", 10)
     """
-    if not is_authorized(update):
-        await deny_message(update, "종목봇")
-        return
-    args = context.args or []
+    if not args:
+        return None, 10
     n = 10
-    if args:
+    industry_tokens: list[str] = []
+    for tok in args:
         try:
-            v = int(args[0])
+            v = int(tok)
             n = max(1, min(15, v))
         except (ValueError, TypeError):
-            pass
-    bot = context.bot
-    chat_id = str(update.effective_chat.id)
+            industry_tokens.append(tok)
+    industry = " ".join(industry_tokens).strip() if industry_tokens else None
+    if industry and len(industry) > 60:
+        industry = industry[:60]
+    return industry, n
+
+
+async def _lookup_gics_async(query: str) -> str | None:
+    """wisereport GICS 코드 룩업 — 블로킹 Playwright 호출을 thread executor에 위임."""
+    from pathlib import Path as _P
+    from src.bot_helpers import wisereport_creds, MissingWisereportCreds
+    from src.wisereport import WisereportClient
+    try:
+        wr_id, wr_pw = wisereport_creds()
+    except MissingWisereportCreds:
+        logging.exception("wisereport 자격 증명 누락 (curate GICS lookup)")
+        return None
+
+    def _blocking() -> str | None:
+        with WisereportClient(
+            user_id=wr_id, password=wr_pw,
+            download_root=_P("/tmp"),
+            headless=True,
+            ignore_https_errors=os.environ.get("IGNORE_HTTPS_ERRORS", "false").lower() == "true",
+            state_file=_P(os.environ.get("STORAGE_STATE", "./.wisereport_state.json")),
+        ) as cli:
+            cli.ensure_logged_in()
+            return cli.lookup_industry_code(query)
+
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, _blocking)
+
+
+async def _launch_company_curate(
+    bot, chat_id: str, n: int, industry: IndustryCandidate | None,
+) -> None:
+    """confirmed 산업 (or None) + N 으로 실제 run_curated 호출."""
     try:
         from src.curator import COMPANY_MODE, run_curated
     except Exception:
         logging.exception("curator 모듈 로드 실패 (company)")
-        await update.message.reply_text("❌ 큐레이션 모듈 로드 실패")
+        await bot.send_message(chat_id=int(chat_id), text="❌ 큐레이션 모듈 로드 실패")
         return
-    await run_curated(bot, chat_id, n=n, mode=COMPANY_MODE)
+
+    industry_name: str | None = None
+    industry_gics: str | None = None
+    if industry is not None:
+        industry_name = industry.name_ko
+        await bot.send_message(
+            chat_id=int(chat_id),
+            text=f"🎯 산업 한정: *{industry_name}* — GICS 코드 룩업 중...",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        try:
+            industry_gics = await _lookup_gics_async(industry.wisereport_query)
+        except Exception:
+            logging.exception("GICS lookup 예외")
+            industry_gics = None
+        if not industry_gics:
+            await bot.send_message(
+                chat_id=int(chat_id),
+                text=(
+                    f"⚠️ '{industry_name}' GICS 코드 못 찾음 — "
+                    "산업 한정 없이 일반 큐레이션으로 진행합니다 (sonnet 프롬프트로만 필터)."
+                ),
+            )
+            # GICS 못 찾아도 industry_name은 살려서 sonnet 프롬프트에 한정 강제
+    await run_curated(
+        bot, chat_id, n=n, mode=COMPANY_MODE,
+        industry_name=industry_name, industry_gics=industry_gics,
+    )
+
+
+async def cmd_curate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """종목 도메인 AI 큐레이션 — 주도주·학습가치 종목 선별 + Top N 리포트.
+
+    `/curate [N] [산업명]` — 산업명 명시 시 그 산업 종목만 큐레이션.
+    """
+    if not is_authorized(update):
+        await deny_message(update, "종목봇")
+        return
+    industry_q, n = _parse_curate_args(context.args or [])
+    bot = context.bot
+    chat_id = str(update.effective_chat.id)
+
+    if not industry_q:
+        # 산업 미지정 — 기존 동작 (전체 종목 풀)
+        await _launch_company_curate(bot, chat_id, n=n, industry=None)
+        return
+
+    # 산업 정규화
+    loop = asyncio.get_running_loop()
+    try:
+        result = await loop.run_in_executor(None, resolve_industry, industry_q)
+    except Exception:
+        logging.exception("curate resolve_industry 예외")
+        await update.message.reply_text("❌ 산업명 해석 중 오류 — 잠시 후 재시도")
+        return
+
+    if result.failed:
+        await update.message.reply_text(
+            f"❌ '{industry_q}'을(를) 산업으로 해석 못 했습니다.\n"
+            "예: `/curate 소부장`, `/curate 2차전지 소재 5`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    if result.is_single and result.best is not None:
+        await _launch_company_curate(bot, chat_id, n=n, industry=result.best)
+        return
+
+    # 신뢰도 낮음 — 후보 인라인 버튼
+    names = [c.name_ko for c in result.candidates[:3]]
+    if not names:
+        await update.message.reply_text(
+            f"❌ '{industry_q}' 매핑 후보 없음 — 더 명확히 입력해 주세요."
+        )
+        return
+    _CURATE_PENDING[chat_id] = {"names": names, "n": n}
+    buttons = [
+        [InlineKeyboardButton(f"{i+1}. {nm}", callback_data=f"{_CURATE_PICK_PREFIX}|{i}")]
+        for i, nm in enumerate(names)
+    ]
+    await update.message.reply_text(
+        f"🤔 '{industry_q}' 해석이 애매합니다. 어느 산업인가요? (N={n})",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
+
+async def cmd_curate_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/curate` 인라인 후보 버튼 콜백."""
+    query = update.callback_query
+    if query is None:
+        return
+    await query.answer()
+    chat_id = str(query.message.chat.id) if query.message else None
+    if not chat_id or not _bh_is_authorized(update, "ALLOWED_CHAT_IDS"):
+        return
+    data = query.data or ""
+    parts = data.split("|", 1)
+    if len(parts) != 2 or parts[0] != _CURATE_PICK_PREFIX:
+        return
+    try:
+        idx = int(parts[1])
+    except ValueError:
+        return
+    pending = _CURATE_PENDING.get(chat_id)
+    if not pending:
+        await query.edit_message_text("⏰ 선택 만료 — `/curate` 다시 실행해 주세요.")
+        return
+    names: list[str] = pending["names"]
+    n: int = pending.get("n", 10)
+    if not (0 <= idx < len(names)):
+        await query.edit_message_text("⏰ 선택 만료 — `/curate` 다시 실행해 주세요.")
+        return
+    picked_name = names[idx]
+    picked = industry_lookup_by_name(picked_name)
+    if picked is None:
+        await query.edit_message_text(f"❌ '{picked_name}' 카탈로그에서 못 찾음")
+        return
+    _CURATE_PENDING.pop(chat_id, None)
+    await query.edit_message_text(
+        f"✅ 선택: *{picked_name}* (Top {n})", parse_mode=ParseMode.MARKDOWN,
+    )
+    await _launch_company_curate(context.bot, chat_id, n=n, industry=picked)
 
 
 COMPANY_COMMANDS = [
     ("research", "📋 통합 딥리서치 — DART+증권사+웹 → 한 편의 리포트 (8-15분)"),
-    ("curate", "🎯 AI 큐레이션 — 주도주·학습가치 종목 Top N 선별"),
+    ("curate", "🎯 AI 큐레이션 — Top N (예: /curate 소부장, /curate 2차전지 소재 5)"),
     ("report", "특정 종목 리포트 다운 + 요약 (분리 발송)"),
     ("deepdive", "DART 사업보고서·IR·재무차트 심층분석 (분리 발송)"),
     ("status", "현재 작업 진행 상태"),
@@ -593,6 +765,9 @@ def build_company_app(token: str) -> Application:
     app.add_handler(CommandHandler("report", cmd_report))
     app.add_handler(CommandHandler("research", cmd_research))
     app.add_handler(CommandHandler("curate", cmd_curate))
+    app.add_handler(
+        CallbackQueryHandler(cmd_curate_pick, pattern=f"^{_CURATE_PICK_PREFIX}\\|")
+    )
     # --- deepdive (격리: 실패해도 기존 봇 정상) ---
     try:
         from src.deepdive.handler import register as register_deepdive
