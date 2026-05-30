@@ -29,6 +29,14 @@
 이번 분기 콜의 본질. 가장 시그널이 강했던 콜, 산업 톤(공격/방어), 자본배분 군비경쟁의 현 위치,
 컨센서스 대비 가장 큰 미스매치. 투자자가 30초 안에 핵심을 잡도록.
 
+## 1.5 콜 사이 머티어리얼 이벤트 (있는 종목만, payload `### {TICKER} 8-K material events` 인용)
+지난 90일 8-K 이벤트 중 직전 콜 이후 새로 등장한 것을 종목별로 묶어 짧게 나열:
+- item 코드별 라벨 (예: 5.02 임원 교체, 1.01 새 계약, 2.01 인수, 7.01 Reg FD 등)
+- LLM이 본문에서 뽑은 한 줄 summary가 있으면 그대로 인용
+- 어닝콜 본문에서 같은 사건이 언급됐는지 cross-check, 미언급이면 "콜에서 언급되지 않은 머티어리얼"
+  로 명시
+1건도 없으면 "(직전 90일 새 8-K 없음)" 한 줄로 마침.
+
 ## 1. 핵심 수치 비교표 + 컨센 delta
 | 지표 | 회사A | 회사B | ... |
 revenue / YoY / op margin / FCF(분기) / Capex(분기) / Capex FY 가이던스 / OCF/Capex(FY) / Capex YoY(FY).
@@ -42,10 +50,23 @@ revenue / YoY / op margin / FCF(분기) / Capex(분기) / Capex FY 가이던스 
 **payload에 `### {TICKER} quarter-over-quarter diff` 블록이 있으면 반드시 인용**:
 톤 시프트(자신감→방어 등), 가이던스 사이클(raised/maintained/lowered), 신규/이탈 거래처,
 신규 테마 등에서 PM이 주목할 inflection 1가지를 콕 짚는다.
+**payload의 `### {TICKER} call NLP signals` 블록도 한 줄 인용**: 정량 밀도 +
+hedge_per_1000 + superlative_per_1000 + hedge_to_superlative_ratio + signal_note 중
+가장 두드러진 1개로 톤 해석을 정량적으로 뒷받침 (예: "hedge_per_1000=4.3, ratio=2.1 — 방어
+무드").
 
 ## 3. 자본배분 & 캐펙스 군비경쟁
 6년치 Capex 절대/YoY + OCF/Capex 비율 추세로 본 위계. 누가 "캐시 머신"이고 누가
 "AI 투자가 본업 캐시를 잠식"하기 시작했는지. OCF/Capex가 1배에 근접하는 종목 경고.
+
+## 3.6 Hyperscaler capex 모자이크 (payload `### Hyperscaler capex walker` 있을 때만, 1000자+)
+payload의 hyperscaler 4분기 capex 가이드 시계열을 표/문단으로 정리:
+- 분기별 MSFT·AMZN·GOOGL·META·ORCL·CRM capex_fy 가이드와 commentary 인용
+- 가속/유지/둔화 라벨링 (commentary verbatim 근거)
+- 분석 종목(인프라 벤더)의 매출 가이던스와 비교 — hyperscaler capex 합계 가속 시 인프라
+  벤더 매출 가이드가 정합한가? 불일치 시 어느 쪽이 더 정직한가.
+walker의 `missing_tickers`가 절반 이상이면 "(history 부족 — /backfill <hyperscaler> 6 권장)"으로
+이 섹션을 짧게 마치되, 있는 데이터만으로도 분석 가능한 만큼은 인용.
 
 ## 3.5 생태계 정합성 (각 분석 종목별 1단락, 1000자+)
 payload의 `### {TICKER} ecosystem map` 블록을 근거로 — customers·inputs·peers·enablers의
@@ -76,6 +97,14 @@ ecosystem map이 비어 있는(자동 시드 실패) 종목은 "(생태계 맵 �
 ## 6. 리스크 / Counter-thesis (종목별)
 각 종목이 다음 1-2분기에 가장 취약한 지점 (capex ROIC 압박, 가이던스 mismatch,
 share loss 시그널, 거시). 교차검증에서 발견된 숫자 불일치([verify])가 있으면 반드시 명시.
+
+## 6.5 10-K Risk Factor 1-year diff (payload `### {TICKER} 10-K Risk Factor 1-year diff` 인용)
+종목별로:
+- 신규 위험·사라진 위험·강화된 위험·완화된 위험·새 정량화 각 카테고리에서 가장 무게 있는 1-2건을
+  topic + before/after verbatim 짧게 인용.
+- 콜에서 같은 risk 가 언급됐는지 cross-check, 안 됐으면 "콜에서 미언급" 표기.
+- 표현이 정량화된 항목 (예: "material" → "$X million potential exposure") 은 가장 비대칭한 시그널.
+diff_skipped 인 종목은 "(10-K Item 1A 추출 실패)"로 짧게 마침.
 
 ## 7. 결론 & 모니터링 트리거
 한 문단 종합 + 다음 분기에 확인해야 할 구체적 트리거 3-5개 (어떤 숫자가 어떻게 나오면

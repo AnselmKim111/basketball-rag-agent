@@ -125,6 +125,113 @@ async def _cmd_earnings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     asyncio.create_task(_run_pipeline(update, context, args))
 
 
+async def _cmd_backfill(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/backfill <TICKER> [N] — 한 종목에 대해 직전 N분기 longitudinal history 시드.
+
+    매 분기당 흐름: transcripts.fetch_and_extract → history.save_call. 컨센서스는 fetch 안 함
+    (과거 컨센은 무의미). AV 25 req/day 제한 안에서. asyncio.create_task로 분리해 즉시 응답.
+    """
+    if not _is_authorized(update):
+        await deny_message(update, "어닝콜 기능")
+        return
+    args = context.args or []
+    if not args:
+        await update.message.reply_text(
+            "사용법: `/backfill <TICKER> [N=4]`\n예: `/backfill MSFT 6`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+    ticker = args[0].upper().strip()
+    n = 4
+    if len(args) > 1:
+        try:
+            n = max(1, min(int(args[1]), 12))  # 1-12 분기 cap (AV 25/day)
+        except ValueError:
+            await update.message.reply_text("N은 정수. 예: `/backfill MSFT 6`")
+            return
+    asyncio.create_task(_run_backfill(update, context, ticker, n))
+
+
+async def _run_backfill(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, ticker: str, n: int
+) -> None:
+    """직전 N분기 시퀀셜 backfill 워커. AV rate-limit 대응 — 실패 1건은 skip하고 계속."""
+    from datetime import datetime as _dt
+    from src import summarizer
+    from src.earnings import history, transcripts as trans
+
+    bot: Bot = context.bot
+    chat_id = str(update.effective_chat.id)
+
+    # 현재 시점에서 직전 N분기 시퀀스 도출 (calendar quarter 기준)
+    today = _dt.utcnow()
+    cur_y = today.year
+    cur_q = (today.month - 1) // 3 + 1  # 1-4
+    # 직전 분기부터 거꾸로 N개 (이번 분기는 미보고 가능성 ↑ → 직전부터)
+    seq: list[tuple[int, int]] = []
+    y, q = cur_y, cur_q
+    for _ in range(n):
+        q -= 1
+        if q == 0:
+            q = 4
+            y -= 1
+        seq.append((y, q))
+
+    await _safe_send(
+        bot, chat_id,
+        f"🔁 /backfill {ticker} {n}분기 — 시퀀스: " + ", ".join(f"{yy}Q{qq}" for yy, qq in seq),
+    )
+
+    extract_model = _extract_model()
+    success = 0
+    failed: list[str] = []
+    skipped_already: list[str] = []
+    loop = asyncio.get_running_loop()
+    client = summarizer.get_client()
+
+    for idx, (yy, qq) in enumerate(seq, 1):
+        # 이미 저장돼 있으면 skip
+        if history.load_call(ticker, yy, qq):
+            skipped_already.append(f"{yy}Q{qq}")
+            await _safe_send(bot, chat_id, f"  ⏭️ ({idx}/{n}) {ticker} {yy}Q{qq} 이미 캐시 — 스킵")
+            continue
+        await _safe_send(bot, chat_id, f"  ⏳ ({idx}/{n}) {ticker} {yy}Q{qq} 전문 확보 + 추출 …")
+        fiscal_label = f"Q{qq} {yy}"
+        try:
+            tr = await loop.run_in_executor(
+                None,
+                lambda yy=yy, qq=qq, fl=fiscal_label: trans.fetch_and_extract(
+                    client, ticker, yy, qq, extract_model=extract_model, fiscal_label=fl,
+                ),
+            )
+        except Exception:
+            log.exception("[backfill] fetch_and_extract 실패 %s %sQ%s", ticker, yy, qq)
+            tr = None
+        if tr is None or tr.get("extract_failed"):
+            failed.append(f"{yy}Q{qq}")
+            await _safe_send(bot, chat_id, f"  ⚠️ ({idx}/{n}) {ticker} {yy}Q{qq} 실패 — 계속")
+            continue
+        try:
+            history.save_call(
+                ticker=ticker, year=yy, quarter=qq, fiscal_label=fiscal_label,
+                extract=tr, consensus=None, consensus_deltas=[], verify_results=[],
+                synthesis_excerpt="", counter_excerpt="",
+            )
+            success += 1
+        except Exception:
+            log.exception("[backfill] save_call 실패 %s %sQ%s", ticker, yy, qq)
+            failed.append(f"{yy}Q{qq}(save)")
+
+    msg = (
+        f"✅ /backfill {ticker} 완료 — 신규 {success} · 스킵(기존) {len(skipped_already)} · "
+        f"실패 {len(failed)}\n"
+        f"  · 시드 분기: " + (", ".join(f"{y}Q{q}" for y, q in seq) or "—") + "\n"
+        + (f"  · 실패 분기: {', '.join(failed)}\n" if failed else "")
+        + "이후 이 종목 분석부터 분기간 diff·hyperscaler walker가 풍부해집니다."
+    )
+    await _safe_send(bot, chat_id, msg)
+
+
 async def _on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _is_authorized(update):
         await deny_message(update, "어닝콜 기능")
@@ -238,14 +345,19 @@ async def _run_pipeline(
         f"Q{fiscal_quarter} {fiscal_year}" if (fiscal_year and fiscal_quarter) else "the most recent reported quarter"
     )
 
-    # 3) SEC EDGAR 재무 + sell-side 컨센서스 + 생태계 맵 + Form 4 인사이더
-    #    (검증·차트·페이로드 모두에서 쓰이므로 먼저 4-track 병렬 수집)
-    await _safe_send(bot, chat_id, "📊 SEC + 컨센서스 + 생태계 맵 + 인사이더 4-track 수집 중 …")
-    financials, consensus_by_ticker, ecosystem_by_ticker, insider_by_ticker = await asyncio.gather(
+    # 3) SEC EDGAR 재무 + 컨센서스 + 생태계 맵 + Form 4 + 8-K + 10-K Risk diff
+    #    (먼저 6-track 병렬 수집)
+    await _safe_send(bot, chat_id, "📊 SEC + 컨센 + 생태계 + 인사이더 + 8-K + 10-K Risk 6-track 수집 중 …")
+    (
+        financials, consensus_by_ticker, ecosystem_by_ticker,
+        insider_by_ticker, events_8k_by_ticker, risk_diff_by_ticker,
+    ) = await asyncio.gather(
         _step_fetch_financials(tickers),
         _step_fetch_consensus(tickers, fiscal_label),
         _step_fetch_ecosystem(tickers),
         _step_fetch_insider(tickers, window_days=30),
+        _step_fetch_8k(tickers, window_days=90),
+        _step_fetch_risk_diff(tickers),
     )
     if not financials:
         await _safe_send(bot, chat_id, "⚠️ SEC EDGAR 데이터를 못 가져왔습니다 — 차트·검증 제한됩니다.")
@@ -253,10 +365,16 @@ async def _run_pipeline(
         got_c = sum(1 for v in consensus_by_ticker.values() if v is not None)
         got_e = sum(1 for v in (ecosystem_by_ticker or {}).values() if v is not None)
         got_i = sum(1 for v in (insider_by_ticker or {}).values() if v is not None)
+        got_k = sum(1 for v in (events_8k_by_ticker or {}).values() if v is not None)
+        got_r = sum(
+            1 for v in (risk_diff_by_ticker or {}).values()
+            if v and not v.get("diff_skipped")
+        )
         await _safe_send(
             bot, chat_id,
-            f"  📐 컨센서스 {got_c}/{len(tickers)} · 🌐 생태계 {got_e}/{len(tickers)} · "
-            f"👥 인사이더 {got_i}/{len(tickers)}"
+            f"  📐 컨센 {got_c}/{len(tickers)} · 🌐 생태계 {got_e}/{len(tickers)} · "
+            f"👥 인사이더 {got_i}/{len(tickers)} · 📂 8-K {got_k}/{len(tickers)} · "
+            f"📜 10-K Risk {got_r}/{len(tickers)}"
         )
 
     # 2+3) 종목별: 진짜 전문 확보 → 심층추출 → 숫자 교차검증 + 컨센서스 delta + 분기간 diff
@@ -264,6 +382,7 @@ async def _run_pipeline(
     verify_by_ticker: dict[str, list] = {}
     consensus_delta_by_ticker: dict[str, list] = {}
     diff_by_ticker: dict[str, dict] = {}
+    # risk_diff_by_ticker는 위 6-track gather에서 채워짐 (Track I)
     await _safe_send(
         bot, chat_id,
         f"📞 어닝콜 전문 확보 + 심층추출 시작 ({len(tickers)}개, {fiscal_label})\n"
@@ -320,6 +439,24 @@ async def _run_pipeline(
             itxt = fmt_insider_summary(insider)
             if itxt:
                 body += "\n\n" + itxt
+        # NLP 시그널 (Track K — 정규식, LLM 0회)
+        sig = tr.get("_signals")
+        if sig:
+            from src.earnings.nlp_signals import fmt_signals_text
+            body += "\n\n" + fmt_signals_text(sig)
+        # 8-K 머티어리얼 이벤트 (Track H)
+        events_8k = (events_8k_by_ticker or {}).get(t)
+        if events_8k is not None:
+            from src.earnings.sec_edgar import fmt_8k_summary
+            etxt = fmt_8k_summary(events_8k)
+            if etxt:
+                body += "\n\n" + etxt
+        # 10-K Risk diff (Track I)
+        rd = (risk_diff_by_ticker or {}).get(t)
+        if rd:
+            rdtxt = _fmt_risk_diff_text(rd)
+            if rdtxt:
+                body += "\n\n" + rdtxt
         await send_text_chunked(bot, chat_id, body)
 
     if not transcripts:
@@ -332,12 +469,22 @@ async def _run_pipeline(
         f"  ✅ {len(transcripts)}개 분석 완료 (전문 grounding {grounded_n}/{len(transcripts)})",
     )
 
+    # 5.7) Hyperscaler capex 모자이크 walker (Track L — 외부 fetch 0회, history만)
+    hyper_walker = _build_hyperscaler_capex_table(
+        quarters=4,
+        ecosystem_by_ticker=ecosystem_by_ticker,
+        analyzed_tickers=list(transcripts.keys()),
+    )
+    if hyper_walker.get("applicable"):
+        await _safe_send(bot, chat_id, fmt_hyperscaler_text(hyper_walker))
+
     # 6) 비교 합성 (Opus, 딥리서치급 — 컨센서스 delta·정성 서프라이즈 강제 인용)
     await _safe_send(bot, chat_id, "🧠 비교 합성 중 (Opus, 인용·시나리오 기반 8000자+)…")
     industry_summary = await _step_synthesize_industry(
         transcripts, financials, fiscal_label, verify_by_ticker,
         consensus_by_ticker, consensus_delta_by_ticker, diff_by_ticker,
-        ecosystem_by_ticker, insider_by_ticker,
+        ecosystem_by_ticker, insider_by_ticker, events_8k_by_ticker, risk_diff_by_ticker,
+        hyper_walker,
     )
     if industry_summary:
         # 합성 결과엔 [TICKER] 인용·표·# 헤더가 있어 텔레그램 Markdown 파싱이 깨짐 → 평문 발송
@@ -350,7 +497,8 @@ async def _run_pipeline(
     counter_summary = await _step_synthesize_counter(
         transcripts, financials, fiscal_label, verify_by_ticker,
         consensus_by_ticker, consensus_delta_by_ticker, diff_by_ticker,
-        ecosystem_by_ticker, insider_by_ticker,
+        ecosystem_by_ticker, insider_by_ticker, events_8k_by_ticker, risk_diff_by_ticker,
+        hyper_walker,
     )
     if counter_summary:
         await send_text_chunked(bot, chat_id, counter_summary)
@@ -384,7 +532,8 @@ async def _run_pipeline(
         custom_answer = await _step_synthesize_custom(
             custom_question, transcripts, financials, fiscal_label, verify_by_ticker,
             consensus_by_ticker, consensus_delta_by_ticker, diff_by_ticker,
-            ecosystem_by_ticker, insider_by_ticker,
+            ecosystem_by_ticker, insider_by_ticker, events_8k_by_ticker, risk_diff_by_ticker,
+            hyper_walker=hyper_walker,
         ) or ""
         if custom_answer:
             await send_text_chunked(bot, chat_id, "🎯 커스텀 분석\n\n" + custom_answer)
@@ -523,6 +672,165 @@ async def _step_fetch_financials(tickers: list[str]) -> dict[str, Any]:
     return out
 
 
+async def _step_fetch_risk_diff(tickers: list[str]) -> dict[str, Any]:
+    """티커별 10-K Item 1A Risk Factor 1년 diff (Track I).
+
+    1단계: 최신 + 1년 전 10-K Item 1A 텍스트 병렬 fetch (SEC HTML).
+    2단계: 페어가 둘 다 있는 종목에 대해 sonnet 1회 diff JSON.
+    실패는 graceful — 그 종목은 risk_diff_by_ticker[t] = None.
+    """
+    from src import summarizer
+    from src.earnings import sec_edgar
+    from src.idea_bot import _parse_json
+    loop = asyncio.get_running_loop()
+
+    snaps = await asyncio.gather(
+        *[loop.run_in_executor(None, sec_edgar.fetch_10k_risk_factors, t) for t in tickers],
+        return_exceptions=True,
+    )
+
+    system = _load_prompt("earnings_risk_diff")
+    out: dict[str, Any] = {}
+    model = _extract_model()
+
+    async def _diff_one(ticker: str, current, prior) -> dict | None:
+        if current is None or prior is None:
+            return None
+        user_msg = (
+            f"# ticker: {ticker}\n"
+            f"# current_filed: {current.filed} (chars: {current.risk_chars:,}, sent: {len(current.risk_text):,})\n"
+            f"# prior_filed: {prior.filed} (chars: {prior.risk_chars:,}, sent: {len(prior.risk_text):,})\n\n"
+            f"=== CURRENT 10-K Item 1A START ===\n{current.risk_text}\n=== END ===\n\n"
+            f"=== PRIOR 10-K Item 1A START ===\n{prior.risk_text}\n=== END ===\n\n"
+            "위 두 텍스트의 1년간 위험 진화를 schema 그대로 JSON으로 출력하세요."
+        )
+        def _call():
+            client = summarizer.get_client()
+            return summarizer.chat_with_retry(
+                client,
+                model=model,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user_msg},
+                ],
+                temperature=0.2,
+                max_tokens=4000,
+                context=f"earnings-risk-diff:{ticker}",
+            )
+        try:
+            content = await loop.run_in_executor(None, _call)
+        except Exception:
+            log.exception("risk diff LLM 실패 (%s)", ticker)
+            return None
+        return _parse_json(content) if content else None
+
+    diff_jobs = []
+    for t, snap_pair in zip(tickers, snaps):
+        if isinstance(snap_pair, Exception):
+            log.warning("10-K fetch 실패 (%s): %s", t, snap_pair)
+            out[t] = None
+            continue
+        current, prior = snap_pair
+        if current is None or prior is None:
+            # 페어 둘 다 있어야 의미 — fetch 상태만 메타로 보관
+            out[t] = {
+                "ticker": t,
+                "diff_skipped": True,
+                "reason": (
+                    "최신·이전 10-K Item 1A 페어 미확보 (추출 실패 또는 신규 상장)"
+                ),
+                "current_meta": ({"filed": current.filed, "chars": current.risk_chars} if current else None),
+                "prior_meta": ({"filed": prior.filed, "chars": prior.risk_chars} if prior else None),
+            }
+            continue
+        diff_jobs.append((t, current, prior))
+
+    # 2단계: 페어 있는 종목 sonnet 병렬
+    if diff_jobs:
+        results = await asyncio.gather(*[_diff_one(t, c, p) for t, c, p in diff_jobs])
+        for (t, current, prior), res in zip(diff_jobs, results):
+            payload = res or {}
+            payload.setdefault("ticker", t)
+            payload.setdefault("current_filed", current.filed)
+            payload.setdefault("prior_filed", prior.filed)
+            payload["_current_meta"] = {"filed": current.filed, "chars": current.risk_chars}
+            payload["_prior_meta"] = {"filed": prior.filed, "chars": prior.risk_chars}
+            out[t] = payload
+    return out
+
+
+def _fmt_risk_diff_text(rd: dict | None) -> str:
+    """텔레그램용 한국어 요약."""
+    if not rd:
+        return ""
+    ticker = rd.get("ticker", "?")
+    if rd.get("diff_skipped"):
+        return f"📜 10-K Risk diff({ticker}): 추출 실패 — {rd.get('reason','')}"
+    lines = [
+        f"📜 10-K Risk diff({ticker}) — "
+        f"최신 {rd.get('current_filed','?')} vs 이전 {rd.get('prior_filed','?')}"
+    ]
+    def _add(label, key, max_items=3):
+        items = rd.get(key) or []
+        if not items:
+            return
+        lines.append(f"  · {label} ({len(items)}건):")
+        for it in items[:max_items]:
+            t = (it.get("topic") or "?")[:60]
+            lines.append(f"    - {t}")
+    _add("🆕 신규 위험", "new_risks")
+    _add("🗑️ 사라진 위험", "removed_risks")
+    _add("🔺 강화", "intensified_risks")
+    _add("🔻 완화", "softened_risks")
+    _add("🔢 새 정량화", "new_quantification")
+    if rd.get("pm_takeaway"):
+        lines.append(f"  · PM takeaway: {rd.get('pm_takeaway')}")
+    return "\n".join(lines)
+
+
+async def _step_fetch_8k(tickers: list[str], window_days: int = 90) -> dict[str, Any]:
+    """티커별 최근 N일 8-K material events (Track H). 메타 fetch 후 가장 의미 있는 항목
+    상위 3건만 sonnet 1줄 요약 (비용 가드: 종목당 ~$0.03 max)."""
+    from src.earnings import sec_edgar
+    loop = asyncio.get_running_loop()
+    # 1단계: 모든 종목 8-K 메타 병렬 fetch
+    metas = await asyncio.gather(
+        *[loop.run_in_executor(None, sec_edgar.fetch_recent_8k, t, window_days, True) for t in tickers],
+        return_exceptions=True,
+    )
+    out: dict[str, Any] = {}
+    summary_jobs: list[tuple[str, Any]] = []  # (ticker, event) 페어 — 요약 대상
+    for t, meta in zip(tickers, metas):
+        if isinstance(meta, Exception):
+            log.warning("8-K fetch 실패 (%s): %s", t, meta)
+            out[t] = None
+            continue
+        out[t] = meta
+        if meta is None:
+            continue
+        # 2.02 (earnings release) 는 어차피 우리가 콜로 분석 중이므로 요약 우선순위 ↓
+        prioritized = sorted(
+            meta.events,
+            key=lambda e: (0 if any(c != "2.02" for c in e.items) else 1, e.filed),
+            reverse=True,  # 최신 + non-2.02 우선
+        )
+        for ev in prioritized[:3]:
+            summary_jobs.append((t, ev))
+    # 2단계: 우선순위 상위 이벤트만 sonnet 1줄 요약 (모두 병렬)
+    if summary_jobs:
+        from src.earnings import sec_edgar as _sec
+        model = _extract_model()
+        summaries = await asyncio.gather(
+            *[loop.run_in_executor(None, _sec.summarize_event_8k, ev, tk, model) for tk, ev in summary_jobs],
+            return_exceptions=True,
+        )
+        for (tk, ev), s in zip(summary_jobs, summaries):
+            if isinstance(s, Exception):
+                continue
+            ev.summary_line = s
+    return out
+
+
 async def _step_fetch_ecosystem(tickers: list[str]) -> dict[str, Any]:
     """티커별 4-bucket 생태계 맵 (Track D). 캐시 hit이면 instant, miss면 perplexity 1회/종목."""
     from src.earnings import ecosystem
@@ -591,6 +899,9 @@ async def _step_synthesize_industry(
     diff_by_ticker: dict[str, dict] | None = None,
     ecosystem_by_ticker: dict[str, Any] | None = None,
     insider_by_ticker: dict[str, Any] | None = None,
+    events_8k_by_ticker: dict[str, Any] | None = None,
+    risk_diff_by_ticker: dict[str, Any] | None = None,
+    hyper_walker: dict | None = None,
 ) -> str | None:
     """비교 합성 (Opus, 딥리서치급). 컨센서스·diff·생태계·인사이더 데이터를 모두 payload에 포함."""
     from src import summarizer
@@ -598,7 +909,8 @@ async def _step_synthesize_industry(
     user_payload = _build_synthesis_payload(
         transcripts, financials, fiscal_period, verify_by_ticker,
         consensus_by_ticker, consensus_delta_by_ticker, diff_by_ticker,
-        ecosystem_by_ticker, insider_by_ticker,
+        ecosystem_by_ticker, insider_by_ticker, events_8k_by_ticker, risk_diff_by_ticker,
+        hyper_walker,
     )
     loop = asyncio.get_running_loop()
 
@@ -667,6 +979,144 @@ def _format_diff_text(diff: dict | None) -> str:
     pm = (diff.get("pm_takeaway") or "").strip()
     if pm:
         lines.append(f"  · PM takeaway: {pm}")
+    return "\n".join(lines)
+
+
+def _load_hyperscaler_set() -> dict:
+    """prompts/data/hyperscaler_set.json 1회 로드 (cached). 실패 시 기본값."""
+    if hasattr(_load_hyperscaler_set, "_cache"):
+        return _load_hyperscaler_set._cache
+    path = Path(__file__).resolve().parent.parent / "prompts" / "data" / "hyperscaler_set.json"
+    default = {
+        "tickers": ["MSFT", "AMZN", "GOOGL", "META", "ORCL", "CRM"],
+        "infra_vendors": ["NVDA", "AMD", "AVGO", "SMCI", "DELL", "HPE", "ANET", "VRT"],
+    }
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        for k in ("tickers", "infra_vendors"):
+            data.setdefault(k, default[k])
+        _load_hyperscaler_set._cache = data  # type: ignore[attr-defined]
+        return data
+    except Exception:
+        log.warning("hyperscaler_set.json 로드 실패 → 기본값")
+        _load_hyperscaler_set._cache = default  # type: ignore[attr-defined]
+        return default
+
+
+def _build_hyperscaler_capex_table(
+    quarters: int = 4,
+    ecosystem_by_ticker: dict[str, Any] | None = None,
+    analyzed_tickers: list[str] | None = None,
+) -> dict:
+    """6 hyperscaler × N분기 capex 가이드 walker. 외부 fetch 0회, history cache만.
+
+    반환:
+      {
+        "applicable": bool,    # 분석 대상이 인프라 벤더거나 ecosystem.customers에 hyperscaler가 있으면 True
+        "trigger_reason": str,
+        "table": {
+          ticker: [{quarter, capex_fy, capex_commentary, source_label}],
+          ...
+        },
+        "missing_tickers": [...]  # history 미보유 hyperscaler
+      }
+    """
+    from src.earnings import history
+    cfg = _load_hyperscaler_set()
+    hyper = [t.upper() for t in (cfg.get("tickers") or [])]
+    vendors = {t.upper() for t in (cfg.get("infra_vendors") or [])}
+
+    trigger_reason = ""
+    applicable = False
+    analyzed_set = {t.upper() for t in (analyzed_tickers or [])}
+    if analyzed_set & vendors:
+        applicable = True
+        trigger_reason = "분석 종목이 infra_vendors에 포함"
+    if not applicable and ecosystem_by_ticker:
+        for t, eco in ecosystem_by_ticker.items():
+            if not eco:
+                continue
+            customers = {c.upper() for c in (eco.get("customers") or [])}
+            if customers & set(hyper):
+                applicable = True
+                trigger_reason = f"{t} ecosystem.customers에 hyperscaler 포함"
+                break
+
+    table: dict[str, list[dict]] = {}
+    missing: list[str] = []
+    for h in hyper:
+        recent = history.load_recent(h, n=quarters)
+        if not recent:
+            missing.append(h)
+            continue
+        rows: list[dict] = []
+        for call in recent:
+            ext = call.get("extract") or {}
+            g = ext.get("guidance") or {}
+            cap_fy = g.get("capex_fy") or ""
+            cap_comm = g.get("capex_commentary") or ""
+            if not (cap_fy or cap_comm):
+                continue
+            rows.append({
+                "quarter": call.get("fiscal_label") or f"FY{call.get('year')}Q{call.get('quarter')}",
+                "capex_fy": str(cap_fy)[:240],
+                "capex_commentary": str(cap_comm)[:600],
+                "source_label": ext.get("source") or "?",
+            })
+        if rows:
+            table[h] = rows
+    return {
+        "applicable": applicable,
+        "trigger_reason": trigger_reason,
+        "table": table,
+        "missing_tickers": missing,
+        "quarters_requested": quarters,
+    }
+
+
+def hyperscaler_payload_block(walker: dict | None) -> str:
+    """walker → synthesis 페이로드용 영문 블록. 비어 있으면 빈 문자열."""
+    if not walker or not walker.get("applicable"):
+        return ""
+    table = walker.get("table") or {}
+    if not table:
+        return (
+            "### Hyperscaler capex walker — N/A (history에 hyperscaler 콜 없음, "
+            "/backfill <MSFT|AMZN|GOOGL|META|ORCL|CRM> N 권장)"
+        )
+    lines = [
+        f"### Hyperscaler capex walker (trigger: {walker.get('trigger_reason','?')})"
+    ]
+    for ticker, rows in table.items():
+        lines.append(f"#### {ticker}")
+        for r in rows:
+            lines.append(f"  - {r.get('quarter')}: capex_fy={r.get('capex_fy')}")
+            if r.get("capex_commentary"):
+                lines.append(f"    commentary: {r.get('capex_commentary')}")
+    missing = walker.get("missing_tickers") or []
+    if missing:
+        lines.append(f"missing (history 없음): {', '.join(missing)}")
+    return "\n".join(lines)
+
+
+def fmt_hyperscaler_text(walker: dict | None) -> str:
+    """텔레그램용 한국어 요약."""
+    if not walker or not walker.get("applicable"):
+        return ""
+    table = walker.get("table") or {}
+    if not table:
+        return (
+            "🛰️ Hyperscaler capex 모자이크 — N/A\n"
+            "  · history에 hyperscaler 콜 없음. `/backfill MSFT 6` 등으로 시드 권장."
+        )
+    lines = [f"🛰️ Hyperscaler capex 모자이크 ({walker.get('trigger_reason','')})"]
+    for ticker, rows in table.items():
+        lines.append(f"  · {ticker}: " + " / ".join(
+            f"{r.get('quarter')}: {(r.get('capex_fy') or '')[:60]}" for r in rows[:4]
+        ))
+    miss = walker.get("missing_tickers") or []
+    if miss:
+        lines.append(f"  · history 없음: {', '.join(miss)} — backfill 권장")
     return "\n".join(lines)
 
 
@@ -777,6 +1227,9 @@ async def _step_synthesize_counter(
     diff_by_ticker: dict[str, dict] | None = None,
     ecosystem_by_ticker: dict[str, Any] | None = None,
     insider_by_ticker: dict[str, Any] | None = None,
+    events_8k_by_ticker: dict[str, Any] | None = None,
+    risk_diff_by_ticker: dict[str, Any] | None = None,
+    hyper_walker: dict | None = None,
 ) -> str | None:
     """Counter-thesis 합성 (Opus) — 동일 cached payload + 다른 시스템 프롬프트.
 
@@ -791,7 +1244,8 @@ async def _step_synthesize_counter(
     user_payload = _build_synthesis_payload(
         transcripts, financials, fiscal_period, verify_by_ticker,
         consensus_by_ticker, consensus_delta_by_ticker, diff_by_ticker,
-        ecosystem_by_ticker, insider_by_ticker,
+        ecosystem_by_ticker, insider_by_ticker, events_8k_by_ticker, risk_diff_by_ticker,
+        hyper_walker,
     )
     loop = asyncio.get_running_loop()
 
@@ -828,6 +1282,9 @@ async def _step_synthesize_custom(
     diff_by_ticker: dict[str, dict] | None = None,
     ecosystem_by_ticker: dict[str, Any] | None = None,
     insider_by_ticker: dict[str, Any] | None = None,
+    events_8k_by_ticker: dict[str, Any] | None = None,
+    risk_diff_by_ticker: dict[str, Any] | None = None,
+    hyper_walker: dict | None = None,
 ) -> str | None:
     """커스텀 분석 답변 합성 (Opus). 컨센서스가 있으면 PM-grade로 활용."""
     from src import summarizer
@@ -837,7 +1294,7 @@ async def _step_synthesize_custom(
         + _build_synthesis_payload(
             transcripts, financials, fiscal_period, verify_by_ticker,
             consensus_by_ticker, consensus_delta_by_ticker, diff_by_ticker,
-            ecosystem_by_ticker, insider_by_ticker,
+            ecosystem_by_ticker, insider_by_ticker, events_8k_by_ticker, risk_diff_by_ticker,
         )
     )
     loop = asyncio.get_running_loop()
@@ -926,9 +1383,12 @@ def _build_synthesis_payload(
     diff_by_ticker: dict[str, dict] | None = None,
     ecosystem_by_ticker: dict[str, Any] | None = None,
     insider_by_ticker: dict[str, Any] | None = None,
+    events_8k_by_ticker: dict[str, Any] | None = None,
+    risk_diff_by_ticker: dict[str, Any] | None = None,
+    hyper_walker: dict | None = None,
 ) -> str:
-    """LLM에 넘길 유저 메시지. 종목별 심층추출 + 재무 6년치 + 검증 + 컨센서스 + diff + 생태계 + 인사이더."""
-    from src.earnings.sec_edgar import fmt_usd
+    """LLM에 넘길 유저 메시지. 종목별 심층추출 + 재무 6년치 + 검증 + 컨센서스 + diff + 생태계 + 인사이더 + 8-K + 10-K risk diff + hyperscaler capex 모자이크."""
+    from src.earnings.sec_edgar import fmt_usd, events_8k_payload_block
     from src.earnings.consensus import consensus_payload_block
     from src.earnings.ecosystem import ecosystem_payload_block
     from src.earnings.sec_edgar import fmt_insider_summary
@@ -939,6 +1399,8 @@ def _build_synthesis_payload(
     diff_by_ticker = diff_by_ticker or {}
     ecosystem_by_ticker = ecosystem_by_ticker or {}
     insider_by_ticker = insider_by_ticker or {}
+    events_8k_by_ticker = events_8k_by_ticker or {}
+    risk_diff_by_ticker = risk_diff_by_ticker or {}
     parts: list[str] = []
     parts.append(f"# 분기: {fiscal_period}")
     parts.append(f"# 분석 기업: {', '.join(transcripts.keys())}")
@@ -1055,7 +1517,30 @@ def _build_synthesis_payload(
             for f in (insider.forms or [])[:6]:
                 rep = (f.get("reporter") or "?")
                 parts.append(f"  - {f.get('filed','?')} reporter={rep}")
+        # NLP 시그널 (Track K)
+        sig = tr.get("_signals")
+        if sig:
+            from src.earnings.nlp_signals import signals_payload_block
+            parts.append(signals_payload_block(t, sig))
+        # 8-K 머티어리얼 이벤트 (Track H)
+        ek = events_8k_by_ticker.get(t)
+        if ek is not None:
+            block = events_8k_payload_block(ek)
+            if block:
+                parts.append(block)
+        # 10-K Risk Factor diff (Track I)
+        rd = risk_diff_by_ticker.get(t)
+        if rd:
+            parts.append(f"### {t} 10-K Risk Factor 1-year diff")
+            parts.append(json.dumps(rd, ensure_ascii=False))
         parts.append("")
+
+    # Hyperscaler capex 모자이크 (Track L) — 분석 종목별 블록 끝난 뒤 1회만
+    if hyper_walker and hyper_walker.get("applicable"):
+        block = hyperscaler_payload_block(hyper_walker)
+        if block:
+            parts.append(block)
+            parts.append("")
 
     # 재무 6년치
     parts.append("## 재무 (SEC EDGAR 10-K FY)")
@@ -1206,6 +1691,7 @@ async def _self_test(app: Application) -> None:
 
 EARNINGS_COMMANDS = [
     ("earnings", "📞 미국 기업 어닝콜 + 비교 PDF (5-10분)"),
+    ("backfill", "🔁 종목 longitudinal history 시드 (`/backfill MSFT 6`)"),
     ("help", "ℹ️ 사용법"),
 ]
 
@@ -1213,12 +1699,13 @@ EARNINGS_COMMANDS = [
 def build_earnings_app(token: str) -> Application:
     """전용 EarningsBot Application 빌더 (orchestrator BOT_SPECS에서 호출).
 
-    핸들러: /start·/help · /earnings · 자유 텍스트(_on_text)로도 바로 진입.
+    핸들러: /start·/help · /earnings · /backfill · 자유 텍스트(_on_text)로도 바로 진입.
     EARNINGS_TEST_PROMPT env가 있으면 부팅 후 1회 self-test 자동 실행 (CLAUDE.md 검증 의무).
     """
     app = Application.builder().token(token).build()
     app.add_handler(CommandHandler(["start", "help"], _help))
     app.add_handler(CommandHandler("earnings", _cmd_earnings))
+    app.add_handler(CommandHandler("backfill", _cmd_backfill))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _on_text))
 
     try:

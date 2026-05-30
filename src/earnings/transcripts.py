@@ -147,6 +147,12 @@ def fetch_and_extract(
     parsed["source"] = doc.source
     parsed["source_urls"] = doc.source_urls
     parsed["transcript_chars"] = len(doc.full_text)
+    # Track K — call-internal NLP signals (정규식, LLM 0회)
+    try:
+        from src.earnings import nlp_signals
+        parsed["_signals"] = nlp_signals.compute_signals(doc.full_text, parsed)
+    except Exception:
+        log.exception("[earnings/nlp_signals] compute_signals 실패 (%s)", ticker)
     return parsed
 
 
