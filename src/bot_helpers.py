@@ -29,6 +29,46 @@ MESSAGE_CHUNK = 4000
 MAX_DOC_MB = 49
 
 
+def md_escape(s: str) -> str:
+    """레거시 텔레그램 Markdown 특수문자 이스케이프 (구버전 호환용)."""
+    if not s:
+        return s
+    for ch in ("\\", "[", "]", "_", "*", "`"):
+        s = s.replace(ch, "\\" + ch)
+    return s
+
+
+def html_escape(s: str) -> str:
+    """텔레그램 parse_mode='HTML'용 이스케이프 — & < > 만 처리.
+    레거시 Markdown은 한글 종목명·특수문자에 취약해 파싱 깨짐(=메시지 미발송)이 잦음.
+    HTML이 훨씬 견고 → 메인 메시지/캡션 링크는 <a href="url">html_escape(text)</a> 사용.
+    """
+    if not s:
+        return s
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+async def send_channel_photo(bot, chat_id, photo, caption=None, parse_mode=None, attempts: int = 4):
+    """채널에 사진 게시 — RetryAfter(flood control) 자동 대기·재시도.
+
+    성공 시 Message, 실패 시 None. 채널은 ~20건/분 한도라 호출측에서 간격(>=3s)도 둘 것.
+    """
+    import asyncio
+    from telegram.error import RetryAfter
+    for i in range(attempts):
+        try:
+            return await bot.send_photo(chat_id=chat_id, photo=photo, caption=caption,
+                                        parse_mode=parse_mode)
+        except RetryAfter as e:
+            wait = int(getattr(e, "retry_after", 5)) + 1
+            log.warning("send_channel_photo RetryAfter %ds (try %d/%d)", wait, i + 1, attempts)
+            await asyncio.sleep(wait)
+        except Exception:
+            log.exception("send_channel_photo 실패 (chat_id=%s)", chat_id)
+            return None
+    return None
+
+
 # ------------------------------------------------------------------
 # 인가 (chat_id allowlist)
 # ------------------------------------------------------------------
@@ -86,8 +126,14 @@ async def send_text_chunked(
         try:
             await bot.send_message(chat_id=chat_id, text=body, parse_mode=parse_mode)
         except Exception:
-            log.exception("send_message 실패 (chat_id=%s)", chat_id)
-            break
+            # parse_mode(HTML/Markdown) 파싱 실패 등 → plain text로 폴백 재전송 (배달 보장)
+            log.warning("send_message 1차 실패(parse_mode=%s) → plain 폴백 (chat_id=%s)",
+                        parse_mode, chat_id)
+            try:
+                await bot.send_message(chat_id=chat_id, text=body)
+            except Exception:
+                log.exception("send_message 최종 실패 (chat_id=%s)", chat_id)
+                break
 
 
 async def deny_message(update: Update, bot_label: str = "이 봇") -> None:

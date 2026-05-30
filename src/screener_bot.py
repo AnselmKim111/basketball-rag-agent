@@ -225,7 +225,7 @@ async def _cmd_screen(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
         return
     try:
-        await update.message.reply_text("🔄 스크리닝 즉시 실행 중... (~2-3분 소요)")
+        await update.message.reply_text("🔄 스크리닝 즉시 실행 중... (Naver 재수집 ~10분 소요)")
     except Exception:
         log.exception("screen 안내 실패")
     try:
@@ -358,7 +358,8 @@ def _permalink(channel: str, message_id: int) -> str | None:
 
 def _chart_caption(ticker: str, item: dict, cats: list[str], rows: list[dict], ytd, eps) -> str:
     from src.screener import fundamentals
-    name = item.get("name") or ticker
+    from src.bot_helpers import html_escape
+    name = html_escape(item.get("name") or ticker)
     chg = item.get("chg_pct") or 0.0
     turnover = fundamentals.turnover_won(rows[-1]) if rows else 0
     badge = " ".join(_BADGE[c] for c in cats if c in _BADGE)
@@ -366,12 +367,12 @@ def _chart_caption(ticker: str, item: dict, cats: list[str], rows: list[dict], y
         f"🇰🇷 {name} ({chg:+.1f}%)",
         badge,
         "",
-        f"✝ 종목명 : {name} ({ticker})",
+        f"✝ 종목명 : {name} ({html_escape(ticker)})",
         f"✝ 시가총액 : {_fmt_won(item.get('market_cap'))}",
         f"✝ 거래대금 : {_fmt_won(turnover)}",
         f"✝ 연초대비 상승률 : {_fmt_pct(ytd)}",
         f"✝ 최근 EPS YoY : {_fmt_pct(eps)}",
-        f"✝ [최신 종목 뉴스 조회](https://finance.naver.com/item/news.naver?code={ticker})",
+        f'✝ <a href="https://finance.naver.com/item/news.naver?code={ticker}">최신 종목 뉴스 조회</a>',
     ]
     return "\n".join(lines)
 
@@ -388,6 +389,8 @@ async def _post_charts_and_meta(results: dict, base_date: str,
     by_ticker: dict[str, dict] = {}
     badges: dict[str, list] = {}
     for cat, items in results.items():
+        if cat == "volume_breakout":
+            continue  # 거래량 돌파는 메시지·채널서 제외
         for it in items:
             t = it.get("ticker")
             if not t:
@@ -427,18 +430,22 @@ async def _post_charts_and_meta(results: dict, base_date: str,
                 png = await loop.run_in_executor(
                     None, lambda t=t, rows=rows, title=title: chart.render_candle_volume(t, rows, title=title))
                 if png:
+                    from src.bot_helpers import send_channel_photo
                     cap = _chart_caption(t, it, badges[t], rows, ytd, eps)
-                    msg = await chart_bot.send_photo(chat_id=channel, photo=png, caption=cap,
-                                                     parse_mode=ParseMode.MARKDOWN)
-                    url = _permalink(channel, msg.message_id)
-                    if url:
-                        links[t] = url
-                    posted += 1
-                    await asyncio.sleep(1.2)  # 채널 레이트리밋
+                    msg = await send_channel_photo(chart_bot, channel, png, cap, ParseMode.HTML)
+                    if msg:
+                        url = _permalink(channel, msg.message_id)
+                        if url:
+                            links[t] = url
+                        posted += 1
+                    await asyncio.sleep(3.0)  # 채널 ~20건/분 한도 → 게시 간 간격 (성공/실패 무관 페이싱)
         except Exception:
             log.exception("[screener] 종목 처리 실패 %s", t)
     log.info("[screener] 채널 게시 %d건 · 메타 %d종목 (links=%d)", posted, len(extra), len(links))
     return links, extra
+
+
+_screener_running = False  # 동시 /screen·cron 중복 실행 방지 (겹치면 서로 느려짐)
 
 
 async def screener_daily_job(bot: Bot, override_chat_id: str | None = None) -> None:
@@ -450,7 +457,17 @@ async def screener_daily_job(bot: Bot, override_chat_id: str | None = None) -> N
     신호 계산은 한 번만 수행 + 결과를 모든 대상자에게 발송 (효율).
     진행 상황(universe 빌드/백필) 메시지는 첫 대상자(주로 admin)에게만 발송.
     """
+    global _screener_running
     log.info("[scheduled] screener_daily_job 시작 override=%s", override_chat_id)
+    if _screener_running:
+        log.info("[scheduled] 이미 실행 중 — 중복 호출 스킵")
+        if override_chat_id:
+            try:
+                await send_text_chunked(bot, str(override_chat_id),
+                                        "⏳ 이미 스크리닝 실행 중입니다 — 곧 결과가 옵니다. (잠시만요)")
+            except Exception:
+                pass
+        return
 
     # 발송 대상 chat_id 리스트 결정
     if override_chat_id:
@@ -488,6 +505,7 @@ async def screener_daily_job(bot: Bot, override_chat_id: str | None = None) -> N
     # 진행 메시지 helper (admin에게만)
     chat_id = progress_chat  # 기존 코드 변수명 유지 (진행 메시지용)
 
+    _screener_running = True
     try:
         # universe 보장
         await loop.run_in_executor(None, db.ensure_schema)
@@ -558,26 +576,31 @@ async def screener_daily_job(bot: Bot, override_chat_id: str | None = None) -> N
             lengths2 = await loop.run_in_executor(None, db.ticker_data_lengths)
             log.info("[scheduled] 백필 후 ticker_data_lengths: %s", lengths2)
 
-        # 증분 (오늘 1일치) — KRX 16:30 이전 미발행 대비 retry
-        # SCREENER_RETRY_INTERVAL_S(기본 300=5분), SCREENER_RETRY_MAX(기본 6회 → 최대 30분)
-        retry_interval = int(os.getenv("SCREENER_RETRY_INTERVAL_S", "300"))
-        retry_max = int(os.getenv("SCREENER_RETRY_MAX", "6"))
-        inc = await loop.run_in_executor(None, incremental.update_today)
-        attempt = 1
-        while inc.get("empty") and inc.get("is_business_day") and attempt < retry_max:
-            log.info(
-                "[scheduled] today fetch 미발행 → %d초 후 재시도 (%d/%d)",
-                retry_interval, attempt, retry_max,
-            )
-            await asyncio.sleep(retry_interval)
+        if override_chat_id:
+            # 수동 /screen: 무거운 재수집(Naver 1200종목, ~10분) 생략 → 기존 DB 최신일자로 즉시 계산.
+            # validator가 신호 발생 종목을 Naver로 재검증하므로 정확성 유지. DB 비었을 때만 최소 보장.
+            latest = await loop.run_in_executor(None, db.latest_date)
+            if not latest:
+                log.info("[scheduled] /screen: DB 비어있음 → ensure_recent_business_day_data")
+                await loop.run_in_executor(None, incremental.ensure_recent_business_day_data)
+            else:
+                log.info("[scheduled] /screen override → Naver 재수집 생략, DB 최신=%s 사용", latest)
+        else:
+            # 16:00 cron: 오늘 1일치 fetch + KRX 미발행 대비 retry(5분×6=최대 30분) + 폴백
+            retry_interval = int(os.getenv("SCREENER_RETRY_INTERVAL_S", "300"))
+            retry_max = int(os.getenv("SCREENER_RETRY_MAX", "6"))
             inc = await loop.run_in_executor(None, incremental.update_today)
-            attempt += 1
-
-        # 영업일인데도 끝까지 today 미수신이면 어제 영업일 데이터라도 보장
-        if inc.get("empty"):
-            log.info("[scheduled] today 데이터 미수신 → ensure_recent_business_day_data")
-            ensured = await loop.run_in_executor(None, incremental.ensure_recent_business_day_data)
-            log.info("[scheduled] ensure_recent_business_day 결과: %s", ensured)
+            attempt = 1
+            while inc.get("empty") and inc.get("is_business_day") and attempt < retry_max:
+                log.info("[scheduled] today fetch 미발행 → %d초 후 재시도 (%d/%d)",
+                         retry_interval, attempt, retry_max)
+                await asyncio.sleep(retry_interval)
+                inc = await loop.run_in_executor(None, incremental.update_today)
+                attempt += 1
+            if inc.get("empty"):
+                log.info("[scheduled] today 데이터 미수신 → ensure_recent_business_day_data")
+                ensured = await loop.run_in_executor(None, incremental.ensure_recent_business_day_data)
+                log.info("[scheduled] ensure_recent_business_day 결과: %s", ensured)
 
         # 진단: 사용자 메시지에 나온 종목들의 last 7일치 close 출력 (DB값과 실제 비교 위함)
         # 삼성E&A(028050), 가온전선(000500), 한솔테크닉스(004710), 두산에너빌리티(034020),
@@ -654,7 +677,7 @@ async def screener_daily_job(bot: Bot, override_chat_id: str | None = None) -> N
         sent_count = 0
         for cid in target_chat_ids:
             try:
-                await send_text_chunked(bot, cid, text, parse_mode=ParseMode.MARKDOWN)
+                await send_text_chunked(bot, cid, text, parse_mode=ParseMode.HTML)
                 sent_count += 1
             except Exception:
                 log.exception("[scheduled] 발송 실패 cid=%s", cid)
@@ -666,6 +689,8 @@ async def screener_daily_job(bot: Bot, override_chat_id: str | None = None) -> N
             await send_text_chunked(bot, chat_id, "⚠️ 스크리너 작업 실패 — 로그 확인")
         except Exception:
             pass
+    finally:
+        _screener_running = False
 
 
 # ------------------------------------------------------------------

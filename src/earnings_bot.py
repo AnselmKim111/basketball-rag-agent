@@ -130,9 +130,14 @@ async def _on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await deny_message(update, "어닝콜 기능")
         return
     text = (update.message.text or "").strip()
-    if not text or len(text) > 1000:
+    if not text:
+        await update.message.reply_text("입력이 비어 있습니다. 사용법은 /help")
+        return
+    if len(text) > 1000:
         await update.message.reply_text(
-            "입력은 1-1000자. 사용법은 /help",
+            f"입력이 너무 깁니다 ({len(text)}자, 최대 1000자).\n"
+            "회사·조건만 간결히 적어 주세요. 예: `AAPL MSFT GOOGL 2026 1Q`",
+            parse_mode=ParseMode.MARKDOWN,
         )
         return
     asyncio.create_task(_run_pipeline(update, context, text))
@@ -155,7 +160,12 @@ async def _run_pipeline(
     # 0) 파싱
     parsed = await _step_parse(user_text)
     if parsed is None:
-        await _safe_send(bot, chat_id, "⚠️ 입력 파싱 실패 — 다시 시도해 주세요.")
+        await _safe_send(
+            bot, chat_id,
+            "⚠️ 입력을 이해하지 못했습니다.\n"
+            "첫 줄에 회사명 또는 티커를 적어 주세요 (예: AAPL MSFT GOOGL).\n"
+            "사용법: /help",
+        )
         return
 
     mode = parsed.get("mode") or "custom_only"
@@ -205,8 +215,12 @@ async def _run_pipeline(
     else:  # custom_only — 회사 미상
         await _safe_send(
             bot, chat_id,
-            "⚠️ 회사가 명시되지 않았고 조건도 모호합니다.\n"
-            "회사명 또는 조건(예: 빅테크, capex 상위 N개)을 함께 적어 주세요.",
+            "⚠️ 분석 대상을 찾지 못했습니다.\n\n"
+            "입력 예시:\n"
+            "  • 회사 지정: AAPL MSFT GOOGL 2026 1Q\n"
+            "  • 조건: 빅테크 2026 1Q / capex 상위 5\n"
+            "  • 커스텀: MSFT GOOGL 어디가 경쟁 우위?\n\n"
+            "사용법: /help",
         )
         return
 
@@ -238,11 +252,11 @@ async def _run_pipeline(
         f"📞 어닝콜 전문 확보 + 심층추출 시작 ({len(tickers)}개, {fiscal_label})\n"
         f"  진짜 전문에 grounding → 종목별 deep read (종목당 1-2분)",
     )
-    for t in tickers:
-        await _safe_send(bot, chat_id, f"  ⏳ {t} 전문 확보 + 심층 분석 중 …")
+    for idx, t in enumerate(tickers, 1):
+        await _safe_send(bot, chat_id, f"  ⏳ ({idx}/{len(tickers)}) {t} 전문 확보 + 심층 분석 중 …")
         tr = await _step_deep_extract(t, fiscal_year, fiscal_quarter, fiscal_label)
         if tr is None:
-            await _safe_send(bot, chat_id, f"  ⚠️ {t} 전문 확보 실패 — 스킵")
+            await _safe_send(bot, chat_id, f"  ⚠️ ({idx}/{len(tickers)}) {t} 전문 확보 실패 — 스킵")
             continue
         # 숫자 교차검증 (SEC와 대조)
         vres = await _step_verify(tr, financials.get(t), fiscal_year, fiscal_quarter)
@@ -403,15 +417,20 @@ async def _step_verify(extract: dict, financials, year: int | None, quarter: int
 
 
 async def _step_fetch_financials(tickers: list[str]) -> dict[str, Any]:
-    """SEC EDGAR 재무 (FY 6년 + 분기). {ticker: CompanyFinancials}."""
+    """SEC EDGAR 재무 (FY 6년 + 분기). {ticker: CompanyFinancials}.
+
+    종목별 병렬 fetch — sec_edgar._throttle (전역 스레드락, ≈6.6 req/s) 가 SEC 정책 보장.
+    """
     from src.earnings import sec_edgar
     loop = asyncio.get_running_loop()
+    results = await asyncio.gather(
+        *[loop.run_in_executor(None, sec_edgar.fetch_company_financials, t, 6) for t in tickers],
+        return_exceptions=True,
+    )
     out: dict[str, Any] = {}
-    for t in tickers:
-        try:
-            fin = await loop.run_in_executor(None, sec_edgar.fetch_company_financials, t, 6)
-        except Exception:
-            log.exception("SEC fetch 실패 (%s)", t)
+    for t, fin in zip(tickers, results):
+        if isinstance(fin, Exception):
+            log.warning("SEC fetch 실패 (%s): %s", t, fin)
             continue
         if fin is not None:
             out[t] = fin

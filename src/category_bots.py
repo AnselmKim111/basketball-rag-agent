@@ -18,9 +18,16 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 import httpx
-from telegram import Bot, Update
+from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 
 from src.bot_helpers import (
     MissingWisereportCreds,
@@ -30,6 +37,11 @@ from src.bot_helpers import (
     send_pdf as _bh_send_pdf,
     send_text_chunked as _bh_send_text,
     wisereport_creds,
+)
+from src.industry_catalog import (
+    Candidate as IndustryCandidate,
+    lookup_by_name as industry_lookup_by_name,
+    resolve_industry,
 )
 from src.pipeline_lock import PIPELINE_LOCK
 from src.state_store import mark_seen, mark_seen_with_titles, normalize_title, seen, seen_titles
@@ -257,10 +269,91 @@ async def industry_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await update.message.reply_text(INDUSTRY_HELP, parse_mode=ParseMode.MARKDOWN)
 
 
+# 인라인 버튼 callback prefix — 8자 이내 권장 (telegram 64바이트 제한)
+_INDUSTRY_PICK_PREFIX = "indpick"
+
+# CallbackQuery → 정식 산업명 매핑 (process-local). user_data 보다 단순.
+_PENDING_PICKS: dict[str, list[str]] = {}
+
+
+async def _send_industry_reports(
+    bot: Bot, chat_id: str, picked: IndustryCandidate
+) -> None:
+    """정식 산업명으로 wisereport 코드 룩업 → 인기 5 + 최신 5 발송.
+
+    industry_on_demand와 inline 버튼 callback 양쪽에서 공유.
+    """
+    loop = asyncio.get_running_loop()
+    try:
+        wr_id, wr_pw = wisereport_creds()
+    except MissingWisereportCreds as e:
+        log.error("wisereport 자격 증명 누락 (industry lookup): %s", e)
+        await bot.send_message(chat_id=chat_id, text="⚠️ wisereport 자격 증명 미설정 — 관리자에게 문의")
+        return
+
+    def _lookup() -> str | None:
+        with WisereportClient(
+            user_id=wr_id,
+            password=wr_pw,
+            download_root=Path("/tmp"),
+            headless=True,
+            ignore_https_errors=os.environ.get("IGNORE_HTTPS_ERRORS", "false").lower() == "true",
+            state_file=Path(os.environ.get("STORAGE_STATE", "./.wisereport_state.json")),
+        ) as cli:
+            cli.ensure_logged_in()
+            return cli.lookup_industry_code(picked.wisereport_query)
+
+    code = await loop.run_in_executor(None, _lookup)
+    if not code:
+        await bot.send_message(
+            chat_id=chat_id,
+            text=(
+                f"❌ wisereport에서 '{picked.name_ko}' (검색어: {picked.wisereport_query}) "
+                f"GICS 코드 룩업 실패.\n전체 산업 인기순 5건으로 대체 발송합니다."
+            ),
+        )
+        await _process_and_send_category(
+            bot=bot, chat_id=chat_id,
+            category="industry", label="산업 (인기 5건)",
+            sort_by="popular", limit=5, days_back=30,
+            dedup_key=None,
+            download_root=Path(os.environ.get("DOWNLOAD_DIR", "./downloads")),
+            short_summary=False,
+        )
+        return
+
+    await bot.send_message(
+        chat_id=chat_id,
+        text=f"✅ GICS 코드 확정: {code}\n이제 리포트를 받아옵니다.",
+    )
+
+    download_root = Path(os.environ.get("DOWNLOAD_DIR", "./downloads"))
+    await _process_and_send_category(
+        bot=bot, chat_id=chat_id,
+        category="industry",
+        label=f"{picked.name_ko} 인기순 5건",
+        sort_by="popular", limit=5, days_back=60,
+        dedup_key=None,
+        download_root=download_root,
+        short_summary=False,
+        industry_gics=code,
+    )
+    await _process_and_send_category(
+        bot=bot, chat_id=chat_id,
+        category="industry",
+        label=f"{picked.name_ko} 최신순 5건",
+        sort_by="latest", limit=5, days_back=60,
+        dedup_key=None,
+        download_root=download_root,
+        short_summary=False,
+        industry_gics=code,
+    )
+
+
 async def industry_on_demand(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
-    """사용자가 산업명 입력 → 인기 5 + 최신 5 발송."""
+    """사용자가 산업명 입력 → (정규화) → 인기 5 + 최신 5 발송."""
     if not _is_authorized(update, "INDUSTRY_ALLOWED_CHAT_IDS"):
         await deny_message(update, "산업봇")
         return
@@ -280,74 +373,92 @@ async def industry_on_demand(
 
     bot: Bot = context.bot
     chat_id = str(update.effective_chat.id)
-    await update.message.reply_text(
-        f"🔎 *{industry_name}* 산업 리포트 검색 중...\n⏱️ 약 8-15분 소요",
-        parse_mode=ParseMode.MARKDOWN,
-    )
 
-    # 산업명 → gicscode (best effort)
+    # 1단계: 산업명 정규화 (사전 + sonnet 하이브리드)
     loop = asyncio.get_running_loop()
-
     try:
-        wr_id, wr_pw = wisereport_creds()
-    except MissingWisereportCreds as e:
-        log.error("wisereport 자격 증명 누락 (industry lookup): %s", e)
-        await update.message.reply_text("⚠️ wisereport 자격 증명 미설정 — 관리자에게 문의")
+        result = await loop.run_in_executor(None, resolve_industry, industry_name)
+    except OpenRouterCreditExhausted:
+        await update.message.reply_text(
+            "❌ OpenRouter 한도 초과 — 산업명 해석 불가. 키 충전 후 재시도."
+        )
+        return
+    except Exception:
+        log.exception("resolve_industry 예외")
+        await update.message.reply_text("❌ 산업명 해석 중 오류 — 잠시 후 재시도")
         return
 
-    def _lookup() -> str | None:
-        with WisereportClient(
-            user_id=wr_id,
-            password=wr_pw,
-            download_root=Path("/tmp"),
-            headless=True,
-            ignore_https_errors=os.environ.get("IGNORE_HTTPS_ERRORS", "false").lower() == "true",
-            state_file=Path(os.environ.get("STORAGE_STATE", "./.wisereport_state.json")),
-        ) as cli:
-            cli.ensure_logged_in()
-            return cli.lookup_industry_code(industry_name)
-
-    code = await loop.run_in_executor(None, _lookup)
-    if not code:
-        await bot.send_message(
-            chat_id=chat_id,
-            text=f"❌ 산업 코드 룩업 실패: {industry_name}\n전체 산업 인기순 5건 발송으로 대체합니다.",
-        )
-        # 폴백: 전체 산업 인기순 5건
-        await _process_and_send_category(
-            bot=bot, chat_id=chat_id,
-            category="industry", label=f"산업 (인기 5건)",
-            sort_by="popular", limit=5, days_back=30,
-            dedup_key=None,
-            download_root=Path(os.environ.get("DOWNLOAD_DIR", "./downloads")),
-            short_summary=False,  # 5000자
+    if result.failed:
+        await update.message.reply_text(
+            f"❌ '{industry_name}'을(를) 알아듣지 못했습니다.\n"
+            "예: `반도체 소재·부품·장비`, `2차전지·배터리`, `방산·우주·항공`",
+            parse_mode=ParseMode.MARKDOWN,
         )
         return
 
-    download_root = Path(os.environ.get("DOWNLOAD_DIR", "./downloads"))
+    # 단일 결정 — confirm 한 줄 + 즉시 진행
+    if result.is_single and result.best is not None:
+        picked = result.best
+        await update.message.reply_text(
+            f"🎯 해석: {industry_name} → *{picked.name_ko}* (conf={picked.confidence:.2f})\n"
+            f"⏱️ 약 8-15분 소요",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        await _send_industry_reports(bot, chat_id, picked)
+        return
 
-    # 인기 5건
-    await _process_and_send_category(
-        bot=bot, chat_id=chat_id,
-        category="industry",
-        label=f"{industry_name} 인기순 5건",
-        sort_by="popular", limit=5, days_back=60,
-        dedup_key=None,
-        download_root=download_root,
-        short_summary=False,
-        industry_gics=code,
+    # 신뢰도 낮음 — 후보 3개 인라인 버튼
+    names = [c.name_ko for c in result.candidates[:3]]
+    if not names:
+        await update.message.reply_text(
+            f"❌ '{industry_name}' 매핑 후보가 없습니다. 더 명확하게 입력해 주세요."
+        )
+        return
+    _PENDING_PICKS[chat_id] = names
+    buttons = [
+        [InlineKeyboardButton(f"{i+1}. {n}", callback_data=f"{_INDUSTRY_PICK_PREFIX}|{i}")]
+        for i, n in enumerate(names)
+    ]
+    await update.message.reply_text(
+        f"🤔 '{industry_name}' 해석이 애매합니다. 어느 산업인가요?",
+        reply_markup=InlineKeyboardMarkup(buttons),
     )
-    # 최신 5건
-    await _process_and_send_category(
-        bot=bot, chat_id=chat_id,
-        category="industry",
-        label=f"{industry_name} 최신순 5건",
-        sort_by="latest", limit=5, days_back=60,
-        dedup_key=None,
-        download_root=download_root,
-        short_summary=False,
-        industry_gics=code,
-    )
+
+
+async def industry_pick_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """인라인 버튼 콜백 — 사용자가 후보 산업 1개를 선택했을 때."""
+    query = update.callback_query
+    if query is None:
+        return
+    await query.answer()
+    chat_id = str(query.message.chat.id) if query.message else None
+    if not chat_id:
+        return
+    if not _bh_is_authorized(update, "INDUSTRY_ALLOWED_CHAT_IDS"):
+        await query.edit_message_text("권한 없음")
+        return
+    data = query.data or ""
+    parts = data.split("|", 1)
+    if len(parts) != 2 or parts[0] != _INDUSTRY_PICK_PREFIX:
+        return
+    try:
+        idx = int(parts[1])
+    except ValueError:
+        return
+    names = _PENDING_PICKS.get(chat_id) or []
+    if not (0 <= idx < len(names)):
+        await query.edit_message_text("⏰ 선택 만료 — 다시 입력해 주세요.")
+        return
+    picked_name = names[idx]
+    picked = industry_lookup_by_name(picked_name)
+    if picked is None:
+        await query.edit_message_text(f"❌ '{picked_name}' 카탈로그에서 못 찾음")
+        return
+    _PENDING_PICKS.pop(chat_id, None)
+    await query.edit_message_text(f"✅ 선택: *{picked_name}*\n⏱️ 약 8-15분 소요", parse_mode=ParseMode.MARKDOWN)
+    await _send_industry_reports(context.bot, chat_id, picked)
 
 
 async def industry_trigger(
@@ -625,6 +736,9 @@ def build_industry_app(token: str) -> Application:
     app.add_handler(CommandHandler("industry", industry_on_demand))
     app.add_handler(CommandHandler("trigger", industry_trigger))
     app.add_handler(CommandHandler("curate", industry_curated))
+    app.add_handler(
+        CallbackQueryHandler(industry_pick_callback, pattern=f"^{_INDUSTRY_PICK_PREFIX}\\|")
+    )
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, industry_on_demand))
     return app
 
