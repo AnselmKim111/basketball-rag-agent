@@ -272,16 +272,12 @@ def build_pdf(
 ) -> Path | None:
     """전체 PDF 빌드. 성공 시 output_path 반환, 실패 None."""
     try:
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
         from matplotlib.backends.backend_pdf import PdfPages
 
         from src.earnings import charts
 
-        # 텍스트의 '$'를 LaTeX 수식으로 파싱하지 않음 — "$28B" 등 달러 기호가
-        # mathtext ParseException을 일으키는 것을 방지 (matplotlib ≥3.7).
-        plt.rcParams["text.parse_math"] = False
+        # 공통 matplotlib 설정 (Agg backend + text.parse_math=False 등).
+        plt = charts.setup_matplotlib_safe()
         _setup_korean_font()
         output_path = Path(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)

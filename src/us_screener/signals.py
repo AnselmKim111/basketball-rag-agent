@@ -155,13 +155,13 @@ def compute_signals_for_ticker(rows: list[dict], base_date: str | None = None) -
                                 "chg_pct": chg_pct,
                             }
 
-    # 5) VCP 돌파 (최근 2주 이내 — 러프 버전)
+    # 5) VCP 돌파 (최근 1주 이내 — 러프 버전)
     # "오늘 돌파"만 잡던 4중 AND를 완화: 변동성 수축 base 형성 후 최근 N영업일
-    # (SCREENER_VCP_WINDOW, 기본 10=2주) 중 박스권 상단을 돌파한 종목.
+    # (SCREENER_VCP_WINDOW, 기본 5=1주) 중 박스권 상단을 돌파한 종목.
     #   (a) base: 돌파 window 직전 50일 박스권 (high/low ≤ SCREENER_VCP_BASE_MAX, 1.25)
     #   (b) 변동성 수축: base 후반 20일 ATR ≤ 전반 30일 ATR × SCREENER_VCP_ATR_MAX (0.75)
     #   (c) 돌파: 최근 window일 중 종가가 base 박스권 high 초과한 날 존재 (거래량 조건은 러프하게 생략)
-    vcp_window = int(_get_float_env("SCREENER_VCP_WINDOW", 10))
+    vcp_window = int(_get_float_env("SCREENER_VCP_WINDOW", 5))
     if len(df) >= 50 + vcp_window:
         try:
             # base 구간: 돌파 window 직전 50일

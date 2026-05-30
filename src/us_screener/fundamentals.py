@@ -89,10 +89,14 @@ def _latest_shares(facts: dict) -> float | None:
 
 
 def ticker_fundamentals(ticker: str, use_cache: bool = True) -> dict:
-    """{eps_yoy, shares, eps_asof}. companyfacts 1회 fetch로 EPS+발행주식수 동시 추출, 캐시."""
+    """{eps_yoy, shares, eps_asof}. companyfacts 1회 fetch로 EPS+발행주식수 동시 추출.
+
+    캐시 규칙(시총 N/A 포이즈닝 방지): 회사는 항상 발행주식수가 존재하므로 shares=None은
+    'fetch 실패'로 간주 → 캐시를 신뢰하지 않고 재시도. 성공(shares 확보) 시에만 캐시.
+    """
     if use_cache:
         c = db.fundamentals_get(ticker)
-        if c is not None:
+        if c is not None and c.get("shares"):  # shares 있는 캐시만 신뢰 (None은 실패 → 재fetch)
             return c
     eps_val: float | None = None
     shares: float | None = None
@@ -114,7 +118,8 @@ def ticker_fundamentals(ticker: str, use_cache: bool = True) -> dict:
                 shares = _latest_shares(facts)
     except Exception:
         log.warning("[fundamentals] %s 펀더멘털 실패", ticker)
-    db.fundamentals_put(ticker, eps_val, asof, shares)  # None도 캐시(재호출 방지)
+    if shares:  # 실데이터(발행주식수) 확보 시에만 캐시 — None 포이즈닝 방지
+        db.fundamentals_put(ticker, eps_val, asof, shares)
     return {"eps_yoy": eps_val, "shares": shares, "eps_asof": asof}
 
 
