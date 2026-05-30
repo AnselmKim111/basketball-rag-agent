@@ -61,16 +61,21 @@ def write_report(
     }
     user_msg = (
         "다음은 오늘 시장 데이터·전일 대비 변화(deltas_vs_yesterday)·생성된 차트 목록이다. "
-        "시스템 규칙(버터대디 캐주얼 1인칭 문체 + 오늘의 핵심 가설 관통 + 8섹션 + 전일 대비 팔로업)에 따라 "
-        "한국어 Markdown 시황 리포트를 작성하라. "
-        "맨 앞에 '📍 어제 대비 변화' 블록과 Executive Summary(3~4줄)를 두고, 각 차트는 반드시 "
-        "![](images/파일명)으로 본문에 삽입하며, 각 섹션 끝에 '한 줄 takeaway(•)'를 붙여라. "
-        "§5 어닝 모멘텀은 earnings(최근 beat율·평균 서프라이즈·top beats/misses·다가올 일정)로 작성하라. "
-        "§6 개별 종목은 highlights와 news를 엮어 종목별 미니 스토리로(단순 등락 나열 금지). "
-        "news는 내러티브에 자연스럽게 녹이되 **출처 URL은 절대 쓰지 말고**(지어내기 금지), 매체/주체 이름만 "
-        "필요시 언급하라. 입력 news에 있는 사실만 쓰고 없는 수치·사실은 만들지 마라. "
-        "stale_data에 있는 카테고리는 '⚠ 전일자 데이터(asof)'로 명시하라. "
-        "데이터 미확보는 '데이터 미수집'으로, 가설은 '가설'로 표기하라.\n\n"
+        "시스템 규칙(버터대디 캐주얼 1인칭 문체 + S급 thesis-driven 구조)에 따라 한국어 Markdown "
+        "시황 리포트를 작성하라.\n\n"
+        "**필수 구조 (어기면 실패):**\n"
+        "1. 제목 직후 **🎯 오늘의 베팅 (THESIS BOX)** 5줄 인용블록: 베팅·진입조건·깨지는신호·시간축·확신도.\n"
+        "2. **📍 어제 대비 변화**, **Executive Summary**(첫 줄 인과 사슬 4-5단).\n"
+        "3. §0~§8 매 섹션은 **관찰 → 해석 → 베팅(구체 레벨) → 반박(해당시) → • takeaway(thesis 관계)** 4부 스키마.\n"
+        "4. 모든 차트는 반드시 `![](images/파일명)`으로 본문 1회 삽입.\n"
+        "5. **마지막에 🌅 내일 체크포인트 표 3행** (무엇·시간·왜 중요·진행 신호).\n"
+        "6. 마지막 문장은 '지수는 움직였고, 이제 돈은 어디로 가고 있는가?'에 답.\n\n"
+        "**베팅 레벨은 signals/macro/breadth의 실제 수치만 인용**(추측 가격 금지). "
+        "§5 어닝은 earnings(beat율·평균 서프라이즈·top beats/misses·다가올 일정) 기반. "
+        "§6 개별 종목은 highlights와 news를 엮은 종목별 미니 스토리(단순 등락 나열 금지). "
+        "news는 내러티브에 자연스럽게 녹이되 **출처 URL 절대 금지**(지어내기 금지), 매체/주체 이름만. "
+        "입력 news에 있는 사실만 쓰고 없는 수치·사실은 만들지 마라. "
+        "stale_data 카테고리는 '⚠ 전일자 데이터(asof)'로 명시. 데이터 미확보는 '데이터 미수집'으로.\n\n"
         + json.dumps(payload, ensure_ascii=False, indent=2)
     )
     try:
@@ -85,7 +90,7 @@ def write_report(
             client,
             messages=[{"role": "system", "content": _system_prompt()},
                       {"role": "user", "content": user_msg}],
-            max_tokens=8000,
+            max_tokens=10000,
             model=model,
             temperature=0.4,
             context="report_writer",
