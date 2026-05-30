@@ -65,6 +65,41 @@ _send_text = _bh_send_text
 _send_pdf = _bh_send_pdf
 
 
+# OpenRouter 동시 호출 상한. 너무 크면 429. 5-8 권장 — wisereport 한 카테고리 5건
+# + 인기/최신 합쳐서 10건도 한 번에 안전하게 처리 가능한 보수적 값.
+_LLM_SUMMARY_CONCURRENCY = int(os.environ.get("LLM_SUMMARY_CONCURRENCY", "8"))
+
+
+async def _summarize_pdfs_parallel(
+    paths: list[Path], *, short_summary: bool, label: str
+) -> list[str]:
+    """N개 PDF를 asyncio.gather + semaphore로 동시 요약.
+
+    PIPELINE_LOCK 바깥에서 호출 — 같은 chat의 후속 발송 응답성을 위해.
+    각 호출은 to_thread로 워커 스레드에서 sync OpenRouter SDK 사용.
+    실패는 자리에 (요약 실패: ...) 문자열로 들어가 발송은 계속.
+    """
+    if not paths:
+        return []
+    sum_client = get_client()
+    summarize_fn = summarize_pdf_short if short_summary else summarize_pdf
+    sem = asyncio.Semaphore(_LLM_SUMMARY_CONCURRENCY)
+
+    async def _one(p: Path) -> str:
+        async with sem:
+            try:
+                s = await asyncio.to_thread(summarize_fn, sum_client, p)
+                return s.summary_text
+            except OpenRouterCreditExhausted:
+                log.warning("[%s] %s 요약 — OpenRouter 한도 초과", label, p.name)
+                return "(요약 실패: OpenRouter 토큰 부족)"
+            except Exception as e:
+                log.exception("[%s] %s 요약 실패", label, p.name)
+                return f"(요약 실패: {e!r})"
+
+    return await asyncio.gather(*[_one(p) for p in paths])
+
+
 # ------------------------------------------------------------------
 # 공통: 카테고리 → 다운로드 + 짧은 요약 + 발송
 # ------------------------------------------------------------------
@@ -81,18 +116,25 @@ async def _process_and_send_category(
     short_summary: bool = True,
     industry_gics: str | None = None,
 ) -> int:
-    """카테고리 리포트 가져와서 (옵션: dedup) 다운로드 → 짧은 요약 → 텔레그램 발송.
+    """카테고리 리포트 가져와서 (옵션: dedup) 다운로드 → 요약 → 텔레그램 발송.
 
-    blocking I/O (Playwright + OpenRouter) 는 thread executor에서 실행.
-    PIPELINE_LOCK으로 직렬화 — 다른 작업 진행 중이면 큐 대기.
+    동시성 설계
+    -----------
+    PIPELINE_LOCK은 **wisereport 다운로드 구간에서만** 유지. wisereport는 같은 계정
+    동시 로그인 시 세션 무효화되어 직렬화 필수. 하지만 LLM 요약·텔레그램 발송은
+    lock 밖에서 진행 — 다운로드 끝나는 즉시 다른 사용자 명령이 wisereport를 잡을
+    수 있다.
+
+    LLM 요약은 `_summarize_pdfs_parallel`로 동시 호출 (semaphore 상한). 5-10개
+    PDF가 한 번에 요약되어 사용자 체감 응답 속도가 5-8배 빨라진다.
+
     반환: 발송한 리포트 개수.
     """
-    # 다른 wisereport 작업이 돌고 있으면 큐 안내
     if PIPELINE_LOCK.locked():
         await _send_text(
             bot,
             chat_id,
-            f"⏳ *{label}*: 다른 작업 진행 중 — 끝나면 순차 처리합니다",
+            f"⏳ *{label}*: wisereport 사용 중 — 다운로드만 잠시 대기 (요약은 즉시 병렬 진행)",
         )
 
     try:
@@ -102,9 +144,10 @@ async def _process_and_send_category(
         await _send_text(bot, chat_id, f"⚠️ {label}: wisereport 자격 증명 미설정 — 관리자에게 문의")
         return 0
 
-    async with PIPELINE_LOCK:
-        loop = asyncio.get_running_loop()
+    loop = asyncio.get_running_loop()
 
+    # ─── STEP A: wisereport 다운로드 (lock 안 — 직렬 필수) ───
+    async with PIPELINE_LOCK:
         seen_ids: set[str] = set()
         seen_t_set: set[str] = set()
         if dedup_key:
@@ -115,10 +158,8 @@ async def _process_and_send_category(
                 dedup_key, len(seen_ids), len(seen_t_set),
             )
 
-        # blocking 파이프라인을 thread에서 실행
-        def _blocking() -> tuple[list[Path], list[str], list[tuple[str, str]]]:
+        def _wisereport_only() -> tuple[list[Path], list[ReportItem]]:
             from src.summarizer import IndividualSummary  # noqa: F401
-            items: list[ReportItem] = []
             with WisereportClient(
                 user_id=wr_id,
                 password=wr_pw,
@@ -128,7 +169,6 @@ async def _process_and_send_category(
                 state_file=Path(os.environ.get("STORAGE_STATE", "./.wisereport_state.json")),
             ) as cli:
                 cli.ensure_logged_in()
-                # dedup으로 잘릴 가능성 보정 — 넉넉하게 가져온 뒤 필터.
                 fetch_limit = limit + len(seen_ids) + 30
                 raw = cli.list_top_reports(
                     category=category,  # type: ignore[arg-type]
@@ -144,65 +184,51 @@ async def _process_and_send_category(
                     limit=limit,
                 )
                 if not items:
-                    return [], [], []
+                    return [], []
                 if len(raw) != len(items):
                     log.info(
                         "dedup [%s]: %d → %d (rpt_id+title+batch+freshness)",
                         dedup_key or "no-dedup", len(raw), len(items),
                     )
-
                 target_dir = download_root / _safe_dirname(label)
                 saved_paths = cli.download_reports(items, target_dir)
-
-            # OpenRouter 요약
-            summaries: list[str] = []
-            sum_client = get_client()
-            for p in saved_paths:
-                try:
-                    if short_summary:
-                        s = summarize_pdf_short(sum_client, p)
-                    else:
-                        s = summarize_pdf(sum_client, p)
-                    summaries.append(s.summary_text)
-                except OpenRouterCreditExhausted:
-                    summaries.append("(요약 실패: OpenRouter 토큰 부족)")
-                except Exception as e:
-                    summaries.append(f"(요약 실패: {e!r})")
-
-            sent_pairs = [(it.rpt_id, it.title) for it in items[: len(saved_paths)]]
-            return saved_paths, summaries, sent_pairs
+                return saved_paths, items[: len(saved_paths)]
 
         try:
-            saved_paths, summaries, sent_pairs = await loop.run_in_executor(None, _blocking)
+            saved_paths, items_sent = await loop.run_in_executor(None, _wisereport_only)
         except Exception:
-            log.exception("[%s] wisereport 파이프라인 실패", label)
+            log.exception("[%s] wisereport 다운로드 실패", label)
             await _send_text(
                 bot, chat_id,
                 f"⚠️ {label}: wisereport 접속 실패 (사이트 응답 지연) — 잠시 후 자동 재시도",
             )
             return 0
+    # ─── lock 해제 — 이 시점 다른 사용자가 wisereport 즉시 사용 가능 ───
 
-        if not saved_paths:
-            await _send_text(bot, chat_id, f"📭 {label}: 새 리포트 없음")
-            return 0
+    if not saved_paths:
+        await _send_text(bot, chat_id, f"📭 {label}: 새 리포트 없음")
+        return 0
 
-        # 인트로
-        today = datetime.now(KST).strftime("%Y-%m-%d %H:%M")
-        intro = f"📊 *{label}* ({today})\n총 {len(saved_paths)}건 발송"
-        await _send_text(bot, chat_id, intro)
+    # ─── STEP B: LLM 요약을 N개 동시 호출 (lock 밖) ───
+    summaries = await _summarize_pdfs_parallel(
+        saved_paths, short_summary=short_summary, label=label
+    )
 
-        # 각 (요약 + PDF) 한 쌍씩 발송
-        for i, (p, summary) in enumerate(zip(saved_paths, summaries), start=1):
-            header = f"━━━ [{i}/{len(saved_paths)}] {p.stem} ━━━\n\n"
-            await _send_text(bot, chat_id, header + summary)
-            await _send_pdf(bot, chat_id, p, caption=f"[{i}/{len(saved_paths)}] {p.name}")
+    # ─── STEP C: 텔레그램 발송 (순서 보존 위해 sequential) ───
+    today = datetime.now(KST).strftime("%Y-%m-%d %H:%M")
+    intro = f"📊 *{label}* ({today})\n총 {len(saved_paths)}건 발송"
+    await _send_text(bot, chat_id, intro)
+    for i, (p, summary) in enumerate(zip(saved_paths, summaries), start=1):
+        header = f"━━━ [{i}/{len(saved_paths)}] {p.stem} ━━━\n\n"
+        await _send_text(bot, chat_id, header + summary)
+        await _send_pdf(bot, chat_id, p, caption=f"[{i}/{len(saved_paths)}] {p.name}")
 
-        if dedup_key and sent_pairs:
-            await loop.run_in_executor(
-                None, mark_seen_with_titles, dedup_key, sent_pairs, 5000,
-            )
-
-        return len(saved_paths)
+    if dedup_key and items_sent:
+        sent_pairs = [(it.rpt_id, it.title) for it in items_sent]
+        await loop.run_in_executor(
+            None, mark_seen_with_titles, dedup_key, sent_pairs, 5000,
+        )
+    return len(saved_paths)
 
 
 def _filter_and_order(
@@ -324,30 +350,103 @@ async def _send_industry_reports(
 
     await bot.send_message(
         chat_id=chat_id,
-        text=f"✅ GICS 코드 확정: {code}\n이제 리포트를 받아옵니다.",
+        text=f"✅ GICS 코드 확정: {code}\n인기·최신 10건을 한 세션에 받고 동시 요약합니다.",
     )
 
     download_root = Path(os.environ.get("DOWNLOAD_DIR", "./downloads"))
-    await _process_and_send_category(
+    await _process_industry_popular_and_latest(
         bot=bot, chat_id=chat_id,
-        category="industry",
-        label=f"{picked.name_ko} 인기순 5건",
-        sort_by="popular", limit=5, days_back=60,
-        dedup_key=None,
-        download_root=download_root,
-        short_summary=False,
-        industry_gics=code,
+        industry_name=picked.name_ko, gics_code=code,
+        download_root=download_root, per_bucket=5,
     )
-    await _process_and_send_category(
-        bot=bot, chat_id=chat_id,
-        category="industry",
-        label=f"{picked.name_ko} 최신순 5건",
-        sort_by="latest", limit=5, days_back=60,
-        dedup_key=None,
-        download_root=download_root,
-        short_summary=False,
-        industry_gics=code,
+
+
+async def _process_industry_popular_and_latest(
+    *, bot: Bot, chat_id: str, industry_name: str, gics_code: str,
+    download_root: Path, per_bucket: int = 5,
+) -> None:
+    """한 wisereport 세션 + 한 번의 PIPELINE_LOCK으로 인기·최신을 모두 다운로드,
+    LLM 요약 N개를 lock 밖에서 동시에 실행 → 발송.
+
+    기존: lock×2 (인기 → 요약 → 발송 → lock 해제 → lock 재획득 → 최신 …) — 다른
+    사용자가 그 사이에 끼어들기 어렵고, 요약도 sequential.
+    이후: lock×1 (다운로드만) → gather로 10개 동시 요약 → 두 섹션 순차 발송.
+    """
+    if PIPELINE_LOCK.locked():
+        await _send_text(
+            bot, chat_id,
+            f"⏳ *{industry_name}*: wisereport 사용 중 — 다운로드만 잠시 대기",
+        )
+
+    try:
+        wr_id, wr_pw = wisereport_creds()
+    except MissingWisereportCreds as e:
+        log.error("wisereport 자격 증명 누락 (industry combined): %s", e)
+        await _send_text(bot, chat_id, "⚠️ wisereport 자격 증명 미설정")
+        return
+
+    loop = asyncio.get_running_loop()
+
+    async with PIPELINE_LOCK:
+        def _fetch_both() -> tuple[list[Path], list[Path]]:
+            with WisereportClient(
+                user_id=wr_id, password=wr_pw,
+                download_root=download_root, headless=True,
+                ignore_https_errors=os.environ.get("IGNORE_HTTPS_ERRORS", "false").lower() == "true",
+                state_file=Path(os.environ.get("STORAGE_STATE", "./.wisereport_state.json")),
+            ) as cli:
+                cli.ensure_logged_in()
+                pop_dir = download_root / _safe_dirname(f"{industry_name} 인기순 {per_bucket}건")
+                lat_dir = download_root / _safe_dirname(f"{industry_name} 최신순 {per_bucket}건")
+                pop_raw = cli.list_top_reports(
+                    category="industry", sort_by="popular",
+                    limit=per_bucket + 5, days_back=60, industry_gics=gics_code,
+                )
+                lat_raw = cli.list_top_reports(
+                    category="industry", sort_by="latest",
+                    limit=per_bucket + 5, days_back=60, industry_gics=gics_code,
+                )
+                # 인기 vs 최신 중복 제거 (rpt_id 기준) — 같은 리포트 두 번 다운로드 방지
+                pop_items = _filter_and_order(pop_raw, seen_ids=set(), seen_titles_norm=set(), limit=per_bucket)
+                pop_ids = {it.rpt_id for it in pop_items}
+                lat_items = _filter_and_order(
+                    lat_raw, seen_ids=pop_ids, seen_titles_norm=set(), limit=per_bucket,
+                )
+                pop_paths_local = cli.download_reports(pop_items, pop_dir) if pop_items else []
+                lat_paths_local = cli.download_reports(lat_items, lat_dir) if lat_items else []
+                return pop_paths_local, lat_paths_local
+
+        try:
+            pop_paths, lat_paths = await loop.run_in_executor(None, _fetch_both)
+        except Exception:
+            log.exception("[%s] wisereport 인기·최신 동시 fetch 실패", industry_name)
+            await _send_text(bot, chat_id, f"⚠️ {industry_name}: wisereport 접속 실패")
+            return
+    # ─── lock 해제 ───
+
+    if not pop_paths and not lat_paths:
+        await _send_text(bot, chat_id, f"📭 {industry_name}: 인기·최신 모두 신규 리포트 없음")
+        return
+
+    # 두 묶음을 합쳐 한 번에 동시 요약 (gather)
+    all_paths = pop_paths + lat_paths
+    all_summaries = await _summarize_pdfs_parallel(
+        all_paths, short_summary=False, label=industry_name,
     )
+    pop_summaries = all_summaries[: len(pop_paths)]
+    lat_summaries = all_summaries[len(pop_paths) :]
+
+    today = datetime.now(KST).strftime("%Y-%m-%d %H:%M")
+    if pop_paths:
+        await _send_text(bot, chat_id, f"📊 *{industry_name} 인기순 {len(pop_paths)}건* ({today})")
+        for i, (p, s) in enumerate(zip(pop_paths, pop_summaries), start=1):
+            await _send_text(bot, chat_id, f"━━━ [{i}/{len(pop_paths)}] {p.stem} ━━━\n\n{s}")
+            await _send_pdf(bot, chat_id, p, caption=f"[{i}/{len(pop_paths)}] {p.name}")
+    if lat_paths:
+        await _send_text(bot, chat_id, f"🆕 *{industry_name} 최신순 {len(lat_paths)}건* ({today})")
+        for i, (p, s) in enumerate(zip(lat_paths, lat_summaries), start=1):
+            await _send_text(bot, chat_id, f"━━━ [{i}/{len(lat_paths)}] {p.stem} ━━━\n\n{s}")
+            await _send_pdf(bot, chat_id, p, caption=f"[{i}/{len(lat_paths)}] {p.name}")
 
 
 async def industry_on_demand(
