@@ -358,12 +358,13 @@ def _permalink(channel: str, message_id: int) -> str | None:
 def _chart_caption(ticker: str, item: dict, cats: list[str], rows: list[dict],
                    ytd, eps, market_cap=None) -> str:
     from src.us_screener import fundamentals
-    name = item.get("name") or ticker
+    from src.bot_helpers import html_escape
+    name = html_escape(item.get("name") or ticker)
     chg = item.get("chg_pct") or 0.0
     turnover = fundamentals.turnover_usd(rows[-1]) if rows else 0
     badge = " ".join(_BADGE[c] for c in cats if c in _BADGE)
     lines = [
-        f"🇺🇸 {ticker} ({chg:+.1f}%)",
+        f"🇺🇸 {html_escape(ticker)} ({chg:+.1f}%)",
         badge,
         "",
         f"✝ 종목명 : {name}",
@@ -371,7 +372,7 @@ def _chart_caption(ticker: str, item: dict, cats: list[str], rows: list[dict],
         f"✝ 거래대금 : {_fmt_usd(turnover)}",
         f"✝ 연초대비 상승률 : {_fmt_pct(ytd)}",
         f"✝ 최근분기 EPS YoY : {_fmt_pct(eps)}",
-        f"✝ [최신 종목 뉴스 조회](https://finviz.com/quote.ashx?t={ticker})",
+        f'✝ <a href="https://finviz.com/quote.ashx?t={ticker}">최신 종목 뉴스 조회</a>',
     ]
     return "\n".join(lines)
 
@@ -388,6 +389,8 @@ async def _post_charts_and_meta(results: dict, max_tickers: int = 120) -> tuple[
     by_ticker: dict[str, dict] = {}
     badges: dict[str, list] = {}
     for cat, items in results.items():
+        if cat == "volume_breakout":
+            continue  # 거래량 돌파는 메시지·채널서 제외
         for it in items:
             t = it.get("ticker")
             if not t:
@@ -410,6 +413,7 @@ async def _post_charts_and_meta(results: dict, max_tickers: int = 120) -> tuple[
     extra: dict[str, dict] = {}
     loop = asyncio.get_event_loop()
     posted = 0
+    mcap_n = 0
     for t, it in list(by_ticker.items())[:max_tickers]:
         try:
             rows = await loop.run_in_executor(None, lambda t=t: db.load_ohlcv(t, days=260))
@@ -421,23 +425,26 @@ async def _post_charts_and_meta(results: dict, max_tickers: int = 120) -> tuple[
             mcap = it.get("market_cap")
             if not mcap and rows and f.get("shares"):
                 mcap = (rows[-1]["close"] / 100.0) * f["shares"]
+            if mcap:
+                mcap_n += 1
             if chart_bot and rows:
                 png = await loop.run_in_executor(
                     None, lambda t=t, rows=rows, it=it: chart.render_candle_volume(
                         t, rows, title=f"{t} — {it.get('name', '')}"))
                 if png:
+                    from src.bot_helpers import send_channel_photo
                     cap = _chart_caption(t, it, badges[t], rows, ytd, eps, market_cap=mcap)
-                    msg = await chart_bot.send_photo(chat_id=channel, photo=png, caption=cap,
-                                                     parse_mode=ParseMode.MARKDOWN)
-                    url = _permalink(channel, msg.message_id)
-                    if url:
-                        links[t] = url
-                    posted += 1
-                    await asyncio.sleep(1.2)  # 채널 레이트리밋
+                    msg = await send_channel_photo(chart_bot, channel, png, cap, ParseMode.HTML)
+                    if msg:
+                        url = _permalink(channel, msg.message_id)
+                        if url:
+                            links[t] = url
+                        posted += 1
+                    await asyncio.sleep(3.0)  # 채널 ~20건/분 한도 → 게시 간 간격 (성공/실패 무관 페이싱)
         except Exception:
             log.exception("[us_screener] 티커 처리 실패 %s", t)
-    log.info("[us_screener] 채널 게시 %d건 · 메타 %d종목 (links=%d)",
-             posted, len(extra), len(links))
+    log.info("[us_screener] 채널 게시 %d건 · 메타 %d종목 (links=%d, 시총확보=%d)",
+             posted, len(extra), len(links), mcap_n)
     return links, extra
 
 
@@ -644,7 +651,7 @@ async def us_screener_daily_job(bot: Bot, override_chat_id: str | None = None) -
         sent_count = 0
         for cid in target_chat_ids:
             try:
-                await send_text_chunked(bot, cid, text, parse_mode=ParseMode.MARKDOWN)
+                await send_text_chunked(bot, cid, text, parse_mode=ParseMode.HTML)
                 sent_count += 1
             except Exception:
                 log.exception("[scheduled] 발송 실패 cid=%s", cid)
