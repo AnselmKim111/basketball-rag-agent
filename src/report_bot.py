@@ -167,6 +167,22 @@ def _build_report():
     for label, df in us_idx.items():
         signals += technical_signals.detect_signals(df, label)
 
+    # ---------- §0 글로벌 위험선호 (표지 직후 시각 요약) ----------
+    risk_gauge: dict = {"score": 50, "label": "중립", "signals": {}}
+    try:
+        from src.report.data import fetch_global_risk
+        from src.report.charts import global_risk_matrix
+        risk_rows, risk_gauge = fetch_global_risk.load_risk_map(days=220)
+        if risk_rows:
+            add(global_risk_matrix.risk_matrix(risk_rows, risk_gauge, img_dir, date_iso=date_iso),
+                "글로벌 위험선호 매트릭스",
+                f"자산 클래스별 1D·5D · {risk_gauge.get('label')} {risk_gauge.get('score')}/100",
+                "0. 글로벌 위험선호", key=True)
+            log.info("[report] §0 글로벌 위험선호: %d자산·게이지 %d(%s)",
+                     len(risk_rows), risk_gauge.get("score"), risk_gauge.get("label"))
+    except Exception:
+        log.exception("[report] 글로벌 위험선호 매트릭스 실패 — 생략")
+
     # ---------- §1 매크로 ----------
     add(index_charts.us_indices_grid(us_idx, img_dir, date_iso=date_iso),
         "미국 4대 지수", "4대 지수 등락", "1. 매크로 컨텍스트")
@@ -220,6 +236,11 @@ def _build_report():
         "섹터·테마 상대강도", "1M/3M 정렬", "3. 섹터 로테이션 맵")
     add(rotation_charts.region_compare(region_etfs, img_dir, date_iso=date_iso),
         "글로벌 지역 비교", "지역 디커플링", "3. 섹터 로테이션 맵")
+    # 테마 자금 흐름 시계열 (B: 20일 누적, 좌 유입·우 이탈) — 시간 진화 통찰
+    add(flow_charts.theme_flow_timeline_chart(theme_rows, combined_themes, img_dir,
+                                              date_iso=date_iso),
+        "테마 자금 흐름 시계열", "20일 누적 — 어디서 언제부터 빠져 어디로",
+        "3. 섹터 로테이션 맵", key=True)
     for i, r in enumerate(theme_rows[:16], 1):
         lbl = r["label"]
         add(index_charts.theme_chart(combined_themes.get(lbl), lbl, img_dir,
@@ -259,10 +280,13 @@ def _build_report():
     for mkt, fdf in (kr_flows or {}).items():
         korea_summary[mkt] = {inv: round(float(fdf[inv].iloc[-20:].sum()), 0) for inv in fdf.columns}
 
-    # ---------- §8 종합 자금흐름 다이어그램 ----------
+    # ---------- §8 종합 자금흐름 다이어그램 (Sankey, Risk 게이지 허브 통합) ----------
     src_ep, dst_ep = theme_momentum.flow_endpoints(theme_rows)
-    add(flow_charts.capital_flow_diagram(src_ep, dst_ep, img_dir, date_iso=date_iso),
-        "종합 자금흐름 다이어그램", "이탈 → 유입", "8. 종합 자금흐름", key=False)
+    add(flow_charts.capital_flow_diagram(src_ep, dst_ep, img_dir, date_iso=date_iso,
+                                          gauge_score=risk_gauge.get("score"),
+                                          gauge_label=risk_gauge.get("label")),
+        "종합 자금흐름 다이어그램", "Sankey · 굵기=강도 · 허브=Risk 게이지",
+        "8. 종합 자금흐름", key=True)
 
     if not chart_list:
         log.error("[report] 차트 0개 — 데이터 전부 미확보")
