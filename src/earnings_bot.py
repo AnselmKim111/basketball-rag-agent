@@ -125,6 +125,225 @@ async def _cmd_earnings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     asyncio.create_task(_run_pipeline(update, context, args))
 
 
+async def _step_synthesize_pre_call(
+    ticker: str, year: int, quarter: int, fiscal_label: str,
+) -> tuple[str | None, Any]:
+    """Track G — 콜 발표 전 기대치 보고서 합성 (Opus).
+
+    입력: 현재 컨센서스(Yahoo) + 이전 N분기 history + 생태계 맵.
+    반환: (report_text, consensus_snapshot).
+    """
+    from src import summarizer
+    from src.earnings import consensus, history, ecosystem
+    loop = asyncio.get_running_loop()
+    # 1) 데이터 병렬 fetch
+    snap, eco = await asyncio.gather(
+        loop.run_in_executor(None, consensus.fetch_consensus, ticker, fiscal_label),
+        loop.run_in_executor(None, ecosystem.get_ecosystem, ticker, True),
+    )
+    priors = history.load_recent(ticker, n=4, exclude=(year, quarter))
+
+    # 2) payload 빌드
+    parts: list[str] = []
+    parts.append(f"# 분석 대상: {ticker}")
+    parts.append(f"# 분기: {fiscal_label}")
+    parts.append("")
+    if snap is not None:
+        from src.earnings.consensus import consensus_payload_block
+        parts.append(consensus_payload_block(snap))
+    else:
+        parts.append("### consensus snapshot — N/A")
+    parts.append("")
+    if priors:
+        parts.append(f"### prior {len(priors)} quarters history (most recent first)")
+        for p in priors:
+            ext = p.get("extract") or {}
+            parts.append(
+                f"- {p.get('fiscal_label','?')} tone='{(ext.get('management_tone') or '')[:120]}' "
+                f"guidance_keys={list((ext.get('guidance') or {}).keys())[:6]} "
+                f"named_deals_n={len(ext.get('named_deals') or [])} "
+                f"recurring_themes_hint={(ext.get('notable_verbatim') or [''])[0][:80] if ext.get('notable_verbatim') else ''}"
+            )
+    else:
+        parts.append("### prior history — N/A (/backfill 권장)")
+    parts.append("")
+    if eco:
+        from src.earnings.ecosystem import ecosystem_payload_block
+        parts.append(ecosystem_payload_block(ticker, eco, None))
+    else:
+        parts.append("### ecosystem map — N/A")
+    user_payload = "\n".join(parts)
+
+    system = _load_prompt("earnings_pre_call")
+    if not system:
+        log.warning("earnings_pre_call.txt 로드 실패 — pre-call 합성 스킵")
+        return None, snap
+
+    def _call():
+        client = summarizer.get_client()
+        return summarizer.chat_with_retry(
+            client,
+            model=_synthesis_model(),
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user_payload},
+            ],
+            temperature=0.3,
+            max_tokens=7000,
+            context=f"earnings-precall:{ticker}",
+        )
+    try:
+        content = await loop.run_in_executor(None, _call)
+    except Exception:
+        log.exception("pre-call 합성 실패 (%s %s)", ticker, fiscal_label)
+        return None, snap
+    return (content or None), snap
+
+
+async def _step_synthesize_pre_vs_actual(
+    ticker: str, year: int, quarter: int, fiscal_label: str,
+    actual_extract: dict,
+    consensus_snap: Any | None,
+    consensus_deltas: list | None,
+) -> str | None:
+    """Track G — pre-call vs actual diff (Opus 1회). pre-call 캐시가 있을 때만 호출."""
+    from src import summarizer
+    from src.earnings import precall
+
+    pre = precall.load(ticker, year, quarter)
+    if not pre:
+        return None
+
+    system = _load_prompt("earnings_pre_vs_actual")
+    if not system:
+        log.warning("earnings_pre_vs_actual.txt 로드 실패")
+        return None
+
+    # actual 추출에서 핵심만 압축
+    hn = actual_extract.get("headline_numbers") or {}
+    guidance = actual_extract.get("guidance") or {}
+    deals = actual_extract.get("named_deals") or []
+    sc = actual_extract.get("supply_chain_signals") or []
+    cc = actual_extract.get("competitor_callouts") or []
+    mp = actual_extract.get("macro_policy_mentions") or []
+    tone = actual_extract.get("management_tone") or ""
+    surprises = actual_extract.get("surprises_and_risks") or []
+
+    user_payload = (
+        f"# ticker: {ticker}\n# fiscal_label: {fiscal_label}\n\n"
+        "## PRE-CALL REPORT (직전 합성, 콜 발표 전)\n"
+        f"generated_at: {pre.get('generated_at','?')}\n"
+        f"pre_call_bias: {pre.get('pre_call_bias','?')}\n\n"
+        f"{pre.get('report_text','(pre-call report body missing)')}\n\n"
+        "## ACTUAL CALL EXTRACT (지금 콜 결과)\n"
+        f"headline_numbers: {json.dumps(hn, ensure_ascii=False)}\n"
+        f"guidance: {json.dumps(guidance, ensure_ascii=False)}\n"
+        f"management_tone: {tone}\n"
+        f"named_deals ({len(deals)}): {json.dumps(deals[:6], ensure_ascii=False)}\n"
+        f"supply_chain_signals ({len(sc)}): {json.dumps(sc[:6], ensure_ascii=False)}\n"
+        f"competitor_callouts ({len(cc)}): {json.dumps(cc[:6], ensure_ascii=False)}\n"
+        f"macro_policy_mentions ({len(mp)}): {json.dumps(mp[:6], ensure_ascii=False)}\n"
+        f"surprises_and_risks: {json.dumps(surprises[:6], ensure_ascii=False)}\n\n"
+        "## CONSENSUS SNAPSHOT (콜 시점)\n"
+        f"{json.dumps({k: v for k, v in (consensus_snap.__dict__ if consensus_snap else {}).items() if not k.startswith('_')}, ensure_ascii=False, default=str)[:2000]}\n\n"
+        "## CONSENSUS DELTAS\n"
+        + "\n".join(f"- {d.message}" for d in (consensus_deltas or []))
+        + "\n\n위 정보로 schema 그대로 'Pre vs Actual' 보고서 작성."
+    )
+
+    loop = asyncio.get_running_loop()
+    def _call():
+        client = summarizer.get_client()
+        return summarizer.chat_with_retry(
+            client,
+            model=_synthesis_model(),
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user_payload},
+            ],
+            temperature=0.3,
+            max_tokens=5500,
+            context=f"earnings-pre-vs-actual:{ticker}",
+        )
+    try:
+        return (await loop.run_in_executor(None, _call)) or None
+    except Exception:
+        log.exception("pre-vs-actual 합성 실패 (%s)", ticker)
+        return None
+
+
+async def _cmd_preearnings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/preearnings <TICKER> [FYxxxxQy] — 콜 발표 전 사전 기대치 보고서."""
+    if not _is_authorized(update):
+        await deny_message(update, "어닝콜 기능")
+        return
+    args = context.args or []
+    if not args:
+        await update.message.reply_text(
+            "사용법: `/preearnings <TICKER> [FY2026Q1]`\n예: `/preearnings MSFT` (분기 미명시 시 자동 추정)",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+    ticker = args[0].upper().strip()
+    period = " ".join(args[1:]).strip() if len(args) > 1 else ""
+    asyncio.create_task(_run_pre_call(update, context, ticker, period))
+
+
+async def _run_pre_call(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, ticker: str, period: str,
+) -> None:
+    """pre-call 워커."""
+    from datetime import datetime as _dt
+    from src.earnings import precall
+    from src.earnings.transcript_source import resolve_year_quarter
+
+    bot: Bot = context.bot
+    chat_id = str(update.effective_chat.id)
+
+    # 분기 도출 — 명시 안 됐으면 다음 어닝 예정일 기준, 그것도 없으면 다음 calendar 분기
+    y, q = resolve_year_quarter(period) if period else (None, None)
+    if not y or not q:
+        from src.earnings import consensus as _cons
+        loop = asyncio.get_running_loop()
+        try:
+            nd = await loop.run_in_executor(None, _cons.fetch_next_earnings_date, ticker)
+        except Exception:
+            nd = None
+        if nd:
+            try:
+                ref = _dt.strptime(nd, "%Y-%m-%d")
+                y, q = ref.year, (ref.month - 1) // 3 + 1
+            except Exception:
+                pass
+    if not y or not q:
+        today = _dt.utcnow()
+        y, q = today.year, (today.month - 1) // 3 + 1
+
+    fiscal_label = f"Q{q} {y}"
+    await _safe_send(bot, chat_id, f"🎯 /preearnings 시작 — {ticker} {fiscal_label} 사전 기대치 합성 중 …")
+
+    report, snap = await _step_synthesize_pre_call(ticker, y, q, fiscal_label)
+    if not report:
+        await _safe_send(bot, chat_id, "⚠️ Pre-call 합성 실패 — 컨센·history·생태계 데이터 부족 가능.")
+        return
+
+    # 보고서 발송
+    await send_text_chunked(bot, chat_id, report)
+
+    # 캐시 저장 — 콜 transcript 등재 시 자동 비교
+    try:
+        precall.save(
+            ticker=ticker, year=y, quarter=q, fiscal_label=fiscal_label,
+            report_text=report, consensus=snap, key_questions=[], pre_call_bias="",
+        )
+        await _safe_send(
+            bot, chat_id,
+            f"💾 pre-call 캐시 저장 — 콜 transcript 등재 시 자동으로 'pre vs actual' diff가 따라옵니다.",
+        )
+    except Exception:
+        log.exception("pre-call 캐시 저장 실패")
+
+
 async def _cmd_watch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/watch <TICKER> [more] — 다음 콜 자동 발송 예약."""
     if not _is_authorized(update):
@@ -586,6 +805,24 @@ async def _run_pipeline(
         await send_text_chunked(bot, chat_id, counter_summary)
     else:
         counter_summary = ""
+
+    # 6.7) Pre vs Actual diff (Track G) — pre-call 캐시가 있으면 1회 opus 비교
+    if fiscal_year and fiscal_quarter:
+        from src.earnings import precall as _precall
+        for t, tr in transcripts.items():
+            if not _precall.exists(t, fiscal_year, fiscal_quarter):
+                continue
+            await _safe_send(bot, chat_id, f"🔄 {t} — pre-call 캐시 발견 → pre vs actual diff 합성 중 (Opus)…")
+            try:
+                pa_text = await _step_synthesize_pre_vs_actual(
+                    t, fiscal_year, fiscal_quarter, fiscal_label, tr,
+                    consensus_by_ticker.get(t), consensus_delta_by_ticker.get(t),
+                )
+            except Exception:
+                log.exception("[pre-vs-actual] 합성 실패 (%s)", t)
+                pa_text = None
+            if pa_text:
+                await send_text_chunked(bot, chat_id, pa_text)
 
     # 6.6) longitudinal history 영속화 (Track C) — 합성·counter 끝난 시점에 1회.
     if fiscal_year and fiscal_quarter:
@@ -1757,16 +1994,36 @@ async def earnings_watch_poll_job(bot: Bot) -> None:
     skipped: list[str] = []
 
     for ticker, raw_date in zip(tickers, cal_dates):
-        # 2) calendar gating — 알려진 예정일 기준 D-1 ~ D+3 윈도만 transcript 시도
-        in_window = True
+        # 2) calendar gating
+        delta = None
+        edate = None
         if isinstance(raw_date, str):
             try:
                 edate = _dt.strptime(raw_date, "%Y-%m-%d").date()
                 delta = (today - edate).days
-                # 예정일 1일 전부터 4일 후까지 (콜은 보통 발표 당일 ~ 1-2일 내 transcript 등재)
-                in_window = -1 <= delta <= 4
             except Exception:
-                in_window = True
+                pass
+
+        # 2-1) pre-call 윈도 (D-2 ~ D-1) — pre-call 보고서 자동 발사
+        if edate is not None and delta is not None and -2 <= delta <= -1:
+            ref_date = edate
+            y_pre = ref_date.year
+            q_pre = (ref_date.month - 1) // 3 + 1
+            from src.earnings import precall as _precall
+            if not _precall.exists(ticker, y_pre, q_pre):
+                fiscal_label_pre = f"Q{q_pre} {y_pre}"
+                subs = wl.subscribers_of(ticker)
+                if subs:
+                    log.info("[earnings_watch_poll] %s pre-call window 발사 (delta=%s)", ticker, delta)
+                    for cid in subs:
+                        asyncio.create_task(
+                            _watch_fire_pre_call(bot, cid, ticker, y_pre, q_pre, fiscal_label_pre)
+                        )
+
+        # 2-2) actual transcript 윈도 (D-1 ~ D+4)만 transcript 시도
+        in_window = True
+        if delta is not None:
+            in_window = -1 <= delta <= 4
         if not in_window:
             skipped.append(f"{ticker}(date={raw_date}, out of window)")
             continue
@@ -1826,6 +2083,43 @@ async def earnings_watch_poll_job(bot: Bot) -> None:
     )
     if skipped and fired == 0:
         log.info("[earnings_watch_poll] skip 사유 sample: %s", skipped[:8])
+
+
+async def _watch_fire_pre_call(
+    bot: Bot, chat_id: str, ticker: str, year: int, quarter: int, fiscal_label: str,
+) -> None:
+    """watch_poll에서 D-2~D-1 pre-call 자동 발사. precall 캐시 저장 + 발송 1회."""
+    from src.earnings import precall
+    if precall.exists(ticker, year, quarter):
+        return
+    await _safe_send(
+        bot, chat_id,
+        f"🎯 [watch] {ticker} 어닝 D-{abs((_today_utc() - _to_date(fiscal_label, year, quarter)).days) if False else '1~2'} — pre-call 자동 발사 …",
+    )
+    report, snap = await _step_synthesize_pre_call(ticker, year, quarter, fiscal_label)
+    if not report:
+        await _safe_send(bot, chat_id, f"⚠️ {ticker} pre-call 합성 실패 — 데이터 부족 가능")
+        return
+    await send_text_chunked(bot, chat_id, report)
+    try:
+        precall.save(
+            ticker=ticker, year=year, quarter=quarter, fiscal_label=fiscal_label,
+            report_text=report, consensus=snap,
+        )
+        await _safe_send(bot, chat_id, "💾 pre-call 캐시 저장 — 실제 콜 등재 시 자동 비교 합성이 따라옵니다.")
+    except Exception:
+        log.exception("[watch] pre-call 캐시 저장 실패")
+
+
+def _today_utc():
+    from datetime import datetime as _dt
+    return _dt.utcnow().date()
+
+
+def _to_date(fiscal_label: str, year: int, quarter: int):
+    # 정확한 어닝 발표일을 알 수 없어 분기 중간 날짜로 대체 (UI용 표시만)
+    from datetime import date as _d
+    return _d(year, max(1, min(12, quarter * 3 - 1)), 15)
 
 
 async def _watch_fire_pipeline(bot: Bot, chat_id: str, ticker: str, fiscal_label: str, year: int, quarter: int) -> None:
@@ -1919,6 +2213,7 @@ async def _self_test(app: Application) -> None:
 
 EARNINGS_COMMANDS = [
     ("earnings", "📞 미국 기업 어닝콜 + 비교 PDF (5-10분)"),
+    ("preearnings", "🎯 콜 발표 전 사전 기대치 (`/preearnings MSFT`)"),
     ("watch", "🔭 종목 어닝 자동 발송 예약 (`/watch MSFT NVDA`)"),
     ("unwatch", "🚫 자동 발송 해제"),
     ("watchlist", "📋 현재 watch 목록 + 다음 어닝 예정"),
@@ -1936,6 +2231,7 @@ def build_earnings_app(token: str) -> Application:
     app = Application.builder().token(token).build()
     app.add_handler(CommandHandler(["start", "help"], _help))
     app.add_handler(CommandHandler("earnings", _cmd_earnings))
+    app.add_handler(CommandHandler("preearnings", _cmd_preearnings))
     app.add_handler(CommandHandler("watch", _cmd_watch))
     app.add_handler(CommandHandler("unwatch", _cmd_unwatch))
     app.add_handler(CommandHandler("watchlist", _cmd_watchlist))
