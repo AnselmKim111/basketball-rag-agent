@@ -27,6 +27,7 @@ from src.report.data import (
     fetch_earnings_surprise,
     fetch_estimate_revisions,
     fetch_ipo,
+    fetch_market_caps,
     kr_theme_linkage,
 )
 
@@ -300,6 +301,34 @@ def _stream_trend_reversal(market: str) -> list[dict]:
     for c in sorted_list[: _STREAM_CAP["trend_reversal"]]:
         out.append(c)
     return out
+
+
+# ------------------------------------------------------------------
+# 시총 backfill — 0인 후보 일괄 fetch
+# ------------------------------------------------------------------
+def _backfill_market_caps(us_pool: dict, kr_pool: dict) -> None:
+    us_missing = [c["ticker"] for c in us_pool.values() if not (c.get("market_cap") or 0)]
+    kr_missing = [c["ticker"] for c in kr_pool.values() if not (c.get("market_cap") or 0)]
+    if us_missing:
+        try:
+            caps = fetch_market_caps.fetch_us_market_caps(us_missing)
+            for c in us_pool.values():
+                if not (c.get("market_cap") or 0):
+                    cap = caps.get(c["ticker"].upper())
+                    if cap:
+                        c["market_cap"] = cap
+        except Exception:
+            log.exception("[watchlist] US 시총 backfill 실패")
+    if kr_missing:
+        try:
+            kr_caps = fetch_market_caps.fetch_kr_market_caps()
+            for c in kr_pool.values():
+                if not (c.get("market_cap") or 0):
+                    cap = kr_caps.get(c["ticker"])
+                    if cap:
+                        c["market_cap"] = cap
+        except Exception:
+            log.exception("[watchlist] KR 시총 backfill 실패")
 
 
 # ------------------------------------------------------------------
@@ -610,6 +639,9 @@ def build_watchlist(date_iso: str, theme_rows: list[dict] | None,
     # 뉴스 mention 카운트 부착
     _annotate_news_mentions(us_pool, news)
     _annotate_news_mentions(kr_pool, news)
+
+    # 시총 보강 — 0인 후보에 한해 fetch (KR: FDR/screener.db · US: FMP /stable/quote)
+    _backfill_market_caps(us_pool, kr_pool)
 
     log.info("[watchlist] 후보 풀 US=%d KR=%d (theme_hot=%s)",
              len(us_pool), len(kr_pool), theme_hot)
