@@ -27,6 +27,7 @@ from src.report.data import (
     fetch_earnings_surprise,
     fetch_estimate_revisions,
     fetch_ipo,
+    kr_theme_linkage,
 )
 
 log = logging.getLogger(__name__)
@@ -36,6 +37,7 @@ _CAT_BONUS = {
     "ipo": 1.00,
     "earnings_actual": 0.90,
     "trend_reversal": 0.80,
+    "kr_linkage": 0.75,
     "sector_leader": 0.70,
     "followup": 0.50,
     "estimate_revision": 0.55,
@@ -48,6 +50,7 @@ _STREAM_CAP = {
     "ipo": 10,
     "sector_leader": 12,
     "trend_reversal": 20,
+    "kr_linkage": 15,
 }
 
 # trend_reversal로 분류할 screener 시그널 키
@@ -300,6 +303,42 @@ def _stream_trend_reversal(market: str) -> list[dict]:
 
 
 # ------------------------------------------------------------------
+# Stream F — KR theme linkage (미국 hot 테마 → 한국 수혜주 매핑)
+# screener.db 비어있어도 작동. theme_rows의 r5d 강도를 chg_5d로 사용.
+# ------------------------------------------------------------------
+def _stream_kr_theme_linkage(theme_rows: list[dict] | None, top_n_themes: int = 8) -> list[dict]:
+    if not theme_rows:
+        return []
+    # 5D 강도 절대값 큰 순 (강하게 움직이는 테마 우선) → 상위 top_n_themes만
+    ranked = sorted(
+        [r for r in theme_rows if r.get("r5d") is not None],
+        key=lambda r: -abs(float(r.get("r5d") or 0)),
+    )[:top_n_themes]
+    out: list[dict] = []
+    seen: set[str] = set()
+    for r in ranked:
+        label = r.get("label") or ""
+        r5d = float(r.get("r5d") or 0)
+        for name, ticker, sector in kr_theme_linkage.beneficiaries_with_tickers(label):
+            if ticker in seen:
+                continue
+            seen.add(ticker)
+            cand = _new_candidate(
+                ticker, "KR",
+                name=name,
+                sector=sector,
+                market_cap=0,  # enrichment에서 fetch_prices가 채울 수 있음
+                signal_raw={"theme": label, "r5d": r5d, "beneficiary_of": label},
+            )
+            cand["chg_5d"] = r5d  # 미국 테마 5D 강도 = 한국 수혜주 잠재력 proxy
+            cand["signal_strength"] = min(abs(r5d) / 5.0, 2.0)  # 5%당 1.0, max 2.0
+            out.append(cand)
+            if len(out) >= _STREAM_CAP["kr_linkage"]:
+                return out
+    return out
+
+
+# ------------------------------------------------------------------
 # 점수 함수
 # ------------------------------------------------------------------
 def _score(c: dict, max_cap: float) -> float:
@@ -511,6 +550,12 @@ def _enrich_one(cand: dict, theme_rows: list[dict] | None,
     sr = cand.get("_signal_raw")
     if sr:
         out["screener_signals"] = sr.get("signals") or []
+        # KR theme linkage 정보 — LLM이 "미국 X 테마(5D Y%) 수혜주" 맥락 활용
+        if sr.get("beneficiary_of"):
+            out["theme_linkage"] = {
+                "us_theme_label": sr.get("beneficiary_of"),
+                "us_theme_r5d": sr.get("r5d"),
+            }
     return out
 
 
@@ -556,6 +601,11 @@ def build_watchlist(date_iso: str, theme_rows: list[dict] | None,
         _merge_candidate(kr_pool, c, "trend_reversal", strength_add=1.0)
     for c in _stream_trend_reversal("US"):
         _merge_candidate(us_pool, c, "trend_reversal", strength_add=1.0)
+
+    # KR theme linkage (미국 hot 테마 → 한국 수혜주 hardcoded 매핑)
+    # screener.db 비어있어도 작동 — KR pool 활성화 보장.
+    for c in _stream_kr_theme_linkage(theme_rows):
+        _merge_candidate(kr_pool, c, "kr_linkage", strength_add=1.0)
 
     # 뉴스 mention 카운트 부착
     _annotate_news_mentions(us_pool, news)
