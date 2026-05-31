@@ -38,3 +38,6 @@ playwright-report/
 *.swo
 .DS_Store
 CLAUDE.md
+
+# Claude Code 개인 설정 (커밋 금지)
+.claude/settings.local.json
