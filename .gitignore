@@ -4,6 +4,9 @@
 *.env
 CLAUDE.local.md
 
+# Claude Code 개인 설정 (팀 공유 X)
+.claude/settings.local.json
+
 # Downloaded reports (do not commit user data)
 downloads/
 output/
