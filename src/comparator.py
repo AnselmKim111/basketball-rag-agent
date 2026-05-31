@@ -132,28 +132,33 @@ async def _run_deep_research_capture(bot: Bot, chat_id: str, name: str, ticker: 
 
     download_root = Path(os.environ.get("DOWNLOAD_DIR", "./downloads")) / "compare" / ticker
 
-    # PIPELINE_LOCK은 호출자(run_compare)가 보유. 여기서 lock 미사용 — 중첩 방지.
+    # ─── 3축 수집은 PIPELINE_LOCK 안 (wisereport 직렬화 필요) ───
+    # run_compare의 outer lock을 제거했으므로 여기서 종목별로 짧게 잡는다.
+    # dart/web도 같은 gather 안이라 lock 점유 = gather 시간 = 보통 30-90초.
     try:
-        dart_task = asyncio.create_task(
-            deep_research._collect_dart(ticker, corp_code, corp_name, download_root / "dart")
-        )
-        wise_task = asyncio.create_task(
-            deep_research._collect_wisereport(ticker, download_root / "wisereport")
-        )
-        web_task = asyncio.create_task(
-            deep_research._collect_web(corp_name, ticker)
-        )
-        dart_data, wise_data, web_data = await asyncio.gather(
-            dart_task, wise_task, web_task, return_exceptions=False,
-        )
+        async with PIPELINE_LOCK:
+            dart_task = asyncio.create_task(
+                deep_research._collect_dart(ticker, corp_code, corp_name, download_root / "dart")
+            )
+            wise_task = asyncio.create_task(
+                deep_research._collect_wisereport(ticker, download_root / "wisereport")
+            )
+            web_task = asyncio.create_task(
+                deep_research._collect_web(corp_name, ticker)
+            )
+            dart_data, wise_data, web_data = await asyncio.gather(
+                dart_task, wise_task, web_task, return_exceptions=False,
+            )
     except Exception as e:
         out.error = f"Stage 1 수집 실패: {e}"
         return out
+    # ─── lock 해제 ───
 
     if dart_data.error and wise_data.error and web_data.error:
         out.error = "3축 모두 실패"
         return out
 
+    # 합성은 lock 밖 (sonnet, 2-3분)
     try:
         out.report_md = await deep_research._synthesize(
             corp_name, ticker, dart_data, wise_data, web_data,
@@ -237,12 +242,9 @@ async def run_compare(
     aspect_clean = (aspect or "전반").strip()
     started = datetime.now(KST)
 
-    if PIPELINE_LOCK.locked():
-        await send_text_chunked(
-            bot, chat_id,
-            f"⏳ 다른 작업 진행 중 — 끝나면 *{' vs '.join(names)}* {aspect_clean} 비교 시작",
-            parse_mode="Markdown",
-        )
+    # 비교 작업은 종목별로 짧은 lock window를 가짐 (각 _run_deep_research_capture
+    # 안에서 wisereport 수집 구간만 잡고 합성·발송은 lock 밖). outer lock은 제거 —
+    # 한 비교가 15-40분 도는 동안 다른 봇이 wisereport에 끼어들 수 있음.
     await send_text_chunked(
         bot, chat_id,
         f"📊 *{' vs '.join(names)}* — *{aspect_clean}* 비교 분석 시작\n"
@@ -250,81 +252,79 @@ async def run_compare(
         parse_mode="Markdown",
     )
 
-    async with PIPELINE_LOCK:
-        # Stage 1: 각 종목 deep_research 순차 (wisereport 세션 충돌 방지)
-        inputs: list[CompareInput] = []
-        for i, (name, ticker) in enumerate(pairs, start=1):
-            log.info("compare [%d/%d] start: %s (%s)", i, len(pairs), name, ticker)
-            await send_text_chunked(
-                bot, chat_id,
-                f"🔍 [{i}/{len(pairs)}] {name} ({ticker}) 데이터 수집·합성 중...",
-            )
-            inp = await _run_deep_research_capture(bot, chat_id, name, ticker)
-            inputs.append(inp)
-            log.info("compare [%d/%d] done: err=%r len=%d",
-                     i, len(pairs), inp.error or "OK", len(inp.report_md))
-
-        ok_count = sum(1 for r in inputs if not r.error)
-        if ok_count < 2:
-            await send_text_chunked(
-                bot, chat_id,
-                f"❌ 비교 불가 — 정상 수집된 종목이 {ok_count}개뿐.\n"
-                + "\n".join(f"  {r.name}: {r.error or 'OK'}" for r in inputs),
-            )
-            return
-
-        # Stage 2: 비교 합성
-        await send_text_chunked(
-            bot, chat_id, f"🧠 AI 비교 합성 중... ({aspect_clean} 관점)"
-        )
-        report_md = await _synthesize_compare(names, aspect_clean, inputs)
-
-        # Stage 3: PDF 변환
-        from src.pdf_export import markdown_to_pdf
-        pdf_dir = Path(os.environ.get("DOWNLOAD_DIR", "./downloads")) / "compare" / "_pdf"
-        pdf_path = pdf_dir / f"compare_{'_'.join(tickers)}_{aspect_clean[:20]}.pdf"
-        pdf_result = await markdown_to_pdf(
-            report_md, pdf_path,
-            title=f"{' vs '.join(names)} — {aspect_clean} 비교",
-        )
-
-        elapsed = int((datetime.now(KST) - started).total_seconds() / 60)
-
-        # Stage 4: 발송 — PDF + 마크다운 본문 (둘 다)
-        if pdf_result:
-            try:
-                await send_pdf(
-                    bot, chat_id, pdf_result,
-                    caption=f"📊 {' vs '.join(names)} — {aspect_clean} 비교 분석 ({elapsed}분)",
-                )
-            except Exception:
-                log.exception("compare PDF 발송 실패")
-                await send_text_chunked(bot, chat_id, "⚠️ PDF 발송 실패 — 마크다운으로 대체 발송")
-
-        # 본문 마크다운도 텔레그램에 (PDF + 본문 둘 다 제공 — 사용자 결정)
-        await send_text_chunked(bot, chat_id, report_md, parse_mode="Markdown")
-
-        # 참고 자료 PDF (각 종목 raw)
-        await send_text_chunked(bot, chat_id, "📎 참고 자료 (각 종목 raw)")
-        for inp in inputs:
-            if inp.error:
-                continue
-            if inp.chart_png:
-                try:
-                    await bot.send_photo(
-                        chat_id=chat_id, photo=inp.chart_png,
-                        caption=f"📊 {inp.name} 분기 재무 추이",
-                    )
-                except Exception:
-                    log.exception("chart 발송 실패")
-            for label, p in inp.research_pdfs[:6]:  # 종목당 최대 6 PDF
-                try:
-                    await send_pdf(bot, chat_id, p, caption=f"📎 [{inp.name}] {label}")
-                except Exception:
-                    log.exception("참고 PDF 발송 실패: %s", p)
-
-        # 완료 ack
+    # Stage 1: 각 종목 deep_research_capture — 종목당 wisereport 수집만 짧게 lock
+    # (lock 안: 30-60초, 합성·발송: lock 밖). 종목 사이에 다른 봇 진입 가능.
+    inputs: list[CompareInput] = []
+    for i, (name, ticker) in enumerate(pairs, start=1):
+        log.info("compare [%d/%d] start: %s (%s)", i, len(pairs), name, ticker)
         await send_text_chunked(
             bot, chat_id,
-            f"✅ {' vs '.join(names)} {aspect_clean} 비교 완료 ({elapsed}분)",
+            f"🔍 [{i}/{len(pairs)}] {name} ({ticker}) 데이터 수집·합성 중...",
         )
+        inp = await _run_deep_research_capture(bot, chat_id, name, ticker)
+        inputs.append(inp)
+        log.info("compare [%d/%d] done: err=%r len=%d",
+                 i, len(pairs), inp.error or "OK", len(inp.report_md))
+
+    ok_count = sum(1 for r in inputs if not r.error)
+    if ok_count < 2:
+        await send_text_chunked(
+            bot, chat_id,
+            f"❌ 비교 불가 — 정상 수집된 종목이 {ok_count}개뿐.\n"
+            + "\n".join(f"  {r.name}: {r.error or 'OK'}" for r in inputs),
+        )
+        return
+
+    # Stage 2: 비교 합성 (lock 밖, sonnet)
+    await send_text_chunked(
+        bot, chat_id, f"🧠 AI 비교 합성 중... ({aspect_clean} 관점)"
+    )
+    report_md = await _synthesize_compare(names, aspect_clean, inputs)
+
+    # Stage 3: PDF 변환 (lock 밖)
+    from src.pdf_export import markdown_to_pdf
+    pdf_dir = Path(os.environ.get("DOWNLOAD_DIR", "./downloads")) / "compare" / "_pdf"
+    pdf_path = pdf_dir / f"compare_{'_'.join(tickers)}_{aspect_clean[:20]}.pdf"
+    pdf_result = await markdown_to_pdf(
+        report_md, pdf_path,
+        title=f"{' vs '.join(names)} — {aspect_clean} 비교",
+    )
+
+    elapsed = int((datetime.now(KST) - started).total_seconds() / 60)
+
+    # Stage 4: 발송 — PDF + 마크다운 본문 (lock 밖)
+    if pdf_result:
+        try:
+            await send_pdf(
+                bot, chat_id, pdf_result,
+                caption=f"📊 {' vs '.join(names)} — {aspect_clean} 비교 분석 ({elapsed}분)",
+            )
+        except Exception:
+            log.exception("compare PDF 발송 실패")
+            await send_text_chunked(bot, chat_id, "⚠️ PDF 발송 실패 — 마크다운으로 대체 발송")
+
+    await send_text_chunked(bot, chat_id, report_md, parse_mode="Markdown")
+
+    # 참고 자료 PDF (각 종목 raw)
+    await send_text_chunked(bot, chat_id, "📎 참고 자료 (각 종목 raw)")
+    for inp in inputs:
+        if inp.error:
+            continue
+        if inp.chart_png:
+            try:
+                await bot.send_photo(
+                    chat_id=chat_id, photo=inp.chart_png,
+                    caption=f"📊 {inp.name} 분기 재무 추이",
+                )
+            except Exception:
+                log.exception("chart 발송 실패")
+        for label, p in inp.research_pdfs[:6]:  # 종목당 최대 6 PDF
+            try:
+                await send_pdf(bot, chat_id, p, caption=f"📎 [{inp.name}] {label}")
+            except Exception:
+                log.exception("참고 PDF 발송 실패: %s", p)
+
+    await send_text_chunked(
+        bot, chat_id,
+        f"✅ {' vs '.join(names)} {aspect_clean} 비교 완료 ({elapsed}분)",
+    )

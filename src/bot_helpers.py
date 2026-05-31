@@ -13,6 +13,7 @@ private 헬퍼(_send_text 등)가 이미 있어 여기를 import하지 않아도
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import re
@@ -212,6 +213,55 @@ def wisereport_creds() -> tuple[str, str]:
         missing = [k for k, v in (("WISEREPORT_ID", uid), ("WISEREPORT_PW", pw)) if not v]
         raise MissingWisereportCreds(f"환경변수 미설정: {', '.join(missing)}")
     return uid, pw
+
+
+# ------------------------------------------------------------------
+# LLM 요약 병렬 호출 — wisereport PIPELINE_LOCK 밖에서 사용
+# ------------------------------------------------------------------
+# OpenRouter 동시 요약 상한. 너무 크면 429. 5-8 권장.
+_LLM_SUMMARY_CONCURRENCY = int(os.environ.get("LLM_SUMMARY_CONCURRENCY", "8"))
+
+
+async def _summarize_pdfs_parallel(
+    paths: list[Path], *, short_summary: bool, label: str,
+) -> list[str]:
+    """N개 PDF를 asyncio.gather + semaphore로 동시 요약.
+
+    PIPELINE_LOCK 바깥에서 호출 — 같은 chat의 후속 발송 응답성을 위해.
+    각 호출은 asyncio.to_thread로 워커 스레드에서 sync OpenRouter SDK 사용
+    (OpenRouter SDK는 thread-safe). 실패는 자리에 "(요약 실패: ...)" 문자열로
+    들어가 호출자의 zip(paths, summaries) 흐름이 깨지지 않음.
+
+    - paths: 요약할 PDF 경로 리스트 (비어있으면 빈 리스트 반환).
+    - short_summary=True → summarizer.summarize_pdf_short (짧음), False → summarize_pdf.
+    - label: 실패 로그용 컨텍스트 (예: "산업 인기 5건" / "curator-company").
+    """
+    if not paths:
+        return []
+    # 지연 import — bot_helpers 자체는 summarizer를 강제 의존하지 않음.
+    from src.summarizer import (
+        OpenRouterCreditExhausted,
+        get_client,
+        summarize_pdf,
+        summarize_pdf_short,
+    )
+    sum_client = get_client()
+    fn = summarize_pdf_short if short_summary else summarize_pdf
+    sem = asyncio.Semaphore(_LLM_SUMMARY_CONCURRENCY)
+
+    async def _one(p: Path) -> str:
+        async with sem:
+            try:
+                s = await asyncio.to_thread(fn, sum_client, p)
+                return s.summary_text
+            except OpenRouterCreditExhausted:
+                log.warning("[%s] %s 요약 — OpenRouter 한도 초과", label, p.name)
+                return "(요약 실패: OpenRouter 토큰 부족)"
+            except Exception as e:
+                log.exception("[%s] %s 요약 실패", label, p.name)
+                return f"(요약 실패: {e!r})"
+
+    return await asyncio.gather(*[_one(p) for p in paths])
 
 
 def diag_env_keys(prefixes: Iterable[str]) -> dict[str, str]:
