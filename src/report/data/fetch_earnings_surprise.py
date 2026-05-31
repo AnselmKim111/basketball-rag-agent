@@ -121,12 +121,20 @@ def cross_validate_eps(symbol: str, finnhub_entries: list[dict],
 
 
 def select_top_surprises(entries: list[dict], top_beats: int = 8, top_misses: int = 5,
-                         min_abs_surprise_pct: float = 5.0) -> dict:
+                         min_abs_surprise_pct: float = 5.0,
+                         max_abs_surprise_pct: float = 200.0) -> dict:
     """후보 풀용 — eps_surprise_pct 기준 top beats + misses 선별.
+
+    max_abs_surprise_pct: 200% 초과는 데이터 품질 이슈 (낮은 estimate 분모로 인한 inflation,
+    또는 NM/Loss-to-Profit 같은 special case). 노이즈 제거를 위해 제외.
 
     반환: {"beats": [...], "misses": [...]}
     """
-    valid = [e for e in entries if e.get("eps_surprise_pct") is not None]
+    valid = [
+        e for e in entries
+        if e.get("eps_surprise_pct") is not None
+        and abs(float(e["eps_surprise_pct"])) <= max_abs_surprise_pct
+    ]
     beats = sorted(
         [e for e in valid if e["eps_surprise_pct"] >= min_abs_surprise_pct],
         key=lambda e: -float(e["eps_surprise_pct"]),
