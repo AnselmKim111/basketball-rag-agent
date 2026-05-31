@@ -100,11 +100,12 @@ def write_report(
             api_key=os.environ["OPENROUTER_API_KEY"],
         )
         model = os.getenv("REPORT_SYNTHESIS_MODEL") or os.getenv("IDEA_SYNTHESIS_MODEL") or "anthropic/claude-sonnet-4.5"
+        max_tok = int(os.getenv("REPORT_MAX_TOKENS") or "24000")
         md = summarizer.chat_with_retry(
             client,
             messages=[{"role": "system", "content": _system_prompt()},
                       {"role": "user", "content": user_msg}],
-            max_tokens=12000,
+            max_tokens=max_tok,
             model=model,
             temperature=0.4,
             context="report_writer",
