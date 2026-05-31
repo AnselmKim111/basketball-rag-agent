@@ -960,6 +960,9 @@ def _list_recent_10k(ticker: str, max_count: int = 4) -> list[dict]:
 _ITEM_1A_RE = re.compile(r"item\s+1a\.?\s*(?:risk\s+factors)?", re.IGNORECASE)
 _ITEM_1B_RE = re.compile(r"item\s+1b\.?", re.IGNORECASE)
 _ITEM_2_RE = re.compile(r"item\s+2\.?\s*(?:properties)?", re.IGNORECASE)
+_ITEM_7_RE = re.compile(r"item\s+7\.?\s*(?:management.{0,30}analysis)?", re.IGNORECASE)
+_ITEM_7A_RE = re.compile(r"item\s+7a\.?", re.IGNORECASE)
+_ITEM_8_RE = re.compile(r"item\s+8\.?\s*(?:financial\s+statements)?", re.IGNORECASE)
 
 
 def _extract_item_1a(html_text: str) -> str:
@@ -993,6 +996,71 @@ def _extract_item_1a(html_text: str) -> str:
     if len(section) < 200:
         return ""
     return section
+
+
+def _extract_mdna_item_7(html_text: str) -> str:
+    """10-K HTML → Item 7 MD&A 텍스트. 시작=Item 7, 종료=Item 7A 또는 Item 8."""
+    try:
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(html_text, "html.parser")
+        for tag in soup(["script", "style"]):
+            tag.decompose()
+        text = soup.get_text(" ", strip=True)
+    except Exception:
+        return ""
+    if not text:
+        return ""
+    starts = [m.start() for m in _ITEM_7_RE.finditer(text)]
+    # filter: Item 7A 매치는 제외 (Item 7와 별개)
+    starts = [s for s in starts if not _ITEM_7A_RE.match(text[s:s+15])]
+    if not starts:
+        return ""
+    start_idx = starts[1] if len(starts) > 1 else starts[0]
+    after = text[start_idx:]
+    end_match = _ITEM_7A_RE.search(after, pos=200)
+    if not end_match:
+        end_match = _ITEM_8_RE.search(after, pos=200)
+    end_idx = end_match.start() if end_match else min(len(after), 300_000)
+    section = after[:end_idx].strip()
+    if len(section) < 500:
+        return ""
+    return section
+
+
+def fetch_10k_mdna(ticker: str) -> tuple[TenKSnapshot | None, TenKSnapshot | None]:
+    """가장 최근 10-K + 1년 전 10-K → (current, prior) Item 7 MD&A 텍스트.
+
+    `fetch_10k_risk_factors` 패턴 그대로 — 추출 함수만 _extract_mdna_item_7.
+    """
+    ticker = (ticker or "").upper().strip()
+    filings = _list_recent_10k(ticker, max_count=4)
+    if not filings:
+        return (None, None)
+
+    def _fetch_one(meta: dict) -> TenKSnapshot | None:
+        try:
+            _throttle()
+            with httpx.Client(timeout=DEFAULT_TIMEOUT, follow_redirects=True) as cli:
+                r = cli.get(meta["primary_url"], headers={"User-Agent": USER_AGENT})
+                if r.status_code != 200:
+                    return None
+                html = r.text
+        except Exception:
+            return None
+        section = _extract_mdna_item_7(html)
+        if not section:
+            log.info("[mdna] Item 7 추출 실패 (%s acc=%s)", ticker, meta["accession"])
+            return None
+        return TenKSnapshot(
+            accession=meta["accession"], filed=meta["filed"],
+            primary_url=meta["primary_url"],
+            risk_text=section[:80_000],  # LLM 입력 cap
+            risk_chars=len(section),
+        )
+
+    current = _fetch_one(filings[0]) if filings else None
+    prior = _fetch_one(filings[1]) if len(filings) > 1 else None
+    return (current, prior)
 
 
 def fetch_10k_risk_factors(ticker: str) -> tuple[TenKSnapshot | None, TenKSnapshot | None]:

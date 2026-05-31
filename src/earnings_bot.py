@@ -824,12 +824,13 @@ async def _run_pipeline(
         f"Q{fiscal_quarter} {fiscal_year}" if (fiscal_year and fiscal_quarter) else "the most recent reported quarter"
     )
 
-    # 3) SEC EDGAR 재무 + 컨센서스 + 생태계 맵 + Form 4 + 8-K + 10-K Risk diff
-    #    (먼저 6-track 병렬 수집)
-    await _safe_send(bot, chat_id, "📊 SEC + 컨센 + 생태계 + 인사이더 + 8-K + 10-K Risk 6-track 수집 중 …")
+    # 3) SEC + 컨센 + 생태계 + Form 4 + 8-K + 10-K Risk diff + 10-K MD&A diff
+    #    (먼저 7-track 병렬 수집)
+    await _safe_send(bot, chat_id, "📊 7-track 수집 중 (SEC·컨센·생태계·인사이더·8-K·10-K Risk·MD&A) …")
     (
         financials, consensus_by_ticker, ecosystem_by_ticker,
         insider_by_ticker, events_8k_by_ticker, risk_diff_by_ticker,
+        mdna_diff_by_ticker,
     ) = await asyncio.gather(
         _step_fetch_financials(tickers),
         _step_fetch_consensus(tickers, fiscal_label),
@@ -837,6 +838,7 @@ async def _run_pipeline(
         _step_fetch_insider(tickers, window_days=30),
         _step_fetch_8k(tickers, window_days=90),
         _step_fetch_risk_diff(tickers),
+        _step_fetch_mdna_diff(tickers),
     )
     if not financials:
         await _safe_send(bot, chat_id, "⚠️ SEC EDGAR 데이터를 못 가져왔습니다 — 차트·검증 제한됩니다.")
@@ -849,11 +851,15 @@ async def _run_pipeline(
             1 for v in (risk_diff_by_ticker or {}).values()
             if v and not v.get("diff_skipped")
         )
+        got_md = sum(
+            1 for v in (mdna_diff_by_ticker or {}).values()
+            if v and not v.get("diff_skipped")
+        )
         await _safe_send(
             bot, chat_id,
             f"  📐 컨센 {got_c}/{len(tickers)} · 🌐 생태계 {got_e}/{len(tickers)} · "
             f"👥 인사이더 {got_i}/{len(tickers)} · 📂 8-K {got_k}/{len(tickers)} · "
-            f"📜 10-K Risk {got_r}/{len(tickers)}"
+            f"📜 10-K Risk {got_r}/{len(tickers)} · 📊 MD&A {got_md}/{len(tickers)}"
         )
 
     # 2+3) 종목별: 진짜 전문 확보 → 심층추출 → 숫자 교차검증 + 컨센서스 delta + 분기간 diff
@@ -936,6 +942,12 @@ async def _run_pipeline(
             rdtxt = _fmt_risk_diff_text(rd)
             if rdtxt:
                 body += "\n\n" + rdtxt
+        # 10-K MD&A diff (Phase 7E)
+        mdr = (mdna_diff_by_ticker or {}).get(t)
+        if mdr:
+            mdtxt = _fmt_mdna_diff_text(mdr)
+            if mdtxt:
+                body += "\n\n" + mdtxt
         await send_text_chunked(bot, chat_id, body)
 
     if not transcripts:
@@ -1000,6 +1012,29 @@ async def _run_pipeline(
             await _safe_send(bot, chat_id, summary_line)
     except Exception:
         log.exception("[quality_gate] 텔레그램 요약 발송 실패")
+
+    # 6.4) Phase 7D — Multi-Perspective Synthesis (sonnet 3 + opus 1 메타)
+    await _safe_send(bot, chat_id, "🎭 Multi-Perspective 합성 중 — bull/bear/neutral 3시각 (sonnet 병렬)…")
+    perspectives = await _step_multi_perspective(
+        transcripts, financials, fiscal_label, verify_by_ticker,
+        consensus_by_ticker, consensus_delta_by_ticker, diff_by_ticker,
+        ecosystem_by_ticker, insider_by_ticker, events_8k_by_ticker, risk_diff_by_ticker,
+        hyper_walker,
+    )
+    # 3개 시각 각각 발송 (확장 정보 — 사용자가 원하면 borrow)
+    if perspectives.get("bull"):
+        await send_text_chunked(bot, chat_id, perspectives["bull"])
+    if perspectives.get("bear"):
+        await send_text_chunked(bot, chat_id, perspectives["bear"])
+    if perspectives.get("neutral"):
+        await send_text_chunked(bot, chat_id, perspectives["neutral"])
+    # 메타 합성 — opus 1회 (3개 모두 비어 있지 않을 때만)
+    meta_text = ""
+    if any(perspectives.values()):
+        await _safe_send(bot, chat_id, "🧬 §9 Perspective Consensus & Conflicts 메타 합성 (Opus)…")
+        meta_text = await _step_meta_synthesis(perspectives) or ""
+        if meta_text:
+            await send_text_chunked(bot, chat_id, meta_text)
 
     # 6.5) Counter-thesis 자동 합성 (Track E) — 동일 payload + opus 1회 추가
     await _safe_send(bot, chat_id, "🛡️ Counter-thesis 자동 반박 합성 중 (Opus)…")
@@ -1223,6 +1258,98 @@ async def _step_fetch_financials(tickers: list[str]) -> dict[str, Any]:
         if fin is not None:
             out[t] = fin
     return out
+
+
+async def _step_fetch_mdna_diff(tickers: list[str]) -> dict[str, Any]:
+    """Phase 7E — 10-K Item 7 MD&A 1년 diff (Track I 패턴 재사용)."""
+    from src import summarizer
+    from src.earnings import sec_edgar
+    from src.idea_bot import _parse_json
+    loop = asyncio.get_running_loop()
+    snaps = await asyncio.gather(
+        *[loop.run_in_executor(None, sec_edgar.fetch_10k_mdna, t) for t in tickers],
+        return_exceptions=True,
+    )
+    system = _load_prompt("earnings_mdna_diff")
+    out: dict[str, Any] = {}
+    model = _extract_model()
+
+    async def _diff_one(ticker: str, current, prior) -> dict | None:
+        if current is None or prior is None:
+            return None
+        user_msg = (
+            f"# ticker: {ticker}\n"
+            f"# current_filed: {current.filed} (chars: {current.risk_chars:,})\n"
+            f"# prior_filed: {prior.filed} (chars: {prior.risk_chars:,})\n\n"
+            f"=== CURRENT 10-K MD&A START ===\n{current.risk_text}\n=== END ===\n\n"
+            f"=== PRIOR 10-K MD&A START ===\n{prior.risk_text}\n=== END ===\n\n"
+            "schema 그대로 JSON 출력."
+        )
+        def _call():
+            client = summarizer.get_client()
+            return summarizer.chat_with_retry(
+                client,
+                model=model,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user_msg},
+                ],
+                temperature=0.2,
+                max_tokens=4500,
+                context=f"earnings-mdna-diff:{ticker}",
+            )
+        try:
+            content = await loop.run_in_executor(None, _call)
+        except Exception:
+            log.exception("MD&A diff LLM 실패 (%s)", ticker)
+            return None
+        return _parse_json(content) if content else None
+
+    diff_jobs = []
+    for t, snap_pair in zip(tickers, snaps):
+        if isinstance(snap_pair, Exception):
+            out[t] = None
+            continue
+        current, prior = snap_pair
+        if current is None or prior is None:
+            out[t] = {"diff_skipped": True, "reason": "MD&A 페어 미확보"}
+            continue
+        diff_jobs.append((t, current, prior))
+    if diff_jobs:
+        results = await asyncio.gather(*[_diff_one(t, c, p) for t, c, p in diff_jobs])
+        for (t, current, prior), res in zip(diff_jobs, results):
+            payload = res or {}
+            payload.setdefault("ticker", t)
+            payload.setdefault("current_filed", current.filed)
+            payload.setdefault("prior_filed", prior.filed)
+            out[t] = payload
+    return out
+
+
+def _fmt_mdna_diff_text(rd: dict | None) -> str:
+    """텔레그램용 한국어 요약."""
+    if not rd:
+        return ""
+    ticker = rd.get("ticker", "?")
+    if rd.get("diff_skipped"):
+        return f"📊 MD&A diff({ticker}): {rd.get('reason','추출 실패')}"
+    lines = [f"📊 MD&A 1-year diff({ticker}) — {rd.get('current_filed','?')} vs {rd.get('prior_filed','?')}"]
+    def _add(label, key, max_items=3):
+        items = rd.get(key) or []
+        if not items:
+            return
+        lines.append(f"  · {label} ({len(items)}건):")
+        for it in items[:max_items]:
+            t = (it.get("topic") or it.get("segment") or it.get("area") or it.get("theme") or "?")[:60]
+            lines.append(f"    - {t}")
+    _add("📈 매출 동인 변화", "revenue_drivers_change")
+    _add("💼 세그먼트 마진", "segment_margin_evolution")
+    _add("⛓️ 공급망 톤", "supply_chain_commentary_shift")
+    _add("🔮 전망 변화", "forward_outlook_change")
+    _add("🌐 매크로", "macro_analysis_shift")
+    if rd.get("pm_takeaway"):
+        lines.append(f"  · PM takeaway: {rd.get('pm_takeaway')}")
+    return "\n".join(lines)
 
 
 async def _step_fetch_risk_diff(tickers: list[str]) -> dict[str, Any]:
@@ -1831,6 +1958,106 @@ async def _step_compute_diff(
     if not content:
         return None
     return _parse_json(content)
+
+
+async def _step_multi_perspective(
+    transcripts: dict[str, dict],
+    financials: dict[str, Any],
+    fiscal_period: str,
+    verify_by_ticker: dict[str, list],
+    consensus_by_ticker: dict[str, Any] | None = None,
+    consensus_delta_by_ticker: dict[str, list] | None = None,
+    diff_by_ticker: dict[str, dict] | None = None,
+    ecosystem_by_ticker: dict[str, Any] | None = None,
+    insider_by_ticker: dict[str, Any] | None = None,
+    events_8k_by_ticker: dict[str, Any] | None = None,
+    risk_diff_by_ticker: dict[str, Any] | None = None,
+    hyper_walker: dict | None = None,
+) -> dict[str, str]:
+    """Phase 7D — 동일 cached payload + 3개 system prompt (bull/bear/neutral) 병렬 sonnet 합성.
+
+    반환: {"bull": text, "bear": text, "neutral": text} (실패 항목은 빈 문자열).
+    """
+    from src import summarizer
+    user_payload = _build_synthesis_payload(
+        transcripts, financials, fiscal_period, verify_by_ticker,
+        consensus_by_ticker, consensus_delta_by_ticker, diff_by_ticker,
+        ecosystem_by_ticker, insider_by_ticker, events_8k_by_ticker, risk_diff_by_ticker,
+        hyper_walker,
+    )
+    perspectives = {
+        "bull": _load_prompt("earnings_bull"),
+        "bear": _load_prompt("earnings_bear"),
+        "neutral": _load_prompt("earnings_neutral"),
+    }
+    loop = asyncio.get_running_loop()
+    model = _extract_model()  # sonnet — 비용 절약
+
+    def _call_one(system: str):
+        client = summarizer.get_client()
+        return summarizer.chat_with_retry(
+            client,
+            model=model,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user_payload},
+            ],
+            temperature=0.3,
+            max_tokens=4500,
+            context="earnings-multi-perspective",
+        )
+
+    results = await asyncio.gather(
+        *[loop.run_in_executor(None, _call_one, sys_p) if sys_p else asyncio.sleep(0, result=None)
+          for sys_p in perspectives.values()],
+        return_exceptions=True,
+    )
+    out: dict[str, str] = {}
+    for (name, _), res in zip(perspectives.items(), results):
+        if isinstance(res, Exception) or not res:
+            log.warning("[multi-perspective] %s 실패", name)
+            out[name] = ""
+        else:
+            out[name] = res
+    return out
+
+
+async def _step_meta_synthesis(perspectives: dict[str, str]) -> str | None:
+    """Phase 7D — bull/bear/neutral 3개 보고서를 받아 opus 1회 메타 합성. §9 출력."""
+    from src import summarizer
+    if not perspectives or not any(perspectives.values()):
+        return None
+    system = _load_prompt("earnings_meta")
+    if not system:
+        return None
+    user_msg = (
+        "다음 3개 보고서는 같은 데이터에서 bull/bear/neutral 시각으로 작성됐다. "
+        "schema 그대로 §9 메타 합성을 출력하라.\n\n"
+        f"## BULL VIEW\n{perspectives.get('bull') or '(empty)'}\n\n"
+        f"## BEAR VIEW\n{perspectives.get('bear') or '(empty)'}\n\n"
+        f"## NEUTRAL VIEW\n{perspectives.get('neutral') or '(empty)'}"
+    )
+    loop = asyncio.get_running_loop()
+
+    def _call():
+        client = summarizer.get_client()
+        return summarizer.chat_with_retry(
+            client,
+            model=_synthesis_model(),  # opus
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user_msg},
+            ],
+            temperature=0.3,
+            max_tokens=5500,
+            context="earnings-meta-synthesis",
+        )
+    try:
+        content = await loop.run_in_executor(None, _call)
+    except Exception:
+        log.exception("[meta synthesis] 실패")
+        return None
+    return content or None
 
 
 async def _step_synthesize_counter(
