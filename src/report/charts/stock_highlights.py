@@ -157,13 +157,13 @@ def highlight_grid(dfs: dict[str, object] | None, out_dir: Path,
     paths: list[str] = []
     if us_items:
         p = _render_grid(us_items, dfs or {}, out_dir, "30_highlights_us.png",
-                         "🇺🇸 미국 — 개별 종목 하이라이트 (watchlist)",
+                         "[US] 미국 — 개별 종목 하이라이트 (watchlist)",
                          days=days, date_iso=date_iso)
         if p:
             paths.append(p)
     if kr_items:
         p = _render_grid(kr_items, dfs or {}, out_dir, "31_highlights_kr.png",
-                         "🇰🇷 한국 — 개별 종목 하이라이트 (watchlist)",
+                         "[KR] 한국 — 개별 종목 하이라이트 (watchlist)",
                          days=days, date_iso=date_iso)
         if p:
             paths.append(p)
