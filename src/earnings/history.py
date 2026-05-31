@@ -130,10 +130,28 @@ def save_call(
             tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
             tmp.replace(path)
             log.info("[earnings/history] saved %s", path)
-            return path
         except Exception:
             log.exception("[earnings/history] save 실패: %s", path)
             return None
+    # Phase 7F — knowledge_db에도 백업 (검색·digest용). 실패해도 JSON은 이미 저장됨.
+    try:
+        from src.earnings import knowledge_db
+        ext = extract if isinstance(extract, dict) else {}
+        knowledge_db.upsert_call(
+            ticker=ticker, year=year, quarter=quarter,
+            call_date=(ext.get("call_date") if isinstance(ext, dict) else "") or "",
+            source=(ext.get("source") if isinstance(ext, dict) else "") or "",
+            grounded=bool((ext.get("grounded") if isinstance(ext, dict) else False)),
+            transcript_chars=int((ext.get("transcript_chars") if isinstance(ext, dict) else 0) or 0),
+            extract=ext,
+            synthesis_text=synthesis_excerpt or "",
+            counter_text=counter_excerpt or "",
+            retrospective_text=(ext.get("_retrospective") if isinstance(ext, dict) else "") or "",
+            quality=(ext.get("_gate_extract") if isinstance(ext, dict) else None),
+        )
+    except Exception:
+        log.exception("[earnings/history] knowledge_db upsert 실패 (JSON은 정상 저장)")
+    return path
 
 
 def load_call(ticker: str, year: int, quarter: int) -> dict | None:

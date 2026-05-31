@@ -431,6 +431,207 @@ async def _step_retrospective(
     return parsed.get("retrospective_report") or None
 
 
+async def _cmd_digest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/digest [days=7] — 사용자 watchlist 기준 지난 N일 동안의 콜 digest."""
+    if not _is_authorized(update):
+        await deny_message(update, "어닝콜 기능")
+        return
+    args = context.args or []
+    days = 7
+    if args:
+        try:
+            days = max(1, min(int(args[0]), 30))
+        except ValueError:
+            pass
+    asyncio.create_task(_run_digest(update.effective_chat.id, context.bot, days))
+
+
+async def _run_digest(chat_id: int | str, bot: Bot, days: int = 7) -> None:
+    """digest 워커. watchlist에 있는 ticker 중 지난 N일 처리된 콜 모음 + opus 1회 요약."""
+    from src.earnings import knowledge_db, earnings_watchlist as wl
+    from src import summarizer
+
+    loop = asyncio.get_running_loop()
+    watched = wl.list_for_chat(chat_id)
+    if not watched:
+        await _safe_send(bot, str(chat_id), "📰 digest 생략 — watchlist 비어 있음 (`/watch <TICKER>` 권장).")
+        return
+    recent = await loop.run_in_executor(None, knowledge_db.list_recent_calls, days, 60)
+    in_watch = [r for r in recent if r["ticker"] in {t.upper() for t in watched}]
+    if not in_watch:
+        await _safe_send(bot, str(chat_id), f"📰 지난 {days}일 watchlist 종목 신규 콜 없음 ({len(watched)}개 watch 중).")
+        return
+
+    payload_parts = [f"# 사용자 watchlist: {', '.join(sorted(watched))}", f"# 윈도: 최근 {days}일", ""]
+    for c in in_watch:
+        payload_parts.append(
+            f"## [{c['ticker']} FY{c['year']}Q{c['quarter']}] (grounded={c['grounded']}) {c.get('call_date','')}"
+        )
+        payload_parts.append((c.get("syn_head") or "")[:600])
+        if c.get("cnt_head"):
+            payload_parts.append(f"counter excerpt: {(c.get('cnt_head') or '')[:300]}")
+        payload_parts.append("")
+    user_msg = "\n".join(payload_parts)
+
+    system = (
+        "당신은 시니어 PM의 비서. 사용자 watchlist의 지난 N일 어닝콜들을 종합해 한국어로 정리한다. "
+        "구조:\n"
+        "1. 🔥 가장 강한 surprise (종목별)\n"
+        "2. 🛡️ counter-thesis 경계할 점\n"
+        "3. 📐 컨센 vs 실제 가장 큰 비대칭\n"
+        "4. 👥 인사이더·8-K·MD&A 알림\n"
+        "5. 다음 주 모니터링 트리거\n"
+        "각 항목 짧고 정량. 데이터에 없는 사실 추측 금지. 4000자 이하."
+    )
+
+    def _call():
+        client = summarizer.get_client()
+        return summarizer.chat_with_retry(
+            client, model=_synthesis_model(),  # opus
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user_msg},
+            ],
+            temperature=0.3, max_tokens=4500, context="earnings-digest",
+        )
+    await _safe_send(bot, str(chat_id), f"📰 digest 합성 중 ({len(in_watch)}개 콜, 지난 {days}일)…")
+    try:
+        content = await loop.run_in_executor(None, _call)
+    except Exception:
+        log.exception("digest 합성 실패")
+        content = None
+    if content:
+        await send_text_chunked(bot, str(chat_id), content)
+    else:
+        # 폴백: raw
+        lines = [f"📰 digest (raw) — watchlist 신규 콜 {len(in_watch)}건"]
+        for c in in_watch[:10]:
+            lines.append(f"  · [{c['ticker']} FY{c['year']}Q{c['quarter']}]: {(c.get('syn_head') or '')[:200]}")
+        await _safe_send(bot, str(chat_id), "\n".join(lines))
+
+
+async def earnings_digest_cron_job(bot: Bot) -> None:
+    """orchestrator APScheduler — 매주 월 09:00 KST, 모든 chat의 watchlist 기준 digest 자동 발송."""
+    from src.earnings import earnings_watchlist as wl
+    log.info("[earnings_digest_cron] 시작")
+    all_t = wl.all_tickers()
+    if not all_t:
+        log.info("[earnings_digest_cron] watch 종목 0 — skip")
+        return
+    # subscriber 별로 한 번씩
+    seen_chats: set[str] = set()
+    for t in all_t:
+        for cid in wl.subscribers_of(t):
+            if cid in seen_chats:
+                continue
+            seen_chats.add(cid)
+    for cid in seen_chats:
+        try:
+            await _run_digest(cid, bot, days=7)
+        except Exception:
+            log.exception("[earnings_digest_cron] chat=%s digest 실패", cid)
+
+
+async def _cmd_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/query <자유 텍스트> — knowledge_db 부분 매칭 + sonnet 결과 정리.
+
+    예시:
+      /query SK Hynix mentions in hyperscaler calls
+      /query NVDA recent counter-thesis 약점
+    """
+    if not _is_authorized(update):
+        await deny_message(update, "어닝콜 기능")
+        return
+    from src.earnings import knowledge_db
+    args = (context.args or [])
+    if not args:
+        await update.message.reply_text(
+            "사용법: `/query <자유 텍스트>`\n"
+            "예시:\n"
+            "  `/query SK Hynix mentions`\n"
+            "  `/query NVDA counter-thesis 약점`\n"
+            "  `/query AAPL FY2026Q1`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+    query_text = " ".join(args).strip()
+    asyncio.create_task(_run_query(update, context, query_text))
+
+
+async def _run_query(update: Update, context: ContextTypes.DEFAULT_TYPE, q: str) -> None:
+    from src.earnings import knowledge_db
+    from src import summarizer
+    from src.idea_bot import _parse_json
+    bot: Bot = context.bot
+    chat_id = str(update.effective_chat.id)
+    await _safe_send(bot, chat_id, f"🔍 /query 시작 — \"{q[:100]}\"")
+    loop = asyncio.get_running_loop()
+
+    # 1) ticker가 명시되면 그 종목 분기 정리
+    ticker_m = re.search(r"\b([A-Z]{1,5})\b", q)
+    ticker_candidate = ticker_m.group(1) if ticker_m else None
+
+    # 2) 엔티티/풀텍스트 부분 매칭 (단순 LIKE)
+    keyword_m = re.findall(r"[A-Za-z가-힣][\w가-힣]{2,30}", q)
+    candidates = sorted(set(keyword_m), key=len, reverse=True)[:5]
+    entity_hits: list[dict] = []
+    text_hits: list[dict] = []
+    for kw in candidates:
+        entity_hits.extend(await loop.run_in_executor(None, knowledge_db.search_entity_mentions, kw, 12))
+        text_hits.extend(await loop.run_in_executor(None, knowledge_db.fulltext_search, kw, 8))
+
+    # 3) ticker별 최근 콜 메타
+    ticker_calls = []
+    if ticker_candidate:
+        ticker_calls = await loop.run_in_executor(None, knowledge_db.list_calls_for_ticker, ticker_candidate, 6)
+
+    if not entity_hits and not text_hits and not ticker_calls:
+        await _safe_send(bot, chat_id, "🤷 매칭 결과 없음. DB가 비어 있거나 다른 단어로 시도.")
+        return
+
+    # 4) sonnet 1회로 자연어 응답 합성
+    raw_data = {
+        "query": q, "ticker_candidate": ticker_candidate,
+        "keywords_used": candidates,
+        "entity_matches": entity_hits[:20],
+        "fulltext_matches": [{k: v for k, v in h.items() if k != "syn_head"} for h in text_hits[:10]],
+        "fulltext_snippets": [{"id": h["id"], "snippet": (h.get("syn_head") or "")[:300]} for h in text_hits[:8]],
+        "ticker_calls": ticker_calls,
+    }
+    system = (
+        "당신은 어닝콜 봇의 query 응답기다. raw_data를 받아 사용자 질문에 한국어로 명확히 답한다. "
+        "결과 없으면 '결과 없음'. 데이터에 없는 사실 추측 금지. "
+        "각 결과에 [TICKER FY...Q...] 라벨. 4000자 이하."
+    )
+    user_msg = f"# 질문\n{q}\n\n# raw_data (knowledge_db search 결과)\n{json.dumps(raw_data, ensure_ascii=False, default=str)[:30000]}"
+
+    def _call():
+        client = summarizer.get_client()
+        return summarizer.chat_with_retry(
+            client, model=_extract_model(),
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user_msg},
+            ],
+            temperature=0.2, max_tokens=3500, context="earnings-query",
+        )
+    try:
+        content = await loop.run_in_executor(None, _call)
+    except Exception:
+        log.exception("/query LLM 실패")
+        content = None
+    if content:
+        await send_text_chunked(bot, chat_id, content)
+    else:
+        # 폴백: raw 결과만이라도
+        lines = ["🔍 매칭 (raw)"]
+        for e in entity_hits[:10]:
+            lines.append(f"  · [{e['ticker']} FY{e['year']}Q{e['quarter']}] {e['mention_text']} ({e['mention_type']})")
+        for h in text_hits[:5]:
+            lines.append(f"  · [{h['ticker']} FY{h['year']}Q{h['quarter']}] {(h.get('syn_head') or '')[:200]}")
+        await _safe_send(bot, chat_id, "\n".join(lines))
+
+
 async def _cmd_credibility(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/credibility <TICKER> — 봇의 누적 적중률 표시."""
     if not _is_authorized(update):
@@ -2743,6 +2944,8 @@ EARNINGS_COMMANDS = [
     ("watchlist", "📋 현재 watch 목록 + 다음 어닝 예정"),
     ("backfill", "🔁 longitudinal history 시드 (`/backfill MSFT 6`)"),
     ("credibility", "📈 봇 누적 적중률 (`/credibility NVDA`)"),
+    ("query", "🔍 knowledge_db 자유 검색 (`/query SK Hynix`)"),
+    ("digest", "📰 watchlist 주간 digest (`/digest 7`)"),
     ("help", "ℹ️ 사용법"),
 ]
 
@@ -2762,6 +2965,8 @@ def build_earnings_app(token: str) -> Application:
     app.add_handler(CommandHandler("watchlist", _cmd_watchlist))
     app.add_handler(CommandHandler("backfill", _cmd_backfill))
     app.add_handler(CommandHandler("credibility", _cmd_credibility))
+    app.add_handler(CommandHandler("query", _cmd_query))
+    app.add_handler(CommandHandler("digest", _cmd_digest))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _on_text))
 
     try:
