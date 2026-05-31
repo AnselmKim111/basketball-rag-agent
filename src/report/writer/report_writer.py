@@ -33,7 +33,7 @@ def write_report(
     theme_momentum: dict | None = None,
     deltas: dict | None = None,
     breadth: dict | None = None,
-    highlights: list[dict] | None = None,
+    highlights: list[dict] | dict | None = None,
     earnings: dict | None = None,
     stale: list[dict] | None = None,
 ) -> str:
@@ -44,6 +44,8 @@ def write_report(
     deltas: 전일 대비 변화, breadth: 시장 폭, highlights: 개별주 [{label,chg,note}].
     실패 시 규칙 기반 fallback markdown 반환.
     """
+    # highlights는 watchlist 결과 {us:[...], kr:[...]} 또는 legacy list 형태 둘 다 허용
+    hl_payload = highlights if isinstance(highlights, dict) else {"legacy": highlights or []}
     payload = {
         "date": date_iso,
         "market_color": market_color,
@@ -54,26 +56,38 @@ def write_report(
         "signals": signals[:60],
         "macro": macro_summary,
         "korea": korea_summary,
-        "highlights": highlights or [],
+        "highlights": hl_payload,
         "news": (news or [])[:15],
         "earnings": earnings or {},
         "stale_data": stale or [],
     }
     user_msg = (
         "다음은 오늘 시장 데이터·전일 대비 변화(deltas_vs_yesterday)·생성된 차트 목록이다. "
-        "시스템 규칙(버터대디 캐주얼 1인칭 문체 + S급 thesis-driven 구조)에 따라 한국어 Markdown "
+        "시스템 규칙(버터대디 캐주얼 1인칭 문체 + 신호 인사이트 톤)에 따라 한국어 Markdown "
         "시황 리포트를 작성하라.\n\n"
         "**필수 구조 (어기면 실패):**\n"
-        "1. 제목 직후 **🎯 오늘의 베팅 (THESIS BOX)** 5줄 인용블록: 베팅·진입조건·깨지는신호·시간축·확신도.\n"
+        "1. 제목 직후 **📡 오늘 시장이 말하는 한 줄 (THESIS BOX)** 4줄 인용블록: 관찰·핵심신호·변하면의미바뀌는것·호흡. "
+        "(베팅·진입·손절·확신도 별점 표현 일체 금지 — 액션은 사용자가 한다)\n"
         "2. **📍 어제 대비 변화**, **Executive Summary**(첫 줄 인과 사슬 4-5단).\n"
-        "3. §0~§8 매 섹션은 **관찰 → 해석 → 베팅(구체 레벨) → 반박(해당시) → • takeaway(thesis 관계)** 4부 스키마.\n"
+        "3. §0~§8 매 섹션은 **관찰 → 해석 → 시장 신호의 의미 → 반박(해당시) → • takeaway(thesis 관계)** 4부 스키마.\n"
         "4. 모든 차트는 반드시 `![](images/파일명)`으로 본문 1회 삽입.\n"
         "5. **마지막에 🌅 내일 체크포인트 표 3행** (무엇·시간·왜 중요·진행 신호).\n"
         "6. 마지막 문장은 '지수는 움직였고, 이제 돈은 어디로 가고 있는가?'에 답.\n\n"
-        "**베팅 레벨은 signals/macro/breadth의 실제 수치만 인용**(추측 가격 금지). "
-        "§5 어닝은 earnings(beat율·평균 서프라이즈·top beats/misses·다가올 일정) 기반. "
-        "§6 개별 종목은 highlights와 news를 엮은 종목별 미니 스토리(단순 등락 나열 금지). "
-        "news는 내러티브에 자연스럽게 녹이되 **출처 URL 절대 금지**(지어내기 금지), 매체/주체 이름만. "
+        "**중요 톤 룰**: 봇은 데이터·신호·맥락만 정확하고 풍부하게 전달. '진입/손절/목표가/베팅/추천/확신도 별점' "
+        "어휘 일체 금지. 신호의 의미·강도·다른 신호와의 일치도를 인사이트있게 포착하는 데 집중. "
+        "기술 레벨(MA·52w·support·resistance)은 fact 형태로만 인용('현재 52w 99%, 200MA $122 위') — "
+        "'$146 돌파 시 매수' 같은 트리거 표현 금지. 종목별 한 줄 takeaway는 (thesis 일치 / 강화 / 약화 / 독립 모멘텀 / 노이즈) 중 하나로 분류.\n\n"
+        "**§6 개별 종목 watchlist**: highlights = {us:[…], kr:[…]} 각 종목은 enriched dict — "
+        "categories(earnings_actual/estimate_revision/ipo/sector_leader/trend_reversal/followup), "
+        "earnings_actual(어닝 실제 결과 — eps_surprise_pct·rev_surprise_pct·source_consensus), "
+        "estimate_revision(분석가 기대치 변화 — buy_count_old→new·buy_delta — 어닝과 별개 신호), "
+        "ipo(상장 fact + 자금흐름 함의), screener_signals(기술 신호 종류), technical(MA·52w·support/resistance), "
+        "news_snippets(매체명만 인용, URL 금지), sector_context(섹터 모멘텀과 일치/대비). "
+        "**어닝 실제(earnings_actual)와 분석가 기대치(estimate_revision)는 다른 의미** — 전자는 사실 발표 후 reaction, "
+        "후자는 발표 없이 시장 컨센서스 shift. 둘 다 있으면 결과→기대 사슬, 한쪽만이면 그 해석만. "
+        "카테고리별 mini-section(📈 어닝 / 🔭 기대 / 💎 IPO / 🚀 리더 / 🔄 반전 / 🔁 F/U)으로 구조화. "
+        "카테고리 0개면 그 mini-section 자체 생략.\n\n"
+        "**일반 룰**: news는 내러티브에 자연스럽게 녹이되 **출처 URL 절대 금지**, 매체/주체 이름만. "
         "입력 news에 있는 사실만 쓰고 없는 수치·사실은 만들지 마라. "
         "stale_data 카테고리는 '⚠ 전일자 데이터(asof)'로 명시. 데이터 미확보는 '데이터 미수집'으로.\n\n"
         + json.dumps(payload, ensure_ascii=False, indent=2)
@@ -90,7 +104,7 @@ def write_report(
             client,
             messages=[{"role": "system", "content": _system_prompt()},
                       {"role": "user", "content": user_msg}],
-            max_tokens=10000,
+            max_tokens=12000,
             model=model,
             temperature=0.4,
             context="report_writer",
