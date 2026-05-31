@@ -68,6 +68,36 @@ class ScheduledJob:
     job_id: str
     cron: dict  # CronTrigger kwargs (day_of_week, hour, minute 등)
     description: str = ""
+    deadline_sec: int = 1800  # 이 시간 안에 잡이 끝나지 않으면 admin에 미완주 알림
+    alert_env_keys: tuple = ()  # admin chat_id env vars (없으면 알림 생략)
+
+
+async def _instrumented_job(func: Callable[[Bot], Awaitable[None]], bot: Bot,
+                            job_id: str, deadline_sec: int,
+                            alert_env_keys: tuple) -> None:
+    """크론 잡 래퍼 — deadline_sec 안에 완주 안 되면 admin에 ⚠ 알림."""
+    import asyncio
+    from src.admin_alerts import alert_admin
+    done = asyncio.Event()
+
+    async def _watchdog():
+        try:
+            await asyncio.sleep(deadline_sec)
+            if not done.is_set() and alert_env_keys:
+                await alert_admin(
+                    bot, alert_env_keys,
+                    f"⏰ 크론 {job_id} 미완주",
+                    f"{deadline_sec // 60}분 경과, 발송 완료 없음 — 로그 확인 필요",
+                )
+        except asyncio.CancelledError:
+            pass
+
+    watchdog = asyncio.create_task(_watchdog())
+    try:
+        await func(bot)
+    finally:
+        done.set()
+        watchdog.cancel()
 
 
 @dataclass
@@ -175,6 +205,8 @@ BOT_SPECS: list[BotSpec] = [
                 job_id="screener_daily",
                 cron={"hour": 16, "minute": 0},
                 description="한국 주식 기술적 신호 — 매일 16:00 KST (15:30 종가 기준)",
+                deadline_sec=2700,  # 45분 — 16:00 cron의 30분 today-fetch retry + Naver 배치 여유
+                alert_env_keys=("SCREENER_ALLOWED_CHAT_IDS", "SCREENER_CHAT_ID"),
             ),
         ],
     ),
@@ -189,6 +221,8 @@ BOT_SPECS: list[BotSpec] = [
                 job_id="us_screener_daily",
                 cron={"hour": 7, "minute": 0},
                 description="미국 기술적 신호 — 매일 07:00 KST (미국 4PM ET 종가)",
+                deadline_sec=1500,  # 25분 — Naver 없어 KR보다 짧음
+                alert_env_keys=("US_SCREENER_ALLOWED_CHAT_IDS", "US_SCREENER_CHAT_ID"),
             ),
         ],
     ),
@@ -296,15 +330,15 @@ async def _run_forever() -> None:
         if bot is None:
             continue
         scheduler.add_job(
-            job.func,
+            _instrumented_job,
             CronTrigger(timezone=KST, **job.cron),
-            args=[bot],
+            args=[job.func, bot, job.job_id, job.deadline_sec, job.alert_env_keys],
             id=job.job_id,
             misfire_grace_time=3600,
             coalesce=True,
             max_instances=1,
         )
-        log.info("스케줄: %s", job.description or job.job_id)
+        log.info("스케줄: %s (deadline %ds)", job.description or job.job_id, job.deadline_sec)
 
     scheduler.start()
     next_run = {j.id: str(j.next_run_time) for j in scheduler.get_jobs()}

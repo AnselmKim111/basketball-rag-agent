@@ -191,6 +191,50 @@ def has_date(date_str: str) -> bool:
         return cur.fetchone() is not None
 
 
+def recent_signals(days_back: int = 14, exclude_date: Optional[str] = None) -> list[dict]:
+    """최근 days_back 영업일 내 신호 [{date,ticker,signal,payload}]. exclude_date 시 그날 제외(오늘)."""
+    ensure_schema()
+    with _conn() as c:
+        from datetime import date, timedelta
+        cutoff = (date.today() - timedelta(days=int(days_back * 1.5))).isoformat()
+        if exclude_date:
+            cur = c.execute(
+                "SELECT date, ticker, signal, payload FROM signals "
+                "WHERE date >= ? AND date != ? ORDER BY date ASC, ticker, signal",
+                (cutoff, exclude_date),
+            )
+        else:
+            cur = c.execute(
+                "SELECT date, ticker, signal, payload FROM signals "
+                "WHERE date >= ? ORDER BY date ASC, ticker, signal",
+                (cutoff,),
+            )
+        rows = cur.fetchall()
+    out = []
+    for r in rows:
+        try:
+            payload = json.loads(r[3]) if r[3] else {}
+        except Exception:
+            payload = {}
+        out.append({"date": r[0], "ticker": r[1], "signal": r[2], "payload": payload})
+    return out
+
+
+def close_after_n_business_days(ticker: str, start_date: str, n: int = 5) -> Optional[int]:
+    """start_date로부터 n영업일 후 close(cents). 아직 안 됐으면 None."""
+    ensure_schema()
+    with _conn() as c:
+        cur = c.execute(
+            "SELECT date, close FROM ohlcv WHERE ticker=? AND date >= ? "
+            "ORDER BY date ASC LIMIT ?",
+            (ticker, start_date, n + 1),
+        )
+        rows = cur.fetchall()
+    if len(rows) < n + 1:
+        return None
+    return int(rows[n][1])
+
+
 def delete_older_than(cutoff_date: str) -> int:
     ensure_schema()
     with _conn() as c:
