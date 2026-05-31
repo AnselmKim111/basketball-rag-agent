@@ -125,6 +125,88 @@ async def _cmd_earnings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     asyncio.create_task(_run_pipeline(update, context, args))
 
 
+async def _cmd_watch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/watch <TICKER> [more] — 다음 콜 자동 발송 예약."""
+    if not _is_authorized(update):
+        await deny_message(update, "어닝콜 기능")
+        return
+    from src.earnings import earnings_watchlist as wl
+    args = context.args or []
+    if not args:
+        await update.message.reply_text(
+            "사용법: `/watch <TICKER1> [TICKER2 ...]`\n예: `/watch MSFT NVDA AAPL`\n\n"
+            "콜 발표 직후 자동으로 풀 분석(Tracks A-L) 보고서를 보냅니다.\n"
+            "관리: /watchlist · /unwatch",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+    chat_id = update.effective_chat.id
+    msgs: list[str] = []
+    for raw in args:
+        t = raw.strip().upper()
+        ok, m = wl.add(chat_id, t)
+        msgs.append(f"{'✅' if ok else '⏭️'} {m}")
+    current = wl.list_for_chat(chat_id)
+    await update.message.reply_text(
+        "\n".join(msgs) + (f"\n\n현재 watch: {', '.join(current) or '비어 있음'}")
+    )
+
+
+async def _cmd_unwatch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/unwatch <TICKER> [more]."""
+    if not _is_authorized(update):
+        await deny_message(update, "어닝콜 기능")
+        return
+    from src.earnings import earnings_watchlist as wl
+    args = context.args or []
+    if not args:
+        await update.message.reply_text(
+            "사용법: `/unwatch <TICKER1> [TICKER2 ...]`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+    chat_id = update.effective_chat.id
+    msgs: list[str] = []
+    for raw in args:
+        t = raw.strip().upper()
+        ok, m = wl.remove(chat_id, t)
+        msgs.append(f"{'✅' if ok else '⏭️'} {m}")
+    current = wl.list_for_chat(chat_id)
+    await update.message.reply_text(
+        "\n".join(msgs) + (f"\n\n현재 watch: {', '.join(current) or '비어 있음'}")
+    )
+
+
+async def _cmd_watchlist(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/watchlist — 현재 chat의 자동 발송 ticker 목록 + 다음 어닝 예정일."""
+    if not _is_authorized(update):
+        await deny_message(update, "어닝콜 기능")
+        return
+    from src.earnings import earnings_watchlist as wl
+    from src.earnings import consensus
+    chat_id = update.effective_chat.id
+    tickers = wl.list_for_chat(chat_id)
+    if not tickers:
+        await update.message.reply_text(
+            "watch 중인 종목 없음. `/watch MSFT NVDA` 형태로 추가.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+    await update.message.reply_text(f"🔭 watch ({len(tickers)}): {', '.join(tickers)}\n다음 어닝 예정 조회 중 …")
+    loop = asyncio.get_running_loop()
+    dates = await asyncio.gather(
+        *[loop.run_in_executor(None, consensus.fetch_next_earnings_date, t) for t in tickers],
+        return_exceptions=True,
+    )
+    lines = ["📅 다음 어닝 예정 (Yahoo 기준):"]
+    for t, d in zip(tickers, dates):
+        if isinstance(d, Exception) or not d:
+            lines.append(f"  · {t}: 미상")
+        else:
+            lines.append(f"  · {t}: {d}")
+    await update.message.reply_text("\n".join(lines))
+
+
 async def _cmd_backfill(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/backfill <TICKER> [N] — 한 종목에 대해 직전 N분기 longitudinal history 시드.
 
@@ -1634,6 +1716,152 @@ async def _safe_send(bot: Bot, chat_id: str, text: str) -> None:
 # ------------------------------------------------------------------
 # self-test + builder
 # ------------------------------------------------------------------
+# ------------------------------------------------------------------
+# Pre-emptive watch poller (cron job)
+# ------------------------------------------------------------------
+async def earnings_watch_poll_job(bot: Bot) -> None:
+    """orchestrator APScheduler가 호출. watch된 종목의 새 콜 자동 감지·발송.
+
+    흐름:
+      1) earnings_watchlist.all_tickers()로 모든 watched ticker 수집.
+      2) 각 ticker별 Yahoo `calendarEvents`로 다음 어닝 예정일 확인 → 윈도 안인지 게이팅.
+         (예정일 미상이면 안전하게 항상 시도; AV 25/day는 state_store dedup이 보호.)
+      3) state_store dedup 키 `earnings_watch:{TICKER}:Q{q}_{year}` — 이미 발송이면 skip.
+      4) `transcript_source.fetch_full_transcript` 시도 → grounded + 비어 있지 않으면 새 콜.
+      5) fan-out: `subscribers_of(ticker)` 각 chat_id로 풀 분석 파이프라인 1회씩 실행.
+      6) 성공 시 state_store에 mark_seen.
+    """
+    from datetime import datetime as _dt
+    from src import state_store, summarizer
+    from src.earnings import earnings_watchlist as wl
+    from src.earnings import consensus
+    from src.earnings import transcript_source as ts
+
+    log.info("[earnings_watch_poll] 시작")
+    tickers = sorted(wl.all_tickers())
+    if not tickers:
+        log.info("[earnings_watch_poll] watched ticker 없음 — skip")
+        return
+
+    today = _dt.utcnow().date()
+    loop = asyncio.get_running_loop()
+    client = summarizer.get_client()
+
+    # 1) 다음 어닝 예정일 일괄 조회 (Yahoo는 cheap)
+    cal_dates = await asyncio.gather(
+        *[loop.run_in_executor(None, consensus.fetch_next_earnings_date, t) for t in tickers],
+        return_exceptions=True,
+    )
+
+    fired = 0
+    skipped: list[str] = []
+
+    for ticker, raw_date in zip(tickers, cal_dates):
+        # 2) calendar gating — 알려진 예정일 기준 D-1 ~ D+3 윈도만 transcript 시도
+        in_window = True
+        if isinstance(raw_date, str):
+            try:
+                edate = _dt.strptime(raw_date, "%Y-%m-%d").date()
+                delta = (today - edate).days
+                # 예정일 1일 전부터 4일 후까지 (콜은 보통 발표 당일 ~ 1-2일 내 transcript 등재)
+                in_window = -1 <= delta <= 4
+            except Exception:
+                in_window = True
+        if not in_window:
+            skipped.append(f"{ticker}(date={raw_date}, out of window)")
+            continue
+
+        # 3) (year, quarter) 추정 — 가장 최근 분기. 예정일이 있으면 그 기준, 없으면 today.
+        ref_date = today
+        if isinstance(raw_date, str):
+            try:
+                ref_date = _dt.strptime(raw_date, "%Y-%m-%d").date()
+            except Exception:
+                pass
+        y = ref_date.year
+        q = (ref_date.month - 1) // 3 + 1
+
+        # 4) dedup — 같은 (ticker, year, quarter) 이미 발송했으면 skip
+        seen_key = f"{ticker}:Q{q}_{y}"
+        if seen_key in state_store.seen("earnings_watch"):
+            skipped.append(f"{ticker}(이미 발송 Q{q} {y})")
+            continue
+
+        # 5) transcript 가용성 체크
+        try:
+            doc = await loop.run_in_executor(None, ts.fetch_full_transcript, client, ticker, y, q)
+        except Exception:
+            log.exception("[earnings_watch_poll] transcript fetch 실패 (%s Q%s %s)", ticker, q, y)
+            doc = None
+        if doc is None or not getattr(doc, "grounded", False) or len(doc.full_text or "") < 2000:
+            skipped.append(f"{ticker}(Q{q} {y} transcript 아직 미공개)")
+            continue
+
+        # 6) 구독자 fan-out
+        subs = wl.subscribers_of(ticker)
+        if not subs:
+            log.info("[earnings_watch_poll] %s — 구독자 없음 (race), skip", ticker)
+            continue
+        fiscal_label = f"Q{q} {y}"
+
+        # 즉시 mark_seen — 한 번 fire하면 race 시에도 두 번 안 보내게
+        try:
+            state_store.mark_seen("earnings_watch", [seen_key])
+        except Exception:
+            log.exception("[earnings_watch_poll] mark_seen 실패")
+
+        await _safe_send(
+            bot, subs[0],
+            f"🔔 watch 감지 — {ticker} {fiscal_label} transcript 확보 ({len(doc.full_text):,}자). 자동 풀 분석 시작 …",
+        )
+
+        # 구독자별로 풀 파이프라인 실행 (각자에게 보고서 fan-out)
+        for cid in subs:
+            asyncio.create_task(_watch_fire_pipeline(bot, cid, ticker, fiscal_label, y, q))
+        fired += 1
+
+    log.info(
+        "[earnings_watch_poll] 완료 — fired=%d skipped=%d (총 %d ticker)",
+        fired, len(skipped), len(tickers),
+    )
+    if skipped and fired == 0:
+        log.info("[earnings_watch_poll] skip 사유 sample: %s", skipped[:8])
+
+
+async def _watch_fire_pipeline(bot: Bot, chat_id: str, ticker: str, fiscal_label: str, year: int, quarter: int) -> None:
+    """단일 (ticker, chat_id, period) 풀 분석 — _run_pipeline 재사용 (FakeUpdate)."""
+    class _FakeChat:
+        def __init__(self, cid: str): self.id = int(cid)
+
+    class _FakeMessage:
+        def __init__(self, cid: str, text: str):
+            self.text = text
+            self.chat = _FakeChat(cid)
+
+        async def reply_text(self, *a, **kw) -> None:
+            try:
+                await bot.send_message(chat_id=self.chat.id,
+                                       text=str(a[0]) if a else (kw.get("text") or ""))
+            except Exception:
+                log.exception("[earnings_watch_poll] reply 실패")
+
+    class _FakeUpdate:
+        def __init__(self, cid: str, text: str):
+            self.effective_chat = _FakeChat(cid)
+            self.message = _FakeMessage(cid, text)
+
+    class _FakeContext:
+        def __init__(self):
+            self.bot = bot
+            self.args: list[str] = []
+
+    user_text = f"{ticker} {fiscal_label}"
+    try:
+        await _run_pipeline(_FakeUpdate(chat_id, user_text), _FakeContext(), user_text)
+    except Exception:
+        log.exception("[earnings_watch_poll] 풀 분석 실패 (%s %s)", ticker, fiscal_label)
+
+
 async def _self_test(app: Application) -> None:
     test_prompt = (os.getenv("EARNINGS_TEST_PROMPT") or "").strip()
     if not test_prompt:
@@ -1691,7 +1919,10 @@ async def _self_test(app: Application) -> None:
 
 EARNINGS_COMMANDS = [
     ("earnings", "📞 미국 기업 어닝콜 + 비교 PDF (5-10분)"),
-    ("backfill", "🔁 종목 longitudinal history 시드 (`/backfill MSFT 6`)"),
+    ("watch", "🔭 종목 어닝 자동 발송 예약 (`/watch MSFT NVDA`)"),
+    ("unwatch", "🚫 자동 발송 해제"),
+    ("watchlist", "📋 현재 watch 목록 + 다음 어닝 예정"),
+    ("backfill", "🔁 longitudinal history 시드 (`/backfill MSFT 6`)"),
     ("help", "ℹ️ 사용법"),
 ]
 
@@ -1705,6 +1936,9 @@ def build_earnings_app(token: str) -> Application:
     app = Application.builder().token(token).build()
     app.add_handler(CommandHandler(["start", "help"], _help))
     app.add_handler(CommandHandler("earnings", _cmd_earnings))
+    app.add_handler(CommandHandler("watch", _cmd_watch))
+    app.add_handler(CommandHandler("unwatch", _cmd_unwatch))
+    app.add_handler(CommandHandler("watchlist", _cmd_watchlist))
     app.add_handler(CommandHandler("backfill", _cmd_backfill))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _on_text))
 

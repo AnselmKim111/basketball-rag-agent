@@ -124,7 +124,7 @@ def _ensure_yahoo_auth(client: httpx.Client) -> tuple[httpx.Cookies, str] | None
 # Yahoo quoteSummary 호출
 # ------------------------------------------------------------------
 def _yahoo_fetch(ticker: str) -> dict[str, Any] | None:
-    """quoteSummary로 6개 module 동시 fetch. 실패 시 None."""
+    """quoteSummary로 module 동시 fetch. 실패 시 None."""
     modules = ",".join([
         "earningsEstimate",
         "revenueEstimate",
@@ -134,6 +134,7 @@ def _yahoo_fetch(ticker: str) -> dict[str, Any] | None:
         "financialData",
         "price",
         "defaultKeyStatistics",
+        "calendarEvents",  # next earnings date
     ])
     url = f"{YAHOO_BASE}/v10/finance/quoteSummary/{ticker}"
     with httpx.Client(timeout=YAHOO_TIMEOUT, follow_redirects=True) as client:
@@ -352,6 +353,52 @@ def fetch_consensus(ticker: str, fiscal_period: str | None = None) -> ConsensusS
 # ------------------------------------------------------------------
 # 포매팅 헬퍼 (텔레그램·payload 공용)
 # ------------------------------------------------------------------
+def fetch_next_earnings_date(ticker: str) -> str | None:
+    """다음 어닝 발표 예정일 (YYYY-MM-DD). Yahoo calendarEvents 모듈.
+
+    실패·미설정 시 None — 호출자가 게이팅 없이 진행 결정.
+    """
+    from datetime import datetime as _dt
+    ticker = (ticker or "").upper().strip()
+    if not ticker:
+        return None
+    url = f"{YAHOO_BASE}/v10/finance/quoteSummary/{ticker}"
+    with httpx.Client(timeout=YAHOO_TIMEOUT, follow_redirects=True) as client:
+        auth = _ensure_yahoo_auth(client)
+        if auth is None:
+            return None
+        cookies, crumb = auth
+        try:
+            r = client.get(
+                url,
+                params={"modules": "calendarEvents", "crumb": crumb},
+                headers={"User-Agent": UA, "Accept": "application/json"},
+                cookies=cookies,
+            )
+            if r.status_code != 200:
+                return None
+            j = r.json()
+        except Exception as e:
+            log.debug("Yahoo calendarEvents %s 실패: %s", ticker, e)
+            return None
+    results = (((j or {}).get("quoteSummary") or {}).get("result") or [])
+    if not results:
+        return None
+    ce = (results[0] or {}).get("calendarEvents") or {}
+    earnings_block = ce.get("earnings") or {}
+    dates = earnings_block.get("earningsDate") or []
+    if not isinstance(dates, list) or not dates:
+        return None
+    raw = _raw(dates[0])
+    if raw is None:
+        return None
+    try:
+        # Yahoo는 epoch seconds 반환
+        return _dt.utcfromtimestamp(int(raw)).strftime("%Y-%m-%d")
+    except Exception:
+        return None
+
+
 def fmt_currency(v: float | None) -> str:
     if v is None:
         return "—"
