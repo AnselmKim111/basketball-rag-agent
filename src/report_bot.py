@@ -307,6 +307,8 @@ def _build_report():
     theme_etfs = foc("theme", lambda: fp.fetch_many(fp.US_THEME_ETFS, days=365))
     region_etfs = foc("region", lambda: fp.fetch_many(fp.REGION_ETFS, days=365))
     fx = foc("fx", lambda: fp.fetch_many(fp.FX_SYMBOLS, days=365))
+    # 기존 하드코딩 9종 — 차트용으로만 잠시 유지 (watchlist 통합 후 deprecate).
+    # 향후 watchlist us 상위 종목 OHLCV로 자동 대체될 예정.
     highlights_df = foc("highlights", lambda: fp.fetch_many(fp.HIGHLIGHT_STOCKS, days=365))
     macro = foc("macro", lambda: fetch_macro.fetch_macro(days=365))
     fred = foc("macro_fred", lambda: fetch_macro.fetch_fred_many())
@@ -420,14 +422,39 @@ def _build_report():
         add(flow_charts.usdkrw_ewy_dual(fx["USD/KRW"], ewy, img_dir, date_iso=date_iso),
             "USD/KRW ↔ EWY", "환전 압력 (가설)", "4. IPO·환전 임팩트", key=False)
 
-    # ---------- §6 개별 종목 하이라이트 ----------
-    add(stock_highlights.highlight_grid(highlights_df, img_dir, date_iso=date_iso),
-        "개별 종목 하이라이트", "스토리 종목", "6. 개별 종목")
-    highlights_meta = []
-    for label, df in highlights_df.items():
-        dc = fp.day_change(df)
-        if dc is not None:
-            highlights_meta.append({"label": label, "chg": round(dc, 2)})
+    # ---------- §6 개별 종목 하이라이트 — 통합 watchlist (5 stream) ----------
+    from src.report.data import watchlist as _wl
+    prev_snapshot_for_wl = state.load_previous(date_iso)
+    try:
+        watchlist_result = _wl.build_watchlist(
+            date_iso=date_iso, theme_rows=theme_rows,
+            earnings=earnings, news=news, prev_snapshot=prev_snapshot_for_wl,
+        )
+    except Exception:
+        log.exception("[report] watchlist 빌드 실패 — 기존 highlights_df 폴백")
+        watchlist_result = {"us": [], "kr": []}
+    n_us = len(watchlist_result.get("us") or [])
+    n_kr = len(watchlist_result.get("kr") or [])
+    log.info("[report.watchlist] US=%d KR=%d", n_us, n_kr)
+
+    # 차트는 highlights_df (기존) + watchlist enriched 메타 합쳐 카테고리 배지로 표시.
+    # watchlist 있으면 US/KR 분리 2장, 없으면 단일 폴백 차트.
+    _hl_result = stock_highlights.highlight_grid(
+        highlights_df, img_dir, date_iso=date_iso,
+        watchlist_us=watchlist_result.get("us") or [],
+        watchlist_kr=watchlist_result.get("kr") or [])
+    if isinstance(_hl_result, list):
+        for _p in _hl_result:
+            _basename = _p.split("/")[-1] if isinstance(_p, str) else _p
+            label_kr = "🇰🇷 한국" if "_kr" in (_basename or "") else "🇺🇸 미국"
+            add(_basename, f"{label_kr} 개별 종목 하이라이트",
+                "watchlist 카테고리별 (📈 어닝 / 💎 IPO / 🚀 리더 / 🔄 반전 / 🔁 F/U)",
+                "6. 개별 종목")
+    elif _hl_result:
+        add(_hl_result, "개별 종목 하이라이트", "스토리 종목 (폴백)", "6. 개별 종목")
+
+    # 다음날 F/U용 메타 (state snapshot에 저장)
+    highlights_snapshot_meta = _wl.snapshot_tickers(watchlist_result)
 
     # ---------- §7 한국시장 자금흐름 ----------
     korea_summary: dict = {}
@@ -465,7 +492,8 @@ def _build_report():
         macro_summary["USD/KRW"] = round(float(fx["USD/KRW"]["Close"].iloc[-1]), 2)
 
     snapshot = state.build_snapshot(date_iso, rotation, theme_summary, theme_rows,
-                                    macro_summary, breadth, korea_summary, rsp_new_high)
+                                    macro_summary, breadth, korea_summary, rsp_new_high,
+                                    highlights_meta=highlights_snapshot_meta)
     prev = state.load_previous(date_iso)
     deltas = state.compute_deltas(snapshot, prev)
     state.save_snapshot(date_iso, snapshot)
@@ -475,7 +503,8 @@ def _build_report():
     log.info("[report] 차트 %d개, 신호 %d개 → LLM 작성", len(chart_list), len(signals))
     md = report_writer.write_report(date_iso, rotation, chart_list, signals, macro_summary,
                                     korea_summary, news=news, theme_momentum=theme_summary,
-                                    deltas=deltas, breadth=breadth, highlights=highlights_meta,
+                                    deltas=deltas, breadth=breadth,
+                                    highlights=watchlist_result,
                                     earnings=earnings, stale=stale)
 
     # headline 추출 (첫 # 라인)

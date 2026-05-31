@@ -58,8 +58,12 @@ def load_previous(date_iso: str) -> dict | None:
 
 def build_snapshot(date_iso: str, market_color: dict, theme_summary: dict,
                    theme_rows: list[dict], macro_summary: dict, breadth: dict,
-                   korea_summary: dict, rsp_new_high: bool) -> dict:
-    """스냅샷 dict 생성 (JSON 직렬화 가능 값만)."""
+                   korea_summary: dict, rsp_new_high: bool,
+                   highlights_meta: list[dict] | None = None) -> dict:
+    """스냅샷 dict 생성 (JSON 직렬화 가능 값만).
+
+    highlights_meta: watchlist에서 산출된 종목 메타 (다음날 F/U stream용).
+    """
     leaders = [r["label"] for r in theme_rows
                if r.get("bucket") in ("주도지속", "새로 강해지는")]
     laggards = [r["label"] for r in theme_rows if r.get("bucket") == "소외·빈집"]
@@ -76,6 +80,7 @@ def build_snapshot(date_iso: str, market_color: dict, theme_summary: dict,
         "macro": macro_summary,
         "breadth": breadth,
         "korea": korea_summary,
+        "highlights_meta": highlights_meta or [],
     }
 
 
