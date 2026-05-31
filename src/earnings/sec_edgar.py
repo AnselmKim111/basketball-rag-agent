@@ -366,3 +366,495 @@ def sanitize_tickers(raw: str) -> list[str]:
         seen.add(c)
         out.append(c)
     return out
+
+
+# ------------------------------------------------------------------
+# Form 4 인사이더 매매 (Track F)
+# ------------------------------------------------------------------
+@dataclass
+class InsiderTradeSummary:
+    """ticker별 최근 N일 인사이더 매매 요약. 상세 거래는 forms 리스트로."""
+    ticker: str
+    cik: str
+    window_days: int
+    form4_count: int               # 기간 내 Form 4 filing 수
+    forms: list[dict] = field(default_factory=list)  # [{accession, filed, reporter, primary_doc_url}]
+    note: str = ""
+
+
+def fetch_recent_form4(ticker: str, window_days: int = 30) -> InsiderTradeSummary | None:
+    """최근 N일 내 Form 4 (인사이더 매매 신고) 메타데이터 fetch.
+
+    SEC EDGAR submissions endpoint: https://data.sec.gov/submissions/CIK{10}.json
+    이건 재무 facts와 같은 무료 endpoint — 같은 USER_AGENT·throttle 재사용.
+
+    각 거래의 정확한 수량·가격은 Form 4 XML(`primary_doc_url` 안)을 파싱해야 알 수 있어
+    여기선 메타만 수집한다. (synthesis가 "최근 N일 net buy/sell" 같이 정성적으로 활용.)
+    """
+    import json
+    from datetime import datetime as _dt, timedelta as _td
+
+    ticker = (ticker or "").upper().strip()
+    cik = ticker_to_cik(ticker)
+    if not cik:
+        return None
+    url = f"{EDGAR_BASE}/submissions/CIK{cik}.json"
+    try:
+        _throttle()
+        with httpx.Client(timeout=DEFAULT_TIMEOUT) as cli:
+            r = cli.get(url, headers={"User-Agent": USER_AGENT})
+            if r.status_code != 200:
+                log.warning("SEC submissions %s → %s", ticker, r.status_code)
+                return None
+            data = r.json()
+    except Exception as e:
+        log.warning("SEC Form 4 fetch %s 예외: %s", ticker, e)
+        return None
+
+    recent = ((data or {}).get("filings") or {}).get("recent") or {}
+    forms = recent.get("form") or []
+    dates = recent.get("filingDate") or []
+    accns = recent.get("accessionNumber") or []
+    primary = recent.get("primaryDocument") or []
+    reporters = recent.get("reportingOwnerName") or recent.get("name") or []
+
+    cutoff = _dt.utcnow().date() - _td(days=window_days)
+    out: list[dict] = []
+    for i, f in enumerate(forms):
+        if f != "4":
+            continue
+        try:
+            filed = _dt.strptime(dates[i], "%Y-%m-%d").date()
+        except (ValueError, IndexError):
+            continue
+        if filed < cutoff:
+            continue
+        accession = accns[i] if i < len(accns) else None
+        primary_doc = primary[i] if i < len(primary) else None
+        reporter = reporters[i] if i < len(reporters) else None
+        acc_clean = (accession or "").replace("-", "")
+        doc_url = (
+            f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{acc_clean}/{primary_doc}"
+            if accession and primary_doc else None
+        )
+        out.append({
+            "accession": accession,
+            "filed": dates[i] if i < len(dates) else None,
+            "reporter": reporter,
+            "primary_doc_url": doc_url,
+        })
+
+    summary = InsiderTradeSummary(
+        ticker=ticker, cik=cik, window_days=window_days,
+        form4_count=len(out), forms=out,
+        note=f"최근 {window_days}일 내 Form 4 filing {len(out)}건 (메타데이터만, 거래 상세는 XML 파싱 필요)",
+    )
+    return summary
+
+
+def fmt_insider_summary(summary: InsiderTradeSummary | None) -> str:
+    """텔레그램·payload용 짧은 요약."""
+    if summary is None:
+        return ""
+    if summary.form4_count == 0:
+        return f"👥 인사이더({summary.ticker}): 최근 {summary.window_days}일 Form 4 filing 없음"
+    lines = [f"👥 인사이더({summary.ticker}): 최근 {summary.window_days}일 Form 4 {summary.form4_count}건"]
+    for f in summary.forms[:8]:
+        rep = f.get("reporter") or "?"
+        filed = f.get("filed") or "?"
+        lines.append(f"  · {filed} — {rep}")
+    if summary.form4_count > 8:
+        lines.append(f"  · … 외 {summary.form4_count - 8}건")
+    return "\n".join(lines)
+
+
+# ------------------------------------------------------------------
+# 8-K 머티어리얼 이벤트 (Track H)
+# ------------------------------------------------------------------
+# 8-K item 코드 → 사람이 읽는 라벨. SEC 공식 코드.
+ITEM_8K_LABELS: dict[str, str] = {
+    "1.01": "Material Definitive Agreement",
+    "1.02": "Termination of Material Definitive Agreement",
+    "1.03": "Bankruptcy or Receivership",
+    "2.01": "Completion of Acquisition or Disposition of Assets",
+    "2.02": "Results of Operations and Financial Condition (earnings press release)",
+    "2.03": "Material Direct Financial Obligation",
+    "2.04": "Material Triggering Event",
+    "2.05": "Costs from Exit or Disposal Activities",
+    "2.06": "Material Impairments",
+    "3.01": "Notice of Delisting / Failure to Satisfy Listing Rule",
+    "3.02": "Unregistered Sales of Equity Securities",
+    "3.03": "Material Modification to Rights of Security Holders",
+    "4.01": "Changes in Registrant's Certifying Accountant",
+    "4.02": "Non-Reliance on Previously Issued Financials",
+    "5.01": "Changes in Control",
+    "5.02": "Departure/Appointment of Directors or Officers",
+    "5.03": "Amendments to Articles / Bylaws / Fiscal Year Change",
+    "5.07": "Submission of Matters to a Vote of Security Holders",
+    "7.01": "Regulation FD Disclosure",
+    "8.01": "Other Events",
+    "9.01": "Financial Statements and Exhibits",
+}
+
+
+@dataclass
+class Event8K:
+    """단일 8-K filing 요약."""
+    accession: str
+    filed: str                     # YYYY-MM-DD
+    items: list[str]               # ['2.02', '9.01'] 같은 코드 리스트
+    item_labels: list[str]         # 사람이 읽는 라벨 (item별 1:1)
+    primary_doc_url: str | None    # cover 8-K HTML
+    ex99_urls: list[str] = field(default_factory=list)  # 첨부 EX-99 파일들
+    summary_line: str = ""         # LLM 1줄 요약 (옵션, sonnet 1회/8-K)
+
+
+@dataclass
+class Material8KSummary:
+    ticker: str
+    cik: str
+    window_days: int
+    events: list[Event8K] = field(default_factory=list)
+
+
+def _parse_8k_items(raw: Any) -> list[str]:
+    """SEC 응답의 items 필드가 'Item 2.02,Item 9.01' 같은 콤마 문자열이라 정규화."""
+    if not raw:
+        return []
+    if isinstance(raw, list):
+        text = ",".join(str(x) for x in raw)
+    else:
+        text = str(raw)
+    codes = re.findall(r"\d+\.\d+", text)
+    out: list[str] = []
+    seen: set[str] = set()
+    for c in codes:
+        if c not in seen:
+            seen.add(c)
+            out.append(c)
+    return out
+
+
+def _fetch_filing_index(cik_padded: str, accession: str) -> list[str]:
+    """그 accession의 첨부 파일 목록 → EX-99* 후보 URL 리스트. 실패 시 빈 리스트."""
+    acc_clean = (accession or "").replace("-", "")
+    if not acc_clean:
+        return []
+    url = f"https://www.sec.gov/Archives/edgar/data/{int(cik_padded)}/{acc_clean}/index.json"
+    try:
+        _throttle()
+        with httpx.Client(timeout=DEFAULT_TIMEOUT) as cli:
+            r = cli.get(url, headers={"User-Agent": USER_AGENT})
+            if r.status_code != 200:
+                return []
+            j = r.json()
+    except Exception:
+        return []
+    items = ((j or {}).get("directory") or {}).get("item") or []
+    out: list[str] = []
+    for it in items:
+        name = (it.get("name") or "").lower()
+        if name.startswith("ex99") or name.startswith("ex-99") or "ex991" in name:
+            out.append(
+                f"https://www.sec.gov/Archives/edgar/data/{int(cik_padded)}/{acc_clean}/{it.get('name')}"
+            )
+    return out[:3]  # 보통 EX-99.1 / EX-99.2 정도
+
+
+def fetch_recent_8k(ticker: str, window_days: int = 90, fetch_ex99_index: bool = True) -> Material8KSummary | None:
+    """최근 N일 8-K filing 메타 + EX-99 첨부 URL. LLM 호출 0회 (요약은 별도 함수)."""
+    from datetime import datetime as _dt, timedelta as _td
+
+    ticker = (ticker or "").upper().strip()
+    cik = ticker_to_cik(ticker)
+    if not cik:
+        return None
+    url = f"{EDGAR_BASE}/submissions/CIK{cik}.json"
+    try:
+        _throttle()
+        with httpx.Client(timeout=DEFAULT_TIMEOUT) as cli:
+            r = cli.get(url, headers={"User-Agent": USER_AGENT})
+            if r.status_code != 200:
+                log.warning("SEC submissions %s → %s (8-K)", ticker, r.status_code)
+                return None
+            data = r.json()
+    except Exception as e:
+        log.warning("SEC 8-K fetch %s 예외: %s", ticker, e)
+        return None
+
+    recent = ((data or {}).get("filings") or {}).get("recent") or {}
+    forms = recent.get("form") or []
+    dates = recent.get("filingDate") or []
+    accns = recent.get("accessionNumber") or []
+    primary = recent.get("primaryDocument") or []
+    items_all = recent.get("items") or []
+
+    cutoff = _dt.utcnow().date() - _td(days=window_days)
+    summary = Material8KSummary(ticker=ticker, cik=cik, window_days=window_days, events=[])
+    for i, f in enumerate(forms):
+        if f != "8-K":
+            continue
+        try:
+            filed = _dt.strptime(dates[i], "%Y-%m-%d").date()
+        except (ValueError, IndexError):
+            continue
+        if filed < cutoff:
+            continue
+        accession = accns[i] if i < len(accns) else None
+        primary_doc = primary[i] if i < len(primary) else None
+        items_raw = items_all[i] if i < len(items_all) else ""
+        codes = _parse_8k_items(items_raw)
+        labels = [ITEM_8K_LABELS.get(c, f"Item {c} (?)") for c in codes]
+        acc_clean = (accession or "").replace("-", "")
+        primary_url = (
+            f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{acc_clean}/{primary_doc}"
+            if accession and primary_doc else None
+        )
+        ex99 = _fetch_filing_index(cik, accession) if (fetch_ex99_index and accession) else []
+        summary.events.append(Event8K(
+            accession=accession or "?",
+            filed=dates[i] if i < len(dates) else "?",
+            items=codes,
+            item_labels=labels,
+            primary_doc_url=primary_url,
+            ex99_urls=ex99,
+        ))
+    return summary
+
+
+def _scrape_html_text(url: str, max_chars: int = 8000) -> str:
+    """EX-99 본문에서 마크업 제거한 텍스트 첫 N자. 실패 시 빈 문자열."""
+    try:
+        from bs4 import BeautifulSoup
+        _throttle()
+        with httpx.Client(timeout=DEFAULT_TIMEOUT, follow_redirects=True) as cli:
+            r = cli.get(url, headers={"User-Agent": USER_AGENT})
+            if r.status_code != 200:
+                return ""
+            soup = BeautifulSoup(r.text, "html.parser")
+            for tag in soup(["script", "style"]):
+                tag.decompose()
+            text = soup.get_text(" ", strip=True)
+            return text[:max_chars]
+    except Exception:
+        log.debug("[sec_edgar] EX-99 본문 추출 실패: %s", url)
+        return ""
+
+
+def summarize_event_8k(event: Event8K, ticker: str, summary_model: str | None = None) -> str:
+    """sonnet 1회 호출로 8-K 이벤트 한 줄 요약. 본문 fetch 실패하면 item 라벨만 반환."""
+    from src import summarizer
+
+    text = ""
+    for url in event.ex99_urls[:1]:  # 첫 EX-99 1개만
+        text = _scrape_html_text(url, max_chars=6000)
+        if text:
+            break
+    if not text and event.primary_doc_url:
+        text = _scrape_html_text(event.primary_doc_url, max_chars=6000)
+    if not text:
+        # 본문 없으면 item 라벨만
+        return "Items: " + ", ".join(event.item_labels) if event.item_labels else "(no body)"
+
+    items_hint = ", ".join(event.item_labels) or "(no items)"
+    user_msg = (
+        f"Ticker: {ticker}\nFiled: {event.filed}\nItems: {items_hint}\n\n"
+        f"8-K excerpt (first {len(text)} chars):\n{text}\n\n"
+        "Return ONE short sentence (≤ 35 words) describing the material event AND its likely "
+        "directional impact (positive / negative / neutral) on the company's thesis. No prose, "
+        "just one sentence."
+    )
+    model = summary_model or os.getenv("EARNINGS_EXTRACT_MODEL") or "anthropic/claude-sonnet-4.5"
+    try:
+        client = summarizer.get_client()
+        content = summarizer.chat_with_retry(
+            client,
+            model=model,
+            messages=[
+                {"role": "system", "content": "You are a senior US equity analyst summarizing SEC 8-K filings for a PM."},
+                {"role": "user", "content": user_msg},
+            ],
+            temperature=0.1,
+            max_tokens=200,
+            context=f"earnings-8k-summary:{ticker}",
+        )
+    except Exception:
+        log.warning("8-K LLM 요약 실패 (%s acc=%s)", ticker, event.accession)
+        return "Items: " + items_hint
+    return (content or "").strip().split("\n")[0][:280] or ("Items: " + items_hint)
+
+
+def fmt_8k_summary(summary: Material8KSummary | None) -> str:
+    """텔레그램용 한국어 요약."""
+    if summary is None:
+        return ""
+    if not summary.events:
+        return f"📂 8-K({summary.ticker}): 최근 {summary.window_days}일 머티어리얼 이벤트 없음"
+    lines = [f"📂 8-K({summary.ticker}): 최근 {summary.window_days}일 {len(summary.events)}건"]
+    for e in summary.events[:10]:
+        labels = ", ".join(e.item_labels) if e.item_labels else ", ".join(e.items) or "?"
+        line = f"  · {e.filed} [{labels}]"
+        if e.summary_line:
+            line += f" — {e.summary_line}"
+        lines.append(line)
+    if len(summary.events) > 10:
+        lines.append(f"  · … 외 {len(summary.events) - 10}건")
+    return "\n".join(lines)
+
+
+def events_8k_payload_block(summary: Material8KSummary | None) -> str:
+    """synthesis 페이로드용 영문 블록."""
+    if summary is None or not summary.events:
+        return ""
+    lines = [f"### {summary.ticker} 8-K material events (last {summary.window_days} days)"]
+    for e in summary.events[:12]:
+        items_str = ", ".join(e.items) or "?"
+        labels = " / ".join(e.item_labels) or "?"
+        lines.append(f"- {e.filed} items=[{items_str}] {labels}")
+        if e.summary_line:
+            lines.append(f"  summary: {e.summary_line}")
+    return "\n".join(lines)
+
+
+# ------------------------------------------------------------------
+# 10-K Item 1A Risk Factors 추출 (Track I)
+# ------------------------------------------------------------------
+@dataclass
+class TenKSnapshot:
+    accession: str
+    filed: str
+    primary_url: str
+    risk_text: str
+    risk_chars: int
+
+
+def _list_recent_10k(ticker: str, max_count: int = 4) -> list[dict]:
+    """submissions endpoint에서 가장 최근 10-K filing 메타 N개. 시간순 정렬."""
+    cik = ticker_to_cik(ticker)
+    if not cik:
+        return []
+    url = f"{EDGAR_BASE}/submissions/CIK{cik}.json"
+    try:
+        _throttle()
+        with httpx.Client(timeout=DEFAULT_TIMEOUT) as cli:
+            r = cli.get(url, headers={"User-Agent": USER_AGENT})
+            if r.status_code != 200:
+                return []
+            data = r.json()
+    except Exception as e:
+        log.warning("SEC submissions 10-K %s 예외: %s", ticker, e)
+        return []
+
+    recent = ((data or {}).get("filings") or {}).get("recent") or {}
+    forms = recent.get("form") or []
+    dates = recent.get("filingDate") or []
+    accns = recent.get("accessionNumber") or []
+    primary = recent.get("primaryDocument") or []
+
+    out: list[dict] = []
+    for i, f in enumerate(forms):
+        if f != "10-K":
+            continue
+        accession = accns[i] if i < len(accns) else None
+        primary_doc = primary[i] if i < len(primary) else None
+        if not accession or not primary_doc:
+            continue
+        acc_clean = accession.replace("-", "")
+        primary_url = (
+            f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{acc_clean}/{primary_doc}"
+        )
+        out.append({
+            "accession": accession,
+            "filed": dates[i] if i < len(dates) else "?",
+            "primary_url": primary_url,
+        })
+        if len(out) >= max_count:
+            break
+    return out
+
+
+_ITEM_1A_RE = re.compile(r"item\s+1a\.?\s*(?:risk\s+factors)?", re.IGNORECASE)
+_ITEM_1B_RE = re.compile(r"item\s+1b\.?", re.IGNORECASE)
+_ITEM_2_RE = re.compile(r"item\s+2\.?\s*(?:properties)?", re.IGNORECASE)
+
+
+def _extract_item_1a(html_text: str) -> str:
+    """10-K HTML → Item 1A Risk Factors 텍스트. 휴리스틱 (목차 1개 + 본문 1개 → 2번째 match).
+
+    실패 시 빈 문자열 반환. 60-80% 성공률 목표 (큰 회사일수록 정형).
+    """
+    try:
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(html_text, "html.parser")
+        for tag in soup(["script", "style"]):
+            tag.decompose()
+        text = soup.get_text(" ", strip=True)
+    except Exception:
+        return ""
+    if not text:
+        return ""
+
+    starts = [m.start() for m in _ITEM_1A_RE.finditer(text)]
+    if not starts:
+        return ""
+    # 1차 후보: 두 번째 출현 (첫 번째는 TOC). 종료: Item 1B 또는 Item 2 첫 출현
+    start_idx = starts[1] if len(starts) > 1 else starts[0]
+    after = text[start_idx:]
+    end_match = _ITEM_1B_RE.search(after, pos=200)  # 첫 200자 안엔 Item 1B 없을 것 (헤더 보호)
+    if not end_match:
+        end_match = _ITEM_2_RE.search(after, pos=200)
+    end_idx = end_match.start() if end_match else min(len(after), 200_000)
+    section = after[:end_idx].strip()
+    # 헤더 노이즈 제거: 문장 길이 < 200이면 의미 없음
+    if len(section) < 200:
+        return ""
+    return section
+
+
+def fetch_10k_risk_factors(ticker: str) -> tuple[TenKSnapshot | None, TenKSnapshot | None]:
+    """가장 최근 10-K + 1년 전 10-K (직전) → (current, prior). 둘 다 추출 가능해야 의미."""
+    ticker = (ticker or "").upper().strip()
+    filings = _list_recent_10k(ticker, max_count=4)
+    if len(filings) < 1:
+        return (None, None)
+
+    def _fetch_one(meta: dict) -> TenKSnapshot | None:
+        try:
+            _throttle()
+            with httpx.Client(timeout=DEFAULT_TIMEOUT, follow_redirects=True) as cli:
+                r = cli.get(meta["primary_url"], headers={"User-Agent": USER_AGENT})
+                if r.status_code != 200:
+                    log.warning("10-K HTML %s → %s", ticker, r.status_code)
+                    return None
+                html = r.text
+        except Exception as e:
+            log.warning("10-K HTML fetch %s 예외: %s", ticker, e)
+            return None
+        section = _extract_item_1a(html)
+        if not section:
+            log.info("10-K Item 1A 추출 실패 (%s acc=%s)", ticker, meta["accession"])
+            return None
+        return TenKSnapshot(
+            accession=meta["accession"], filed=meta["filed"],
+            primary_url=meta["primary_url"],
+            risk_text=section[:60_000],  # LLM 입력 cap (큰 회사 ~80K-150K → 60K 잘림 OK)
+            risk_chars=len(section),
+        )
+
+    current = _fetch_one(filings[0]) if filings else None
+    prior = _fetch_one(filings[1]) if len(filings) > 1 else None
+    return (current, prior)
+
+
+def fmt_10k_risk_status(current: TenKSnapshot | None, prior: TenKSnapshot | None) -> str:
+    """텔레그램 짧은 상태 한 줄."""
+    if current is None and prior is None:
+        return ""
+    if current is None:
+        return "📜 10-K Risk Factors: 최신 10-K Item 1A 추출 실패 (HTML 레이아웃 비표준)"
+    if prior is None:
+        return f"📜 10-K Risk Factors: 최신 ({current.filed}, {current.risk_chars:,}자) 확보 — 비교 대상 미확보"
+    return (
+        f"📜 10-K Risk Factors: 최신 {current.filed} ({current.risk_chars:,}자) "
+        f"vs 이전 {prior.filed} ({prior.risk_chars:,}자) — diff 합성 진행"
+    )

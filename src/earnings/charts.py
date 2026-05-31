@@ -19,7 +19,7 @@ from typing import Any, Optional
 log = logging.getLogger(__name__)
 
 
-def _setup_matplotlib():
+def setup_matplotlib_safe():
     """matplotlib + 영문 폰트 + 색 팔레트 셋업. import는 본문 안에서 (cold-start 가드)."""
     import matplotlib
     matplotlib.use("Agg")
@@ -59,7 +59,7 @@ def _format_billions(x, _):
 def chart_capex_absolute(financials_by_ticker: dict[str, Any]) -> Optional[Any]:
     """CapEx 6년치 grouped bar. financials_by_ticker: {ticker: CompanyFinancials}."""
     try:
-        plt = _setup_matplotlib()
+        plt = setup_matplotlib_safe()
         from matplotlib.ticker import FuncFormatter
 
         years_set: set[int] = set()
@@ -108,7 +108,7 @@ def chart_capex_absolute(financials_by_ticker: dict[str, Any]) -> Optional[Any]:
 def chart_capex_yoy(financials_by_ticker: dict[str, Any]) -> Optional[Any]:
     """CapEx YoY 증감률 (%) line."""
     try:
-        plt = _setup_matplotlib()
+        plt = setup_matplotlib_safe()
         fig, ax = plt.subplots(figsize=(11, 6.5))
         any_drawn = False
         for i, (t, fin) in enumerate(financials_by_ticker.items()):
@@ -130,8 +130,7 @@ def chart_capex_yoy(financials_by_ticker: dict[str, Any]) -> Optional[Any]:
             any_drawn = True
 
         if not any_drawn:
-            import matplotlib.pyplot as plt2
-            plt2.close(fig)
+            plt.close(fig)
             return None
 
         ax.axhline(y=0, color="black", linewidth=0.6, alpha=0.5)
@@ -150,7 +149,7 @@ def chart_capex_yoy(financials_by_ticker: dict[str, Any]) -> Optional[Any]:
 def chart_fcf(financials_by_ticker: dict[str, Any]) -> Optional[Any]:
     """FCF 6년치 grouped bar."""
     try:
-        plt = _setup_matplotlib()
+        plt = setup_matplotlib_safe()
         from matplotlib.ticker import FuncFormatter
         import numpy as np
 
@@ -200,7 +199,7 @@ def chart_fcf(financials_by_ticker: dict[str, Any]) -> Optional[Any]:
 def chart_ocf_capex_ratio(financials_by_ticker: dict[str, Any]) -> Optional[Any]:
     """OCF / CapEx 비율 line. 1보다 크면 영업현금흐름이 자본지출보다 많은 흑자 흐름."""
     try:
-        plt = _setup_matplotlib()
+        plt = setup_matplotlib_safe()
         fig, ax = plt.subplots(figsize=(11, 6.5))
         any_drawn = False
         for i, (t, fin) in enumerate(financials_by_ticker.items()):
@@ -222,8 +221,7 @@ def chart_ocf_capex_ratio(financials_by_ticker: dict[str, Any]) -> Optional[Any]
             any_drawn = True
 
         if not any_drawn:
-            import matplotlib.pyplot as plt2
-            plt2.close(fig)
+            plt.close(fig)
             return None
 
         ax.axhline(y=1.0, color="red", linewidth=1.2, linestyle="--", alpha=0.6, label="OCF = CapEx (break-even)")
@@ -242,7 +240,7 @@ def chart_ocf_capex_ratio(financials_by_ticker: dict[str, Any]) -> Optional[Any]
 def chart_capex_intensity(financials_by_ticker: dict[str, Any]) -> Optional[Any]:
     """CapEx Intensity = CapEx / Revenue (%) line."""
     try:
-        plt = _setup_matplotlib()
+        plt = setup_matplotlib_safe()
         fig, ax = plt.subplots(figsize=(11, 6.5))
         any_drawn = False
         for i, (t, fin) in enumerate(financials_by_ticker.items()):
@@ -270,8 +268,7 @@ def chart_capex_intensity(financials_by_ticker: dict[str, Any]) -> Optional[Any]
             any_drawn = True
 
         if not any_drawn:
-            import matplotlib.pyplot as plt2
-            plt2.close(fig)
+            plt.close(fig)
             return None
 
         ax.set_xlabel("Fiscal Year")
@@ -289,7 +286,7 @@ def chart_capex_intensity(financials_by_ticker: dict[str, Any]) -> Optional[Any]
 def chart_revenue(financials_by_ticker: dict[str, Any]) -> Optional[Any]:
     """Revenue 6년치 grouped bar (참고용)."""
     try:
-        plt = _setup_matplotlib()
+        plt = setup_matplotlib_safe()
         from matplotlib.ticker import FuncFormatter
         import numpy as np
 

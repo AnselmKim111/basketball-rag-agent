@@ -18,7 +18,7 @@ log = logging.getLogger(__name__)
 
 MACRO_SYMBOLS = {
     "미국 10년물 금리": "^TNX",
-    "미국 2년물 금리": "^IRX",
+    "미국 3개월 금리": "^IRX",
     "미국 30년물 금리": "^TYX",
     "WTI 유가": "CL=F",
     "Brent 유가": "BZ=F",

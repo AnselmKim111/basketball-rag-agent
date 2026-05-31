@@ -1,0 +1,11 @@
+{
+  "description": "Hyperscaler capex walker — 6개 US 빅테크 ticker가 분기별로 콜에서 가이드한 FY capex를 history에서 모아 인프라 벤더 가이던스와 cross-check하는 데 사용. tickers·infra_vendors는 운영 중 편집 가능.",
+  "tickers": ["MSFT", "AMZN", "GOOGL", "META", "ORCL", "CRM"],
+  "infra_vendors": [
+    "NVDA", "AMD", "AVGO", "MRVL", "INTC",
+    "SMCI", "DELL", "HPE", "ANET", "CSCO", "JNPR",
+    "VRT", "ETN", "GEV", "GE", "ABBV",
+    "TSM", "ASML"
+  ],
+  "notes": "infra_vendors에 분석 종목이 포함되거나 ecosystem.customers에 hyperscaler가 등장하면 walker 결과를 합성 페이로드에 자동 첨부 (§3.6)."
+}

@@ -173,8 +173,16 @@ def _build_report():
     add(index_charts.indices_normalized(us_idx, img_dir, date_iso=date_iso),
         "미국 4대 지수 (1Y 리베이스)", "상대 강도", "1. 매크로 컨텍스트")
     if macro:
-        add(volatility_chart.macro_grid(macro, img_dir),
-            "매크로 대시보드", "금리·유가·달러·VIX·BTC", "1. 매크로 컨텍스트", key=True)
+        add(volatility_chart.rates_curve(macro, img_dir, date_iso=date_iso),
+            "미국 국채 금리 곡선", "3M·10Y·30Y + 장단기 스프레드", "1. 매크로 컨텍스트", key=True)
+        add(volatility_chart.oil_chart(macro, img_dir, date_iso=date_iso),
+            "국제 유가", "WTI·Brent", "1. 매크로 컨텍스트")
+        add(volatility_chart.single_macro(macro, img_dir, "23_macro_dxy.png", "달러 인덱스", date_iso=date_iso),
+            "달러 인덱스", "DXY — 위험선호 척도", "1. 매크로 컨텍스트")
+        add(volatility_chart.vol_chart(macro, img_dir, date_iso=date_iso),
+            "변동성 게이지", "VIX·OVX", "1. 매크로 컨텍스트", key=True)
+        add(volatility_chart.single_macro(macro, img_dir, "24_macro_btc.png", "비트코인", date_iso=date_iso),
+            "비트코인", "위험선호 자산", "1. 매크로 컨텍스트")
     for i, (label, df) in enumerate(fred.items(), 1):
         add(volatility_chart.macro_line(df, label, img_dir, f"04_fred_{i:02d}.png"),
             label, "FRED 매크로", "1. 매크로 컨텍스트")
@@ -187,7 +195,25 @@ def _build_report():
             "RSP/SPY 비율", "동일가중 우위 여부", "2. 쏠림 둔화 시그널", key=True)
     rsp_new_high = bool(technical_signals.analyze(deconc.get("RSP")).get("is_new_high")) if deconc.get("RSP") is not None else False
 
-    # ---------- §3 섹터 로테이션 맵 (+ S&P500 히트맵) ----------
+    # ---------- §3 섹터 로테이션 맵 (S&P500 개별종목 히트맵 우선 + 테마 로테이션) ----------
+    breadth: dict = {}
+    try:
+        from src.report.data import fetch_us_breadth
+        caps, changes, sectors, industries = fetch_us_breadth.load_us_market_map(top_n=120)
+        log.info("[report] S&P500 맵: caps=%d sectors=%d industries=%d changes=%d",
+                 len(caps), len(sectors), len(industries), len(changes))
+        if changes:  # TradingView식 개별 종목 시총 트리맵 — §3 최상단(시그니처)
+            add(heatmap_chart.sp500_heatmap(caps, changes, sectors, img_dir,
+                date_iso=date_iso, industries=industries),
+                "S&P500 히트맵", "개별 종목 시총 가중 — 종목명·당일등락 (녹=상승)", "3. 섹터 로테이션 맵", key=True)
+            adv = sum(1 for v in changes.values() if v > 0)
+            breadth["advancers"] = adv
+            breadth["total"] = len(changes)
+        else:
+            log.warning("[report] S&P500 히트맵 등락 0개 — 생략")
+    except Exception:
+        log.exception("[report] S&P500 히트맵 실패 — 생략")
+
     add(heatmap_chart.theme_rotation_heatmap(theme_rows, img_dir, date_iso=date_iso),
         "테마 로테이션 히트맵", "5일 모멘텀 — 돈이 어디로", "3. 섹터 로테이션 맵", key=True)
     add(rotation_charts.sector_return_bars(theme_rows, img_dir, date_iso=date_iso),
@@ -199,26 +225,6 @@ def _build_report():
         add(index_charts.theme_chart(combined_themes.get(lbl), lbl, img_dir,
             f"12_theme_{i:02d}.png", date_iso=date_iso), lbl, "캔들+MA+거래량", "3. 섹터 로테이션 맵")
 
-    breadth: dict = {}
-    try:
-        from src.us_screener import data_source as us_ds
-        caps = us_ds.fetch_market_caps()
-        sectors = us_ds.fetch_sectors()
-        top = sorted(caps, key=lambda s: -caps[s])[:120]
-        top_dfs = fp.fetch_many({s: s for s in top}, days=10, workers=12)
-        changes = {}
-        for s, df in top_dfs.items():
-            dc = fp.day_change(df)
-            if dc is not None:
-                changes[s] = dc
-        if changes:
-            add(heatmap_chart.sp500_heatmap(caps, changes, sectors, img_dir, date_iso=date_iso),
-                "S&P500 히트맵", "시총 가중 — 시장 폭", "3. 섹터 로테이션 맵", key=True)
-            adv = sum(1 for v in changes.values() if v > 0)
-            breadth["advancers"] = adv
-            breadth["total"] = len(changes)
-    except Exception:
-        log.exception("[report] S&P500 히트맵 실패 — 생략")
     # 200일선 위 테마 비율 (breadth proxy)
     if theme_rows:
         above = sum(1 for r in theme_rows if r.get("above_ma200"))

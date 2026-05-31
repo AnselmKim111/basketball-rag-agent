@@ -41,11 +41,12 @@ def _parse_json_array(text: str) -> list[dict]:
         return []
 
 
-def fetch_market_news(max_items: int = 18) -> list[dict]:
+def fetch_market_news(max_items: int = 18, attempts: int = 3) -> list[dict]:
     """오늘의 시장 견인 뉴스 list[dict]. 실패 시 빈 리스트.
 
     각 항목: title·summary·tickers·theme·source. URL은 부정확하므로 수집/사용하지 않음
     (모델이 url을 넣어도 여기서 제거 — 가짜 인용 방지).
+    perplexity가 간헐적으로 빈 배열을 반환하므로 최대 attempts회 재시도(0건이면 재시도).
     """
     api_key = os.getenv("OPENROUTER_API_KEY")
     if not api_key:
@@ -57,26 +58,35 @@ def fetch_market_news(max_items: int = 18) -> list[dict]:
         from openai import OpenAI
         from src import summarizer
         client = OpenAI(base_url="https://openrouter.ai/api/v1", api_key=api_key)
-        text = summarizer.chat_with_retry(
-            client,
-            messages=[
-                {"role": "system", "content": "You are a precise financial research assistant. Output JSON only."},
-                {"role": "user", "content": _prompt()},
-            ],
-            max_tokens=4000,
-            model=model,
-            temperature=0.2,
-            context="report_news",
-        )
-        items = _parse_json_array(text or "")
-        clean = []
-        for it in items:
-            if not isinstance(it, dict) or not it.get("title"):
-                continue
-            it.pop("url", None)  # 부정확한 URL 차단 (가짜 인용 방지)
-            clean.append(it)
-        log.info("[report.news] %d건 확보 (model=%s)", len(clean), model)
-        return clean[:max_items]
     except Exception:
-        log.exception("[report.news] fetch 실패")
+        log.exception("[report.news] 클라이언트 초기화 실패")
         return []
+
+    for attempt in range(1, attempts + 1):
+        try:
+            text = summarizer.chat_with_retry(
+                client,
+                messages=[
+                    {"role": "system", "content": "You are a precise financial research assistant. Output JSON only."},
+                    {"role": "user", "content": _prompt()},
+                ],
+                max_tokens=4000,
+                model=model,
+                temperature=0.3,
+                context="report_news",
+            )
+            items = _parse_json_array(text or "")
+            clean = []
+            for it in items:
+                if not isinstance(it, dict) or not it.get("title"):
+                    continue
+                it.pop("url", None)  # 부정확한 URL 차단 (가짜 인용 방지)
+                clean.append(it)
+            if clean:
+                log.info("[report.news] %d건 확보 (model=%s, attempt=%d)", len(clean), model, attempt)
+                return clean[:max_items]
+            log.warning("[report.news] 0건 (attempt=%d/%d) — 재시도", attempt, attempts)
+        except Exception:
+            log.exception("[report.news] fetch 예외 (attempt=%d)", attempt)
+    log.warning("[report.news] 전 시도 0건 — 빈 리스트 반환(캐시 폴백 예정)")
+    return []

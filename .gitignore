@@ -9,6 +9,7 @@ CLAUDE.local.md
 downloads/
 output/
 summaries/
+reports/
 .wisereport_state.json
 
 # Python

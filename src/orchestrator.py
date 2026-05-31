@@ -49,7 +49,7 @@ from src.category_bots import (
     market_daily_job,
 )
 from src.disclosure_bot import DISCLOSURE_COMMANDS, build_disclosure_app, disclosure_poll_job
-from src.earnings_bot import EARNINGS_COMMANDS, build_earnings_app
+from src.earnings_bot import EARNINGS_COMMANDS, build_earnings_app, earnings_watch_poll_job
 from src.idea_bot import IDEA_COMMANDS, build_idea_app
 from src.screener_bot import SCREENER_COMMANDS, build_screener_app, screener_daily_job
 from src.us_screener_bot import US_SCREENER_COMMANDS, build_us_screener_app, us_screener_daily_job
@@ -177,7 +177,15 @@ BOT_SPECS: list[BotSpec] = [
         token_env="EARNINGS_BOT_TOKEN",
         builder=build_earnings_app,
         commands=EARNINGS_COMMANDS,
-        jobs=[],  # 사용자 입력 기반, 스케줄 없음
+        jobs=[
+            ScheduledJob(
+                func=earnings_watch_poll_job,
+                job_id="earnings_watch_poll",
+                # 4시간 간격 — Yahoo calendarEvents로 D-1~D+4 윈도 게이팅. AV 25/day 안전.
+                cron={"hour": "0,4,8,12,16,20", "minute": 7},
+                description="어닝콜 watch 자동 감지 — 4h 간격 (calendar 게이팅)",
+            ),
+        ],
     ),
     BotSpec(
         name="disclosure",

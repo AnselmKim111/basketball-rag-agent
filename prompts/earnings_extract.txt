@@ -54,6 +54,47 @@ Schema:
   "notable_verbatim": [
     "The 3-5 single most important verbatim sentences from the entire call (exact words)",
     ...
+  ],
+  "named_deals": [
+    {
+      "counterparty": "Specific customer/partner name (e.g., Microsoft, xAI, CoreWeave, US Navy). Generic 'a major hyperscaler' is NOT enough — only include if a name is given.",
+      "magnitude": "$X.XB or specific capacity (e.g., '50,000 GPUs', '500MW'). If size not disclosed, write 'undisclosed' (still include if name + qualitative scale).",
+      "tenure": "deal duration if mentioned ('multi-year', '5-year', or null)",
+      "status": "booked | pipeline | expanded | renewed | lost | exploratory",
+      "verbatim": "exact quote where this deal is announced/discussed",
+      "prior_quarter_mentioned": "true if mgmt indicates this is a continuation/expansion of a previously disclosed relationship, false if new this quarter, null if unclear"
+    }
+  ],
+  "supply_chain_signals": [
+    {
+      "vendor_or_component": "e.g., 'NVIDIA Blackwell', 'HBM3e', 'TSMC N3', 'rack-scale enclosure'",
+      "signal_type": "constrained | improving | diversified | price_up | price_down | substitution | dual_sourcing",
+      "verbatim": "exact quote (1-3 sentences)"
+    }
+  ],
+  "competitor_callouts": [
+    {
+      "competitor": "ticker or name (e.g., SMCI, HPE, AMD)",
+      "dimension": "price | share | product | timing | margin | customer_win | customer_loss",
+      "verbatim": "exact quote — must reference the competitor directly or via clearly inferable phrase ('our largest competitor', 'the incumbent')",
+      "implied_direction": "favorable | unfavorable | neutral (for our company vs competitor)"
+    }
+  ],
+  "macro_policy_mentions": [
+    {
+      "theme": "tariff | export_control | FX | rates | regulation | sanctions | subsidies | labor",
+      "region": "US | China | EU | etc.",
+      "impact_direction": "tailwind | headwind | mixed | uncertain",
+      "verbatim": "exact quote"
+    }
+  ],
+  "segment_geo_mix": [
+    {
+      "segment_or_region": "e.g., 'Infrastructure Solutions Group', 'Americas', 'EMEA'",
+      "share_pct": "% of revenue if disclosed, else null",
+      "yoy": "growth % if disclosed, else null",
+      "callout": "1 sentence on what's driving the mix shift or ASP/margin within the segment (grounded)"
+    }
   ]
 }
 
@@ -62,4 +103,7 @@ Rules:
 - Quotes in management_discussion and notable_verbatim must be VERBATIM (exact words) when grounded text is available.
 - Numbers must match the transcript. If a consensus number is not in the transcript, set null (do not guess).
 - Be comprehensive on Q&A — analysts probe the non-consensus issues; capture them.
+- **named_deals**: ONLY include if a specific counterparty name is given. Two-word generics like "a hyperscaler", "a major customer" do NOT qualify — demote those to notable_verbatim or management_discussion.
+- **supply_chain_signals, competitor_callouts, macro_policy_mentions, segment_geo_mix**: each item MUST be backed by a verbatim quote. If nothing material was said on a theme, return an empty array (do not invent).
+- These five new arrays are how a PM judges qualitative surprise — be aggressive about extracting concrete, named, quantified mentions, and strict about excluding fluff.
 - Output JSON only.
