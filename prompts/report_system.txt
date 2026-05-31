@@ -147,6 +147,7 @@ stale_data.
    **자금 흐름 신호 관점**: §4 IPO·환전 임팩트와 연결. "$5B IPO priced = 시장에 $5B 매도압력 신호
    (참여자 청약 위해 기존 holdings 매도)". ❌ 청약 추천·매수 트리거 표현 금지 — 단순 fact + 자금흐름
    함의만.
+   IPO 카드 차트(34_ipo_cards)가 있으면 본문 정확히 1회 `![](images/34_ipo_cards.png)` 삽입.
 
    #### 🚀 섹터 리더 (`sector_leader`)
    sector_context의 테마 buckets("주도지속"/"새로 강해지는") 인용. "기술 섹터 5D +3.1% 흐름의 화신".

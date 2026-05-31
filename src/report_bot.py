@@ -453,6 +453,15 @@ def _build_report():
     elif _hl_result:
         add(_hl_result, "개별 종목 하이라이트", "스토리 종목 (폴백)", "6. 개별 종목")
 
+    # IPO mini-card (OHLCV 없는 신생주 — Yahoo 404 폴백 시각화)
+    _ipo_card_path = stock_highlights.ipo_cards(
+        watchlist_result.get("us") or [], img_dir, date_iso=date_iso)
+    if _ipo_card_path:
+        _basename = _ipo_card_path.split("/")[-1] if isinstance(_ipo_card_path, str) else _ipo_card_path
+        add(_basename, "다가올 IPO 카드",
+            "offer price · 시총 · D-N · status — OHLCV 없는 신생주 폴백",
+            "6. 개별 종목")
+
     # 다음날 F/U용 메타 (state snapshot에 저장)
     highlights_snapshot_meta = _wl.snapshot_tickers(watchlist_result)
 

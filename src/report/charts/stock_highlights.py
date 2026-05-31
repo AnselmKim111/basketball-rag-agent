@@ -94,6 +94,130 @@ def _resolve_df(item: dict, extra_dfs: dict):
     return None
 
 
+def ipo_cards(items: list[dict], out_dir: Path, filename: str = "34_ipo_cards.png",
+              date_iso: str | None = None) -> str | None:
+    """IPO 종목 mini-card grid — OHLCV 없는 신생주 시각화 폴백.
+
+    각 카드: offer price + 시총 + 발표일 D-N + status 배지 + 테마 매칭.
+    """
+    from datetime import date as _date
+    ipo_items = [it for it in items if it.get("ipo") and "ipo" in (it.get("categories") or [])]
+    if not ipo_items:
+        return None
+    theme.setup()
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import FancyBboxPatch
+
+    n = len(ipo_items)
+    cols = 2 if n >= 2 else 1
+    rows = (n + cols - 1) // cols
+    fig, axes = plt.subplots(rows, cols, figsize=(13, 2.6 * rows))
+    if rows * cols == 1:
+        axes = [axes]
+    else:
+        axes = list(axes.flatten()) if hasattr(axes, "flatten") else list(axes)
+
+    today = None
+    if date_iso:
+        try:
+            today = _date.fromisoformat(date_iso)
+        except Exception:
+            today = None
+    if not today:
+        today = _date.today()
+
+    for i, it in enumerate(ipo_items):
+        ax = axes[i]
+        ax.axis("off")
+        ax.set_xlim(0, 10); ax.set_ylim(0, 10)
+        ipo = it.get("ipo") or {}
+        ticker = it.get("ticker") or ""
+        name = (it.get("label") or ticker).split("(")[0].strip()
+        status = (ipo.get("status") or "").lower()
+        # 상태별 색상
+        if status == "priced":
+            box_col, badge = "#1b5e20", "PRICED"
+        elif status == "expected":
+            box_col, badge = "#2e7d32", "EXPECTED"
+        elif status == "filed":
+            box_col, badge = "#f57c00", "FILED"
+        else:
+            box_col, badge = "#757575", (status.upper() or "TBD")
+
+        # 외곽 박스
+        ax.add_patch(FancyBboxPatch((0.3, 0.3), 9.4, 9.4, boxstyle="round,pad=0.1",
+                     facecolor="#fafafa", edgecolor=box_col, linewidth=1.5))
+        # status 배지 (우상단)
+        ax.add_patch(FancyBboxPatch((7.6, 8.6), 2.0, 0.9, boxstyle="round,pad=0.05",
+                     facecolor=box_col, edgecolor="none"))
+        ax.text(8.6, 9.05, badge, ha="center", va="center", fontsize=9,
+                fontweight="bold", color="white")
+
+        # 종목명 + 티커
+        ax.text(0.6, 8.9, name, ha="left", va="center", fontsize=12, fontweight="bold")
+        ax.text(0.6, 8.0, f"({ticker})", ha="left", va="center", fontsize=10, color="#666")
+
+        # 데이터 줄
+        lines = []
+        # offer price
+        price = ipo.get("price")
+        if price:
+            lines.append(("Offer price", str(price)))
+        # 시총
+        tv = ipo.get("total_value") or it.get("market_cap") or 0
+        if tv:
+            if tv >= 1e9:
+                cap_str = f"${tv/1e9:.2f}B"
+            else:
+                cap_str = f"${tv/1e6:.0f}M"
+            lines.append(("시총", cap_str))
+        # 발행 주식
+        shares = ipo.get("shares")
+        if shares:
+            try:
+                sh_m = float(shares) / 1e6
+                lines.append(("발행", f"{sh_m:.1f}M주"))
+            except Exception:
+                pass
+        # 발표일 + D-N
+        date_str = ipo.get("date") or ""
+        d_n = ""
+        if date_str:
+            try:
+                d = _date.fromisoformat(date_str)
+                delta = (d - today).days
+                d_n = f"D{delta:+d}" if delta != 0 else "D-Day"
+            except Exception:
+                pass
+        if date_str:
+            label = f"{date_str}" + (f"  ({d_n})" if d_n else "")
+            lines.append(("발표일", label))
+        # exchange
+        ex = ipo.get("exchange")
+        if ex:
+            lines.append(("거래소", ex))
+        # 섹터·테마
+        sector = it.get("sector") or ""
+        if sector:
+            lines.append(("섹터", sector))
+
+        # 본문 그리기
+        y0 = 6.9
+        for k, v in lines[:6]:
+            ax.text(0.6, y0, k, ha="left", va="top", fontsize=9, color="#555")
+            ax.text(3.4, y0, v, ha="left", va="top", fontsize=10, fontweight="bold")
+            y0 -= 1.0
+
+    # 빈 셀 숨기기
+    for j in range(len(ipo_items), len(axes)):
+        axes[j].set_axis_off()
+
+    fig.suptitle("[IPO] 다가올 IPO — 자금 흐름 신호 카드", fontsize=13, fontweight="bold")
+    theme.stamp(axes[len(ipo_items) - 1] if ipo_items else axes[0], date_iso)
+    fig.tight_layout()
+    return theme.save_fig(fig, out_dir, filename)
+
+
 def _render_grid(items: list[dict], dfs_map: dict, out_dir: Path, filename: str,
                  title: str, days: int = 120, date_iso: str | None = None) -> str | None:
     theme.setup()
