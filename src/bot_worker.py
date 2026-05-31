@@ -464,7 +464,8 @@ async def _run_pipeline(
             ack = await update.message.reply_text(
                 f"📥 *{name}* ({ticker}) 작업 시작\n"
                 f"PDF {top}건 다운로드 → 요약 → 발송\n"
-                f"⏱️ 약 8-15분 소요",
+                f"⏱️ 약 8-15분 소요\n"
+                f"_⚠️ subprocess가 wisereport 독점 사용 — 다른 봇 명령은 종료까지 큐 대기_",
                 parse_mode=ParseMode.MARKDOWN,
             )
 

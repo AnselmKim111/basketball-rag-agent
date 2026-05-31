@@ -63,41 +63,9 @@ KST = timezone(timedelta(hours=9))
 _safe_dirname = _bh_safe_dirname
 _send_text = _bh_send_text
 _send_pdf = _bh_send_pdf
-
-
-# OpenRouter 동시 호출 상한. 너무 크면 429. 5-8 권장 — wisereport 한 카테고리 5건
-# + 인기/최신 합쳐서 10건도 한 번에 안전하게 처리 가능한 보수적 값.
-_LLM_SUMMARY_CONCURRENCY = int(os.environ.get("LLM_SUMMARY_CONCURRENCY", "8"))
-
-
-async def _summarize_pdfs_parallel(
-    paths: list[Path], *, short_summary: bool, label: str
-) -> list[str]:
-    """N개 PDF를 asyncio.gather + semaphore로 동시 요약.
-
-    PIPELINE_LOCK 바깥에서 호출 — 같은 chat의 후속 발송 응답성을 위해.
-    각 호출은 to_thread로 워커 스레드에서 sync OpenRouter SDK 사용.
-    실패는 자리에 (요약 실패: ...) 문자열로 들어가 발송은 계속.
-    """
-    if not paths:
-        return []
-    sum_client = get_client()
-    summarize_fn = summarize_pdf_short if short_summary else summarize_pdf
-    sem = asyncio.Semaphore(_LLM_SUMMARY_CONCURRENCY)
-
-    async def _one(p: Path) -> str:
-        async with sem:
-            try:
-                s = await asyncio.to_thread(summarize_fn, sum_client, p)
-                return s.summary_text
-            except OpenRouterCreditExhausted:
-                log.warning("[%s] %s 요약 — OpenRouter 한도 초과", label, p.name)
-                return "(요약 실패: OpenRouter 토큰 부족)"
-            except Exception as e:
-                log.exception("[%s] %s 요약 실패", label, p.name)
-                return f"(요약 실패: {e!r})"
-
-    return await asyncio.gather(*[_one(p) for p in paths])
+# _summarize_pdfs_parallel 은 src.bot_helpers 로 이전 (curator·deep_research·comparator
+# 도 같은 헬퍼 공유). 호출부 변경 없도록 alias로 노출.
+from src.bot_helpers import _summarize_pdfs_parallel  # noqa: E402
 
 
 # ------------------------------------------------------------------
