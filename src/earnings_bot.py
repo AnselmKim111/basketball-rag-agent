@@ -1403,20 +1403,33 @@ async def _step_fetch_ecosystem(tickers: list[str]) -> dict[str, Any]:
 
 
 async def _step_fetch_insider(tickers: list[str], window_days: int = 30) -> dict[str, Any]:
-    """티커별 최근 N일 Form 4 인사이더 매매 메타 (Track F). SEC 무료, 같은 USER_AGENT."""
+    """티커별 최근 N일 Form 4 인사이더 매매 (Track F + Phase 7E XML 본문 파싱).
+
+    1단계: fetch_recent_form4로 메타 수집 (병렬).
+    2단계: 각 form의 primary_doc_url에서 XML 파싱 → 거래코드·수량·달러·관계 추출.
+    """
     from src.earnings import sec_edgar
     loop = asyncio.get_running_loop()
-    results = await asyncio.gather(
+    metas = await asyncio.gather(
         *[loop.run_in_executor(None, sec_edgar.fetch_recent_form4, t, window_days) for t in tickers],
         return_exceptions=True,
     )
+    # 2단계: 모든 종목 합쳐서 XML 파싱 병렬 (forms 단위)
+    parse_jobs = []
     out: dict[str, Any] = {}
-    for t, s in zip(tickers, results):
+    for t, s in zip(tickers, metas):
         if isinstance(s, Exception):
             log.warning("Form 4 fetch 실패 (%s): %s", t, s)
             out[t] = None
             continue
         out[t] = s
+        if s is not None:
+            parse_jobs.append((t, s))
+    if parse_jobs:
+        await asyncio.gather(*[
+            loop.run_in_executor(None, sec_edgar.parse_insider_summary, s, 8)
+            for _, s in parse_jobs
+        ], return_exceptions=True)
     return out
 
 
