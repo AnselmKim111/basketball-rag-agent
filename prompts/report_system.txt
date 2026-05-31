@@ -46,7 +46,7 @@ stale_data.
 각 종목은 다음 키 포함 가능:
 - ticker, market, sector, market_cap, categories(아래)
 - chg_1d / chg_5d / chg_1m, close
-- categories: ["earnings_actual","estimate_revision","ipo","sector_leader","trend_reversal","followup"] 중 1개 이상
+- categories: ["earnings_actual","estimate_revision","ipo","sector_leader","trend_reversal","followup","kr_linkage"] 중 1개 이상
 - earnings_actual: {asof, eps_actual, eps_est, eps_surprise_pct, rev_actual, rev_est, rev_surprise_pct,
   source_consensus("FMP+Finnhub agree"/"출처 충돌, 보수 채택"/"Finnhub only"/"FMP only"), eps_disputed}
   → **이미 발표된 실제 결과** (fact 인용 + reaction 해석)
@@ -56,6 +56,8 @@ stale_data.
 - ipo: {name, date, exchange, price, shares, total_value, status} → IPO 자금흐름 신호
 - screener_signals: [신호종류] (예: ["ma_golden_cross","rsi_oversold_recovery","base_hold_after_breakout",
   "downtrend_exit","high_52w","volume_breakout","vcp_breakout","near_breakout_52w","high_all"])
+- theme_linkage (KR 종목 한정): {us_theme_label("태양광(TAN)"), us_theme_r5d(미국 테마 5D %)}
+  → **kr_linkage 카테고리에만 부착**. "미국 X 테마 5D Y% 강세 → 한국 수혜주" 맥락.
 - technical: {pct_52w_high, is_new_high, ma200, above_ma200, above_ma50, above_ma20,
   support_52w_low, resistance_52w_high}
 - news_snippets: [string] (매체명 포함, URL 없음)
@@ -161,6 +163,13 @@ stale_data.
    ### 6-2. 🇰🇷 한국 (highlights.kr, 3~6개)
    동일 구조. 한국은 §7 한국 수급과 자연 연결: "외국인 메모리 매도 + 이 종목 거래량 돌파는 같은 사슬"식.
    시총·기술 레벨은 화폐 단위 KRW로 표시(원 단위).
+
+   #### 🔗 미국 테마 수혜주 (`kr_linkage`)
+   theme_linkage가 부착된 종목 = 미국 hot 테마가 끌고 가는 한국 수혜주 후보. 본문 구조:
+   "미국 X 테마(5D Y%) + 이 종목 5D Z% / 기술 (MA20·52w%) → 미국 강세 추세가 한국 수급으로 옮겨붙는지
+   §7 외국인 흐름과 비교"
+   미국 테마는 강한데(예: 우주 +10%) 한국 수혜주 흐름 약하면 → "디커플링·시차" 분류. 둘 다 강하면 →
+   "글로벌 테마 한국 연동 확인" thesis 강화.
 
    ### 6-3. 공통 룰
    - **earnings_actual.source_consensus 명시**: "FMP+Finnhub 일치" / "출처 충돌, 보수 채택" → 신뢰도 투명.
