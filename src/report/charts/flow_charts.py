@@ -197,14 +197,76 @@ US_KR_LINKAGE = {
 }
 
 
+def _rate_tier(r5d: float) -> str:
+    """5D 등락 → ★ 등급. ≥15%=★★★ · ≥8%=★★ · ≥5%=★ · 그 외=빈문자."""
+    if r5d is None:
+        return ""
+    if r5d >= 15:
+        return "★★★"
+    if r5d >= 8:
+        return "★★"
+    if r5d >= 5:
+        return "★"
+    return ""
+
+
+_KR_5D_CACHE: dict[str, float] = {}
+_KR_5D_CACHE_TS: float = 0.0
+_KR_5D_TTL = 1800  # 30분
+
+
+def _fetch_kr_5d(tickers: list[str]) -> dict[str, float]:
+    """ticker → 5D 등락%. screener_adapter 우선 → fetch_prices.fetch_ohlcv 폴백."""
+    global _KR_5D_CACHE, _KR_5D_CACHE_TS
+    import time
+    now = time.time()
+    if (now - _KR_5D_CACHE_TS) >= _KR_5D_TTL:
+        _KR_5D_CACHE = {}
+        _KR_5D_CACHE_TS = now
+    out: dict[str, float] = {}
+    miss: list[str] = []
+    for t in tickers:
+        if t in _KR_5D_CACHE:
+            out[t] = _KR_5D_CACHE[t]
+        else:
+            miss.append(t)
+    if not miss:
+        return out
+    try:
+        from src.report.data import screener_adapter
+        from src.report.data.fetch_prices import fetch_ohlcv
+        for tk in miss:
+            df = screener_adapter.load_ohlcv_df(tk, "KR", days=15)
+            if df is None or len(df) < 6:
+                try:
+                    df = fetch_ohlcv(tk, days=15)
+                except Exception:
+                    df = None
+            if df is None or len(df) < 6:
+                continue
+            try:
+                close = df["Close"]
+                last = float(close.iloc[-1]); ref = float(close.iloc[-6])
+                if ref:
+                    chg = (last / ref - 1) * 100
+                    out[tk] = chg
+                    _KR_5D_CACHE[tk] = chg
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return out
+
+
 def us_korea_linkage(theme_rows: list[dict], out_dir: Path, filename: str = "33_us_kr_linkage.png",
                      top_n: int = 9, date_iso: str | None = None) -> str | None:
-    """미국 테마 강도(5D) → 한국 수혜주 연결 다이어그램. 강한 테마=굵은/진한 화살표."""
+    """미국 테마 강도(5D) → 한국 수혜주 연결 다이어그램.
+    좌: 미국 테마 + ★ 등급 / 우: 한국 수혜주 + 5D 등락 / 화살표: 강도 두께·색상.
+    """
     theme.setup()
     import matplotlib.pyplot as plt
     from matplotlib.patches import FancyArrowPatch, FancyBboxPatch
     from matplotlib import colors
-    import numpy as np
 
     def _match(label: str):
         for kw, names in US_KR_LINKAGE.items():
@@ -219,35 +281,59 @@ def us_korea_linkage(theme_rows: list[dict], out_dir: Path, filename: str = "33_
             mapped.append((r["label"], r["r5d"], names))
     if not mapped:
         return None
-    # 5D 모멘텀 절대값 큰 순 (강하게 움직이는 테마 우선)
     mapped = sorted(mapped, key=lambda m: -abs(m[1]))[:top_n]
-    mapped = sorted(mapped, key=lambda m: -m[1])  # 표시는 강세 위→약세 아래
+    mapped = sorted(mapped, key=lambda m: -m[1])
+
+    # 한국 종목 5D 등락 일괄 fetch (ticker 변환 후)
+    from src.report.data import kr_theme_linkage as kr_link
+    all_tickers: list[str] = []
+    for _, _, names in mapped:
+        for nm in names[:3]:
+            tkr = kr_link.KR_NAME_TO_TICKER.get(nm)
+            if tkr and tkr not in all_tickers:
+                all_tickers.append(tkr)
+    kr_5d = _fetch_kr_5d(all_tickers)
 
     norm = colors.Normalize(vmin=-6, vmax=6)
     cmap = colors.LinearSegmentedColormap.from_list("krrb", ["#1f77b4", "#cfd8dc", "#d62728"])
     mx = max(abs(m[1]) for m in mapped) or 1.0
 
-    fig, ax = plt.subplots(figsize=(13, max(5.5, 0.95 * len(mapped) + 1.5)))
+    fig, ax = plt.subplots(figsize=(14, max(5.5, 1.0 * len(mapped) + 1.5)))
     ax.set_xlim(0, 10); ax.set_ylim(0, len(mapped)); ax.axis("off")
     for i, (label, r5d, names) in enumerate(mapped):
         y = len(mapped) - i - 0.5
         col = cmap(norm(max(-6, min(6, r5d))))
-        # 미국 테마 박스 (좌)
-        ax.add_patch(FancyBboxPatch((0.2, y - 0.36), 3.4, 0.72, boxstyle="round,pad=0.05",
+        tier = _rate_tier(r5d)
+        # 미국 테마 박스 (좌) + 별 등급
+        ax.add_patch(FancyBboxPatch((0.2, y - 0.40), 3.4, 0.80, boxstyle="round,pad=0.05",
                      facecolor=col, edgecolor="#666", linewidth=0.6))
-        ax.text(1.9, y, f"{label}\n5D {r5d:+.1f}%", ha="center", va="center", fontsize=8,
-                color="white" if abs(r5d) > 3 else "#111")
+        head = f"{label}  {tier}".strip()
+        ax.text(1.9, y + 0.13, head, ha="center", va="center", fontsize=9,
+                fontweight="bold", color="white" if abs(r5d) > 3 else "#111")
+        ax.text(1.9, y - 0.16, f"5D {r5d:+.1f}%", ha="center", va="center", fontsize=8,
+                color="white" if abs(r5d) > 3 else "#222")
         # 화살표
         w = 0.8 + 4 * (abs(r5d) / mx)
-        ax.add_patch(FancyArrowPatch((3.7, y), (5.9, y), arrowstyle="-|>", mutation_scale=14,
+        ax.add_patch(FancyArrowPatch((3.7, y), (5.7, y), arrowstyle="-|>", mutation_scale=14,
                      linewidth=w, color=col, alpha=0.7))
-        # 한국 수혜주 박스 (우)
-        ax.add_patch(FancyBboxPatch((6.0, y - 0.36), 3.8, 0.72, boxstyle="round,pad=0.05",
+        # 한국 수혜주 박스 (우) — 종목명 + 5D 등락
+        ax.add_patch(FancyBboxPatch((5.8, y - 0.40), 4.0, 0.80, boxstyle="round,pad=0.05",
                      facecolor="#fafafa", edgecolor=col, linewidth=1.2))
-        ax.text(7.9, y, ", ".join(names[:3]), ha="center", va="center", fontsize=8, color="#111")
-    ax.text(1.9, len(mapped) + 0.05, "미국 테마 (5D 강도)", ha="center", fontsize=10, fontweight="bold")
-    ax.text(7.9, len(mapped) + 0.05, "한국 수혜주", ha="center", fontsize=10, fontweight="bold")
-    ax.set_title("미국 → 한국 자금흐름 연결 — 강한 테마가 끌고 갈 국내 수혜주", fontsize=13)
+        parts = []
+        for nm in names[:3]:
+            tkr = kr_link.KR_NAME_TO_TICKER.get(nm)
+            chg = kr_5d.get(tkr) if tkr else None
+            if chg is not None:
+                color_marker = "+" if chg >= 0 else ""
+                parts.append(f"{nm} {color_marker}{chg:.1f}%")
+            else:
+                parts.append(f"{nm} (N/A)")
+        ax.text(7.8, y, "\n".join(parts), ha="center", va="center", fontsize=8, color="#111")
+    ax.text(1.9, len(mapped) + 0.05, "미국 테마 (5D 강도 · ★ 등급)", ha="center",
+            fontsize=10, fontweight="bold")
+    ax.text(7.8, len(mapped) + 0.05, "한국 수혜주 (5D 등락)", ha="center",
+            fontsize=10, fontweight="bold")
+    ax.set_title("미국 → 한국 자금흐름 연결 — ★★★ ≥15%·★★ ≥8%·★ ≥5%", fontsize=13)
     theme.stamp(ax, date_iso)
     fig.tight_layout()
     return theme.save_fig(fig, out_dir, filename)
