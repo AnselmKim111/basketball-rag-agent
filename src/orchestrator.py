@@ -230,6 +230,11 @@ async def _run_forever() -> None:
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("telegram").setLevel(logging.WARNING)
     logging.getLogger("apscheduler").setLevel(logging.INFO)
+    # pykrx 내부 wrapper가 KRX 빈응답 시 `logging.info(args, kwargs)` 잘못 호출 →
+    # TypeError + Traceback 폭주 (실제 기능은 graceful skip). logging 자체의
+    # exception 전파를 끄면 stderr noise 사라짐. Python 권장: 앱 시작 시 1회.
+    logging.raiseExceptions = False
+    logging.getLogger("pykrx").setLevel(logging.CRITICAL)
 
     log = logging.getLogger("orchestrator")
     _diag_env()
