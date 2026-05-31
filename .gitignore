@@ -3,6 +3,7 @@
 .env.local
 *.env
 CLAUDE.local.md
+.claude/settings.local.json
 
 # Downloaded reports (do not commit user data)
 downloads/
