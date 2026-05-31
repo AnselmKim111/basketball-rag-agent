@@ -114,33 +114,55 @@ def fetch_us_market_caps(tickers: list[str]) -> dict[str, int]:
     if not miss:
         return out
 
-    key = os.getenv("FMP_API_KEY")
-    if not key:
-        log.info("[market_caps.us] FMP_API_KEY 없음 — 캐시만 반환")
+    fmp_key = os.getenv("FMP_API_KEY")
+    fh_key = os.getenv("FINNHUB_API_KEY")
+    if not fmp_key and not fh_key:
+        log.info("[market_caps.us] FMP·Finnhub 키 모두 없음 — 캐시만 반환")
         return out
 
-    # FMP /stable/quote는 단일 symbol 호출. batch 위해 ?symbol= 콤마 미지원 →
-    # 종목별 호출. 14개 정도면 ~5초.
-    for sym in miss[:50]:  # 안전 cap
-        try:
-            r = requests.get(
-                f"{_FMP_BASE}/quote",
-                params={"symbol": sym, "apikey": key},
-                timeout=10,
-            )
-            if r.status_code != 200:
-                continue
-            data = r.json()
-            if not data or not isinstance(data, list):
-                continue
-            cap = data[0].get("marketCap")
-            if cap:
-                cap_int = int(cap)
-                out[sym] = cap_int
-                _US_CACHE[sym] = cap_int
-        except Exception:
-            log.exception("[market_caps.us] %s fetch 실패", sym)
-    log.info("[market_caps.us] %d종목 시총 확보 (miss=%d)", len(out), len(miss) - len(out))
+    # FMP /stable/quote 1차 시도. 무료 키는 소형/신생주에 402 Premium 차단 →
+    # 그 경우 Finnhub /stock/profile2 폴백 (marketCapitalization in millions USD).
+    fmp_hits = 0
+    fh_hits = 0
+    for sym in miss[:50]:
+        cap_int = 0
+        if fmp_key:
+            try:
+                r = requests.get(
+                    f"{_FMP_BASE}/quote",
+                    params={"symbol": sym, "apikey": fmp_key},
+                    timeout=10,
+                )
+                if r.status_code == 200:
+                    data = r.json()
+                    if data and isinstance(data, list):
+                        cap = data[0].get("marketCap")
+                        if cap:
+                            cap_int = int(cap)
+                            fmp_hits += 1
+            except Exception:
+                log.exception("[market_caps.us] FMP %s fetch 실패", sym)
+        # FMP miss → Finnhub 폴백
+        if not cap_int and fh_key:
+            try:
+                r = requests.get(
+                    "https://finnhub.io/api/v1/stock/profile2",
+                    params={"symbol": sym, "token": fh_key},
+                    timeout=10,
+                )
+                if r.status_code == 200:
+                    data = r.json() or {}
+                    mc_m = data.get("marketCapitalization")  # millions USD
+                    if mc_m:
+                        cap_int = int(float(mc_m) * 1e6)
+                        fh_hits += 1
+            except Exception:
+                log.exception("[market_caps.us] Finnhub %s fetch 실패", sym)
+        if cap_int:
+            out[sym] = cap_int
+            _US_CACHE[sym] = cap_int
+    log.info("[market_caps.us] %d종목 확보 (FMP=%d · Finnhub=%d · miss=%d)",
+             len(out), fmp_hits, fh_hits, len(miss) - len(out) + (len(tickers) - len(miss)))
     return out
 
 
