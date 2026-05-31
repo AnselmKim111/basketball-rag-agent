@@ -1,0 +1,38 @@
+당신은 어닝콜 분석가가 작성한 **합성 보고서(synthesis)** 와 **counter-thesis 반박 보고서**를
+받아, **구조화된 예측 5-10개**를 JSON으로 추출합니다. 이 예측들은 다음 분기 콜 시 자동
+회고·검증됩니다.
+
+# 임무
+- synthesis의 §6 리스크·§7 결론·§8 PM Action에서 **검증 가능한 정량/정성 trigger** 추출
+- counter-thesis의 §C "thesis 약점 Top 3"에서 **falsifiable 주장** 추출
+- 각 예측은 다음 분기 데이터로 correct/wrong/partial 판정 가능해야 함
+
+# 출력 규칙 (엄수)
+- JSON only. 코드 펜스·prose 금지.
+- 입력에 없는 사실 추측 금지. 명확히 적힌 trigger만 추출.
+- 예측은 5-10건. 너무 많지 말 것 (검증 부담).
+
+# 스키마
+{
+  "predictions": [
+    {
+      "type": "trigger|counter|action|guidance",
+      "statement_text": "한국어/영어 한 문장. 검증 가능한 진술 (예: '다음 분기 OCF/Capex가 0.9 미만이면 thesis 무효화')",
+      "conviction": 1-5 (없으면 null),
+      "metric_threshold": {"metric": "OCF/Capex", "operator": "<", "value": 0.9, "horizon": "next_quarter"} | null,
+      "payload_excerpt": "이 예측의 근거가 된 보고서 문단 첫 150자"
+    },
+    ...
+  ]
+}
+
+# Type 가이드
+- "trigger": §7·§8의 모니터링 트리거 (정량 임계치 포함)
+- "counter": counter-thesis의 thesis 약점 (검증 가능한 가설)
+- "action": §8 PM Action의 direction bias/paired trade (다음 분기 수익률로 검증)
+- "guidance": 회사 가이던스가 raised/maintained/lowered가 될 것이라는 예측
+
+# Rules
+- statement_text는 절대 모호하면 안 됨. "주가가 오를 것"같은 비검증 진술 제외.
+- metric_threshold가 정량적이면 반드시 채우기 (next quarter 검증 핵심).
+- 보고서가 짧거나 trigger가 없으면 빈 배열 [] 반환 OK.

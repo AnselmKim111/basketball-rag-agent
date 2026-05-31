@@ -153,6 +153,26 @@ def fetch_and_extract(
         parsed["_signals"] = nlp_signals.compute_signals(doc.full_text, parsed)
     except Exception:
         log.exception("[earnings/nlp_signals] compute_signals 실패 (%s)", ticker)
+    # Phase 7B — 환각 게이트: extract의 verbatim 인용이 raw_text에 실재하는지 검증.
+    # grounded transcript이고 충분히 길 때만(짧으면 검증 fragment가 우연 매치 불가).
+    if doc.grounded and len(doc.full_text) >= 5000 and not parsed.get("extract_failed"):
+        try:
+            from src.earnings import quality_gate as qg
+            gate = qg.verify_extract_verbatim(parsed, doc.full_text, threshold=0.30)
+            parsed["_gate_extract"] = {
+                "total": gate.total_checked,
+                "violations": len(gate.violations),
+                "ratio": gate.violation_ratio,
+                "passed": gate.passed,
+                "summary": gate.summary(),
+            }
+            if gate.violations:
+                # 위반 항목을 in-place 제거 — 합성·텔레그램 보고서에 깨끗한 데이터만
+                qg.strip_violating_items(parsed, gate.violations)
+                log.info("[quality_gate/%s] extract 위반 %d건 제거 (ratio=%.1f%%)",
+                         ticker, len(gate.violations), gate.violation_ratio*100)
+        except Exception:
+            log.exception("[quality_gate] extract 검증 실패 (%s)", ticker)
     return parsed
 
 

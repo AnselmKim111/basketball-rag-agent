@@ -272,6 +272,184 @@ async def _step_synthesize_pre_vs_actual(
         return None
 
 
+async def _step_extract_predictions(
+    ticker: str, year: int, quarter: int,
+    synthesis_text: str, counter_text: str,
+) -> int:
+    """Phase 7C — synthesis + counter에서 검증 가능한 prediction 5-10개 추출 → SQLite INSERT.
+
+    반환: INSERT 성공 건수.
+    """
+    from src import summarizer
+    from src.earnings import predictions_db
+    from src.idea_bot import _parse_json
+
+    if not synthesis_text and not counter_text:
+        return 0
+    system = _load_prompt("earnings_predictions_extract")
+    if not system:
+        return 0
+
+    user_msg = (
+        f"# ticker: {ticker}\n# year: {year} quarter: {quarter}\n\n"
+        f"## SYNTHESIS REPORT\n{synthesis_text or '(empty)'}\n\n"
+        f"## COUNTER-THESIS REPORT\n{counter_text or '(empty)'}\n\n"
+        "위 두 보고서에서 schema 그대로 predictions JSON 추출."
+    )
+    loop = asyncio.get_running_loop()
+
+    def _call():
+        client = summarizer.get_client()
+        return summarizer.chat_with_retry(
+            client,
+            model=_extract_model(),  # sonnet (구조화 추출)
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user_msg},
+            ],
+            temperature=0.2,
+            max_tokens=3000,
+            context=f"earnings-predictions-extract:{ticker}",
+        )
+    try:
+        content = await loop.run_in_executor(None, _call)
+    except Exception:
+        log.exception("[predictions extract] LLM 실패 (%s)", ticker)
+        return 0
+    parsed = _parse_json(content) if content else None
+    if not isinstance(parsed, dict):
+        return 0
+    rows = []
+    for p in (parsed.get("predictions") or []):
+        if not isinstance(p, dict):
+            continue
+        rows.append({
+            "ticker": ticker, "year": year, "quarter": quarter,
+            "type": p.get("type") or "trigger",
+            "statement_text": p.get("statement_text") or "",
+            "conviction": p.get("conviction"),
+            "metric_threshold": p.get("metric_threshold"),
+            "payload_excerpt": p.get("payload_excerpt") or "",
+        })
+    return predictions_db.insert_predictions_bulk(rows)
+
+
+async def _step_retrospective(
+    ticker: str, current_year: int, current_quarter: int,
+    actual_extract: dict, consensus_snap: Any | None, consensus_deltas: list | None,
+) -> str | None:
+    """Phase 7C — 이전 분기 predictions 회고. opus 1회 + verifications INSERT + report 반환."""
+    from src import summarizer
+    from src.earnings import predictions_db
+    from src.idea_bot import _parse_json
+
+    priors = predictions_db.list_unverified_predictions(ticker, current_year, current_quarter)
+    if not priors:
+        return None
+    system = _load_prompt("earnings_retrospective")
+    if not system:
+        return None
+
+    # actual 데이터 요약
+    hn = actual_extract.get("headline_numbers") or {}
+    g = actual_extract.get("guidance") or {}
+    tone = actual_extract.get("management_tone") or ""
+    deals = actual_extract.get("named_deals") or []
+    sc = actual_extract.get("supply_chain_signals") or []
+    mp = actual_extract.get("macro_policy_mentions") or []
+    cons_summary = ""
+    if consensus_snap is not None:
+        try:
+            cons_summary = json.dumps(
+                {k: v for k, v in (consensus_snap.__dict__ if hasattr(consensus_snap, "__dict__") else {}).items()
+                 if not k.startswith("_") and v is not None},
+                ensure_ascii=False, default=str,
+            )[:1500]
+        except Exception:
+            cons_summary = "(consensus snapshot 직렬화 실패)"
+
+    user_msg = (
+        f"# ticker: {ticker}\n# current_year: {current_year} current_quarter: {current_quarter}\n\n"
+        "## PRIOR PREDICTIONS (verifications 미완)\n"
+        + json.dumps(
+            [{"prediction_id": p["id"], "year": p["year"], "quarter": p["quarter"],
+              "type": p["type"], "statement_text": p["statement_text"],
+              "conviction": p.get("conviction"), "metric_threshold": p.get("metric_threshold_json")}
+             for p in priors], ensure_ascii=False, indent=2,
+        )
+        + "\n\n## ACTUAL THIS QUARTER\n"
+        + f"headline_numbers: {json.dumps(hn, ensure_ascii=False)}\n"
+        + f"guidance: {json.dumps(g, ensure_ascii=False)}\n"
+        + f"management_tone: {tone}\n"
+        + f"named_deals: {json.dumps(deals[:5], ensure_ascii=False)}\n"
+        + f"supply_chain_signals: {json.dumps(sc[:5], ensure_ascii=False)}\n"
+        + f"macro_policy_mentions: {json.dumps(mp[:5], ensure_ascii=False)}\n"
+        + f"consensus_snapshot: {cons_summary}\n"
+        + "consensus_deltas: " + "\n".join(f"- {d.message}" for d in (consensus_deltas or []))
+        + "\n\n위 데이터로 schema 그대로 회고 JSON 출력."
+    )
+    loop = asyncio.get_running_loop()
+
+    def _call():
+        client = summarizer.get_client()
+        return summarizer.chat_with_retry(
+            client,
+            model=_synthesis_model(),  # opus (정밀 판정)
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user_msg},
+            ],
+            temperature=0.2,
+            max_tokens=5000,
+            context=f"earnings-retrospective:{ticker}",
+        )
+    try:
+        content = await loop.run_in_executor(None, _call)
+    except Exception:
+        log.exception("[retrospective] LLM 실패 (%s)", ticker)
+        return None
+    parsed = _parse_json(content) if content else None
+    if not isinstance(parsed, dict):
+        return None
+
+    # verifications INSERT
+    inserted = 0
+    for v in (parsed.get("verifications") or []):
+        pid = v.get("prediction_id")
+        if not pid:
+            continue
+        rid = predictions_db.insert_verification(
+            prediction_id=int(pid),
+            verified_year=current_year, verified_quarter=current_quarter,
+            outcome=v.get("outcome") or "unverifiable",
+            evidence_text=v.get("evidence_text") or "",
+            model_used=_synthesis_model(),
+        )
+        if rid:
+            inserted += 1
+    log.info("[retrospective] %s — verifications INSERTED %d/%d", ticker, inserted, len(parsed.get("verifications") or []))
+    return parsed.get("retrospective_report") or None
+
+
+async def _cmd_credibility(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/credibility <TICKER> — 봇의 누적 적중률 표시."""
+    if not _is_authorized(update):
+        await deny_message(update, "어닝콜 기능")
+        return
+    from src.earnings import predictions_db
+    args = context.args or []
+    if not args:
+        await update.message.reply_text(
+            "사용법: `/credibility <TICKER>`\n예: `/credibility NVDA`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+    ticker = args[0].upper().strip()
+    loop = asyncio.get_running_loop()
+    score = await loop.run_in_executor(None, predictions_db.credibility_score, ticker)
+    await update.message.reply_text(predictions_db.fmt_credibility(score) or f"{ticker} 적중률 조회 실패")
+
+
 async def _cmd_preearnings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/preearnings <TICKER> [FYxxxxQy] — 콜 발표 전 사전 기대치 보고서."""
     if not _is_authorized(update):
@@ -781,7 +959,7 @@ async def _run_pipeline(
 
     # 6) 비교 합성 (Opus, 딥리서치급 — 컨센서스 delta·정성 서프라이즈 강제 인용)
     await _safe_send(bot, chat_id, "🧠 비교 합성 중 (Opus, 인용·시나리오 기반 8000자+)…")
-    industry_summary = await _step_synthesize_industry(
+    industry_summary, synthesis_gate_meta = await _step_synthesize_industry(
         transcripts, financials, fiscal_label, verify_by_ticker,
         consensus_by_ticker, consensus_delta_by_ticker, diff_by_ticker,
         ecosystem_by_ticker, insider_by_ticker, events_8k_by_ticker, risk_diff_by_ticker,
@@ -792,6 +970,36 @@ async def _run_pipeline(
         await send_text_chunked(bot, chat_id, industry_summary)
     else:
         industry_summary = "(비교 합성 실패 — PDF에는 차트·전문만 포함)"
+
+    # 6.05) Phase 7B 환각 검증 결과 노출 — extract 위반 + synthesis 위반 + 길이
+    try:
+        from src.earnings.quality_gate import fmt_quality_summary, GateResult
+        ex_results: dict[str, GateResult] = {}
+        for t, tr in transcripts.items():
+            ge = tr.get("_gate_extract")
+            if not ge:
+                continue
+            r = GateResult(layer="extract")
+            r.total_checked = ge.get("total", 0)
+            r.violation_ratio = ge.get("ratio", 0.0)
+            r.passed = ge.get("passed", True)
+            r.violations = [None] * ge.get("violations", 0)  # 카운트만 필요
+            ex_results[t] = r
+        syn_r = GateResult(layer="synthesis")
+        if synthesis_gate_meta:
+            syn_r.total_checked = synthesis_gate_meta.get("citation_total", 0)
+            syn_r.violation_ratio = synthesis_gate_meta.get("citation_ratio", 0.0)
+            syn_r.passed = synthesis_gate_meta.get("citation_passed", True)
+            syn_r.violations = [None] * synthesis_gate_meta.get("citation_violations", 0)
+        chars = (synthesis_gate_meta or {}).get("synthesis_chars")
+        summary_line = fmt_quality_summary(ex_results, syn_r, chars)
+        attempts = (synthesis_gate_meta or {}).get("attempts", 1)
+        if summary_line:
+            if attempts > 1:
+                summary_line += f"\n  🔄 합성 재시도: {attempts}회 (초기 검증 실패 → 자동 재요청)"
+            await _safe_send(bot, chat_id, summary_line)
+    except Exception:
+        log.exception("[quality_gate] 텔레그램 요약 발송 실패")
 
     # 6.5) Counter-thesis 자동 합성 (Track E) — 동일 payload + opus 1회 추가
     await _safe_send(bot, chat_id, "🛡️ Counter-thesis 자동 반박 합성 중 (Opus)…")
@@ -823,6 +1031,32 @@ async def _run_pipeline(
                 pa_text = None
             if pa_text:
                 await send_text_chunked(bot, chat_id, pa_text)
+
+    # 6.8) Phase 7C — predictions INSERT + retrospective (이전 분기 prediction이 있을 때만)
+    if fiscal_year and fiscal_quarter:
+        for t, tr in transcripts.items():
+            # 6.8a) 현재 분기 prediction 5-10건 추출 → DB INSERT
+            try:
+                n = await _step_extract_predictions(
+                    t, fiscal_year, fiscal_quarter,
+                    industry_summary or "", counter_summary or "",
+                )
+                if n > 0:
+                    log.info("[Phase7C] %s — %d predictions INSERTED FY%sQ%s", t, n, fiscal_year, fiscal_quarter)
+            except Exception:
+                log.exception("[Phase7C] predictions extract 실패 (%s)", t)
+            # 6.8b) 직전 분기 unverified prediction 회고 (있을 때만)
+            try:
+                retro = await _step_retrospective(
+                    t, fiscal_year, fiscal_quarter, tr,
+                    consensus_by_ticker.get(t), consensus_delta_by_ticker.get(t),
+                )
+                if retro:
+                    await _safe_send(bot, chat_id, f"📈 {t} — 직전 분기 thesis 회고 합성 완료")
+                    await send_text_chunked(bot, chat_id, retro)
+                    tr["_retrospective"] = retro  # history 영속화용
+            except Exception:
+                log.exception("[Phase7C] retrospective 실패 (%s)", t)
 
     # 6.6) longitudinal history 영속화 (Track C) — 합성·counter 끝난 시점에 1회.
     if fiscal_year and fiscal_quarter:
@@ -1221,9 +1455,14 @@ async def _step_synthesize_industry(
     events_8k_by_ticker: dict[str, Any] | None = None,
     risk_diff_by_ticker: dict[str, Any] | None = None,
     hyper_walker: dict | None = None,
-) -> str | None:
-    """비교 합성 (Opus, 딥리서치급). 컨센서스·diff·생태계·인사이더 데이터를 모두 payload에 포함."""
+) -> tuple[str | None, dict]:
+    """비교 합성 (Opus, 딥리서치급) + Phase 7B 환각 게이트.
+
+    반환: (text, gate_meta) — gate_meta는 텔레그램 알림·history 영속화용.
+    품질 위반(인용 비율 ≥25%) 또는 너무 짧음(<8000자) 시 opus 1회 재합성 (max 2 attempts).
+    """
     from src import summarizer
+    from src.earnings import quality_gate as qg
     system = _load_prompt("earnings_synthesis")
     user_payload = _build_synthesis_payload(
         transcripts, financials, fiscal_period, verify_by_ticker,
@@ -1233,26 +1472,71 @@ async def _step_synthesize_industry(
     )
     loop = asyncio.get_running_loop()
 
-    def _call():
+    def _call(extra_user: str = ""):
         client = summarizer.get_client()
+        messages = [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user_payload + (("\n\n" + extra_user) if extra_user else "")},
+        ]
         return summarizer.chat_with_retry(
             client,
             model=_synthesis_model(),
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user_payload},
-            ],
+            messages=messages,
             temperature=0.3,
             max_tokens=12000,
             context="earnings-synthesis",
         )
 
-    try:
-        content = await loop.run_in_executor(None, _call)
-    except Exception:
-        log.exception("비교 합성 실패")
-        return None
-    return content or None
+    allowed_tickers = list(transcripts.keys())
+    content: str | None = None
+    gate_result = qg.GateResult(layer="synthesis")
+    length_ok = False
+    attempts_done = 0
+    final_chars = 0
+
+    for attempt in range(1, 3):  # max 2 attempts
+        attempts_done = attempt
+        extra = ""
+        if attempt == 2 and (gate_result.violations or not length_ok):
+            # 2회차: 위반 명시해서 재요청
+            vio_summary = "\n".join(
+                f"- {v.field}: {v.reason}" for v in gate_result.violations[:8]
+            ) or "(인용 위반 없음)"
+            extra = (
+                "다음 검증 실패가 발견됐다. 출력은 (a) 위 payload에 실제 존재하는 데이터만 인용, "
+                "(b) [TICKER]는 분석 종목 리스트에만 한정, (c) 길이는 반드시 10000자 이상.\n"
+                "\n위반 목록:\n" + vio_summary
+            )
+        try:
+            content = await loop.run_in_executor(None, _call, extra)
+        except Exception:
+            log.exception("비교 합성 실패 (attempt=%d)", attempt)
+            content = None
+            break
+        if not content:
+            break
+        # 검증
+        gate_result = qg.verify_synthesis_citations(
+            content, user_payload, allowed_tickers=allowed_tickers, threshold=0.25,
+        )
+        length_ok, final_chars = qg.enforce_min_length(content, min_chars=8000)
+        if gate_result.passed and length_ok:
+            break
+
+    gate_meta = {
+        "attempts": attempts_done,
+        "synthesis_chars": final_chars,
+        "length_ok": length_ok,
+        "citation_total": gate_result.total_checked,
+        "citation_violations": len(gate_result.violations),
+        "citation_ratio": gate_result.violation_ratio,
+        "citation_passed": gate_result.passed,
+        "violations": [
+            {"field": v.field, "reason": v.reason, "fragment": v.fragment[:80]}
+            for v in gate_result.violations[:10]
+        ],
+    }
+    return (content or None), gate_meta
 
 
 def _format_diff_text(diff: dict | None) -> str:
@@ -2218,6 +2502,7 @@ EARNINGS_COMMANDS = [
     ("unwatch", "🚫 자동 발송 해제"),
     ("watchlist", "📋 현재 watch 목록 + 다음 어닝 예정"),
     ("backfill", "🔁 longitudinal history 시드 (`/backfill MSFT 6`)"),
+    ("credibility", "📈 봇 누적 적중률 (`/credibility NVDA`)"),
     ("help", "ℹ️ 사용법"),
 ]
 
@@ -2236,6 +2521,7 @@ def build_earnings_app(token: str) -> Application:
     app.add_handler(CommandHandler("unwatch", _cmd_unwatch))
     app.add_handler(CommandHandler("watchlist", _cmd_watchlist))
     app.add_handler(CommandHandler("backfill", _cmd_backfill))
+    app.add_handler(CommandHandler("credibility", _cmd_credibility))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _on_text))
 
     try:
