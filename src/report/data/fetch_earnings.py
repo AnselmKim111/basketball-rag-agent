@@ -98,6 +98,22 @@ def fetch_earnings_momentum(days_back: int = 21, days_fwd: int = 12,
     upcoming.sort(key=lambda x: -x["revenue_est"])
     upcoming = upcoming[:15]
 
+    # 3) upcoming 종목에 시총 + analyst revision 부착 (forward-looking 신호 강화)
+    if upcoming:
+        try:
+            from src.report.data import fetch_market_caps, fetch_estimate_revisions
+            syms = [u["symbol"] for u in upcoming if u.get("symbol")]
+            caps = fetch_market_caps.fetch_us_market_caps(syms)
+            revs = fetch_estimate_revisions.batch_revisions(syms, cap=15)
+            for u in upcoming:
+                sym = (u.get("symbol") or "").upper()
+                if sym in caps:
+                    u["market_cap"] = caps[sym]
+                if sym in revs:
+                    u["revision"] = revs[sym]
+        except Exception:
+            log.exception("[report.earnings] upcoming 보강 실패")
+
     log.info("[report.earnings] 최근 %d종목(beat율 %s%%) · 예정 %d종목",
              n, recent["beat_rate"], len(upcoming))
     return {"recent": recent, "upcoming": upcoming, "asof": today.isoformat()}
