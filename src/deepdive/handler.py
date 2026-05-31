@@ -21,6 +21,8 @@ from telegram import Bot, Update
 from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, ContextTypes
 
+from src.bot_helpers import html_escape
+
 from src import bot_worker  # is_authorized, CURRENT_TASK 재사용
 from src.pipeline_lock import PIPELINE_LOCK
 
@@ -78,8 +80,8 @@ async def _cmd_deepdive(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     args = context.args or []
     if not args:
         await update.message.reply_text(
-            "사용법: `/deepdive 005930` 또는 `/deepdive 삼성전자`",
-            parse_mode=ParseMode.MARKDOWN,
+            "사용법: <code>/deepdive 005930</code> 또는 <code>/deepdive 삼성전자</code>",
+            parse_mode=ParseMode.HTML,
         )
         return
     # 다단어 종목명 지원 (예: "/deepdive HD 현대중공업")
@@ -96,8 +98,8 @@ async def _run(update: Update, context: ContextTypes.DEFAULT_TYPE, query: str) -
         running = bot_worker.CURRENT_TASK['name'] if bot_worker.CURRENT_TASK else "다른 작업"
         await bot.send_message(
             chat_id=chat_id,
-            text=f"⏳ 진행중: *{running}*\n끝나면 처리: deepdive {query}",
-            parse_mode=ParseMode.MARKDOWN,
+            text=f"⏳ 진행중: <b>{html_escape(running)}</b>\n끝나면 처리: deepdive {html_escape(query)}",
+            parse_mode=ParseMode.HTML,
         )
 
     async with PIPELINE_LOCK:
@@ -161,8 +163,8 @@ async def _resolve_ticker(bot: Bot, chat_id: int, query: str) -> Optional[str]:
     name = dart_client._CORP_NAME_CACHE.get(ticker, "")
     await bot.send_message(
         chat_id=chat_id,
-        text=f"🔎 '{q}' → *{name}* ({ticker})",
-        parse_mode=ParseMode.MARKDOWN,
+        text=f"🔎 '{html_escape(q)}' → <b>{html_escape(name)}</b> ({html_escape(ticker)})",
+        parse_mode=ParseMode.HTML,
     )
     return ticker
 
@@ -187,8 +189,8 @@ async def _execute(bot, chat_id: int, ticker: str) -> None:
     today = datetime.now(KST).strftime("%Y-%m-%d %H:%M")
     await bot.send_message(
         chat_id=chat_id,
-        text=f"📊 *{corp_name}* ({ticker}) 심층분석 시작\n_{today}_\n⏱️ 5-10분 소요",
-        parse_mode=ParseMode.MARKDOWN,
+        text=f"📊 <b>{html_escape(corp_name)}</b> ({html_escape(ticker)}) 심층분석 시작\n<i>{html_escape(today)}</i>\n⏱️ 5-10분 소요",
+        parse_mode=ParseMode.HTML,
     )
 
     download_root = Path(os.environ.get("DOWNLOAD_DIR", "./downloads")) / "deepdive" / ticker
@@ -347,7 +349,7 @@ async def _execute(bot, chat_id: int, ticker: str) -> None:
     else:
         await bot.send_message(chat_id=chat_id, text="ℹ️ 분기별 재무 데이터 없음 — 차트 스킵")
 
-    await bot.send_message(chat_id=chat_id, text=f"✅ *{corp_name}* 심층분석 완료", parse_mode=ParseMode.MARKDOWN)
+    await bot.send_message(chat_id=chat_id, text=f"✅ <b>{html_escape(corp_name)}</b> 심층분석 완료", parse_mode=ParseMode.HTML)
 
 
 def _format_wisereport_context(wctx) -> Optional[str]:

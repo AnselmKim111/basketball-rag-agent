@@ -29,6 +29,7 @@ from telegram import Bot
 
 from src.bot_helpers import (
     MissingWisereportCreds,
+    html_escape,
     safe_dirname,
     send_pdf,
     send_text_chunked,
@@ -512,17 +513,17 @@ async def run_curated(bot: Bot, chat_id: str, n: int = 10, mode: CuratorMode = M
             await send_text_chunked(bot, chat_id, "❌ 큐레이션 실패 — 후보 0")
             return
 
-        # 큐레이션 헤더
-        header_lines = [f"🎯 *Top {len(picks)} 큐레이션*\n"]
+        # 큐레이션 헤더 (HTML — 뉴스 타이틀의 Markdown 특수문자 파싱 깨짐 방지)
+        header_lines = [f"🎯 <b>Top {len(picks)} 큐레이션</b>\n"]
         for i, (c, reason) in enumerate(picks, start=1):
             header_lines.append(
-                f"*{i}. [{c.category}] {c.item.title}*\n"
-                f"  📅 {c.date_short}  💡 {reason}"
+                f"<b>{i}. [{html_escape(c.category)}] {html_escape(c.item.title)}</b>\n"
+                f"  📅 {html_escape(c.date_short)}  💡 {html_escape(reason)}"
             )
         await send_text_chunked(
             bot, chat_id,
             "\n\n".join(header_lines),
-            parse_mode="Markdown",
+            parse_mode="HTML",
         )
 
         # Stage 3 — 다운로드 + 요약 + PDF
@@ -542,13 +543,13 @@ async def run_curated(bot: Bot, chat_id: str, n: int = 10, mode: CuratorMode = M
             await send_text_chunked(bot, chat_id, "❌ 다운로드/요약 단계 실패 — 로그 확인")
             return
 
-        # 발송 — 각 항목 요약 + PDF
+        # 발송 — 각 항목 요약 + PDF (HTML)
         for i, (c, reason, path, summary) in enumerate(results, start=1):
             header = (
-                f"🔖 *{i}/{len(results)}* [{c.category}] {c.item.title}\n"
-                f"📅 {c.date_short}  💡 {reason}"
+                f"🔖 <b>{i}/{len(results)}</b> [{html_escape(c.category)}] {html_escape(c.item.title)}\n"
+                f"📅 {html_escape(c.date_short)}  💡 {html_escape(reason)}"
             )
-            await send_text_chunked(bot, chat_id, header, parse_mode="Markdown")
+            await send_text_chunked(bot, chat_id, header, parse_mode="HTML")
             await send_text_chunked(bot, chat_id, summary)
             if path:
                 await send_pdf(bot, chat_id, path, caption=c.item.title)

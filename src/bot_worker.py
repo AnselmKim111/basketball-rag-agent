@@ -38,6 +38,7 @@ from telegram.ext import (
 from src.bot_helpers import (
     allowed_chat_ids,
     deny_message,
+    html_escape,
     is_authorized as _bh_is_authorized,
 )
 from src.pipeline_lock import PIPELINE_LOCK
@@ -95,8 +96,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_authorized(update):
         await update.message.reply_text(
             "이 봇은 인가된 사용자만 사용 가능합니다.\n"
-            f"chat_id `{update.effective_chat.id}` 를 운영자에게 알려주세요.",
-            parse_mode=ParseMode.MARKDOWN,
+            f"chat_id <code>{update.effective_chat.id}</code> 를 운영자에게 알려주세요.",
+            parse_mode=ParseMode.HTML,
         )
         return
     await update.message.reply_text(HELP_TEXT, parse_mode=ParseMode.MARKDOWN)
@@ -206,13 +207,13 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     if intent.intent == "compare":
         if not intent.ticker_names or len(intent.ticker_names) < 2:
-            await update.message.reply_text("비교는 2종목 이상 필요해요. 예: `삼성전자 SK하이닉스 capex 비교`", parse_mode=ParseMode.MARKDOWN)
+            await update.message.reply_text("비교는 2종목 이상 필요해요. 예: <code>삼성전자 SK하이닉스 capex 비교</code>", parse_mode=ParseMode.HTML)
             return
         pairs, unresolved = await resolve_tickers(intent.ticker_names[:5])
         if unresolved:
             await update.message.reply_text(
-                f"매칭 실패 종목: *{', '.join(unresolved)}* — 정확한 종목명 또는 ticker로 다시 보내주세요.",
-                parse_mode=ParseMode.MARKDOWN,
+                f"매칭 실패 종목: <b>{html_escape(', '.join(unresolved))}</b> — 정확한 종목명 또는 ticker로 다시 보내주세요.",
+                parse_mode=ParseMode.HTML,
             )
             return
         if len(pairs) < 2:
@@ -227,8 +228,8 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     if intent.intent == "theme":
         await update.message.reply_text(
-            f"테마 발굴은 IdeaBot에서: t.me/AnselmsSlave6bot\n명령: `/idea {intent.theme or text}`",
-            parse_mode=ParseMode.MARKDOWN,
+            f"테마 발굴은 IdeaBot에서: t.me/AnselmsSlave6bot\n명령: <code>/idea {html_escape(intent.theme or text)}</code>",
+            parse_mode=ParseMode.HTML,
         )
         return
 
@@ -316,9 +317,9 @@ async def _enqueue_combined(
     if PIPELINE_LOCK.locked():
         running = CURRENT_TASK['name'] if CURRENT_TASK else "다른 작업"
         await update.message.reply_text(
-            f"⏳ 진행중: *{running}*\n"
-            f"끝나면 처리: *{name}* ({ticker}) — /deepdive + /report",
-            parse_mode=ParseMode.MARKDOWN,
+            f"⏳ 진행중: <b>{html_escape(running)}</b>\n"
+            f"끝나면 처리: <b>{html_escape(name)}</b> ({html_escape(ticker)}) — /deepdive + /report",
+            parse_mode=ParseMode.HTML,
         )
     task = asyncio.create_task(
         _run_combined(update, context, name, ticker, top),
@@ -419,8 +420,8 @@ async def _parse_args_with_lookup(
     matched_name = dart_client._CORP_NAME_CACHE.get(ticker, name_query)
     try:
         await update.message.reply_text(
-            f"🔎 '{name_query}' → *{matched_name}* ({ticker})",
-            parse_mode=ParseMode.MARKDOWN,
+            f"🔎 '{html_escape(name_query)}' → <b>{html_escape(matched_name)}</b> ({html_escape(ticker)})",
+            parse_mode=ParseMode.HTML,
         )
     except Exception:
         pass
@@ -434,8 +435,8 @@ async def _enqueue(
     if PIPELINE_LOCK.locked():
         running = CURRENT_TASK['name'] if CURRENT_TASK else "다른 작업"
         await update.message.reply_text(
-            f"⏳ 진행중: *{running}*\n끝나면 처리: *{name}* ({ticker}, top {top})",
-            parse_mode=ParseMode.MARKDOWN,
+            f"⏳ 진행중: <b>{html_escape(running)}</b>\n끝나면 처리: <b>{html_escape(name)}</b> ({html_escape(ticker)}, top {top})",
+            parse_mode=ParseMode.HTML,
         )
 
     task = asyncio.create_task(
@@ -454,10 +455,10 @@ async def _run_pipeline(
         CURRENT_TASK = {"name": name, "ticker": ticker, "top": top}
         try:
             ack = await update.message.reply_text(
-                f"📥 *{name}* ({ticker}) 작업 시작\n"
+                f"📥 <b>{html_escape(name)}</b> ({html_escape(ticker)}) 작업 시작\n"
                 f"PDF {top}건 다운로드 → 요약 → 발송\n"
                 f"⏱️ 약 8-15분 소요",
-                parse_mode=ParseMode.MARKDOWN,
+                parse_mode=ParseMode.HTML,
             )
 
             cmd = [
@@ -484,16 +485,16 @@ async def _run_pipeline(
 
             if proc.returncode == 0:
                 await ack.reply_text(
-                    f"✅ *{name}* ({ticker}) 완료",
-                    parse_mode=ParseMode.MARKDOWN,
+                    f"✅ <b>{html_escape(name)}</b> ({html_escape(ticker)}) 완료",
+                    parse_mode=ParseMode.HTML,
                 )
             else:
                 tail = output.splitlines()[-25:]
                 err_block = "\n".join(tail)[-3500:]
                 await ack.reply_text(
-                    f"❌ *{name}* ({ticker}) 실패 (exit {proc.returncode})\n\n"
-                    f"```\n{err_block}\n```",
-                    parse_mode=ParseMode.MARKDOWN,
+                    f"❌ <b>{html_escape(name)}</b> ({html_escape(ticker)}) 실패 (exit {proc.returncode})\n\n"
+                    f"<pre>{html_escape(err_block)}</pre>",
+                    parse_mode=ParseMode.HTML,
                 )
         except Exception:
             logging.exception("파이프라인 실행 중 예외")

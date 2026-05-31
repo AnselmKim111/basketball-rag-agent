@@ -24,7 +24,7 @@ from typing import Optional
 
 from telegram import Bot
 
-from src.bot_helpers import send_pdf, send_text_chunked
+from src.bot_helpers import html_escape, send_pdf, send_text_chunked
 from src.pipeline_lock import PIPELINE_LOCK
 from src.summarizer import OpenRouterCreditExhausted, chat_with_retry, get_client
 
@@ -238,16 +238,20 @@ async def run_compare(
     started = datetime.now(KST)
 
     if PIPELINE_LOCK.locked():
+        names_html = html_escape(' vs '.join(names))
+        aspect_html = html_escape(aspect_clean)
         await send_text_chunked(
             bot, chat_id,
-            f"⏳ 다른 작업 진행 중 — 끝나면 *{' vs '.join(names)}* {aspect_clean} 비교 시작",
-            parse_mode="Markdown",
+            f"⏳ 다른 작업 진행 중 — 끝나면 <b>{names_html}</b> {aspect_html} 비교 시작",
+            parse_mode="HTML",
         )
+    names_html = html_escape(' vs '.join(names))
+    aspect_html = html_escape(aspect_clean)
     await send_text_chunked(
         bot, chat_id,
-        f"📊 *{' vs '.join(names)}* — *{aspect_clean}* 비교 분석 시작\n"
-        f"_각 종목 통합 리서치 → AI 비교 합성 → PDF — 약 {15 * len(pairs)}분 예상_",
-        parse_mode="Markdown",
+        f"📊 <b>{names_html}</b> — <b>{aspect_html}</b> 비교 분석 시작\n"
+        f"<i>각 종목 통합 리서치 → AI 비교 합성 → PDF — 약 {15 * len(pairs)}분 예상</i>",
+        parse_mode="HTML",
     )
 
     async with PIPELINE_LOCK:
