@@ -27,15 +27,23 @@ log = logging.getLogger(__name__)
 
 _BASE = "https://finnhub.io/api/v1"
 
+# 무료 키 권한 없는 endpoint — 첫 403 후 더 이상 호출 안 함 (로그 노이즈 방지)
+_FORBIDDEN_PATHS: set[str] = set()
+
 
 def _get_json(path: str, params: dict, key: str) -> dict | list | None:
+    if path in _FORBIDDEN_PATHS:
+        return None
     import httpx
     q = "&".join(f"{k}={v}" for k, v in params.items())
     url = f"{_BASE}{path}?{q}&token={key}"
     try:
         r = httpx.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
         if r.status_code in (401, 403):
-            log.info("[estimate_revisions] %s %s — 권한 없음", path, r.status_code)
+            if path not in _FORBIDDEN_PATHS:
+                log.info("[estimate_revisions] %s %s — 권한 없음 (이 endpoint 이후 호출 skip)",
+                         path, r.status_code)
+                _FORBIDDEN_PATHS.add(path)
             return None
         r.raise_for_status()
         return r.json()
