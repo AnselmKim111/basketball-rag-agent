@@ -42,8 +42,13 @@ Schema:
     "fx_impact": "..."
   },
   "qa_highlights": [
-    {"analyst": "Name - Firm", "question": "the actual question asked", "answer_summary": "grounded summary of mgmt answer with any verbatim phrase"},
-    ...  // 8-12 most consequential Q&A exchanges (not just 5)
+    {
+      "analyst": "Name - Firm",
+      "question": "the actual question asked",
+      "answer_summary": "grounded summary of mgmt answer with any verbatim phrase",
+      "significance": "ONE sentence: why this Q&A matters to thesis / risk / surprise — what asymmetric signal it gives a PM (e.g., 'CFO hedge on Q2 ISG margin contradicts §3 thesis of structural mix shift')"
+    },
+    ...  // 8-12 most consequential Q&A exchanges. ORDER BY significance: the most thesis/risk-altering Q&A first.
   ],
   "capital_allocation": "grounded paragraph: capex vs buyback vs dividend vs M&A priorities as stated on the call",
   "management_tone": "grounded read of tone — aggressive/defensive/cautious, where confidence was high vs hedged",

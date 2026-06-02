@@ -1170,13 +1170,25 @@ async def _run_pipeline(
     if hyper_walker.get("applicable"):
         await _safe_send(bot, chat_id, fmt_hyperscaler_text(hyper_walker))
 
+    # 5.8) Phase 8 Track M — 시장 반응 fetch (주가 reaction · alpha · 옵션 · target revision)
+    await _safe_send(bot, chat_id, "📈 시장 반응 데이터 수집 중 (주가 reaction · target revision)…")
+    market_reaction_by_ticker = await _step_fetch_market_reaction(
+        list(transcripts.keys()), transcripts, consensus_by_ticker,
+    )
+    if market_reaction_by_ticker:
+        got_mr = sum(
+            1 for v in market_reaction_by_ticker.values()
+            if v is not None and getattr(v, "ret_1d", None) is not None
+        )
+        await _safe_send(bot, chat_id, f"  📈 시장 반응 {got_mr}/{len(transcripts)} (가격·alpha·target revision)")
+
     # 6) 비교 합성 (Opus, 딥리서치급 — 컨센서스 delta·정성 서프라이즈 강제 인용)
-    await _safe_send(bot, chat_id, "🧠 비교 합성 중 (Opus, 인용·시나리오 기반 8000자+)…")
+    await _safe_send(bot, chat_id, "🧠 비교 합성 중 (Opus, 인용·시나리오 기반 10000자+)…")
     industry_summary, synthesis_gate_meta = await _step_synthesize_industry(
         transcripts, financials, fiscal_label, verify_by_ticker,
         consensus_by_ticker, consensus_delta_by_ticker, diff_by_ticker,
         ecosystem_by_ticker, insider_by_ticker, events_8k_by_ticker, risk_diff_by_ticker,
-        hyper_walker,
+        hyper_walker, market_reaction_by_ticker,
     )
     if industry_summary:
         # 합성 결과엔 [TICKER] 인용·표·# 헤더가 있어 텔레그램 Markdown 파싱이 깨짐 → 평문 발송
@@ -1220,7 +1232,7 @@ async def _run_pipeline(
         transcripts, financials, fiscal_label, verify_by_ticker,
         consensus_by_ticker, consensus_delta_by_ticker, diff_by_ticker,
         ecosystem_by_ticker, insider_by_ticker, events_8k_by_ticker, risk_diff_by_ticker,
-        hyper_walker,
+        hyper_walker, market_reaction_by_ticker,
     )
     # 3개 시각 각각 발송 (확장 정보 — 사용자가 원하면 borrow)
     if perspectives.get("bull"):
@@ -1243,7 +1255,7 @@ async def _run_pipeline(
         transcripts, financials, fiscal_label, verify_by_ticker,
         consensus_by_ticker, consensus_delta_by_ticker, diff_by_ticker,
         ecosystem_by_ticker, insider_by_ticker, events_8k_by_ticker, risk_diff_by_ticker,
-        hyper_walker,
+        hyper_walker, market_reaction_by_ticker,
     )
     if counter_summary:
         await send_text_chunked(bot, chat_id, counter_summary)
@@ -1323,12 +1335,13 @@ async def _run_pipeline(
             consensus_by_ticker, consensus_delta_by_ticker, diff_by_ticker,
             ecosystem_by_ticker, insider_by_ticker, events_8k_by_ticker, risk_diff_by_ticker,
             hyper_walker=hyper_walker,
+            market_reaction_by_ticker=market_reaction_by_ticker,
         ) or ""
         if custom_answer:
             await send_text_chunked(bot, chat_id, "🎯 커스텀 분석\n\n" + custom_answer)
 
     # 8) PDF 빌드 + 발송
-    await _safe_send(bot, chat_id, "📄 PDF 보고서 생성 중 …")
+    await _safe_send(bot, chat_id, "📄 PDF 보고서 생성 중 (PM Decision Document — p.1 verdict + p.2 시장 반응)…")
     pdf_path = await _step_build_pdf(
         tickers=list(transcripts.keys()),
         fiscal_period=fiscal_label,
@@ -1338,6 +1351,11 @@ async def _run_pipeline(
         custom_question=custom_question,
         custom_answer=custom_answer,
         verify_by_ticker=verify_by_ticker,
+        consensus_by_ticker=consensus_by_ticker,
+        consensus_delta_by_ticker=consensus_delta_by_ticker,
+        market_reaction_by_ticker=market_reaction_by_ticker,
+        counter_summary=counter_summary,
+        meta_text=meta_text,
     )
     if pdf_path and pdf_path.exists():
         await send_pdf(
@@ -1783,6 +1801,41 @@ async def _step_fetch_consensus(tickers: list[str], fiscal_label: str | None = N
     return out
 
 
+async def _step_fetch_market_reaction(
+    tickers: list[str],
+    transcripts: dict[str, dict] | None = None,
+    consensus_by_ticker: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """콜 발표 전후 시장 반응 병렬 fetch (Phase 8 Track M).
+
+    call_date는 transcripts[t]["call_date"]에서 우선 추출, 없으면 None (모듈이 추정).
+    {ticker: MarketReaction | None}. 실패는 graceful.
+    """
+    from src.earnings import market_reaction as mr
+    transcripts = transcripts or {}
+    consensus_by_ticker = consensus_by_ticker or {}
+    loop = asyncio.get_running_loop()
+
+    def _one(t: str):
+        tr = transcripts.get(t) or {}
+        cd = tr.get("call_date") or None
+        snap = consensus_by_ticker.get(t)
+        return mr.fetch_market_reaction(t, call_date=cd, consensus_snap=snap)
+
+    results = await asyncio.gather(
+        *[loop.run_in_executor(None, _one, t) for t in tickers],
+        return_exceptions=True,
+    )
+    out: dict[str, Any] = {}
+    for t, snap in zip(tickers, results):
+        if isinstance(snap, Exception):
+            log.warning("market reaction fetch 실패 (%s): %s", t, snap)
+            out[t] = None
+            continue
+        out[t] = snap
+    return out
+
+
 async def _step_synthesize_industry(
     transcripts: dict[str, dict],
     financials: dict[str, Any],
@@ -1796,6 +1849,7 @@ async def _step_synthesize_industry(
     events_8k_by_ticker: dict[str, Any] | None = None,
     risk_diff_by_ticker: dict[str, Any] | None = None,
     hyper_walker: dict | None = None,
+    market_reaction_by_ticker: dict[str, Any] | None = None,
 ) -> tuple[str | None, dict]:
     """비교 합성 (Opus, 딥리서치급) + Phase 7B 환각 게이트.
 
@@ -1809,7 +1863,7 @@ async def _step_synthesize_industry(
         transcripts, financials, fiscal_period, verify_by_ticker,
         consensus_by_ticker, consensus_delta_by_ticker, diff_by_ticker,
         ecosystem_by_ticker, insider_by_ticker, events_8k_by_ticker, risk_diff_by_ticker,
-        hyper_walker,
+        hyper_walker, market_reaction_by_ticker,
     )
     loop = asyncio.get_running_loop()
 
@@ -1824,30 +1878,48 @@ async def _step_synthesize_industry(
             model=_synthesis_model(),
             messages=messages,
             temperature=0.3,
-            max_tokens=12000,
+            max_tokens=16000,
             context="earnings-synthesis",
         )
 
     allowed_tickers = list(transcripts.keys())
     content: str | None = None
     gate_result = qg.GateResult(layer="synthesis")
+    undisclosed_result = qg.GateResult(layer="undisclosed_lint")
     length_ok = False
+    truncated = False
+    trunc_reason = ""
     attempts_done = 0
     final_chars = 0
 
-    for attempt in range(1, 3):  # max 2 attempts
+    MAX_ATTEMPTS = 3
+    for attempt in range(1, MAX_ATTEMPTS + 1):
         attempts_done = attempt
         extra = ""
-        if attempt == 2 and (gate_result.violations or not length_ok):
-            # 2회차: 위반 명시해서 재요청
-            vio_summary = "\n".join(
-                f"- {v.field}: {v.reason}" for v in gate_result.violations[:8]
-            ) or "(인용 위반 없음)"
-            extra = (
-                "다음 검증 실패가 발견됐다. 출력은 (a) 위 payload에 실제 존재하는 데이터만 인용, "
-                "(b) [TICKER]는 분석 종목 리스트에만 한정, (c) 길이는 반드시 10000자 이상.\n"
-                "\n위반 목록:\n" + vio_summary
-            )
+        if attempt > 1 and (
+            gate_result.violations or not length_ok or truncated or not undisclosed_result.passed
+        ):
+            problems: list[str] = []
+            if gate_result.violations:
+                problems.append("(a) 위 payload에 실제 존재하는 데이터만 인용 (인용 위반 발견)")
+                vio_summary = "\n".join(
+                    f"- {v.field}: {v.reason}" for v in gate_result.violations[:8]
+                )
+                problems.append("인용 위반 목록:\n" + vio_summary)
+            if not length_ok:
+                problems.append("(b) 길이는 반드시 10000자 이상 — 모든 섹션 최소 분배 준수")
+            if truncated:
+                problems.append(
+                    f"(c) 직전 출력이 잘림 ({trunc_reason}) — §0부터 끝까지 완전 재작성. "
+                    "마지막 §10 결론까지 자연스러운 종결(. / 다. / 요.)로 마무리할 것"
+                )
+            if not undisclosed_result.passed:
+                problems.append(
+                    "(d) '수치 미공개'·'정량 미공개'·'(미공개)' 문구 사용 금지. "
+                    "표 셀에 실제 숫자가 없으면 '—'만 쓰고, 모든 셀 [출처] bracket 의무. "
+                    "SEC payload·call verbatim에서 정량 가져와 채워라."
+                )
+            extra = "다음 검증 실패가 발견됐다. 재작성 규칙:\n\n" + "\n\n".join(problems)
         try:
             content = await loop.run_in_executor(None, _call, extra)
         except Exception:
@@ -1861,20 +1933,30 @@ async def _step_synthesize_industry(
             content, user_payload, allowed_tickers=allowed_tickers, threshold=0.25,
         )
         length_ok, final_chars = qg.enforce_min_length(content, min_chars=8000)
-        if gate_result.passed and length_ok:
+        truncated, trunc_reason = qg.looks_truncated(content, expected_sections=8)
+        undisclosed_result = qg.verify_no_undisclosed(content)
+        if gate_result.passed and length_ok and not truncated and undisclosed_result.passed:
             break
 
     gate_meta = {
         "attempts": attempts_done,
         "synthesis_chars": final_chars,
         "length_ok": length_ok,
+        "truncated": truncated,
+        "truncation_reason": trunc_reason,
         "citation_total": gate_result.total_checked,
         "citation_violations": len(gate_result.violations),
         "citation_ratio": gate_result.violation_ratio,
         "citation_passed": gate_result.passed,
+        "undisclosed_violations": len(undisclosed_result.violations),
+        "undisclosed_passed": undisclosed_result.passed,
         "violations": [
             {"field": v.field, "reason": v.reason, "fragment": v.fragment[:80]}
             for v in gate_result.violations[:10]
+        ],
+        "undisclosed_samples": [
+            {"fragment": v.fragment[:120]}
+            for v in undisclosed_result.violations[:5]
         ],
     }
     return (content or None), gate_meta
@@ -2174,6 +2256,7 @@ async def _step_multi_perspective(
     events_8k_by_ticker: dict[str, Any] | None = None,
     risk_diff_by_ticker: dict[str, Any] | None = None,
     hyper_walker: dict | None = None,
+    market_reaction_by_ticker: dict[str, Any] | None = None,
 ) -> dict[str, str]:
     """Phase 7D — 동일 cached payload + 3개 system prompt (bull/bear/neutral) 병렬 sonnet 합성.
 
@@ -2184,7 +2267,7 @@ async def _step_multi_perspective(
         transcripts, financials, fiscal_period, verify_by_ticker,
         consensus_by_ticker, consensus_delta_by_ticker, diff_by_ticker,
         ecosystem_by_ticker, insider_by_ticker, events_8k_by_ticker, risk_diff_by_ticker,
-        hyper_walker,
+        hyper_walker, market_reaction_by_ticker,
     )
     perspectives = {
         "bull": _load_prompt("earnings_bull"),
@@ -2274,6 +2357,7 @@ async def _step_synthesize_counter(
     events_8k_by_ticker: dict[str, Any] | None = None,
     risk_diff_by_ticker: dict[str, Any] | None = None,
     hyper_walker: dict | None = None,
+    market_reaction_by_ticker: dict[str, Any] | None = None,
 ) -> str | None:
     """Counter-thesis 합성 (Opus) — 동일 cached payload + 다른 시스템 프롬프트.
 
@@ -2289,7 +2373,7 @@ async def _step_synthesize_counter(
         transcripts, financials, fiscal_period, verify_by_ticker,
         consensus_by_ticker, consensus_delta_by_ticker, diff_by_ticker,
         ecosystem_by_ticker, insider_by_ticker, events_8k_by_ticker, risk_diff_by_ticker,
-        hyper_walker,
+        hyper_walker, market_reaction_by_ticker,
     )
     loop = asyncio.get_running_loop()
 
@@ -2329,6 +2413,7 @@ async def _step_synthesize_custom(
     events_8k_by_ticker: dict[str, Any] | None = None,
     risk_diff_by_ticker: dict[str, Any] | None = None,
     hyper_walker: dict | None = None,
+    market_reaction_by_ticker: dict[str, Any] | None = None,
 ) -> str | None:
     """커스텀 분석 답변 합성 (Opus). 컨센서스가 있으면 PM-grade로 활용."""
     from src import summarizer
@@ -2339,6 +2424,7 @@ async def _step_synthesize_custom(
             transcripts, financials, fiscal_period, verify_by_ticker,
             consensus_by_ticker, consensus_delta_by_ticker, diff_by_ticker,
             ecosystem_by_ticker, insider_by_ticker, events_8k_by_ticker, risk_diff_by_ticker,
+            hyper_walker, market_reaction_by_ticker,
         )
     )
     loop = asyncio.get_running_loop()
@@ -2375,10 +2461,14 @@ async def _step_build_pdf(
     custom_question: str,
     custom_answer: str,
     verify_by_ticker: dict[str, list],
+    consensus_by_ticker: dict[str, Any] | None = None,
+    consensus_delta_by_ticker: dict[str, list] | None = None,
+    market_reaction_by_ticker: dict[str, Any] | None = None,
+    counter_summary: str = "",
+    meta_text: str = "",
 ) -> Path | None:
     """PDF 빌드 (blocking → run_in_executor)."""
     from src.earnings import pdf_report
-    from src.earnings import verify as verify_mod
     loop = asyncio.get_running_loop()
 
     out_dir = download_root_for("earnings")
@@ -2405,6 +2495,11 @@ async def _step_build_pdf(
             custom_question=custom_question,
             custom_answer_kr=custom_answer,
             verify_lines=verify_lines,
+            consensus_by_ticker=consensus_by_ticker or {},
+            consensus_delta_by_ticker=consensus_delta_by_ticker or {},
+            market_reaction_by_ticker=market_reaction_by_ticker or {},
+            counter_summary=counter_summary,
+            meta_text=meta_text,
         )
 
     try:
@@ -2430,12 +2525,14 @@ def _build_synthesis_payload(
     events_8k_by_ticker: dict[str, Any] | None = None,
     risk_diff_by_ticker: dict[str, Any] | None = None,
     hyper_walker: dict | None = None,
+    market_reaction_by_ticker: dict[str, Any] | None = None,
 ) -> str:
-    """LLM에 넘길 유저 메시지. 종목별 심층추출 + 재무 6년치 + 검증 + 컨센서스 + diff + 생태계 + 인사이더 + 8-K + 10-K risk diff + hyperscaler capex 모자이크."""
+    """LLM에 넘길 유저 메시지. 종목별 심층추출 + 재무 6년치 + 검증 + 컨센서스 + diff + 생태계 + 인사이더 + 8-K + 10-K risk diff + hyperscaler capex 모자이크 + 시장 반응(Phase 8 Track M)."""
     from src.earnings.sec_edgar import fmt_usd, events_8k_payload_block
     from src.earnings.consensus import consensus_payload_block
     from src.earnings.ecosystem import ecosystem_payload_block
     from src.earnings.sec_edgar import fmt_insider_summary
+    from src.earnings.market_reaction import market_reaction_payload_block
     from src.earnings import history as _history
     verify_by_ticker = verify_by_ticker or {}
     consensus_by_ticker = consensus_by_ticker or {}
@@ -2445,6 +2542,7 @@ def _build_synthesis_payload(
     insider_by_ticker = insider_by_ticker or {}
     events_8k_by_ticker = events_8k_by_ticker or {}
     risk_diff_by_ticker = risk_diff_by_ticker or {}
+    market_reaction_by_ticker = market_reaction_by_ticker or {}
     parts: list[str] = []
     parts.append(f"# 분기: {fiscal_period}")
     parts.append(f"# 분석 기업: {', '.join(transcripts.keys())}")
@@ -2577,6 +2675,12 @@ def _build_synthesis_payload(
         if rd:
             parts.append(f"### {t} 10-K Risk Factor 1-year diff")
             parts.append(json.dumps(rd, ensure_ascii=False))
+        # 시장 반응 (Phase 8 Track M) — 주가·alpha·옵션·target revision
+        mr_snap = market_reaction_by_ticker.get(t)
+        if mr_snap is not None:
+            mr_block = market_reaction_payload_block(mr_snap)
+            if mr_block:
+                parts.append(mr_block)
         parts.append("")
 
     # Hyperscaler capex 모자이크 (Track L) — 분석 종목별 블록 끝난 뒤 1회만
