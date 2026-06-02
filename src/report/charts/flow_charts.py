@@ -431,3 +431,77 @@ def earnings_calendar_grid(upcoming: list[dict], out_dir: Path,
     theme.stamp(ax, date_iso)
     fig.tight_layout()
     return theme.save_fig(fig, out_dir, filename)
+
+
+def risk_gauge_visual(gauge: dict, prev_gauge_score: float | None,
+                      out_dir: Path, filename: str = "00_risk_gauge.png",
+                      date_iso: str | None = None) -> str | None:
+    """위험선호 반원 게이지 — 0~100 + 어제 대비 delta + 라벨.
+
+    gauge: {score, label, signals?}
+    prev_gauge_score: 어제 점수 (없으면 baseline 표시).
+    """
+    if not gauge or gauge.get("score") is None:
+        return None
+    theme.setup()
+    import matplotlib.pyplot as plt
+    import numpy as np
+    from matplotlib.patches import Wedge, FancyBboxPatch
+
+    score = float(gauge.get("score") or 50)
+    label = gauge.get("label") or ""
+    score = max(0.0, min(100.0, score))
+
+    fig, ax = plt.subplots(figsize=(12, 5.5))
+    ax.set_xlim(-1.3, 1.3); ax.set_ylim(-0.4, 1.25); ax.axis("off")
+
+    # 배경 5단 구간 (Risk-Off → Risk-On)
+    bands = [
+        (0, 30, "#c62828", "Risk-Off"),
+        (30, 45, "#ef6c00", "약 Risk-Off"),
+        (45, 55, "#9e9e9e", "중립"),
+        (55, 75, "#43a047", "약 Risk-On"),
+        (75, 100, "#1b5e20", "Risk-On"),
+    ]
+    for lo, hi, col, _ in bands:
+        # 0=180°(좌), 100=0°(우)
+        ang_lo = 180 - (lo / 100.0) * 180
+        ang_hi = 180 - (hi / 100.0) * 180
+        ax.add_patch(Wedge((0, 0), 1.0, ang_hi, ang_lo, width=0.28,
+                           facecolor=col, edgecolor="white", linewidth=1.5))
+
+    # 눈금 0/25/50/75/100
+    for tick in (0, 25, 50, 75, 100):
+        ang = np.radians(180 - (tick / 100.0) * 180)
+        rx, ry = np.cos(ang), np.sin(ang)
+        ax.plot([rx * 0.72, rx * 0.68], [ry * 0.72, ry * 0.68], color="#222", linewidth=1.2)
+        ax.text(rx * 0.62, ry * 0.62, str(tick), ha="center", va="center",
+                fontsize=9, color="#444")
+
+    # 바늘
+    ang = np.radians(180 - (score / 100.0) * 180)
+    nx, ny = np.cos(ang) * 0.92, np.sin(ang) * 0.92
+    ax.plot([0, nx], [0, ny], color="#111", linewidth=3, solid_capstyle="round")
+    ax.add_patch(plt.Circle((0, 0), 0.05, facecolor="#111", edgecolor="white", linewidth=1.5))
+
+    # 점수 텍스트 (중앙 아래)
+    ax.text(0, -0.18, f"{int(score)}/100", ha="center", va="center",
+            fontsize=26, fontweight="bold", color="#111")
+    ax.text(0, -0.32, label, ha="center", va="center", fontsize=14, color="#333")
+
+    # 어제 대비 delta
+    if isinstance(prev_gauge_score, (int, float)):
+        diff = score - float(prev_gauge_score)
+        arrow = "▲" if diff > 0 else ("▼" if diff < 0 else "·")
+        col = "#2e7d32" if diff > 0 else ("#c62828" if diff < 0 else "#666")
+        ax.text(0, 1.10, f"전일 {int(prev_gauge_score)}/100  {arrow}{abs(diff):.0f}점",
+                ha="center", va="center", fontsize=11, color=col, fontweight="bold")
+    else:
+        ax.text(0, 1.10, "전일 기준선 (snapshot 없음)",
+                ha="center", va="center", fontsize=10, color="#666")
+
+    ax.set_title("[위험선호 게이지] 0=Risk-Off · 50=중립 · 100=Risk-On",
+                 fontsize=13, fontweight="bold")
+    theme.stamp(ax, date_iso)
+    fig.tight_layout()
+    return theme.save_fig(fig, out_dir, filename)
