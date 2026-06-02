@@ -505,3 +505,106 @@ def risk_gauge_visual(gauge: dict, prev_gauge_score: float | None,
     theme.stamp(ax, date_iso)
     fig.tight_layout()
     return theme.save_fig(fig, out_dir, filename)
+
+
+def followup_tracking_table(prev_highlights: list[dict], out_dir: Path,
+                            filename: str = "01_followup_table.png",
+                            date_iso: str | None = None) -> str | None:
+    """어제 watchlist 종목별 어제 5D → 오늘 5D 추적 표.
+
+    prev_highlights: snapshot.highlights_meta (어제 종목 list).
+    각 ticker 오늘 5D 재 fetch (cache 활용) → 표.
+    """
+    if not prev_highlights:
+        return None
+    theme.setup()
+    import matplotlib.pyplot as plt
+
+    # ticker별 오늘 5D fetch
+    from src.report.data import screener_adapter
+    from src.report.data.fetch_prices import fetch_ohlcv
+
+    def _today_5d(tkr: str, market: str) -> float | None:
+        try:
+            df = screener_adapter.load_ohlcv_df(tkr, market, days=15)
+            if df is None or len(df) < 6:
+                try:
+                    df = fetch_ohlcv(tkr, days=15)
+                except Exception:
+                    df = None
+            if df is None or len(df) < 6:
+                return None
+            close = df["Close"]
+            last = float(close.iloc[-1]); ref = float(close.iloc[-6])
+            return (last / ref - 1) * 100 if ref else None
+        except Exception:
+            return None
+
+    rows = []
+    for it in prev_highlights[:14]:  # 최대 14종목
+        tkr = it.get("ticker")
+        if not tkr:
+            continue
+        mkt = it.get("market") or "US"
+        prev_5d = it.get("chg_5d")
+        today_5d = _today_5d(tkr, mkt)
+        if today_5d is None:
+            today_5d_str = "N/A"
+            delta = None
+            cls = "—"
+        else:
+            today_5d_str = f"{today_5d:+.1f}%"
+            if prev_5d is not None:
+                delta = today_5d - float(prev_5d)
+                if delta >= 1:
+                    cls = "강화"
+                elif delta <= -1:
+                    cls = "약화"
+                else:
+                    cls = "유지"
+            else:
+                delta = None
+                cls = "신규"
+        rows.append({
+            "label": (it.get("label") or tkr).split("(")[0].strip(),
+            "ticker": tkr,
+            "market": mkt,
+            "sector": (it.get("sector") or "")[:14],
+            "prev_5d": f"{float(prev_5d):+.1f}%" if isinstance(prev_5d, (int, float)) else "—",
+            "today_5d": today_5d_str,
+            "delta": f"{delta:+.1f}" if delta is not None else "—",
+            "cls": cls,
+        })
+    if not rows:
+        return None
+
+    fig, ax = plt.subplots(figsize=(13, max(2.5, 0.45 * len(rows) + 1.5)))
+    ax.axis("off")
+    headers = ["종목", "티커", "시장", "섹터", "어제 5D", "오늘 5D", "Δ", "분류"]
+    cell_text = [[r["label"], r["ticker"], r["market"], r["sector"],
+                  r["prev_5d"], r["today_5d"], r["delta"], r["cls"]] for r in rows]
+    table = ax.table(cellText=cell_text, colLabels=headers, loc="center",
+                     cellLoc="center", colLoc="center")
+    table.auto_set_font_size(False)
+    table.set_fontsize(9)
+    table.scale(1, 1.5)
+    # 분류 색상
+    cls_col = {"강화": "#c8e6c9", "약화": "#ffcdd2", "유지": "#f5f5f5",
+               "신규": "#e3f2fd", "—": "#fafafa"}
+    for i, r in enumerate(rows, start=1):
+        for j in range(len(headers)):
+            cell = table[(i, j)]
+            if j == 7:  # 분류 셀
+                cell.set_facecolor(cls_col.get(r["cls"], "#fafafa"))
+            elif j == 6 and r["cls"] in ("강화", "약화"):
+                cell.set_facecolor("#e8f5e9" if r["cls"] == "강화" else "#ffebee")
+    # 헤더 진한 색
+    for j in range(len(headers)):
+        cell = table[(0, j)]
+        cell.set_facecolor("#37474f")
+        cell.set_text_props(color="white", fontweight="bold")
+    ax.set_title("[어제 watchlist 추적] 어제 5D → 오늘 5D · 신호 강화·약화·유지",
+                 fontsize=13, fontweight="bold")
+    theme.stamp(ax, date_iso)
+    fig.tight_layout()
+    return theme.save_fig(fig, out_dir, filename)

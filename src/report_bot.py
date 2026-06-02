@@ -358,6 +358,16 @@ def _build_report():
     except Exception:
         log.exception("[report] 글로벌 위험선호 매트릭스 실패 — 생략")
 
+    # ---------- Follow-up 추적 표 (어제 watchlist 종목 어제 5D vs 오늘 5D) ----------
+    if prev_snapshot_early.get("highlights_meta"):
+        try:
+            add(flow_charts.followup_tracking_table(
+                    prev_snapshot_early["highlights_meta"], img_dir, date_iso=date_iso),
+                "어제 watchlist 추적", "어제 5D vs 오늘 5D · 강화·약화·유지 분류",
+                "Follow-up", key=True)
+        except Exception:
+            log.exception("[report] Follow-up 추적 표 실패 — 생략")
+
     # ---------- §1 매크로 ----------
     add(index_charts.us_indices_grid(us_idx, img_dir, date_iso=date_iso),
         "미국 4대 지수", "4대 지수 등락", "1. 매크로 컨텍스트")
