@@ -337,3 +337,97 @@ def us_korea_linkage(theme_rows: list[dict], out_dir: Path, filename: str = "33_
     theme.stamp(ax, date_iso)
     fig.tight_layout()
     return theme.save_fig(fig, out_dir, filename)
+
+
+def earnings_calendar_grid(upcoming: list[dict], out_dir: Path,
+                           filename: str = "35_earnings_calendar.png",
+                           date_iso: str | None = None) -> str | None:
+    """다가올 어닝 발표 캘린더 — 시총 가로bar + 발표일/EPS est/revision 색상.
+
+    upcoming: [{symbol, date, eps_est, revenue_est, market_cap?, revision?, source}]
+    bar 색상: revision.buy_delta ≥+2 = 녹색 / ≤-2 = 빨강 / 무변화·없음 = 회색.
+    """
+    if not upcoming:
+        return None
+    theme.setup()
+    import matplotlib.pyplot as plt
+    import numpy as np
+    from datetime import date as _date
+
+    # 시총 큰 순, 최대 12개
+    items = [u for u in upcoming if u.get("symbol")]
+    items.sort(key=lambda u: -(u.get("market_cap") or 0))
+    items = items[:12]
+    if not items:
+        return None
+
+    today = None
+    if date_iso:
+        try:
+            today = _date.fromisoformat(date_iso)
+        except Exception:
+            today = None
+    today = today or _date.today()
+
+    def _color(rev: dict | None) -> str:
+        if not rev:
+            return "#9e9e9e"
+        bd = rev.get("buy_delta") or 0
+        if bd >= 2:
+            return "#2e7d32"
+        if bd <= -2:
+            return "#c62828"
+        return "#9e9e9e"
+
+    def _cap_b(v) -> float:
+        try:
+            return float(v) / 1e9
+        except Exception:
+            return 0.0
+
+    caps = [_cap_b(u.get("market_cap") or u.get("revenue_est") or 0) for u in items]
+    syms = [u.get("symbol") or "" for u in items]
+    colors = [_color(u.get("revision")) for u in items]
+
+    fig, ax = plt.subplots(figsize=(13, max(4.5, 0.55 * len(items) + 1.8)))
+    y = np.arange(len(items))
+    ax.barh(y, caps, color=colors, edgecolor="#333", linewidth=0.4, alpha=0.85)
+    ax.invert_yaxis()
+    ax.set_xlabel("시총 ($B)  ·  바 색상: 분석가 buy 변화 (녹=+2이상 · 적=-2이하 · 회=무변화)",
+                  fontsize=9)
+    ax.set_yticks(y)
+    ax.set_yticklabels(syms, fontsize=10, fontweight="bold")
+    ax.grid(axis="x", linestyle=":", alpha=0.4)
+
+    # 우측 annotation — 발표일 + EPS est + revenue est + revision 요약
+    mx = max(caps) if caps else 1.0
+    for i, u in enumerate(items):
+        date_s = u.get("date") or ""
+        d_n = ""
+        try:
+            d = _date.fromisoformat(date_s)
+            delta = (d - today).days
+            d_n = f"D{delta:+d}"
+        except Exception:
+            pass
+        eps = u.get("eps_est")
+        rev = u.get("revenue_est") or 0
+        rev_b = rev / 1e9 if rev else 0
+        eps_s = f"EPS est ${eps:.2f}" if eps is not None else ""
+        rev_s = f"Rev est ${rev_b:.1f}B" if rev_b else ""
+        rv = u.get("revision") or {}
+        rv_s = ""
+        if rv:
+            buy_new = rv.get("buy_count_new")
+            buy_old = rv.get("buy_count_old")
+            if buy_new is not None and buy_old is not None:
+                rv_s = f"buy {buy_old}→{buy_new}"
+        annot_parts = [p for p in (date_s + (f" ({d_n})" if d_n else ""), eps_s, rev_s, rv_s) if p]
+        ax.text(caps[i] + mx * 0.02, i, " · ".join(annot_parts),
+                ha="left", va="center", fontsize=8, color="#222")
+
+    ax.set_title("[다가올 어닝] 발표 예정 (시총 큰 순) — 분석가 buy 변화 색상",
+                 fontsize=13, fontweight="bold")
+    theme.stamp(ax, date_iso)
+    fig.tight_layout()
+    return theme.save_fig(fig, out_dir, filename)

@@ -124,6 +124,9 @@ stale_data.
      (revision 없으면 생략 OK. 시총 없으면 "(시총 미확보)").
      thesis 관계: "AI 반도체 thesis 검증" / "소매 반등 thesis 검증" / "thesis 무관" 등 분류.
    - earnings 비면 "데이터 미수집"만(조작 금지). 1-2개로 압축 금지 — 시총 큰 종목 5-10개 풍부히.
+   - 어닝 캘린더 차트(35_earnings_calendar)가 있으면 본문 정확히 1회
+     `![](images/35_earnings_calendar.png)` 삽입. 차트 fact 인용: "녹색 바 = 분석가 buy 증가 → forward
+     visibility 개선 / 적색 = 컨센서스 하향 → 발표 리스크".
 6. **개별 종목 watchlist** — highlights = {us:[…], kr:[…]} 카테고리별 종목 enriched dict 기반.
    각 종목 → 미니 스토리. 단순 "OO +5%" 나열 금지. 다음 카테고리별 mini-section으로 구조화:
 

@@ -437,6 +437,14 @@ def _build_report():
     n_kr = len(watchlist_result.get("kr") or [])
     log.info("[report.watchlist] US=%d KR=%d", n_us, n_kr)
 
+    # ---------- §5 어닝 캘린더 (upcoming 시각화) ----------
+    if earnings and isinstance(earnings.get("upcoming"), list) and earnings["upcoming"]:
+        add(flow_charts.earnings_calendar_grid(
+                earnings["upcoming"], img_dir, date_iso=date_iso),
+            "다가올 어닝 캘린더",
+            "시총 큰 순 가로bar · 색상=분석가 buy 변화 (녹·적·회)",
+            "5. 어닝 모멘텀", key=True)
+
     # 차트는 highlights_df (기존) + watchlist enriched 메타 합쳐 카테고리 배지로 표시.
     # watchlist 있으면 US/KR 분리 2장, 없으면 단일 폴백 차트.
     _hl_result = stock_highlights.highlight_grid(
