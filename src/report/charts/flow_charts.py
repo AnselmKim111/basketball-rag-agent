@@ -41,12 +41,14 @@ def usdkrw_ewy_dual(usdkrw_df, ewy_df, out_dir: Path, filename: str = "09_usdkrw
 
 def capital_flow_diagram(sources: list[tuple], destinations: list[tuple], out_dir: Path,
                          filename: str = "40_capital_flow.png",
-                         date_iso: str | None = None) -> str | None:
-    """박스+화살표 자금흐름도.
+                         date_iso: str | None = None,
+                         gauge_score: int | None = None,
+                         gauge_label: str | None = None) -> str | None:
+    """Sankey식 자금흐름도 (TV 팔레트). 흐름 굵기 = 강도.
 
-    sources: [(label, strength)] 자금 이탈처 (강할수록 굵은 화살표)
-    destinations: [(label, strength)] 자금 유입처
-    중앙 허브를 거쳐 source→dest 흐름을 시각화.
+    sources: [(label, strength)] 자금 이탈처 (적색)
+    destinations: [(label, strength)] 자금 유입처 (녹색)
+    gauge_score/label: Risk-On/Off 점수를 허브에 표시.
     """
     theme.setup()
     import matplotlib.pyplot as plt
@@ -57,45 +59,119 @@ def capital_flow_diagram(sources: list[tuple], destinations: list[tuple], out_di
     def _norm(items):
         vals = [abs(s) for _, s in items] or [1]
         m = max(vals) or 1
-        return [(lbl, abs(s) / m) for lbl, s in items]
+        return [(lbl, abs(s) / m, s) for lbl, s in items]
 
     src = _norm(sources)
     dst = _norm(destinations)
 
-    fig, ax = plt.subplots(figsize=(13, max(6, 0.7 * max(len(src), len(dst)) + 2)))
+    n = max(len(src), len(dst))
+    fig, ax = plt.subplots(figsize=(14, max(7, 0.95 * n + 2)))
     ax.set_xlim(0, 10); ax.set_ylim(0, 10); ax.axis("off")
 
+    # TV 팔레트
+    C_OUT = "#f7525f"  # 적: 자금 이탈
+    C_IN = "#22ab94"   # 녹: 자금 유입
+
     hub = (5.0, 5.0)
-    # 허브
-    ax.add_patch(FancyBboxPatch((4.2, 4.4), 1.6, 1.2, boxstyle="round,pad=0.1",
-                 facecolor="#444", edgecolor="none"))
-    ax.text(hub[0], hub[1], "자금\n재편", ha="center", va="center", color="white", fontsize=10, fontweight="bold")
+    # 중앙 허브 — Risk 게이지 통합
+    if gauge_score is not None:
+        hub_text = f"{gauge_label or ''}\n{gauge_score}/100"
+        hub_fs = 12
+    else:
+        hub_text = "자금\n재편"
+        hub_fs = 11
+    ax.add_patch(FancyBboxPatch((4.05, 4.1), 1.9, 1.8, boxstyle="round,pad=0.08",
+                 facecolor="#2a2e39", edgecolor="#888", linewidth=1.5))
+    ax.text(hub[0], hub[1], hub_text, ha="center", va="center", color="white",
+            fontsize=hub_fs, fontweight="bold")
 
     def _ys(n):
         if n == 1:
             return [5.0]
-        return list(__import__("numpy").linspace(8.6, 1.4, n))
+        return list(__import__("numpy").linspace(8.7, 1.3, n))
 
     sy = _ys(len(src))
-    for (lbl, w), y in zip(src, sy):
-        ax.add_patch(FancyBboxPatch((0.2, y - 0.45), 3.0, 0.9, boxstyle="round,pad=0.05",
-                     facecolor="#1f77b4", alpha=0.18, edgecolor="#1f77b4"))
-        ax.text(1.7, y, lbl, ha="center", va="center", fontsize=8)
-        ax.add_patch(FancyArrowPatch((3.3, y), (4.2, hub[1]), arrowstyle="-|>",
-                     mutation_scale=12, linewidth=0.8 + 4 * w, color="#1f77b4", alpha=0.55))
-    ax.text(1.7, 9.4, "자금 이탈", ha="center", fontsize=10, color="#1f77b4", fontweight="bold")
+    for (lbl, w, raw), y in zip(src, sy):
+        ax.add_patch(FancyBboxPatch((0.2, y - 0.40), 3.5, 0.8, boxstyle="round,pad=0.06",
+                     facecolor=C_OUT, alpha=0.22, edgecolor=C_OUT, linewidth=1.2))
+        ax.text(1.95, y, lbl, ha="center", va="center", fontsize=10.5,
+                fontweight="bold", color="#222")
+        # Sankey식 굵은 흐름 (강도 비례 굵기)
+        ax.add_patch(FancyArrowPatch((3.7, y), (4.05, hub[1]), arrowstyle="-|>",
+                     mutation_scale=16, linewidth=1.5 + 8 * w, color=C_OUT, alpha=0.78))
+    ax.text(1.95, 9.55, "자금 이탈", ha="center", fontsize=13,
+            color=C_OUT, fontweight="bold")
 
     dy = _ys(len(dst))
-    for (lbl, w), y in zip(dst, dy):
-        ax.add_patch(FancyBboxPatch((6.8, y - 0.45), 3.0, 0.9, boxstyle="round,pad=0.05",
-                     facecolor="#d62728", alpha=0.16, edgecolor="#d62728"))
-        ax.text(8.3, y, lbl, ha="center", va="center", fontsize=8)
-        ax.add_patch(FancyArrowPatch((5.8, hub[1]), (6.8, y), arrowstyle="-|>",
-                     mutation_scale=12, linewidth=0.8 + 4 * w, color="#d62728", alpha=0.6))
-    ax.text(8.3, 9.4, "자금 유입(확산)", ha="center", fontsize=10, color="#d62728", fontweight="bold")
+    for (lbl, w, raw), y in zip(dst, dy):
+        ax.add_patch(FancyBboxPatch((6.3, y - 0.40), 3.5, 0.8, boxstyle="round,pad=0.06",
+                     facecolor=C_IN, alpha=0.22, edgecolor=C_IN, linewidth=1.2))
+        ax.text(8.05, y, lbl, ha="center", va="center", fontsize=10.5,
+                fontweight="bold", color="#222")
+        ax.add_patch(FancyArrowPatch((5.95, hub[1]), (6.3, y), arrowstyle="-|>",
+                     mutation_scale=16, linewidth=1.5 + 8 * w, color=C_IN, alpha=0.82))
+    ax.text(8.05, 9.55, "자금 유입", ha="center", fontsize=13,
+            color=C_IN, fontweight="bold")
 
-    ax.set_title("종합 자금흐름 다이어그램 — 어디서 빠져 어디로 가는가", fontsize=13)
+    ax.set_title("종합 자금흐름 — 어디서 빠져 어디로 가는가  (굵기 = 5D 강도)", fontsize=14)
     theme.stamp(ax, date_iso)
+    fig.tight_layout()
+    return theme.save_fig(fig, out_dir, filename)
+
+
+def theme_flow_timeline_chart(theme_rows: list[dict], theme_dfs: dict, out_dir: Path,
+                              filename: str = "35_flow_timeline.png",
+                              days: int = 20, top_n: int = 6,
+                              date_iso: str | None = None) -> str | None:
+    """좌: 유입(5D 상위 N) 누적 라인 · 우: 이탈(5D 하위 N) 누적 라인.
+
+    "어디서 언제부터 빠져 어디로 갔는지" 시간축에서 추적.
+    """
+    from src.report.analysis.theme_momentum import theme_flow_timeline
+    theme.setup()
+    import matplotlib.pyplot as plt
+
+    rows = [r for r in theme_rows if r.get("r5d") is not None]
+    if len(rows) < top_n:
+        return None
+    rows_s = sorted(rows, key=lambda r: r["r5d"])
+    bottoms = rows_s[:top_n]
+    tops = list(reversed(rows_s[-top_n:]))
+
+    series = theme_flow_timeline(theme_dfs, days=days)
+    if not series:
+        return None
+
+    fig, (axL, axR) = plt.subplots(1, 2, figsize=(15, 6.4))
+    palette_up = ["#22ab94", "#0d9e74", "#3dc7ad", "#2e7d63", "#16b585", "#5fc7a3"]
+    palette_dn = ["#f7525f", "#c93747", "#e0524e", "#a82a35", "#d04550", "#b73c47"]
+
+    panels = [
+        (axL, tops, palette_up, f"자금 유입 (5D 상위 {top_n})"),
+        (axR, bottoms, palette_dn, f"자금 이탈 (5D 하위 {top_n})"),
+    ]
+    for ax, group, palette, title_txt in panels:
+        any_drawn = False
+        for i, r in enumerate(group):
+            s = series.get(r["label"])
+            if s is None or len(s) < 2:
+                continue
+            color = palette[i % len(palette)]
+            ax.plot(s.index, s.values, color=color, linewidth=2.0,
+                    label=f"{r['label']} (5D {r['r5d']:+.1f}%)")
+            ax.scatter([s.index[-1]], [float(s.iloc[-1])], color=color, s=42, zorder=5)
+            any_drawn = True
+        if not any_drawn:
+            continue
+        ax.axhline(0, color="#999", linewidth=0.7, linestyle=":")
+        ax.set_title(title_txt, fontsize=13)
+        ax.legend(fontsize=8.5, loc="upper left")
+        ax.tick_params(labelsize=8)
+        ax.set_ylabel("누적 수익률 (%)", fontsize=9)
+        ax.grid(True, alpha=0.22)
+        theme.stamp(ax, date_iso)
+
+    fig.suptitle(f"테마 자금 흐름 시계열 — 최근 {days}영업일 누적", fontsize=14)
     fig.tight_layout()
     return theme.save_fig(fig, out_dir, filename)
 
@@ -121,14 +197,76 @@ US_KR_LINKAGE = {
 }
 
 
+def _rate_tier(r5d: float) -> str:
+    """5D 등락 → ★ 등급. ≥15%=★★★ · ≥8%=★★ · ≥5%=★ · 그 외=빈문자."""
+    if r5d is None:
+        return ""
+    if r5d >= 15:
+        return "★★★"
+    if r5d >= 8:
+        return "★★"
+    if r5d >= 5:
+        return "★"
+    return ""
+
+
+_KR_5D_CACHE: dict[str, float] = {}
+_KR_5D_CACHE_TS: float = 0.0
+_KR_5D_TTL = 1800  # 30분
+
+
+def _fetch_kr_5d(tickers: list[str]) -> dict[str, float]:
+    """ticker → 5D 등락%. screener_adapter 우선 → fetch_prices.fetch_ohlcv 폴백."""
+    global _KR_5D_CACHE, _KR_5D_CACHE_TS
+    import time
+    now = time.time()
+    if (now - _KR_5D_CACHE_TS) >= _KR_5D_TTL:
+        _KR_5D_CACHE = {}
+        _KR_5D_CACHE_TS = now
+    out: dict[str, float] = {}
+    miss: list[str] = []
+    for t in tickers:
+        if t in _KR_5D_CACHE:
+            out[t] = _KR_5D_CACHE[t]
+        else:
+            miss.append(t)
+    if not miss:
+        return out
+    try:
+        from src.report.data import screener_adapter
+        from src.report.data.fetch_prices import fetch_ohlcv
+        for tk in miss:
+            df = screener_adapter.load_ohlcv_df(tk, "KR", days=15)
+            if df is None or len(df) < 6:
+                try:
+                    df = fetch_ohlcv(tk, days=15)
+                except Exception:
+                    df = None
+            if df is None or len(df) < 6:
+                continue
+            try:
+                close = df["Close"]
+                last = float(close.iloc[-1]); ref = float(close.iloc[-6])
+                if ref:
+                    chg = (last / ref - 1) * 100
+                    out[tk] = chg
+                    _KR_5D_CACHE[tk] = chg
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return out
+
+
 def us_korea_linkage(theme_rows: list[dict], out_dir: Path, filename: str = "33_us_kr_linkage.png",
                      top_n: int = 9, date_iso: str | None = None) -> str | None:
-    """미국 테마 강도(5D) → 한국 수혜주 연결 다이어그램. 강한 테마=굵은/진한 화살표."""
+    """미국 테마 강도(5D) → 한국 수혜주 연결 다이어그램.
+    좌: 미국 테마 + ★ 등급 / 우: 한국 수혜주 + 5D 등락 / 화살표: 강도 두께·색상.
+    """
     theme.setup()
     import matplotlib.pyplot as plt
     from matplotlib.patches import FancyArrowPatch, FancyBboxPatch
     from matplotlib import colors
-    import numpy as np
 
     def _match(label: str):
         for kw, names in US_KR_LINKAGE.items():
@@ -143,35 +281,153 @@ def us_korea_linkage(theme_rows: list[dict], out_dir: Path, filename: str = "33_
             mapped.append((r["label"], r["r5d"], names))
     if not mapped:
         return None
-    # 5D 모멘텀 절대값 큰 순 (강하게 움직이는 테마 우선)
     mapped = sorted(mapped, key=lambda m: -abs(m[1]))[:top_n]
-    mapped = sorted(mapped, key=lambda m: -m[1])  # 표시는 강세 위→약세 아래
+    mapped = sorted(mapped, key=lambda m: -m[1])
+
+    # 한국 종목 5D 등락 일괄 fetch (ticker 변환 후)
+    from src.report.data import kr_theme_linkage as kr_link
+    all_tickers: list[str] = []
+    for _, _, names in mapped:
+        for nm in names[:3]:
+            tkr = kr_link.KR_NAME_TO_TICKER.get(nm)
+            if tkr and tkr not in all_tickers:
+                all_tickers.append(tkr)
+    kr_5d = _fetch_kr_5d(all_tickers)
 
     norm = colors.Normalize(vmin=-6, vmax=6)
     cmap = colors.LinearSegmentedColormap.from_list("krrb", ["#1f77b4", "#cfd8dc", "#d62728"])
     mx = max(abs(m[1]) for m in mapped) or 1.0
 
-    fig, ax = plt.subplots(figsize=(13, max(5.5, 0.95 * len(mapped) + 1.5)))
+    fig, ax = plt.subplots(figsize=(14, max(5.5, 1.0 * len(mapped) + 1.5)))
     ax.set_xlim(0, 10); ax.set_ylim(0, len(mapped)); ax.axis("off")
     for i, (label, r5d, names) in enumerate(mapped):
         y = len(mapped) - i - 0.5
         col = cmap(norm(max(-6, min(6, r5d))))
-        # 미국 테마 박스 (좌)
-        ax.add_patch(FancyBboxPatch((0.2, y - 0.36), 3.4, 0.72, boxstyle="round,pad=0.05",
+        tier = _rate_tier(r5d)
+        # 미국 테마 박스 (좌) + 별 등급
+        ax.add_patch(FancyBboxPatch((0.2, y - 0.40), 3.4, 0.80, boxstyle="round,pad=0.05",
                      facecolor=col, edgecolor="#666", linewidth=0.6))
-        ax.text(1.9, y, f"{label}\n5D {r5d:+.1f}%", ha="center", va="center", fontsize=8,
-                color="white" if abs(r5d) > 3 else "#111")
+        head = f"{label}  {tier}".strip()
+        ax.text(1.9, y + 0.13, head, ha="center", va="center", fontsize=9,
+                fontweight="bold", color="white" if abs(r5d) > 3 else "#111")
+        ax.text(1.9, y - 0.16, f"5D {r5d:+.1f}%", ha="center", va="center", fontsize=8,
+                color="white" if abs(r5d) > 3 else "#222")
         # 화살표
         w = 0.8 + 4 * (abs(r5d) / mx)
-        ax.add_patch(FancyArrowPatch((3.7, y), (5.9, y), arrowstyle="-|>", mutation_scale=14,
+        ax.add_patch(FancyArrowPatch((3.7, y), (5.7, y), arrowstyle="-|>", mutation_scale=14,
                      linewidth=w, color=col, alpha=0.7))
-        # 한국 수혜주 박스 (우)
-        ax.add_patch(FancyBboxPatch((6.0, y - 0.36), 3.8, 0.72, boxstyle="round,pad=0.05",
+        # 한국 수혜주 박스 (우) — 종목명 + 5D 등락
+        ax.add_patch(FancyBboxPatch((5.8, y - 0.40), 4.0, 0.80, boxstyle="round,pad=0.05",
                      facecolor="#fafafa", edgecolor=col, linewidth=1.2))
-        ax.text(7.9, y, ", ".join(names[:3]), ha="center", va="center", fontsize=8, color="#111")
-    ax.text(1.9, len(mapped) + 0.05, "미국 테마 (5D 강도)", ha="center", fontsize=10, fontweight="bold")
-    ax.text(7.9, len(mapped) + 0.05, "한국 수혜주", ha="center", fontsize=10, fontweight="bold")
-    ax.set_title("미국 → 한국 자금흐름 연결 — 강한 테마가 끌고 갈 국내 수혜주", fontsize=13)
+        parts = []
+        for nm in names[:3]:
+            tkr = kr_link.KR_NAME_TO_TICKER.get(nm)
+            chg = kr_5d.get(tkr) if tkr else None
+            if chg is not None:
+                color_marker = "+" if chg >= 0 else ""
+                parts.append(f"{nm} {color_marker}{chg:.1f}%")
+            else:
+                parts.append(f"{nm} (N/A)")
+        ax.text(7.8, y, "\n".join(parts), ha="center", va="center", fontsize=8, color="#111")
+    ax.text(1.9, len(mapped) + 0.05, "미국 테마 (5D 강도 · ★ 등급)", ha="center",
+            fontsize=10, fontweight="bold")
+    ax.text(7.8, len(mapped) + 0.05, "한국 수혜주 (5D 등락)", ha="center",
+            fontsize=10, fontweight="bold")
+    ax.set_title("미국 → 한국 자금흐름 연결 — ★★★ ≥15%·★★ ≥8%·★ ≥5%", fontsize=13)
+    theme.stamp(ax, date_iso)
+    fig.tight_layout()
+    return theme.save_fig(fig, out_dir, filename)
+
+
+def earnings_calendar_grid(upcoming: list[dict], out_dir: Path,
+                           filename: str = "35_earnings_calendar.png",
+                           date_iso: str | None = None) -> str | None:
+    """다가올 어닝 발표 캘린더 — 시총 가로bar + 발표일/EPS est/revision 색상.
+
+    upcoming: [{symbol, date, eps_est, revenue_est, market_cap?, revision?, source}]
+    bar 색상: revision.buy_delta ≥+2 = 녹색 / ≤-2 = 빨강 / 무변화·없음 = 회색.
+    """
+    if not upcoming:
+        return None
+    theme.setup()
+    import matplotlib.pyplot as plt
+    import numpy as np
+    from datetime import date as _date
+
+    # 시총 큰 순, 최대 12개
+    items = [u for u in upcoming if u.get("symbol")]
+    items.sort(key=lambda u: -(u.get("market_cap") or 0))
+    items = items[:12]
+    if not items:
+        return None
+
+    today = None
+    if date_iso:
+        try:
+            today = _date.fromisoformat(date_iso)
+        except Exception:
+            today = None
+    today = today or _date.today()
+
+    def _color(rev: dict | None) -> str:
+        if not rev:
+            return "#9e9e9e"
+        bd = rev.get("buy_delta") or 0
+        if bd >= 2:
+            return "#2e7d32"
+        if bd <= -2:
+            return "#c62828"
+        return "#9e9e9e"
+
+    def _cap_b(v) -> float:
+        try:
+            return float(v) / 1e9
+        except Exception:
+            return 0.0
+
+    caps = [_cap_b(u.get("market_cap") or u.get("revenue_est") or 0) for u in items]
+    syms = [u.get("symbol") or "" for u in items]
+    colors = [_color(u.get("revision")) for u in items]
+
+    fig, ax = plt.subplots(figsize=(13, max(4.5, 0.55 * len(items) + 1.8)))
+    y = np.arange(len(items))
+    ax.barh(y, caps, color=colors, edgecolor="#333", linewidth=0.4, alpha=0.85)
+    ax.invert_yaxis()
+    ax.set_xlabel("시총 ($B)  ·  바 색상: 분석가 buy 변화 (녹=+2이상 · 적=-2이하 · 회=무변화)",
+                  fontsize=9)
+    ax.set_yticks(y)
+    ax.set_yticklabels(syms, fontsize=10, fontweight="bold")
+    ax.grid(axis="x", linestyle=":", alpha=0.4)
+
+    # 우측 annotation — 발표일 + EPS est + revenue est + revision 요약
+    mx = max(caps) if caps else 1.0
+    for i, u in enumerate(items):
+        date_s = u.get("date") or ""
+        d_n = ""
+        try:
+            d = _date.fromisoformat(date_s)
+            delta = (d - today).days
+            d_n = f"D{delta:+d}"
+        except Exception:
+            pass
+        eps = u.get("eps_est")
+        rev = u.get("revenue_est") or 0
+        rev_b = rev / 1e9 if rev else 0
+        eps_s = f"EPS est ${eps:.2f}" if eps is not None else ""
+        rev_s = f"Rev est ${rev_b:.1f}B" if rev_b else ""
+        rv = u.get("revision") or {}
+        rv_s = ""
+        if rv:
+            buy_new = rv.get("buy_count_new")
+            buy_old = rv.get("buy_count_old")
+            if buy_new is not None and buy_old is not None:
+                rv_s = f"buy {buy_old}→{buy_new}"
+        annot_parts = [p for p in (date_s + (f" ({d_n})" if d_n else ""), eps_s, rev_s, rv_s) if p]
+        ax.text(caps[i] + mx * 0.02, i, " · ".join(annot_parts),
+                ha="left", va="center", fontsize=8, color="#222")
+
+    ax.set_title("[다가올 어닝] 발표 예정 (시총 큰 순) — 분석가 buy 변화 색상",
+                 fontsize=13, fontweight="bold")
     theme.stamp(ax, date_iso)
     fig.tight_layout()
     return theme.save_fig(fig, out_dir, filename)

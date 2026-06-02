@@ -39,10 +39,11 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from telegram import Bot, Update
+from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -58,6 +59,11 @@ from src.bot_helpers import (
     safe_dirname,
     send_pdf,
     send_text_chunked,
+)
+from src.industry_catalog import (
+    Candidate as IndustryCandidate,
+    lookup_by_name as industry_lookup_by_name,
+    resolve_industry,
 )
 from src.pipeline_lock import PIPELINE_LOCK
 
@@ -153,6 +159,255 @@ async def _on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
     asyncio.create_task(_run_pipeline(update, context, text))
+
+
+# ------------------------------------------------------------------
+# /curate — 섹터 입력 → 종목군 큐레이션 (산업봇과 정규화 로직 공유)
+# ------------------------------------------------------------------
+_CURATE_PICK_PREFIX = "crtpick"
+_CURATE_PENDING_PICKS: dict[str, list[str]] = {}
+
+
+async def _cmd_curate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/curate <섹터>` — 섹터 입력 → 자동 thesis → 기존 7단계 파이프라인 진입.
+
+    출력은 `/idea`와 동일 (Top 5 thesis + 종목별 own 리포트 + 산업 리포트).
+    """
+    if not is_authorized(update, ALLOWED_ENV):
+        await deny_message(update, "아이디어봇")
+        return
+    args = " ".join(context.args or []).strip()
+    if not args or len(args) > 60:
+        await update.message.reply_text(
+            "사용법: `/curate <섹터>` (예: `/curate 소부장`, `/curate 2차전지 소재`)",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    bot: Bot = context.bot
+    chat_id = str(update.effective_chat.id)
+
+    # 1단계: 섹터 정규화
+    loop = asyncio.get_running_loop()
+    try:
+        result = await loop.run_in_executor(None, resolve_industry, args)
+    except Exception as e:
+        from src import summarizer as _sm
+        if isinstance(e, _sm.OpenRouterCreditExhausted):
+            await update.message.reply_text(
+                "❌ OpenRouter 한도 초과 — 섹터 해석 불가. 키 충전 후 재시도."
+            )
+            return
+        log.exception("curate resolve_industry 예외")
+        await update.message.reply_text("❌ 섹터 해석 중 오류 — 잠시 후 재시도")
+        return
+
+    if result.failed:
+        await update.message.reply_text(
+            f"❌ '{args}'을(를) 알아듣지 못했습니다.\n"
+            "예: `/curate 반도체 소재·부품·장비`, `/curate 2차전지 소재`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    if result.is_single and result.best is not None:
+        await _launch_curate_pipeline(update, context, args, result.best)
+        return
+
+    names = [c.name_ko for c in result.candidates[:3]]
+    if not names:
+        await update.message.reply_text(
+            f"❌ '{args}' 매핑 후보 없음 — 더 명확히 입력해 주세요."
+        )
+        return
+    _CURATE_PENDING_PICKS[chat_id] = names
+    buttons = [
+        [InlineKeyboardButton(f"{i+1}. {n}", callback_data=f"{_CURATE_PICK_PREFIX}|{i}")]
+        for i, n in enumerate(names)
+    ]
+    await update.message.reply_text(
+        f"🤔 '{args}' 해석이 애매합니다. 어느 섹터인가요?",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
+
+async def _curate_pick_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """`/curate` 후보 인라인 버튼 콜백."""
+    query = update.callback_query
+    if query is None:
+        return
+    await query.answer()
+    chat_id = str(query.message.chat.id) if query.message else None
+    if not chat_id:
+        return
+    if not is_authorized(update, ALLOWED_ENV):
+        await query.edit_message_text("권한 없음")
+        return
+    data = query.data or ""
+    parts = data.split("|", 1)
+    if len(parts) != 2 or parts[0] != _CURATE_PICK_PREFIX:
+        return
+    try:
+        idx = int(parts[1])
+    except ValueError:
+        return
+    names = _CURATE_PENDING_PICKS.get(chat_id) or []
+    if not (0 <= idx < len(names)):
+        await query.edit_message_text("⏰ 선택 만료 — `/curate` 다시 실행")
+        return
+    picked_name = names[idx]
+    picked = industry_lookup_by_name(picked_name)
+    if picked is None:
+        await query.edit_message_text(f"❌ '{picked_name}' 카탈로그에서 못 찾음")
+        return
+    _CURATE_PENDING_PICKS.pop(chat_id, None)
+    await query.edit_message_text(f"✅ 선택: *{picked_name}*", parse_mode=ParseMode.MARKDOWN)
+
+    # FakeUpdate — _launch_curate_pipeline는 effective_chat/message.reply_text 사용.
+    class _FakeChat:
+        def __init__(self, cid: str) -> None:
+            self.id = int(cid)
+
+    class _FakeMessage:
+        def __init__(self, cid: str) -> None:
+            self.chat = _FakeChat(cid)
+
+        async def reply_text(self, *a, **kw) -> None:
+            await context.bot.send_message(chat_id=int(chat_id), text=str(a[0]) if a else (kw.get("text") or ""))
+
+    class _FakeUpdate:
+        def __init__(self, cid: str) -> None:
+            self.effective_chat = _FakeChat(cid)
+            self.message = _FakeMessage(cid)
+
+    await _launch_curate_pipeline(_FakeUpdate(chat_id), context, picked_name, picked)
+
+
+async def _generate_curate_thesis(industry_name: str) -> dict | None:
+    """`prompts/curate_thesis.txt` + sonnet으로 섹터 → thesis + key_drivers 생성.
+
+    실패 시 None — 호출자가 폴백(템플릿) thesis 사용.
+    """
+    loop = asyncio.get_running_loop()
+
+    def _blocking() -> dict | None:
+        from src import summarizer
+        try:
+            client = summarizer.get_client()
+        except Exception:
+            log.exception("OpenRouter client init 실패 (curate_thesis)")
+            return None
+        sys_prompt = idea_prompts.load("curate_thesis")
+        user_msg = f"정규화된 정식 산업명: {industry_name}\n\n시스템 프롬프트의 형식대로 JSON 출력."
+        try:
+            content = summarizer.chat_with_retry(
+                client,
+                model=_synthesis_model(),
+                fallback_model=_narrow_model(),
+                max_tokens=900,
+                temperature=0.3,
+                messages=[
+                    {"role": "system", "content": sys_prompt},
+                    {"role": "user", "content": user_msg},
+                ],
+                context=f"curate_thesis[{industry_name[:30]}]",
+            )
+        except summarizer.OpenRouterCreditExhausted:
+            raise
+        except Exception:
+            log.exception("curate_thesis LLM 호출 실패")
+            return None
+        if not content:
+            return None
+        return _parse_json(content)
+
+    try:
+        return await loop.run_in_executor(None, _blocking)
+    except Exception as e:
+        from src import summarizer as _sm
+        if isinstance(e, _sm.OpenRouterCreditExhausted):
+            raise
+        log.exception("curate_thesis 비동기 호출 예외")
+        return None
+
+
+def _build_curate_idea_text(industry_name: str, thesis_obj: dict | None) -> str:
+    """thesis_obj → _run_pipeline에 전달할 idea_text 합성.
+
+    parse 단계가 industry_filter를 추출하도록 정식 산업명을 본문에 명시.
+    """
+    if thesis_obj and (thesis_obj.get("thesis") or "").strip():
+        t = (thesis_obj.get("thesis") or "").strip()
+        drivers = thesis_obj.get("key_drivers") or []
+        profile = (thesis_obj.get("candidate_profile") or "").strip()
+        exclude = thesis_obj.get("exclude") or []
+        parts = [
+            f"[큐레이션 대상 산업] {industry_name}",
+            f"[Thesis] {t}",
+        ]
+        if drivers:
+            parts.append("[Key Drivers] " + "; ".join(str(d) for d in drivers[:5]))
+        if profile:
+            parts.append(f"[후보 프로파일] {profile}")
+        if exclude:
+            parts.append("[배제] " + ", ".join(str(x) for x in exclude[:5]))
+        parts.append(
+            f"위 thesis에 따라 {industry_name} 섹터 내에서만 후보를 발굴할 것 (산업 필터: {industry_name})."
+        )
+        return "\n".join(parts)
+    # 폴백 — 단순 템플릿 (LLM 실패 시)
+    return (
+        f"[큐레이션 대상 산업] {industry_name}\n"
+        f"[Thesis] {industry_name} 섹터의 영업레버리지·마진 확장·구조적 수혜 종목 큐레이션. "
+        f"중·소형 specialty pure-play 우선, 시총 상위 자동 우대 금지.\n"
+        f"위 thesis에 따라 {industry_name} 섹터 내에서만 후보를 발굴할 것 (산업 필터: {industry_name})."
+    )
+
+
+async def _launch_curate_pipeline(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    user_query: str,
+    picked: IndustryCandidate,
+) -> None:
+    """섹터 확정 → thesis 생성 → _run_pipeline 진입."""
+    bot: Bot = context.bot
+    chat_id = str(update.effective_chat.id)
+    await update.message.reply_text(
+        f"🎯 큐레이션 대상: *{picked.name_ko}*\n"
+        f"🧠 sonnet으로 thesis 생성 중...",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+    try:
+        thesis_obj = await _generate_curate_thesis(picked.name_ko)
+    except Exception as e:
+        from src import summarizer as _sm
+        if isinstance(e, _sm.OpenRouterCreditExhausted):
+            await send_text_chunked(
+                bot, chat_id, "❌ OpenRouter 한도 초과 — thesis 생성 불가."
+            )
+            return
+        log.exception("curate thesis 생성 예외")
+        thesis_obj = None
+    if thesis_obj:
+        summary = (
+            "🧭 자동 생성 thesis\n\n"
+            f"📌 {thesis_obj.get('thesis', '')}\n\n"
+        )
+        drivers = thesis_obj.get("key_drivers") or []
+        if drivers:
+            summary += "🔑 Key Drivers:\n" + "\n".join(f"  • {d}" for d in drivers[:5]) + "\n\n"
+        if thesis_obj.get("candidate_profile"):
+            summary += f"🎯 후보 프로파일: {thesis_obj['candidate_profile']}\n"
+        await send_text_chunked(bot, chat_id, summary)
+    else:
+        await send_text_chunked(
+            bot, chat_id, "ℹ️ thesis LLM 생성 실패 — 폴백 템플릿으로 진행"
+        )
+    idea_text = _build_curate_idea_text(picked.name_ko, thesis_obj)
+    asyncio.create_task(_run_pipeline(update, context, idea_text))
 
 
 async def _cmd_dive(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -845,24 +1100,34 @@ async def _run_pipeline(
             await send_text_chunked(bot, chat_id, "❌ 리서치 결과에 산업/후보가 비어있음 — 종료")
             return
 
-        # ---- (1.5) 중요도 평가 (graceful — 실패해도 계속)
-        await send_text_chunked(bot, chat_id, "⚖️ 1.5단계: 현상의 중요도 비판적 검증")
-        importance = await _evaluate_importance(idea_text, research)
+        # ---- (1.5 + 2) 중요도 평가 LLM + 산업 리포트 wisereport — 동시 진행.
+        # 둘은 research 결과에만 의존하고 서로 독립. importance는 synthesis(5단계)에서만
+        # 쓰이므로 narrow(3단계) 전에만 끝나면 됨. asyncio.gather로 1-2분 절약.
+        await send_text_chunked(
+            bot, chat_id,
+            f"⚖️ 1.5단계 + 📊 2단계 *동시 진행*: 중요도 평가 + 산업 리포트 {len(industries)}개",
+        )
+        importance_res, industry_res = await asyncio.gather(
+            _evaluate_importance(idea_text, research),
+            _collect_industry_reports(industries, download_root / "industry"),
+            return_exceptions=True,
+        )
+        if isinstance(importance_res, BaseException):
+            log.exception("중요도 평가 예외 — synthesis는 계속", exc_info=importance_res)
+            importance = {}
+        else:
+            importance = importance_res or {}
         if importance:
             await _send_importance_summary(bot, chat_id, importance)
         else:
             await send_text_chunked(
-                bot, chat_id, "ℹ️ 중요도 평가 단계 실패 — Top 5 분석은 계속 진행",
+                bot, chat_id, "ℹ️ 중요도 평가 빈 응답 — Top 5 분석은 계속",
             )
-            importance = {}  # 빈 dict로 placeholder, synthesis에 전달 가능
-
-        # ---- (2) 산업 리포트 수집
-        await send_text_chunked(
-            bot, chat_id, f"📊 2단계: 산업 리포트 다운로드 ({len(industries)}개 산업)",
-        )
-        industry_pdfs, industry_texts = await _collect_industry_reports(
-            industries, download_root / "industry",
-        )
+        if isinstance(industry_res, BaseException):
+            log.exception("산업 리포트 수집 예외 — 빈 텍스트로 진행", exc_info=industry_res)
+            industry_pdfs, industry_texts = [], {}
+        else:
+            industry_pdfs, industry_texts = industry_res
         await send_text_chunked(
             bot, chat_id, f"  ✅ 산업 리포트 {len(industry_pdfs)}건 수집",
         )
@@ -2335,7 +2600,14 @@ async def _self_test(app: Application) -> None:
     # 모든 봇 폴링이 안정화된 후 실행 (구 컨테이너 Conflict 메시지 안 끼게)
     await asyncio.sleep(15)
     try:
-        await _run_pipeline(_FakeUpdate(chat_id, test_prompt), _FakeContext(), test_prompt)
+        # /curate ... 으로 시작하면 curate 진입점으로 분기 (산업 정규화 + 자동 thesis).
+        if test_prompt.startswith("/curate"):
+            sector_q = test_prompt[len("/curate"):].strip()
+            fake_ctx = _FakeContext()
+            fake_ctx.args = sector_q.split() if sector_q else []
+            await _cmd_curate(_FakeUpdate(chat_id, test_prompt), fake_ctx)
+        else:
+            await _run_pipeline(_FakeUpdate(chat_id, test_prompt), _FakeContext(), test_prompt)
     except Exception:
         log.exception("[self-test] 파이프라인 최상위 예외")
     log.info("=" * 60)
@@ -2345,6 +2617,7 @@ async def _self_test(app: Application) -> None:
 
 IDEA_COMMANDS = [
     ("idea", "💡 아이디어 → 영업레버리지 Top 5 종목 (15-25분)"),
+    ("curate", "🎯 섹터 입력 → 자동 thesis → Top 5 종목 큐레이션 (예: /curate 소부장)"),
     ("history", "최근 20개 아이디어 분석 목록"),
     ("show", "과거 결과 다시 보기 (예: /show 143005)"),
     ("dive", "Top N 종목 자동 deepdive (예: /dive 1)"),
@@ -2359,12 +2632,16 @@ def build_idea_app(token: str) -> Application:
     app = Application.builder().token(token).build()
     app.add_handler(CommandHandler(["start", "help"], _help))
     app.add_handler(CommandHandler("idea", _cmd_idea))
+    app.add_handler(CommandHandler("curate", _cmd_curate))
     app.add_handler(CommandHandler("history", _cmd_history))
     app.add_handler(CommandHandler("show", _cmd_show))
     app.add_handler(CommandHandler("dive", _cmd_dive))
     app.add_handler(CommandHandler("refine", _cmd_refine))
     app.add_handler(CommandHandler("contrarian", _cmd_contrarian))
     app.add_handler(CommandHandler("compare", _cmd_compare))
+    app.add_handler(
+        CallbackQueryHandler(_curate_pick_callback, pattern=f"^{_CURATE_PICK_PREFIX}\\|")
+    )
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _on_text))
 
     # self-test 자동 실행 — orchestrator가 build_idea_app을 async _run_forever 안에서

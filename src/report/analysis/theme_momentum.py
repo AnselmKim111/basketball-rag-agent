@@ -77,6 +77,27 @@ def flow_endpoints(rows: list[dict], n: int = 6) -> tuple[list[tuple], list[tupl
     return src, dst
 
 
+def theme_flow_timeline(theme_dfs: dict, days: int = 20) -> dict:
+    """{label: cumulative_normalized_series} — 첫날을 0%로 보고 누적 수익률(%).
+
+    시계열 자금 흐름 차트용. 각 테마 ETF의 최근 days 영업일 누적 normalize.
+    """
+    out: dict = {}
+    for label, df in theme_dfs.items():
+        if df is None or len(df) < days:
+            continue
+        try:
+            s = df["Close"].iloc[-days:]
+            first = float(s.iloc[0])
+            if first <= 0:
+                continue
+            cum = (s / first - 1) * 100
+            out[label] = cum
+        except Exception:
+            continue
+    return out
+
+
 def summarize(rows: list[dict]) -> dict:
     """LLM/스냅샷용 요약: 버킷별 라벨 + hot/cold."""
     buckets: dict[str, list[str]] = {}

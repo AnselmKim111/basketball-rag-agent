@@ -201,6 +201,91 @@ def compute_signals_for_ticker(rows: list[dict], base_date: str | None = None) -
         except Exception:
             log.exception("VCP 계산 실패")
 
+    # ------------------------------------------------------------------
+    # 6~9) Trend reversal 4종 — 추세가 돌기 시작한 종목 포착 (버터대디봇 watchlist용)
+    # ------------------------------------------------------------------
+    try:
+        close = df["close"].astype(float)
+
+        # 6) ma_golden_cross — MA20 × MA50 cross-up, 최근 5일 이내
+        if len(df) >= 51:
+            ma20 = close.rolling(20).mean()
+            ma50 = close.rolling(50).mean()
+            for back in range(0, 5):
+                idx = -1 - back
+                if (
+                    pd.notna(ma20.iloc[idx - 1]) and pd.notna(ma50.iloc[idx - 1])
+                    and pd.notna(ma20.iloc[idx]) and pd.notna(ma50.iloc[idx])
+                    and ma20.iloc[idx - 1] <= ma50.iloc[idx - 1]
+                    and ma20.iloc[idx] > ma50.iloc[idx]
+                ):
+                    out["ma_golden_cross"] = {
+                        "close": int(today["close"]),
+                        "days_ago": int(back),
+                        "ma20": float(ma20.iloc[-1]),
+                        "ma50": float(ma50.iloc[-1]),
+                        "chg_pct": chg_pct,
+                    }
+                    break
+
+        # 7) rsi_oversold_recovery — RSI14 <30 → 45~60 회복, 최근 7일 이내
+        if len(df) >= 21:
+            delta = close.diff()
+            gain = delta.clip(lower=0).ewm(alpha=1 / 14, adjust=False).mean()
+            loss = (-delta.clip(upper=0)).ewm(alpha=1 / 14, adjust=False).mean()
+            rs = gain / loss.replace(0, float("nan"))
+            rsi = 100 - (100 / (1 + rs))
+            cur_rsi = rsi.iloc[-1]
+            if pd.notna(cur_rsi) and 45.0 <= float(cur_rsi) <= 60.0:
+                past = rsi.iloc[-15:-1]
+                if (past < 30).any():
+                    out["rsi_oversold_recovery"] = {
+                        "close": int(today["close"]),
+                        "rsi": float(cur_rsi),
+                        "min_rsi_recent": float(past.min()),
+                        "chg_pct": chg_pct,
+                    }
+
+        # 8) base_hold_after_breakout — 52w 돌파 후 5~15일 base hold (pullback ≤3%)
+        if len(df) >= 252:
+            past_for_52w = df["high"].iloc[-252:-15]
+            if len(past_for_52w) > 0:
+                hi252_pre = float(past_for_52w.max())
+                bo_window = df.iloc[-20:-5]
+                bo_days = bo_window[bo_window["close"] > hi252_pre]
+                if len(bo_days) > 0 and hi252_pre > 0:
+                    recent_hi = float(df["high"].iloc[-5:].max())
+                    if recent_hi >= hi252_pre * 0.97 and today["close"] >= hi252_pre * 0.95:
+                        days_since = int(len(df) - 1 - bo_days.index[-1])
+                        out["base_hold_after_breakout"] = {
+                            "close": int(today["close"]),
+                            "breakout_high": int(hi252_pre),
+                            "days_since_breakout": days_since,
+                            "chg_pct": chg_pct,
+                        }
+
+        # 9) downtrend_exit — 3M r3m <-5% + MA50 상향 돌파 (최근 5일)
+        if len(df) >= 63:
+            r3m = float((close.iloc[-1] / close.iloc[-63] - 1) * 100)
+            ma50_series = close.rolling(50).mean()
+            cur_ma50 = ma50_series.iloc[-1]
+            if pd.notna(cur_ma50) and r3m < -5.0 and close.iloc[-1] > cur_ma50:
+                for back in range(1, 6):
+                    idx = -1 - back
+                    prev_close = close.iloc[idx]
+                    prev_ma = ma50_series.iloc[idx]
+                    if pd.notna(prev_ma) and prev_close <= prev_ma:
+                        out["downtrend_exit"] = {
+                            "close": int(today["close"]),
+                            "r3m_pct": r3m,
+                            "ma50": float(cur_ma50),
+                            "days_ago": int(back),
+                            "chg_pct": chg_pct,
+                        }
+                        break
+    except Exception:
+        log.exception("trend_reversal 신호 계산 실패")
+
     return out
 
 
@@ -210,6 +295,11 @@ CATEGORIES = [
     "vcp_breakout",
     "volume_breakout",
     "near_breakout_52w",
+    # 신규 trend_reversal 4종 — 버터대디봇 watchlist용
+    "ma_golden_cross",
+    "rsi_oversold_recovery",
+    "base_hold_after_breakout",
+    "downtrend_exit",
 ]
 
 

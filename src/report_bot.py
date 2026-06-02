@@ -27,11 +27,32 @@ KST = timezone(timedelta(hours=9))
 ALLOWED_ENV = "REPORT_ALLOWED_CHAT_IDS"
 CHAT_ID_ENV = "REPORT_CHAT_ID"
 
+WELCOME_TEXT = (
+    "✅ *가입 완료!*\n\n"
+    "📊 *버터대디봇* — 매일 아침 시장 색깔 진단 PDF\n\n"
+    "내일부터 매일 *08:00 KST* (미국 마감 + 한국 개장 전)에 PDF가 자동으로 도착합니다.\n\n"
+    "내용: 미국 4대 지수·히트맵·매크로·ETF + 한국 수급 멀티패널 + LLM 시황 내러티브\n\n"
+    "*명령*\n"
+    "  /report — 지금 즉시 리포트 생성 (~3-7분)\n"
+    "  /stop — 자동 발송 탈퇴\n"
+    "  /help — 도움말\n"
+)
+
+WELCOME_BACK_TEXT = (
+    "👋 *이미 가입되어 있어요* — 매일 08:00 KST에 자동 발송됩니다.\n\n"
+    "*명령*\n"
+    "  /report — 지금 즉시 리포트 (~3-7분)\n"
+    "  /stop — 자동 발송 탈퇴\n"
+    "  /help — 도움말\n"
+)
+
 HELP_TEXT = (
     "📊 *버터대디봇* — 차트 기반 시장 색깔 진단 리포트\n\n"
     "매일 08:00 KST 자동 발송 (미국 직전 거래일 마감 + 한국 당일).\n"
     "내용: 미국 4대 지수·히트맵·매크로·ETF + 한국 수급 멀티패널 + LLM 시황 내러티브.\n\n"
     "명령:\n"
+    "  /start — 가입 (자동 발송 활성화)\n"
+    "  /stop — 탈퇴\n"
     "  /report — 지금 즉시 리포트 생성 (~3-7분)\n"
     "  /help — 도움말\n"
 )
@@ -48,11 +69,145 @@ def _parse_chat_ids(*env_keys: str) -> list[str]:
     return out
 
 
+def _is_admin(update: Update) -> bool:
+    """ALLOWED_ENV / CHAT_ID_ENV에 등록된 numeric chat_id만 admin."""
+    cid = str(update.effective_chat.id) if update.effective_chat else ""
+    return cid in set(_parse_chat_ids(ALLOWED_ENV, CHAT_ID_ENV))
+
+
 async def _help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         await update.message.reply_text(HELP_TEXT, parse_mode=ParseMode.MARKDOWN)
     except Exception:
         log.exception("help 실패")
+
+
+async def _cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/start — 누구나 가입. 차단된 chat_id는 거부. admin에게 신규 가입 알림."""
+    from src.report import subscribers as subs
+
+    chat_id = str(update.effective_chat.id)
+    user = update.effective_user
+    username = user.username if user else None
+    full_name = user.full_name if user else None
+    loop = asyncio.get_running_loop()
+    try:
+        is_new = await loop.run_in_executor(
+            None, lambda: subs.subscribe(chat_id, username, full_name)
+        )
+    except Exception:
+        log.exception("[start] subscribe 실패")
+        try:
+            await update.message.reply_text("⚠️ 가입 실패 — 관리자에게 문의해 주세요.")
+        except Exception:
+            pass
+        return
+
+    try:
+        text = WELCOME_TEXT if is_new else WELCOME_BACK_TEXT
+        await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+    except Exception:
+        log.exception("[start] welcome 발송 실패")
+
+    if is_new:
+        try:
+            admin_ids = _parse_chat_ids(ALLOWED_ENV, CHAT_ID_ENV)
+            for aid in admin_ids:
+                if aid == chat_id:
+                    continue
+                try:
+                    await context.bot.send_message(
+                        chat_id=aid,
+                        text=(
+                            f"🆕 버터대디봇 신규 가입자\n"
+                            f"  chat_id: {chat_id}\n"
+                            f"  username: @{username or '(없음)'}\n"
+                            f"  name: {full_name or '(없음)'}\n\n"
+                            f"차단하려면: /block {chat_id}"
+                        ),
+                    )
+                except Exception:
+                    log.exception("admin 알림 실패 aid=%s", aid)
+        except Exception:
+            log.exception("[start] admin 알림 절차 실패")
+
+
+async def _cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/stop — 자가 탈퇴."""
+    from src.report import subscribers as subs
+
+    chat_id = str(update.effective_chat.id)
+    loop = asyncio.get_running_loop()
+    try:
+        ok = await loop.run_in_executor(None, lambda: subs.unsubscribe(chat_id))
+    except Exception:
+        log.exception("[stop] unsubscribe 실패")
+        ok = False
+    try:
+        await update.message.reply_text(
+            "👋 탈퇴 완료. 자동 발송이 중단됩니다." if ok
+            else "ℹ️ 가입되어 있지 않습니다."
+        )
+    except Exception:
+        pass
+
+
+async def _cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/list — admin 전용. 가입자 목록."""
+    from src.report import subscribers as subs
+
+    if not _is_admin(update):
+        await update.message.reply_text("🔒 관리자 전용 명령입니다.")
+        return
+    loop = asyncio.get_running_loop()
+    try:
+        items = await loop.run_in_executor(None, subs.list_all)
+    except Exception:
+        log.exception("[list] 실패")
+        items = []
+    if not items:
+        await update.message.reply_text("📭 가입자 없음")
+        return
+    lines = [f"👥 가입자 {len(items)}명:"]
+    for it in items:
+        flag = "🚫" if it["is_blocked"] else "✓"
+        lines.append(
+            f"{flag} {it['chat_id']} @{it['username'] or '?'} ({it['full_name'] or '?'}) "
+            f"— {it['subscribed_at'][:10]}"
+        )
+    await send_text_chunked(context.bot, str(update.effective_chat.id), "\n".join(lines))
+
+
+async def _cmd_block(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    from src.report import subscribers as subs
+
+    if not _is_admin(update):
+        await update.message.reply_text("🔒 관리자 전용 명령입니다.")
+        return
+    args = context.args or []
+    if not args:
+        await update.message.reply_text("사용: /block <chat_id>")
+        return
+    target = args[0].strip()
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, lambda: subs.block(target))
+    await update.message.reply_text(f"🚫 차단 완료: {target}")
+
+
+async def _cmd_unblock(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    from src.report import subscribers as subs
+
+    if not _is_admin(update):
+        await update.message.reply_text("🔒 관리자 전용 명령입니다.")
+        return
+    args = context.args or []
+    if not args:
+        await update.message.reply_text("사용: /unblock <chat_id>")
+        return
+    target = args[0].strip()
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, lambda: subs.unblock(target))
+    await update.message.reply_text(f"✓ 차단 해제: {target}")
 
 
 async def _cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -71,7 +226,15 @@ async def report_daily_job(bot: Bot, override_chat_id: str | None = None) -> Non
     if override_chat_id:
         targets = [str(override_chat_id)]
     else:
-        targets = _parse_chat_ids(CHAT_ID_ENV, ALLOWED_ENV)
+        # admin (env) + 가입자 (DB) union, 중복 제거
+        admin_ids = _parse_chat_ids(CHAT_ID_ENV, ALLOWED_ENV)
+        try:
+            from src.report import subscribers as _subs
+            sub_ids = _subs.list_active_chat_ids()
+        except Exception:
+            log.exception("[report] subscribers 조회 실패")
+            sub_ids = []
+        targets = list(dict.fromkeys(admin_ids + sub_ids))
     if not targets:
         log.error("[report] 발송 대상 없음")
         return
@@ -144,6 +307,8 @@ def _build_report():
     theme_etfs = foc("theme", lambda: fp.fetch_many(fp.US_THEME_ETFS, days=365))
     region_etfs = foc("region", lambda: fp.fetch_many(fp.REGION_ETFS, days=365))
     fx = foc("fx", lambda: fp.fetch_many(fp.FX_SYMBOLS, days=365))
+    # 기존 하드코딩 9종 — 차트용으로만 잠시 유지 (watchlist 통합 후 deprecate).
+    # 향후 watchlist us 상위 종목 OHLCV로 자동 대체될 예정.
     highlights_df = foc("highlights", lambda: fp.fetch_many(fp.HIGHLIGHT_STOCKS, days=365))
     macro = foc("macro", lambda: fetch_macro.fetch_macro(days=365))
     fred = foc("macro_fred", lambda: fetch_macro.fetch_fred_many())
@@ -166,6 +331,22 @@ def _build_report():
 
     for label, df in us_idx.items():
         signals += technical_signals.detect_signals(df, label)
+
+    # ---------- §0 글로벌 위험선호 (표지 직후 시각 요약) ----------
+    risk_gauge: dict = {"score": 50, "label": "중립", "signals": {}}
+    try:
+        from src.report.data import fetch_global_risk
+        from src.report.charts import global_risk_matrix
+        risk_rows, risk_gauge = fetch_global_risk.load_risk_map(days=220)
+        if risk_rows:
+            add(global_risk_matrix.risk_matrix(risk_rows, risk_gauge, img_dir, date_iso=date_iso),
+                "글로벌 위험선호 매트릭스",
+                f"자산 클래스별 1D·5D · {risk_gauge.get('label')} {risk_gauge.get('score')}/100",
+                "0. 글로벌 위험선호", key=True)
+            log.info("[report] §0 글로벌 위험선호: %d자산·게이지 %d(%s)",
+                     len(risk_rows), risk_gauge.get("score"), risk_gauge.get("label"))
+    except Exception:
+        log.exception("[report] 글로벌 위험선호 매트릭스 실패 — 생략")
 
     # ---------- §1 매크로 ----------
     add(index_charts.us_indices_grid(us_idx, img_dir, date_iso=date_iso),
@@ -220,6 +401,11 @@ def _build_report():
         "섹터·테마 상대강도", "1M/3M 정렬", "3. 섹터 로테이션 맵")
     add(rotation_charts.region_compare(region_etfs, img_dir, date_iso=date_iso),
         "글로벌 지역 비교", "지역 디커플링", "3. 섹터 로테이션 맵")
+    # 테마 자금 흐름 시계열 (B: 20일 누적, 좌 유입·우 이탈) — 시간 진화 통찰
+    add(flow_charts.theme_flow_timeline_chart(theme_rows, combined_themes, img_dir,
+                                              date_iso=date_iso),
+        "테마 자금 흐름 시계열", "20일 누적 — 어디서 언제부터 빠져 어디로",
+        "3. 섹터 로테이션 맵", key=True)
     for i, r in enumerate(theme_rows[:16], 1):
         lbl = r["label"]
         add(index_charts.theme_chart(combined_themes.get(lbl), lbl, img_dir,
@@ -236,14 +422,56 @@ def _build_report():
         add(flow_charts.usdkrw_ewy_dual(fx["USD/KRW"], ewy, img_dir, date_iso=date_iso),
             "USD/KRW ↔ EWY", "환전 압력 (가설)", "4. IPO·환전 임팩트", key=False)
 
-    # ---------- §6 개별 종목 하이라이트 ----------
-    add(stock_highlights.highlight_grid(highlights_df, img_dir, date_iso=date_iso),
-        "개별 종목 하이라이트", "스토리 종목", "6. 개별 종목")
-    highlights_meta = []
-    for label, df in highlights_df.items():
-        dc = fp.day_change(df)
-        if dc is not None:
-            highlights_meta.append({"label": label, "chg": round(dc, 2)})
+    # ---------- §6 개별 종목 하이라이트 — 통합 watchlist (5 stream) ----------
+    from src.report.data import watchlist as _wl
+    prev_snapshot_for_wl = state.load_previous(date_iso)
+    try:
+        watchlist_result = _wl.build_watchlist(
+            date_iso=date_iso, theme_rows=theme_rows,
+            earnings=earnings, news=news, prev_snapshot=prev_snapshot_for_wl,
+        )
+    except Exception:
+        log.exception("[report] watchlist 빌드 실패 — 기존 highlights_df 폴백")
+        watchlist_result = {"us": [], "kr": []}
+    n_us = len(watchlist_result.get("us") or [])
+    n_kr = len(watchlist_result.get("kr") or [])
+    log.info("[report.watchlist] US=%d KR=%d", n_us, n_kr)
+
+    # ---------- §5 어닝 캘린더 (upcoming 시각화) ----------
+    if earnings and isinstance(earnings.get("upcoming"), list) and earnings["upcoming"]:
+        add(flow_charts.earnings_calendar_grid(
+                earnings["upcoming"], img_dir, date_iso=date_iso),
+            "다가올 어닝 캘린더",
+            "시총 큰 순 가로bar · 색상=분석가 buy 변화 (녹·적·회)",
+            "5. 어닝 모멘텀", key=True)
+
+    # 차트는 highlights_df (기존) + watchlist enriched 메타 합쳐 카테고리 배지로 표시.
+    # watchlist 있으면 US/KR 분리 2장, 없으면 단일 폴백 차트.
+    _hl_result = stock_highlights.highlight_grid(
+        highlights_df, img_dir, date_iso=date_iso,
+        watchlist_us=watchlist_result.get("us") or [],
+        watchlist_kr=watchlist_result.get("kr") or [])
+    if isinstance(_hl_result, list):
+        for _p in _hl_result:
+            _basename = _p.split("/")[-1] if isinstance(_p, str) else _p
+            label_kr = "🇰🇷 한국" if "_kr" in (_basename or "") else "🇺🇸 미국"
+            add(_basename, f"{label_kr} 개별 종목 하이라이트",
+                "watchlist 카테고리별 (📈 어닝 / 💎 IPO / 🚀 리더 / 🔄 반전 / 🔁 F/U)",
+                "6. 개별 종목")
+    elif _hl_result:
+        add(_hl_result, "개별 종목 하이라이트", "스토리 종목 (폴백)", "6. 개별 종목")
+
+    # IPO mini-card (OHLCV 없는 신생주 — Yahoo 404 폴백 시각화)
+    _ipo_card_path = stock_highlights.ipo_cards(
+        watchlist_result.get("us") or [], img_dir, date_iso=date_iso)
+    if _ipo_card_path:
+        _basename = _ipo_card_path.split("/")[-1] if isinstance(_ipo_card_path, str) else _ipo_card_path
+        add(_basename, "다가올 IPO 카드",
+            "offer price · 시총 · D-N · status — OHLCV 없는 신생주 폴백",
+            "6. 개별 종목")
+
+    # 다음날 F/U용 메타 (state snapshot에 저장)
+    highlights_snapshot_meta = _wl.snapshot_tickers(watchlist_result)
 
     # ---------- §7 한국시장 자금흐름 ----------
     korea_summary: dict = {}
@@ -259,10 +487,13 @@ def _build_report():
     for mkt, fdf in (kr_flows or {}).items():
         korea_summary[mkt] = {inv: round(float(fdf[inv].iloc[-20:].sum()), 0) for inv in fdf.columns}
 
-    # ---------- §8 종합 자금흐름 다이어그램 ----------
+    # ---------- §8 종합 자금흐름 다이어그램 (Sankey, Risk 게이지 허브 통합) ----------
     src_ep, dst_ep = theme_momentum.flow_endpoints(theme_rows)
-    add(flow_charts.capital_flow_diagram(src_ep, dst_ep, img_dir, date_iso=date_iso),
-        "종합 자금흐름 다이어그램", "이탈 → 유입", "8. 종합 자금흐름", key=False)
+    add(flow_charts.capital_flow_diagram(src_ep, dst_ep, img_dir, date_iso=date_iso,
+                                          gauge_score=risk_gauge.get("score"),
+                                          gauge_label=risk_gauge.get("label")),
+        "종합 자금흐름 다이어그램", "Sankey · 굵기=강도 · 허브=Risk 게이지",
+        "8. 종합 자금흐름", key=True)
 
     if not chart_list:
         log.error("[report] 차트 0개 — 데이터 전부 미확보")
@@ -278,7 +509,8 @@ def _build_report():
         macro_summary["USD/KRW"] = round(float(fx["USD/KRW"]["Close"].iloc[-1]), 2)
 
     snapshot = state.build_snapshot(date_iso, rotation, theme_summary, theme_rows,
-                                    macro_summary, breadth, korea_summary, rsp_new_high)
+                                    macro_summary, breadth, korea_summary, rsp_new_high,
+                                    highlights_meta=highlights_snapshot_meta)
     prev = state.load_previous(date_iso)
     deltas = state.compute_deltas(snapshot, prev)
     state.save_snapshot(date_iso, snapshot)
@@ -288,7 +520,8 @@ def _build_report():
     log.info("[report] 차트 %d개, 신호 %d개 → LLM 작성", len(chart_list), len(signals))
     md = report_writer.write_report(date_iso, rotation, chart_list, signals, macro_summary,
                                     korea_summary, news=news, theme_momentum=theme_summary,
-                                    deltas=deltas, breadth=breadth, highlights=highlights_meta,
+                                    deltas=deltas, breadth=breadth,
+                                    highlights=watchlist_result,
                                     earnings=earnings, stale=stale)
 
     # headline 추출 (첫 # 라인)
@@ -361,15 +594,22 @@ async def _self_test(bot: Bot) -> None:
 
 
 REPORT_COMMANDS = [
+    ("start", "✅ 가입 (매일 08:00 KST 자동 발송)"),
     ("report", "📊 즉시 시황 리포트 생성"),
+    ("stop", "🔕 자동 발송 탈퇴"),
     ("help", "도움말"),
 ]
 
 
 def build_report_app(token: str) -> Application:
     app = Application.builder().token(token).build()
-    app.add_handler(CommandHandler(["start", "help"], _help))
+    app.add_handler(CommandHandler("start", _cmd_start))
+    app.add_handler(CommandHandler("help", _help))
+    app.add_handler(CommandHandler("stop", _cmd_stop))
     app.add_handler(CommandHandler("report", _cmd_report))
+    app.add_handler(CommandHandler("list", _cmd_list))
+    app.add_handler(CommandHandler("block", _cmd_block))
+    app.add_handler(CommandHandler("unblock", _cmd_unblock))
     if os.getenv("REPORT_TEST_MODE", "0") == "1":
         try:
             loop = asyncio.get_running_loop()
