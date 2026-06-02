@@ -147,6 +147,32 @@ def fetch_and_extract(
     parsed["source"] = doc.source
     parsed["source_urls"] = doc.source_urls
     parsed["transcript_chars"] = len(doc.full_text)
+    # Track K — call-internal NLP signals (정규식, LLM 0회)
+    try:
+        from src.earnings import nlp_signals
+        parsed["_signals"] = nlp_signals.compute_signals(doc.full_text, parsed)
+    except Exception:
+        log.exception("[earnings/nlp_signals] compute_signals 실패 (%s)", ticker)
+    # Phase 7B — 환각 게이트: extract의 verbatim 인용이 raw_text에 실재하는지 검증.
+    # grounded transcript이고 충분히 길 때만(짧으면 검증 fragment가 우연 매치 불가).
+    if doc.grounded and len(doc.full_text) >= 5000 and not parsed.get("extract_failed"):
+        try:
+            from src.earnings import quality_gate as qg
+            gate = qg.verify_extract_verbatim(parsed, doc.full_text, threshold=0.30)
+            parsed["_gate_extract"] = {
+                "total": gate.total_checked,
+                "violations": len(gate.violations),
+                "ratio": gate.violation_ratio,
+                "passed": gate.passed,
+                "summary": gate.summary(),
+            }
+            if gate.violations:
+                # 위반 항목을 in-place 제거 — 합성·텔레그램 보고서에 깨끗한 데이터만
+                qg.strip_violating_items(parsed, gate.violations)
+                log.info("[quality_gate/%s] extract 위반 %d건 제거 (ratio=%.1f%%)",
+                         ticker, len(gate.violations), gate.violation_ratio*100)
+        except Exception:
+            log.exception("[quality_gate] extract 검증 실패 (%s)", ticker)
     return parsed
 
 
@@ -215,13 +241,16 @@ def format_transcript_text(tr: dict[str, Any]) -> str:
 
     qa = tr.get("qa_highlights") or []
     if qa:
-        lines.append("❓ Q&A")
-        for item in qa[:10]:
+        lines.append("❓ Q&A (Top 5 + significance)")
+        for item in qa[:5]:
             a = (item.get("analyst") or "?").strip()
             q = (item.get("question") or "").strip()
             ans = (item.get("answer_summary") or "").strip()
+            sig = (item.get("significance") or "").strip()
             lines.append(f"  Q ({a}): {q}")
             lines.append(f"  A: {ans}")
+            if sig:
+                lines.append(f"  ▸ 함의: {sig}")
         lines.append("")
 
     cap = tr.get("capital_allocation")
@@ -237,6 +266,75 @@ def format_transcript_text(tr: dict[str, Any]) -> str:
         lines.append("⚡ 서프라이즈/리스크")
         for item in sr:
             lines.append(f"  · {item}")
+
+    deals = tr.get("named_deals") or []
+    if deals:
+        lines.append("")
+        lines.append("🤝 명명된 계약·파트너십")
+        for d in deals:
+            cp = (d.get("counterparty") or "?").strip()
+            mag = (d.get("magnitude") or "—").strip()
+            ten = (d.get("tenure") or "—").strip()
+            stat = (d.get("status") or "?").strip()
+            prior = d.get("prior_quarter_mentioned")
+            prior_tag = " [신규]" if prior is False else (" [기존 연장]" if prior is True else "")
+            lines.append(f"  · {cp} — {mag} · {ten} · {stat}{prior_tag}")
+            qv = (d.get("verbatim") or "").strip()
+            if qv:
+                lines.append(f"    \"{qv}\"")
+
+    sc = tr.get("supply_chain_signals") or []
+    if sc:
+        lines.append("")
+        lines.append("⛓️ 공급망 시그널")
+        for s in sc:
+            vc = (s.get("vendor_or_component") or "?").strip()
+            st = (s.get("signal_type") or "?").strip()
+            qv = (s.get("verbatim") or "").strip()
+            lines.append(f"  · {vc} — {st}")
+            if qv:
+                lines.append(f"    \"{qv}\"")
+
+    cc = tr.get("competitor_callouts") or []
+    if cc:
+        lines.append("")
+        lines.append("⚔️ 경쟁사 직접 언급")
+        for c in cc:
+            comp = (c.get("competitor") or "?").strip()
+            dim = (c.get("dimension") or "?").strip()
+            direction = (c.get("implied_direction") or "?").strip()
+            qv = (c.get("verbatim") or "").strip()
+            lines.append(f"  · {comp} ({dim}, {direction})")
+            if qv:
+                lines.append(f"    \"{qv}\"")
+
+    mp = tr.get("macro_policy_mentions") or []
+    if mp:
+        lines.append("")
+        lines.append("🌐 매크로·정책 멘션")
+        for m in mp:
+            th = (m.get("theme") or "?").strip()
+            rg = (m.get("region") or "?").strip()
+            di = (m.get("impact_direction") or "?").strip()
+            qv = (m.get("verbatim") or "").strip()
+            lines.append(f"  · {th} ({rg}, {di})")
+            if qv:
+                lines.append(f"    \"{qv}\"")
+
+    sg = tr.get("segment_geo_mix") or []
+    if sg:
+        lines.append("")
+        lines.append("📍 세그먼트·지역 mix")
+        for item in sg:
+            seg_r = (item.get("segment_or_region") or "?").strip()
+            share = item.get("share_pct")
+            yoy = item.get("yoy")
+            call = (item.get("callout") or "").strip()
+            bits = []
+            if share: bits.append(f"share {share}")
+            if yoy: bits.append(f"yoy {yoy}")
+            tail = f" — {call}" if call else ""
+            lines.append(f"  · {seg_r}: {', '.join(bits) or '—'}{tail}")
 
     nv = tr.get("notable_verbatim") or []
     if nv:

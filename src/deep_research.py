@@ -30,7 +30,7 @@ from typing import Optional
 
 from telegram import Bot
 
-from src.bot_helpers import send_pdf, send_text_chunked
+from src.bot_helpers import html_escape, send_pdf, send_text_chunked
 from src.pipeline_lock import PIPELINE_LOCK
 from src.summarizer import (
     OpenRouterCreditExhausted,
@@ -460,18 +460,20 @@ async def run(bot: Bot, chat_id: str, query: str) -> None:
     corp_code, corp_name = pair
 
     started = datetime.now(KST)
+    corp_html = html_escape(corp_name)
+    ticker_html = html_escape(ticker)
     if PIPELINE_LOCK.locked():
         await send_text_chunked(
             bot, chat_id,
-            f"⏳ 다른 작업 진행 중 — 끝나면 *{corp_name}* ({ticker}) 딥리서치 시작",
-            parse_mode="Markdown",
+            f"⏳ 다른 작업 진행 중 — 끝나면 <b>{corp_html}</b> ({ticker_html}) 딥리서치 시작",
+            parse_mode="HTML",
         )
 
     await send_text_chunked(
         bot, chat_id,
-        f"📋 *{corp_name}* ({ticker}) 통합 딥리서치 시작\n"
-        f"_3축 데이터 수집 + AI 합성 — 약 8-15분 소요_",
-        parse_mode="Markdown",
+        f"📋 <b>{corp_html}</b> ({ticker_html}) 통합 딥리서치 시작\n"
+        f"<i>3축 데이터 수집 + AI 합성 — 약 8-15분 소요</i>",
+        parse_mode="HTML",
     )
 
     download_root = Path(os.environ.get("DOWNLOAD_DIR", "./downloads")) / "deep_research" / ticker

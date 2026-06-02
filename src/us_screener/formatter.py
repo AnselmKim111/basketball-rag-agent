@@ -120,6 +120,7 @@ def format_results(
     stats: dict | None = None,
     links: dict | None = None,
     extra: dict | None = None,
+    retro: dict | None = None,
 ) -> str:
     parts: list[str] = []
     parts.append(f"🇺🇸 미국 주식 기술적 신호 — {_fmt_kst_header(as_of)}")
@@ -136,6 +137,13 @@ def format_results(
         if skipped_no_base > 0:
             line += f" · {skipped_no_base}종목 base_date 데이터 누락"
         parts.append(line)
+
+    # 회고 (있으면): 지난 신호 종목들의 N영업일 후 평균 수익률
+    if retro:
+        from src.us_screener.retrospective import format_retrospective_line
+        retro_str = format_retrospective_line(retro)
+        if retro_str:
+            parts.append(retro_str)
 
     # 앞에 나온 종목은 뒷 섹션서 제외 (역사적 신고가 → 52주 신고가 순으로 dedup)
     seen: set = set()

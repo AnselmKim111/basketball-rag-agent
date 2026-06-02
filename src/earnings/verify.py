@@ -98,6 +98,102 @@ def cross_check(extract: dict, financials, year: int | None, quarter: int | None
     return results
 
 
+# ------------------------------------------------------------------
+# 컨센서스 delta (Track B — beat/miss 정량화)
+# ------------------------------------------------------------------
+@dataclass
+class ConsensusDelta:
+    ticker: str
+    metric: str                # 'revenue' | 'eps'
+    actual: float | None
+    consensus: float | None
+    delta_pct: float | None    # (actual-consensus)/consensus
+    direction: str             # 'beat' | 'miss' | 'inline' | 'unavailable'
+    message: str               # 사람이 읽는 한 줄
+
+
+def _parse_eps(s: str | None) -> float | None:
+    """'$2.45', '2.45', '2.45 per share' → float. 실패 None."""
+    if s is None:
+        return None
+    txt = str(s).strip().lower().replace("$", "").replace(",", "")
+    m = re.search(r"(-?\d+(?:\.\d+)?)", txt)
+    if not m:
+        return None
+    try:
+        return float(m.group(1))
+    except ValueError:
+        return None
+
+
+def _direction(delta_pct: float | None, inline_band: float = 0.005) -> str:
+    if delta_pct is None:
+        return "unavailable"
+    if abs(delta_pct) <= inline_band:
+        return "inline"
+    return "beat" if delta_pct > 0 else "miss"
+
+
+def compute_consensus_delta(extract: dict, snap) -> list[ConsensusDelta]:
+    """extract.headline_numbers ↔ ConsensusSnapshot 의 분기 추정치 비교.
+
+    snap이 None이거나 추정치가 모두 비어 있으면 unavailable만 반환.
+    """
+    ticker = (extract or {}).get("ticker", "?")
+    deltas: list[ConsensusDelta] = []
+    hn = (extract or {}).get("headline_numbers") or {}
+
+    rev_actual = _parse_money(hn.get("revenue_actual"))
+    eps_actual = _parse_eps(hn.get("eps_actual"))
+
+    rev_est = getattr(snap, "revenue_est_current_q", None) if snap else None
+    eps_est = getattr(snap, "eps_est_current_q", None) if snap else None
+
+    # revenue
+    if rev_actual is not None and rev_est:
+        d = (rev_actual - rev_est) / rev_est
+        dirn = _direction(d)
+        msg = (
+            f"📐 {ticker} Revenue {dirn.upper()}: 실제 ${rev_actual/1e9:.2f}B vs 컨센 ${rev_est/1e9:.2f}B "
+            f"({d*100:+.2f}%, 출처 {snap.source})"
+        )
+        deltas.append(ConsensusDelta(ticker, "revenue", rev_actual, rev_est, d, dirn, msg))
+    else:
+        deltas.append(ConsensusDelta(
+            ticker, "revenue", rev_actual, rev_est, None, "unavailable",
+            f"📐 {ticker} Revenue 컨센 대조 불가 (실제={rev_actual}, 컨센={rev_est})"
+        ))
+
+    # eps
+    if eps_actual is not None and eps_est:
+        d = (eps_actual - eps_est) / eps_est if eps_est != 0 else None
+        dirn = _direction(d) if d is not None else "unavailable"
+        if d is not None:
+            msg = (
+                f"📐 {ticker} EPS {dirn.upper()}: 실제 ${eps_actual:.2f} vs 컨센 ${eps_est:.2f} "
+                f"({d*100:+.2f}%, 출처 {snap.source})"
+            )
+        else:
+            msg = f"📐 {ticker} EPS 대조 불가 (consensus=0)"
+        deltas.append(ConsensusDelta(ticker, "eps", eps_actual, eps_est, d, dirn, msg))
+    else:
+        deltas.append(ConsensusDelta(
+            ticker, "eps", eps_actual, eps_est, None, "unavailable",
+            f"📐 {ticker} EPS 컨센 대조 불가 (실제={eps_actual}, 컨센={eps_est})"
+        ))
+
+    return deltas
+
+
+def format_consensus_deltas(deltas: list[ConsensusDelta]) -> str:
+    if not deltas:
+        return ""
+    lines = ["📐 컨센서스 vs 실제"]
+    for d in deltas:
+        lines.append(f"  {d.message}")
+    return "\n".join(lines)
+
+
 def format_results(all_results: list[VerifyResult]) -> str:
     """검증 결과 → 사람이 읽는 텍스트 (텔레그램/페이로드용)."""
     if not all_results:
