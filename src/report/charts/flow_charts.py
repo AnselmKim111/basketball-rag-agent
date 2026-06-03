@@ -841,3 +841,84 @@ def risk_component_breakdown(rows: list[dict], out_dir: Path,
     theme.stamp(ax, date_iso)
     fig.tight_layout()
     return theme.save_fig(fig, out_dir, filename)
+
+
+def watchlist_thesis_quadrant(watchlist: dict, out_dir: Path,
+                              filename: str = "30b_thesis_quadrant.png",
+                              date_iso: str | None = None) -> str | None:
+    """watchlist 14종목 → 4 quadrant 분류 dashboard.
+
+    분류 (auto rule):
+    - 강화: chg_5d ≥ +5% (녹색)
+    - 약화: chg_5d ≤ -5% (빨강)
+    - 디커플링: kr_linkage 카테고리 + theme_linkage.us_theme_r5d와 종목 5D 차이 ≥5%
+    - 유지/노이즈: 그 외 (회색)
+    """
+    if not watchlist:
+        return None
+    items = list(watchlist.get("us") or []) + list(watchlist.get("kr") or [])
+    if not items:
+        return None
+    theme.setup()
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import FancyBboxPatch
+
+    groups: dict[str, list[str]] = {"강화": [], "약화": [], "디커플링": [], "유지": []}
+    for it in items:
+        chg = it.get("chg_5d")
+        label = (it.get("label") or it.get("ticker") or "").split("(")[0].strip()
+        market = it.get("market") or "US"
+        tag = f"{label}({market})"
+        if not isinstance(chg, (int, float)):
+            groups["유지"].append(tag)
+            continue
+        tl = it.get("theme_linkage") or {}
+        us_r5d = tl.get("us_theme_r5d")
+        if isinstance(us_r5d, (int, float)) and "kr_linkage" in (it.get("categories") or []):
+            diff = us_r5d - chg
+            if abs(diff) >= 5:
+                groups["디커플링"].append(f"{tag}  Δ{diff:+.0f}%")
+                continue
+        if chg >= 5:
+            groups["강화"].append(f"{tag}  {chg:+.1f}%")
+        elif chg <= -5:
+            groups["약화"].append(f"{tag}  {chg:+.1f}%")
+        else:
+            groups["유지"].append(f"{tag}  {chg:+.1f}%")
+
+    quad_specs = [
+        ("강화", "#1b5e20", "#c8e6c9", (0.05, 0.55, 0.45, 0.40)),
+        ("약화", "#c62828", "#ffcdd2", (0.55, 0.55, 0.40, 0.40)),
+        ("디커플링", "#ef6c00", "#ffe0b2", (0.05, 0.10, 0.45, 0.40)),
+        ("유지", "#616161", "#eeeeee", (0.55, 0.10, 0.40, 0.40)),
+    ]
+
+    fig, ax = plt.subplots(figsize=(13, 7.5))
+    ax.set_xlim(0, 1); ax.set_ylim(0, 1); ax.axis("off")
+
+    for name, dark, light, (x, y, w, h) in quad_specs:
+        lst = groups[name]
+        # 박스
+        ax.add_patch(FancyBboxPatch((x, y), w, h, boxstyle="round,pad=0.01",
+                     facecolor=light, edgecolor=dark, linewidth=1.5))
+        # 헤더
+        ax.text(x + 0.02, y + h - 0.04, f"{name}  ({len(lst)})",
+                ha="left", va="center", fontsize=14, fontweight="bold", color=dark)
+        # 종목 list
+        max_items = 6
+        for i, item in enumerate(lst[:max_items]):
+            ax.text(x + 0.03, y + h - 0.10 - i * 0.05, f"• {item}",
+                    ha="left", va="center", fontsize=10, color="#222")
+        if len(lst) > max_items:
+            ax.text(x + 0.03, y + h - 0.10 - max_items * 0.05,
+                    f"  ... 외 {len(lst) - max_items}",
+                    ha="left", va="center", fontsize=9, color="#666", style="italic")
+        if not lst:
+            ax.text(x + w / 2, y + h / 2, "—", ha="center", va="center",
+                    fontsize=18, color="#aaa")
+
+    ax.set_title("[watchlist thesis quadrant] 14종목 자동 분류 — 강화·약화·디커플링·유지",
+                 fontsize=13, fontweight="bold")
+    theme.stamp(ax, date_iso)
+    fig.tight_layout()
+    return theme.save_fig(fig, out_dir, filename)

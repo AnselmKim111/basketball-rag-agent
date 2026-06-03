@@ -543,6 +543,11 @@ def _build_report():
     elif _hl_result:
         add(_hl_result, "개별 종목 하이라이트", "스토리 종목 (폴백)", "6. 개별 종목")
 
+    # watchlist thesis quadrant — 14종목 강화/약화/디커플링/유지 자동 분류
+    add(flow_charts.watchlist_thesis_quadrant(watchlist_result, img_dir, date_iso=date_iso),
+        "watchlist thesis quadrant", "14종목 자동 분류 — thesis 강도 분포",
+        "6. 개별 종목", key=True)
+
     # IPO mini-card (OHLCV 없는 신생주 — Yahoo 404 폴백 시각화)
     _ipo_card_path = stock_highlights.ipo_cards(
         watchlist_result.get("us") or [], img_dir, date_iso=date_iso)
