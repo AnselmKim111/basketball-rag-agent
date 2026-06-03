@@ -449,8 +449,9 @@ def _build_report():
         if kr_perf:
             add(rotation_charts.sector_return_bars(
                     kr_perf, img_dir, filename="07b_kr_sector_bars.png",
-                    title="한국 섹터 ETF 상대강도 (1M 정렬)", date_iso=date_iso),
-                "한국 섹터 상대강도", "KR ETF 1M/3M — 미국 섹터와 비교",
+                    title="한국 섹터 ETF 상대강도 (1M 정렬)", date_iso=date_iso,
+                    is_korea=True),
+                "한국 섹터 상대강도", "KR ETF 1M/3M — 양수(적)·음수(청) 한국식",
                 "3. 섹터 로테이션 맵")
     except Exception:
         log.exception("[report] KR 섹터 강도 실패 — 생략")

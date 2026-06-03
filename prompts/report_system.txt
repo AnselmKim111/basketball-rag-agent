@@ -95,6 +95,7 @@ stale_data.
 >   각 alert 그대로 명시. 빈 dict이면 "매크로 변수 정상 범위"로 한 줄.
 > **💎 오늘의 surprises:** brief_facts.top_surprises 5-6개 list 그대로 인용 (최대 반전/lapse/streak/
 >   어닝 surprise/게이지 변화/hot 테마). 빈 list이면 "큰 surprise 없음 — 일관 추세"로 한 줄.
+>   **이 줄은 빠뜨리지 말 것 — Daily Brief 박스의 마지막 줄로 반드시 포함.**
 
 (데이터 None이면 그 줄 생략. 베팅 표현 금지. snapshot baseline이면 "(전일 기준선)" 표시)
 
