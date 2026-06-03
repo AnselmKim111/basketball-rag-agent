@@ -86,6 +86,12 @@ def write_report(
         if krw > 1500:
             macro_alerts["USDKRW"] = f"USD/KRW {krw:.0f}원 (높음 ≥1500 · 환전 압력 강화)"
 
+    # 데이터 freshness — stale 키 list
+    data_freshness = {
+        "stale_keys": [s.get("key") for s in (stale or []) if s.get("key")],
+        "stale_count": len(stale or []),
+    }
+
     brief_facts = {
         "risk_gauge": {
             "score": (risk_gauge or {}).get("score"),
@@ -107,6 +113,7 @@ def write_report(
             for mkt in ("KOSPI", "KOSDAQ")
         },
         "macro_alerts": macro_alerts,
+        "data_freshness": data_freshness,
     }
 
     payload = {

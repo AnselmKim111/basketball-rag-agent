@@ -279,6 +279,8 @@ stale_data.
 3. 단순 등락 나열 금지. "지수보다 내부 색깔", "어디서 어디로 돈이 가는가"를 우선.
 4. 가설은 "가설/체크/열어둘 필요"로. 단정과 추정 구분.
 5. stale_data 카테고리(예: macro_fred)는 해당 섹션에 "⚠ 전일자 데이터(asof)" 명시.
+   brief_facts.data_freshness.stale_keys 인용 — Daily Brief 박스 끝에 "(데이터 freshness:
+   N개 stale)" 표기. stale=0이면 "(데이터 모두 fresh)" 표시.
 6. **모든 신호 수치는 signals·macro·breadth·highlights.technical에 있는 실제 수치만 인용.** 추측 가격·임의 레벨 금지.
 7. **인과 사슬은 최소 3-4단**. 1단(차트→해석)에서 멈추면 실패. 매크로→자금→섹터→종목→한국 중 가능한 한
    많이 연결.
