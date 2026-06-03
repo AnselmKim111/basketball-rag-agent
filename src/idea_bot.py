@@ -51,6 +51,7 @@ from telegram.ext import (
 )
 
 from src import idea_prompts
+from src.idea import sourcing as _sourcing
 from src.llm_json import parse_json_object as _parse_json
 from src.bot_helpers import (
     deny_message,
@@ -1100,6 +1101,25 @@ async def _run_pipeline(
         if not industries or not candidates:
             await send_text_chunked(bot, chat_id, "❌ 리서치 결과에 산업/후보가 비어있음 — 종료")
             return
+
+        # ---- (1b) 다중 소스 candidate pool: research + screener universe + (TODO 산업리포트·DART)
+        # screener.db universe로 시총 정확 보강 + 누락된 specialty 발굴.
+        pool = _sourcing.build_candidate_pool(research, parsed, target_size=60)
+        if pool:
+            added = len(pool) - len(candidates)
+            if added > 0:
+                await send_text_chunked(
+                    bot, chat_id,
+                    f"🧭 1b단계: screener universe 통합 — pool {len(pool)}개 (research {len(candidates)} + 추가 {added})",
+                )
+            else:
+                await send_text_chunked(
+                    bot, chat_id,
+                    f"🧭 1b단계: screener 시총·섹터 보강 적용 — pool {len(pool)}개",
+                )
+            # research candidates를 enriched pool로 교체 (narrow 입력에 사용)
+            candidates = pool
+            research["candidates"] = pool  # cache에도 반영
 
         # ---- (1.5 + 2) 중요도 평가 LLM + 산업 리포트 wisereport — 동시 진행.
         # 둘은 research 결과에만 의존하고 서로 독립. importance는 synthesis(5단계)에서만
