@@ -164,20 +164,16 @@ def _build_llm_messages(query: str, catalog: list[dict]) -> list[dict]:
     ]
 
 
+# 모델 티어는 src/llm_models.py 공유. IDEA_* env 이름 그대로.
+from src.llm_models import synthesis_model as _make_synthesis, narrow_model as _make_narrow
+
+
 def _synthesis_model() -> str:
-    """sonnet 기본 (CLAUDE.md §2 IDEA_SYNTHESIS_MODEL). idea_bot._synthesis_model의 인라이닝."""
-    explicit = os.getenv("IDEA_SYNTHESIS_MODEL")
-    if explicit:
-        return explicit
-    return os.getenv("OPENROUTER_MODEL") or "anthropic/claude-sonnet-4.5"
+    return _make_synthesis("IDEA_SYNTHESIS_MODEL")
 
 
 def _narrow_model() -> str:
-    """haiku 폴백 (chat_with_retry 3차 시도)."""
-    explicit = os.getenv("IDEA_NARROW_MODEL")
-    if explicit:
-        return explicit
-    return os.getenv("OPENROUTER_MODEL") or "anthropic/claude-sonnet-4.5"
+    return _make_narrow("IDEA_NARROW_MODEL")
 
 
 def _llm_resolve(query: str, catalog: list[dict]) -> tuple[Candidate | None, list[Candidate]]:

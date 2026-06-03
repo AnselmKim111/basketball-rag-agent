@@ -51,6 +51,7 @@ from telegram.ext import (
 )
 
 from src import idea_prompts
+from src.llm_json import parse_json_object as _parse_json
 from src.bot_helpers import (
     deny_message,
     download_root_for,
@@ -2324,238 +2325,27 @@ async def _send_results(
 #   _narrow_model()    → IDEA_NARROW_MODEL (haiku 등) — 30→10 점수화 (큰 출력)
 #   _synthesis_model() → IDEA_SYNTHESIS_MODEL (sonnet 등) — 1.5+5 단계 진짜 지능
 # ------------------------------------------------------------------
-def _summary_model() -> str:
-    """0.5단계 parse 등 단순 추출용 — 가장 저렴한 OPENROUTER_MODEL 사용.
-
-    PDF 요약·DART 파싱·deepdive 요약과 같은 티어. kimi-k2.6 등 갓성비 모델 권장.
-    """
-    return os.getenv("OPENROUTER_MODEL") or "moonshotai/kimi-k2.6"
+# 모델 티어 헬퍼는 src/llm_models.py 로 이전. 아래는 호환 alias.
+from src.llm_models import (
+    summary_model as _summary_model,
+    maybe_raise_credit as _maybe_raise_credit,
+)
 
 
 def _synthesis_model() -> str:
-    """1.5단계 중요도 평가 + 5단계 최종 Top 5 합성 — 가장 지능 필요. 기본 claude-sonnet."""
-    explicit = os.getenv(SYNTHESIS_MODEL_ENV)
-    if explicit:
-        return explicit
-    return os.getenv("OPENROUTER_MODEL") or "anthropic/claude-sonnet-4.5"
+    """1.5 importance + 5 synthesis — sonnet 기본."""
+    from src.llm_models import synthesis_model
+    return synthesis_model(SYNTHESIS_MODEL_ENV)
 
 
 def _narrow_model() -> str:
-    """3단계 30→10 narrowing — 정형화된 스코어링이라 평소 모델로 충분.
-
-    명시값(IDEA_NARROW_MODEL) 없으면 OPENROUTER_MODEL(평소 모델) 사용.
-    """
-    explicit = os.getenv(NARROW_MODEL_ENV)
-    if explicit:
-        return explicit
-    return os.getenv("OPENROUTER_MODEL") or "anthropic/claude-sonnet-4.5"
+    """3 narrow + parse 폴백 — haiku 기본."""
+    from src.llm_models import narrow_model
+    return narrow_model(NARROW_MODEL_ENV)
 
 
-def _maybe_raise_credit(e: Exception) -> None:
-    """OpenRouter 키 한도/결제 오류면 OpenRouterCreditExhausted 재라이즈.
-
-    그렇지 않으면 no-op. 모든 LLM 호출의 except 블록에서 가장 먼저 호출하면
-    credit error를 silent 실패 대신 사용자에게 명확히 전달.
-    """
-    from src import summarizer
-    if isinstance(e, summarizer.APIStatusError) and summarizer._is_credit_error(e):
-        raise summarizer.OpenRouterCreditExhausted(str(e)) from e
-
-
-def _parse_json(content: str) -> dict | None:
-    """LLM 응답에서 JSON 객체 추출 (tolerant).
-
-    처리 단계:
-      1. 코드 펜스 ```json ... ``` 제거
-      2. 첫 { 부터 마지막 } 까지 잘라냄
-      3. trailing comma 정리 (`,]` → `]`, `,}` → `}`)
-      4. JS 라인 코멘트 / 블록 코멘트 제거
-      5. 그래도 실패 시 progressive truncate — 끝에서부터 한 글자씩 빼며 재시도
-         (Claude가 마지막 객체에서 truncate된 경우 직전 } 까지 살리기)
-
-    파싱 실패 시 None.
-    """
-    if not content:
-        log.warning("_parse_json: 빈 content")
-        return None
-    # 코드 펜스 제거
-    fence = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", content, re.DOTALL)
-    if fence:
-        content_inner = fence.group(1)
-    else:
-        content_inner = content
-    # 첫 { 부터 마지막 } 까지
-    start = content_inner.find("{")
-    end = content_inner.rfind("}")
-    if start < 0 or end <= start:
-        log.warning("JSON 블록 못 찾음 (head=%r tail=%r)", content_inner[:200], content_inner[-200:])
-        return None
-    blob = content_inner[start:end + 1]
-
-    # 1차: 그대로 시도
-    obj = _try_loads(blob)
-    if obj is not None:
-        return obj if isinstance(obj, dict) else None
-
-    # 2차: 정리(trailing comma + 코멘트) 후 시도
-    cleaned = _clean_json_loose(blob)
-    obj = _try_loads(cleaned)
-    if obj is not None:
-        log.info("JSON 파싱 — cleanup 후 성공")
-        return obj if isinstance(obj, dict) else None
-
-    # 3차: depth/string-tracking 으로 완전히 닫힌 마지막 top-level 위치까지 잘라냄
-    #      (Claude가 mid-string 으로 truncate된 경우에 대응. 단순 } 카운팅으론
-    #       문자열 안의 }와 진짜 }를 구별 못함.)
-    safe_blob = _truncate_to_balanced_json(content_inner, start)
-    if safe_blob is not None:
-        cleaned = _clean_json_loose(safe_blob)
-        obj = _try_loads(cleaned)
-        if obj is not None:
-            log.info("JSON 파싱 — balanced truncate 성공 (len=%d)", len(safe_blob))
-            return obj if isinstance(obj, dict) else None
-
-    # 4차: depth-aware partial recovery — 마지막 '완성된 top5 항목까지'라도 살리기.
-    #      중첩 array/object 가 닫히지 않은 채로 끝났으면, 강제로 ] 와 } 닫아서
-    #      직전까지의 항목만이라도 재구성.
-    forced = _force_close_open_brackets(content_inner, start, end)
-    if forced is not None:
-        cleaned = _clean_json_loose(forced)
-        obj = _try_loads(cleaned)
-        if obj is not None:
-            log.info("JSON 파싱 — force-close 성공 (len=%d)", len(forced))
-            return obj if isinstance(obj, dict) else None
-
-    log.warning("JSON 파싱 최종 실패 — head=%r tail=%r", blob[:200], blob[-200:])
-    return None
-
-
-def _truncate_to_balanced_json(s: str, start: int) -> str | None:
-    """문자열·이스케이프를 추적하며 depth가 0으로 돌아온 마지막 위치까지 잘라냄.
-
-    LLM이 출력 중간(예: 문자열 안)에서 끊긴 경우, 가장 가까운 안전한 cutoff를 찾는다.
-    반환: s[start:cutoff+1] 형태의 부분 문자열 (성공 시) 또는 None.
-    """
-    if start < 0 or start >= len(s):
-        return None
-    if s[start] != "{":
-        return None
-    depth = 0
-    in_string = False
-    escape = False
-    last_complete = -1  # depth가 0으로 돌아온 가장 최근 위치
-    for i in range(start, len(s)):
-        c = s[i]
-        if escape:
-            escape = False
-            continue
-        if c == "\\" and in_string:
-            escape = True
-            continue
-        if c == '"':
-            in_string = not in_string
-            continue
-        if in_string:
-            continue
-        if c == "{" or c == "[":
-            depth += 1
-        elif c == "}" or c == "]":
-            depth -= 1
-            if depth == 0:
-                last_complete = i
-    if last_complete < 0:
-        return None
-    return s[start:last_complete + 1]
-
-
-def _force_close_open_brackets(s: str, start: int, end: int) -> str | None:
-    """LLM이 array 중간에서 끊긴 경우 마지막 완전한 *항목* 까지 보존하고 강제 닫음.
-
-    동작:
-      1. start 부터 한 글자씩 진행. 문자열·이스케이프 추적.
-      2. push/pop마다 stack 변화 기록.
-      3. **모든 depth에서** "직전이 닫힌 위치" safe_positions[depth] 를 추적.
-      4. **문자열 안에서 EOF 만나면** 그 문자열 시작 직전의 마지막 안전 위치까지 백트랙
-         (perplexity 등이 specialty_note 같은 string field 안에서 truncate되는 케이스 대응).
-      5. 끝까지 가서 닫히지 않은 ']' 와 '}' 가 있으면, **현재 남은 stack depth와 일치하는**
-         safe_positions[len(stack)] 위치까지 잘라내고 stack 역순으로 닫기.
-
-    예: top5 배열에 5개 항목 중 5번째가 닫혔지만 array ']'와 root '}'가 missing인 경우
-        → stack=['{', '['] 길이 2. safe_positions[2] = 5번째 항목 '}' 위치.
-        → 그 위치까지 잘라낸 후 ']}' append → 5개 항목 보존된 valid JSON.
-    """
-    if start < 0 or start >= len(s) or s[start] != "{":
-        return None
-    in_string = False
-    escape = False
-    stack: list[str] = []
-    safe_positions: dict[int, int] = {}  # depth-after-pop → 그 depth에서 마지막 close 위치
-    for i in range(start, len(s)):
-        c = s[i]
-        if escape:
-            escape = False
-            continue
-        if c == "\\" and in_string:
-            escape = True
-            continue
-        if c == '"':
-            in_string = not in_string
-            continue
-        if in_string:
-            continue
-        if c in "{[":
-            stack.append(c)
-        elif c in "}]":
-            if not stack:
-                return None  # 비정상 — 매칭 brackets 깨짐
-            stack.pop()
-            safe_positions[len(stack)] = i
-    if not stack:
-        return s[start:end + 1] if end >= start else None
-    # safe_positions[len(stack)]이 None인 경우 = 현재 top stack 안에서 한 번도 자식이 닫히지 않음.
-    # (예: candidate object 안의 string field에서 truncate되어 자식이 0개 닫힘)
-    # stack을 가상으로 pop하면서 가능한 safe position 탐색 — 가장 데이터 많이 보존되는 거 우선.
-    truncated_blob = None
-    closing = ""
-    for pop_count in range(0, len(stack) + 1):
-        target_depth = len(stack) - pop_count
-        safe = safe_positions.get(target_depth)
-        if safe is None or safe <= start:
-            continue
-        truncated_blob = s[start:safe + 1]
-        items_to_close = stack[:target_depth]
-        closing = "".join("]" if ch == "[" else "}" for ch in reversed(items_to_close))
-        break
-    if truncated_blob is None:
-        return None
-    # trailing comma 가능성 → cleanup이 처리
-    return truncated_blob + closing
-
-
-def _try_loads(s: str):
-    """json.loads 성공 시 객체, 실패 시 None."""
-    try:
-        return json.loads(s)
-    except json.JSONDecodeError:
-        return None
-    except Exception:
-        return None
-
-
-def _clean_json_loose(s: str) -> str:
-    """LLM JSON에서 흔한 비표준 표기 제거.
-
-    - trailing comma: `,\s*]` → `]`, `,\s*}` → `}`
-    - JS 라인 코멘트: `// ...` 줄
-    - JS 블록 코멘트: `/* ... */`
-    """
-    # 라인 코멘트 (행 끝까지)
-    s = re.sub(r"//[^\n\r]*", "", s)
-    # 블록 코멘트
-    s = re.sub(r"/\*.*?\*/", "", s, flags=re.DOTALL)
-    # trailing comma
-    s = re.sub(r",(\s*[}\]])", r"\1", s)
-    return s
+# JSON 파서는 src/llm_json.py 로 이전 — `_parse_json`은 그 모듈의 `parse_json_object` 별칭.
+# (위에서 `from src.llm_json import parse_json_object as _parse_json` 으로 가져옴.)
 
 
 # ------------------------------------------------------------------

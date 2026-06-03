@@ -241,7 +241,10 @@ async def report_daily_job(bot: Bot, override_chat_id: str | None = None) -> Non
 
     loop = asyncio.get_running_loop()
     try:
-        md_path, pdf_path, key_charts, headline = await loop.run_in_executor(None, _build_report)
+        # portfolio는 첫 target chat_id 사용 (단일 chat 환경 가정).
+        portfolio_chat_id = targets[0] if targets else None
+        md_path, pdf_path, key_charts, headline = await loop.run_in_executor(
+            None, _build_report, portfolio_chat_id)
     except Exception:
         log.exception("[report] 빌드 실패")
         for cid in targets:
@@ -267,7 +270,41 @@ async def report_daily_job(bot: Bot, override_chat_id: str | None = None) -> Non
     log.info("[report] 발송 완료 (%d명, 단일 PDF)", len(targets))
 
 
-def _build_report():
+def _build_portfolio_section(portfolio_chat_id, theme_summary, img_dir, date_iso, add) -> dict:
+    """§B 사용자 보유 종목 섹션 — chart 2개 추가 + payload 반환.
+
+    portfolio_chat_id 없거나 portfolio 미등록이면 빈 dict 반환 (§B 자연 생략).
+    enrichment 예외 시 log + 빈 dict — PDF 빌드 영향 없음.
+    """
+    if not portfolio_chat_id:
+        return {}
+    try:
+        from src import portfolio_store
+        from src.report.data import portfolio_enrich
+        from src.report.charts import portfolio_dashboard
+        positions = portfolio_store.load_positions(portfolio_chat_id)
+        if not positions:
+            return {}
+        theme_hot = (theme_summary or {}).get("hot", []) or []
+        payload = portfolio_enrich.enrich_positions(positions, theme_hot=theme_hot)
+        add(portfolio_dashboard.portfolio_summary_card(
+                payload.get("summary") or {}, img_dir, date_iso=date_iso),
+            "내 보유 종목 현황", "종목 수·매수금·평가금·PnL",
+            "B. 내 보유 종목", key=True)
+        add(portfolio_dashboard.portfolio_positions_grid(
+                payload.get("positions") or [], img_dir, date_iso=date_iso),
+            "내 보유 종목 grid", "종목별 매수가·현재가·PnL·thesis 분류",
+            "B. 내 보유 종목", key=True)
+        log.info("[report.portfolio] chat=%s 종목=%d PnL=%s%%",
+                 portfolio_chat_id, payload["summary"]["total_positions"],
+                 payload["summary"].get("total_pnl_pct"))
+        return payload
+    except Exception:
+        log.exception("[report.portfolio] enrichment 실패 — §B 생략")
+        return {}
+
+
+def _build_report(portfolio_chat_id: str | None = None):
     """동기 빌드 (run_in_executor). 8섹션 + 전일 대비 팔로업.
 
     반환: (md_path, pdf_path, key_chart_paths, headline).
@@ -449,8 +486,9 @@ def _build_report():
         if kr_perf:
             add(rotation_charts.sector_return_bars(
                     kr_perf, img_dir, filename="07b_kr_sector_bars.png",
-                    title="한국 섹터 ETF 상대강도 (1M 정렬)", date_iso=date_iso),
-                "한국 섹터 상대강도", "KR ETF 1M/3M — 미국 섹터와 비교",
+                    title="한국 섹터 ETF 상대강도 (1M 정렬)", date_iso=date_iso,
+                    is_korea=True),
+                "한국 섹터 상대강도", "KR ETF 1M/3M — 양수(적)·음수(청) 한국식",
                 "3. 섹터 로테이션 맵")
     except Exception:
         log.exception("[report] KR 섹터 강도 실패 — 생략")
@@ -527,10 +565,19 @@ def _build_report():
 
     # ---------- §5 어닝 캘린더 (upcoming 시각화) ----------
     if earnings and isinstance(earnings.get("upcoming"), list) and earnings["upcoming"]:
+        # hot 테마 매칭 종목 = upcoming에서 us_theme_linkage 핵심 종목 매칭
+        hot_tkr_set: set[str] = set()
+        try:
+            from src.report.data import us_theme_linkage
+            for lbl in (theme_summary or {}).get("hot", []) or []:
+                hot_tkr_set.update(us_theme_linkage.core_tickers_for_label(lbl))
+        except Exception:
+            pass
         add(flow_charts.earnings_calendar_grid(
-                earnings["upcoming"], img_dir, date_iso=date_iso),
+                earnings["upcoming"], img_dir, date_iso=date_iso,
+                hot_tickers=hot_tkr_set),
             "다가올 어닝 캘린더",
-            "시총 큰 순 가로bar · 색상=분석가 buy 변화 (녹·적·회)",
+            "시총 큰 순 · 색상=분석가 buy 변화 · 노란 outline=hot 테마 종목",
             "5. 어닝 모멘텀", key=True)
 
     # 차트는 highlights_df (기존) + watchlist enriched 메타 합쳐 카테고리 배지로 표시.
@@ -548,6 +595,10 @@ def _build_report():
                 "6. 개별 종목")
     elif _hl_result:
         add(_hl_result, "개별 종목 하이라이트", "스토리 종목 (폴백)", "6. 개별 종목")
+
+    # ---------- §B 사용자 보유 종목 (portfolio_chat_id 있을 때만) ----------
+    portfolio_payload = _build_portfolio_section(
+        portfolio_chat_id, theme_summary, img_dir, date_iso, add)
 
     # watchlist thesis quadrant — 14종목 강화/약화/디커플링/유지 자동 분류
     add(flow_charts.watchlist_thesis_quadrant(watchlist_result, img_dir, date_iso=date_iso),
@@ -584,27 +635,12 @@ def _build_report():
     for mkt, fdf in (kr_flows or {}).items():
         korea_summary[mkt] = {inv: round(float(fdf[inv].iloc[-20:].sum()), 0) for inv in fdf.columns}
 
-    # 외국인 연속 매도/매수 streak 계산 (KOSPI·KOSDAQ) — thesis 격상 alert용
-    def _streak(series) -> int:
-        """마지막 값과 같은 부호로 연속된 거래일수 (음수 = 연속 매도)."""
-        if series is None or len(series) == 0:
-            return 0
-        vals = series.values
-        last = vals[-1]
-        if last == 0:
-            return 0
-        sign = 1 if last > 0 else -1
-        cnt = 0
-        for v in vals[::-1]:
-            if (v > 0 and sign > 0) or (v < 0 and sign < 0):
-                cnt += 1
-            else:
-                break
-        return cnt * sign  # 음수 = 매도 streak, 양수 = 매수 streak
+    # 외국인 연속 매도/매수 streak 계산 (KOSPI·KOSDAQ) — thesis 격상 alert용.
+    # state.streak_count 공용 헬퍼 (korea_flow_chart도 동일 함수 사용).
     for mkt, fdf in (kr_flows or {}).items():
         for inv in ("외국인", "기관", "개인"):
             if inv in fdf.columns:
-                korea_summary.setdefault(mkt, {})[f"{inv}_streak"] = _streak(fdf[inv])
+                korea_summary.setdefault(mkt, {})[f"{inv}_streak"] = state.streak_count(fdf[inv])
 
     # ---------- §8 종합 자금흐름 다이어그램 (Sankey, Risk 게이지 허브 통합) ----------
     src_ep, dst_ep = theme_momentum.flow_endpoints(theme_rows)
@@ -647,7 +683,8 @@ def _build_report():
                                     highlights=watchlist_result,
                                     earnings=earnings, stale=stale,
                                     risk_gauge=risk_gauge, fx_gauge=fx_gauge,
-                                    prev_snapshot=prev)
+                                    prev_snapshot=prev,
+                                    portfolio=portfolio_payload)
 
     # headline 추출 (첫 # 라인)
     headline = next((ln.lstrip("# ").strip() for ln in md.splitlines() if ln.startswith("#")), f"{date_iso} 시장 리포트")
@@ -718,9 +755,85 @@ async def _self_test(bot: Bot) -> None:
     log.info("[report.self-test] 종료")
 
 
+async def _cmd_portfolio_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/portfolio_add TICKER MARKET 매수가 수량 — 보유 종목 등록."""
+    from src import portfolio_store
+    chat_id = str(update.effective_chat.id)
+    args = context.args if context else []
+    if len(args) < 4:
+        await update.message.reply_text(
+            "사용법: /portfolio_add TICKER MARKET 매수가 수량\n"
+            "예: /portfolio_add NVDA US 110.50 50\n"
+            "예: /portfolio_add 005930 KR 89000 100"
+        )
+        return
+    ticker, market, buy_price, shares = args[0], args[1], args[2], args[3]
+    pos = portfolio_store.add_position(chat_id, ticker, market, buy_price, shares)
+    if not pos:
+        await update.message.reply_text(
+            f"❌ 등록 실패 — 형식 확인 (MARKET=US/KR, 가격·수량 양수)"
+        )
+        return
+    unit = "원" if pos["market"] == "KR" else "$"
+    await update.message.reply_text(
+        f"✅ {pos['ticker']} ({pos['market']}) 등록\n"
+        f"매수가 {pos['buy_price']:,.2f}{unit} · {pos['shares']:,.0f}주\n"
+        f"매일 08:00 KST 리포트에 §B 보유 종목 섹션으로 자동 포함."
+    )
+
+
+async def _cmd_portfolio_remove(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/portfolio_remove TICKER — 종목 삭제."""
+    from src import portfolio_store
+    chat_id = str(update.effective_chat.id)
+    args = context.args if context else []
+    if not args:
+        await update.message.reply_text("사용법: /portfolio_remove TICKER")
+        return
+    ok = portfolio_store.remove_position(chat_id, args[0])
+    if ok:
+        await update.message.reply_text(f"✅ {args[0].upper()} 삭제")
+    else:
+        await update.message.reply_text(f"❌ {args[0].upper()} 미등록 종목")
+
+
+async def _cmd_portfolio_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/portfolio_list — 현재 보유 종목 list."""
+    from src import portfolio_store
+    chat_id = str(update.effective_chat.id)
+    positions = portfolio_store.load_positions(chat_id)
+    if not positions:
+        await update.message.reply_text(
+            "📭 등록된 종목 없음\n"
+            "사용법: /portfolio_add TICKER MARKET 매수가 수량"
+        )
+        return
+    lines = [f"📊 보유 종목 {len(positions)}개:"]
+    for pos in positions:
+        unit = "원" if pos.get("market") == "KR" else "$"
+        bp = pos.get("buy_price", 0); sh = pos.get("shares", 0)
+        lines.append(f"• {pos.get('ticker')} ({pos.get('market')}) — "
+                     f"{bp:,.2f}{unit} × {sh:,.0f}주 (등록 {pos.get('added_at', '?')})")
+    await update.message.reply_text("\n".join(lines))
+
+
+async def _cmd_portfolio_clear(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/portfolio_clear — 전체 삭제."""
+    from src import portfolio_store
+    chat_id = str(update.effective_chat.id)
+    ok = portfolio_store.clear_positions(chat_id)
+    if ok:
+        await update.message.reply_text("✅ 전체 삭제")
+    else:
+        await update.message.reply_text("📭 등록 종목 없음")
+
+
 REPORT_COMMANDS = [
     ("start", "✅ 가입 (매일 08:00 KST 자동 발송)"),
     ("report", "📊 즉시 시황 리포트 생성"),
+    ("portfolio_add", "💼 보유 종목 등록"),
+    ("portfolio_list", "📋 보유 종목 list"),
+    ("portfolio_remove", "🗑 보유 종목 삭제"),
     ("stop", "🔕 자동 발송 탈퇴"),
     ("help", "도움말"),
 ]
@@ -735,6 +848,10 @@ def build_report_app(token: str) -> Application:
     app.add_handler(CommandHandler("list", _cmd_list))
     app.add_handler(CommandHandler("block", _cmd_block))
     app.add_handler(CommandHandler("unblock", _cmd_unblock))
+    app.add_handler(CommandHandler("portfolio_add", _cmd_portfolio_add))
+    app.add_handler(CommandHandler("portfolio_remove", _cmd_portfolio_remove))
+    app.add_handler(CommandHandler("portfolio_list", _cmd_portfolio_list))
+    app.add_handler(CommandHandler("portfolio_clear", _cmd_portfolio_clear))
     if os.getenv("REPORT_TEST_MODE", "0") == "1":
         try:
             loop = asyncio.get_running_loop()

@@ -95,6 +95,7 @@ stale_data.
 >   각 alert 그대로 명시. 빈 dict이면 "매크로 변수 정상 범위"로 한 줄.
 > **💎 오늘의 surprises:** brief_facts.top_surprises 5-6개 list 그대로 인용 (최대 반전/lapse/streak/
 >   어닝 surprise/게이지 변화/hot 테마). 빈 list이면 "큰 surprise 없음 — 일관 추세"로 한 줄.
+>   **이 줄은 빠뜨리지 말 것 — Daily Brief 박스의 마지막 줄로 반드시 포함.**
 
 (데이터 None이면 그 줄 생략. 베팅 표현 금지. snapshot baseline이면 "(전일 기준선)" 표시)
 
@@ -174,7 +175,9 @@ stale_data.
    - earnings 비면 "데이터 미수집"만(조작 금지). 1-2개로 압축 금지 — 시총 큰 종목 5-10개 풍부히.
    - 어닝 캘린더 차트(35_earnings_calendar)가 있으면 본문 정확히 1회
      `![](images/35_earnings_calendar.png)` 삽입. 차트 fact 인용: "녹색 바 = 분석가 buy 증가 → forward
-     visibility 개선 / 적색 = 컨센서스 하향 → 발표 리스크".
+     visibility 개선 / 적색 = 컨센서스 하향 → 발표 리스크 / **노란 outline = hot 테마 매칭 종목**".
+   - **hot 테마 매칭 종목 (theme_summary.hot의 us_theme_linkage 매핑)은 listing 상단에 우선 배치**.
+     그 종목 thesis 관계 명시 강제 ("AI 반도체 thesis 직접 검증"). 매칭 안 종목은 "thesis 무관"으로.
 6. **개별 종목 watchlist** — highlights = {us:[…], kr:[…]} 카테고리별 종목 enriched dict 기반.
    각 종목 → 미니 스토리. 단순 "OO +5%" 나열 금지. 다음 카테고리별 mini-section으로 구조화:
 
@@ -241,6 +244,20 @@ stale_data.
 
    ### 6-4. 차트 인용
    §6에는 1~2개 차트(highlights_us·highlights_kr)가 들어옴. 본문 정확히 1회씩 `![](images/파일명)` 삽입.
+
+B. **내 보유 종목** (`portfolio` dict 비어있지 않을 때만, §6 뒤 §7 앞) — 사용자가 직접 등록한
+   보유 종목 분석. payload.portfolio = {summary, positions}.
+   - **현황 표 인용** (portfolio_summary 차트 직후): 종목 수 · US/KR 분리 카운트 · 총 매수금 ·
+     총 평가금 · 총 PnL%(±) · 손익액. 1-2줄 한 요약.
+   - **종목별 분석** (positions list, 손익률 큰 순):
+     `{ticker} ({market}) — 매수가 X · 현재가 Y · PnL ±N% (±액수) · 5D ±M% · 1M ±K% ·
+      52w X%, MA200/50 위/아래 → thesis 관계 한 줄`
+   - **thesis 일관성**: 보유 종목 중 강화/약화/디커플링/유지 카운트 통계. "강화 N개 · 약화 M개"로
+     포트폴리오 전체 신호 방향 fact. watchlist thesis quadrant와 일관 톤.
+   - **§7 외국인 수급과 연결** (KR 종목): 외국인 KOSPI 매도 streak이 보유 종목에 어떻게 영향? fact 연결.
+   - ❌ **베팅·진입·손절·매수·매도 표현 일체 금지** (CLAUDE.md 룰). thesis 강도 분류 + fact 인용만.
+   - ✅ "어제 대비 신호 강화/약화 추적" 톤. Follow-up과 일관.
+   - portfolio.summary.total_positions=0이면 §B 섹션 자체 생략.
 
 7. 한국시장 자금흐름 — 대형/중형/소형/코스닥의 외국인·기관·개인 방향. "외국인 대형주 매도→중소형/코스닥
    매수 = 기대수익률 차이"를 읽어라. 빈집(소외) 섹터(바이오/조선/저PBR/지주사) 발굴.
