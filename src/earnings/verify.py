@@ -150,14 +150,23 @@ def compute_consensus_delta(extract: dict, snap) -> list[ConsensusDelta]:
     eps_est = getattr(snap, "eps_est_current_q", None) if snap else None
 
     # revenue
-    if rev_actual is not None and rev_est:
+    # 가드: rev_est가 비정상 작은 값 (perplexity가 $0.00B로 파싱 → 매우 작은 양수)이면
+    # delta가 폭주 (예: +100,000,000,000%). 임계치 미달 시 unavailable로 강등.
+    if rev_actual is not None and rev_est and rev_est > 1e6:
         d = (rev_actual - rev_est) / rev_est
-        dirn = _direction(d)
-        msg = (
-            f"📐 {ticker} Revenue {dirn.upper()}: 실제 ${rev_actual/1e9:.2f}B vs 컨센 ${rev_est/1e9:.2f}B "
-            f"({d*100:+.2f}%, 출처 {snap.source})"
-        )
-        deltas.append(ConsensusDelta(ticker, "revenue", rev_actual, rev_est, d, dirn, msg))
+        if abs(d) > 5.0:
+            # 500% 초과 = 컨센 데이터 결손 의심
+            deltas.append(ConsensusDelta(
+                ticker, "revenue", rev_actual, rev_est, None, "unavailable",
+                f"📐 {ticker} Revenue 컨센 데이터 결손 의심 — 실제 ${rev_actual/1e9:.2f}B, 컨센 비정상값"
+            ))
+        else:
+            dirn = _direction(d)
+            msg = (
+                f"📐 {ticker} Revenue {dirn.upper()}: 실제 ${rev_actual/1e9:.2f}B vs 컨센 ${rev_est/1e9:.2f}B "
+                f"({d*100:+.2f}%, 출처 {snap.source})"
+            )
+            deltas.append(ConsensusDelta(ticker, "revenue", rev_actual, rev_est, d, dirn, msg))
     else:
         deltas.append(ConsensusDelta(
             ticker, "revenue", rev_actual, rev_est, None, "unavailable",
@@ -165,17 +174,20 @@ def compute_consensus_delta(extract: dict, snap) -> list[ConsensusDelta]:
         ))
 
     # eps
-    if eps_actual is not None and eps_est:
-        d = (eps_actual - eps_est) / eps_est if eps_est != 0 else None
-        dirn = _direction(d) if d is not None else "unavailable"
-        if d is not None:
+    if eps_actual is not None and eps_est and abs(eps_est) > 0.01:
+        d = (eps_actual - eps_est) / eps_est
+        if abs(d) > 5.0:
+            deltas.append(ConsensusDelta(
+                ticker, "eps", eps_actual, eps_est, None, "unavailable",
+                f"📐 {ticker} EPS 컨센 데이터 결손 의심 — 실제 ${eps_actual:.2f}, 컨센 비정상값"
+            ))
+        else:
+            dirn = _direction(d)
             msg = (
                 f"📐 {ticker} EPS {dirn.upper()}: 실제 ${eps_actual:.2f} vs 컨센 ${eps_est:.2f} "
                 f"({d*100:+.2f}%, 출처 {snap.source})"
             )
-        else:
-            msg = f"📐 {ticker} EPS 대조 불가 (consensus=0)"
-        deltas.append(ConsensusDelta(ticker, "eps", eps_actual, eps_est, d, dirn, msg))
+            deltas.append(ConsensusDelta(ticker, "eps", eps_actual, eps_est, d, dirn, msg))
     else:
         deltas.append(ConsensusDelta(
             ticker, "eps", eps_actual, eps_est, None, "unavailable",

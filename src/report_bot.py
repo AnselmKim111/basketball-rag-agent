@@ -527,10 +527,19 @@ def _build_report():
 
     # ---------- §5 어닝 캘린더 (upcoming 시각화) ----------
     if earnings and isinstance(earnings.get("upcoming"), list) and earnings["upcoming"]:
+        # hot 테마 매칭 종목 = upcoming에서 us_theme_linkage 핵심 종목 매칭
+        hot_tkr_set: set[str] = set()
+        try:
+            from src.report.data import us_theme_linkage
+            for lbl in (theme_summary or {}).get("hot", []) or []:
+                hot_tkr_set.update(us_theme_linkage.core_tickers_for_label(lbl))
+        except Exception:
+            pass
         add(flow_charts.earnings_calendar_grid(
-                earnings["upcoming"], img_dir, date_iso=date_iso),
+                earnings["upcoming"], img_dir, date_iso=date_iso,
+                hot_tickers=hot_tkr_set),
             "다가올 어닝 캘린더",
-            "시총 큰 순 가로bar · 색상=분석가 buy 변화 (녹·적·회)",
+            "시총 큰 순 · 색상=분석가 buy 변화 · 노란 outline=hot 테마 종목",
             "5. 어닝 모멘텀", key=True)
 
     # 차트는 highlights_df (기존) + watchlist enriched 메타 합쳐 카테고리 배지로 표시.

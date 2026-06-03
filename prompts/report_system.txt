@@ -93,6 +93,8 @@ stale_data.
 >   (음수 = 매도 streak, ≥5 시 "N거래일 연속 매도" 명시. ≥7 시 ⚠ 격상 표시)
 > **🚨 매크로 alert:** brief_facts.macro_alerts (VIX/10Y/DXY/WTI/USDKRW 임계값 자동 추출).
 >   각 alert 그대로 명시. 빈 dict이면 "매크로 변수 정상 범위"로 한 줄.
+> **💎 오늘의 surprises:** brief_facts.top_surprises 5-6개 list 그대로 인용 (최대 반전/lapse/streak/
+>   어닝 surprise/게이지 변화/hot 테마). 빈 list이면 "큰 surprise 없음 — 일관 추세"로 한 줄.
 
 (데이터 None이면 그 줄 생략. 베팅 표현 금지. snapshot baseline이면 "(전일 기준선)" 표시)
 
@@ -172,7 +174,9 @@ stale_data.
    - earnings 비면 "데이터 미수집"만(조작 금지). 1-2개로 압축 금지 — 시총 큰 종목 5-10개 풍부히.
    - 어닝 캘린더 차트(35_earnings_calendar)가 있으면 본문 정확히 1회
      `![](images/35_earnings_calendar.png)` 삽입. 차트 fact 인용: "녹색 바 = 분석가 buy 증가 → forward
-     visibility 개선 / 적색 = 컨센서스 하향 → 발표 리스크".
+     visibility 개선 / 적색 = 컨센서스 하향 → 발표 리스크 / **노란 outline = hot 테마 매칭 종목**".
+   - **hot 테마 매칭 종목 (theme_summary.hot의 us_theme_linkage 매핑)은 listing 상단에 우선 배치**.
+     그 종목 thesis 관계 명시 강제 ("AI 반도체 thesis 직접 검증"). 매칭 안 종목은 "thesis 무관"으로.
 6. **개별 종목 watchlist** — highlights = {us:[…], kr:[…]} 카테고리별 종목 enriched dict 기반.
    각 종목 → 미니 스토리. 단순 "OO +5%" 나열 금지. 다음 카테고리별 mini-section으로 구조화:
 
