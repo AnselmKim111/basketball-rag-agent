@@ -42,7 +42,7 @@ def _strip_emoji(s: str) -> str:
 
 
 # ------------------------------------------------------------------
-# Phase 10 — 네이버 톤 스타일 상수
+# Phase 10 — 네이버 톤 스타일 상수 + 페이지 레이아웃
 # ------------------------------------------------------------------
 STYLE = {
     "navy":     "#0b3d91",
@@ -55,6 +55,17 @@ STYLE = {
     "green":    "#1b5e20",
     "red":      "#b71c1c",
 }
+
+# A4 페이지 좌표 (inches). matplotlib axis 좌표는 fig 내부 비율(0~1).
+PAGE_W, PAGE_H = 8.27, 11.69
+# 본문 axis (좌표 기준). add_axes([left, bottom, width, height])
+CONTENT_AXES = [0.06, 0.04, 0.88, 0.92]
+# 본문 진입 시 y 시작 / 본문 하한 (BOTTOM 미만 시 새 페이지)
+Y_TOP = 0.93
+Y_BOTTOM = 0.03
+# Markdown 본문 렌더 기본값
+BODY_SIZE = 9.0
+LINE_H = 0.0175
 
 
 def _wrap_text(text: str, width: int = 95) -> list[str]:
@@ -742,7 +753,7 @@ def _clean_md_inline(text: str) -> str:
 def _strip_md_inline_keep_text(text: str) -> str:
     """굵게/인용/citation 마크업만 제거, 텍스트 그대로 유지 (graceful fallback)."""
     s = text or ""
-    s = _MD_CITATION_RE.sub(lambda m: "", s)
+    s = _MD_CITATION_RE.sub("", s)
     s = re.sub(r"\*\*([^*]+)\*\*", r"\1", s)
     s = re.sub(r"`([^`]+)`", r"\1", s)
     s = re.sub(r"_([^_]+)_", r"\1", s)
@@ -766,15 +777,15 @@ def _draw_md_table(ax, rows: list[list[str]], y_top: float, *, max_width: float 
     header, *body = cleaned
     has_header = bool(body)
 
-    row_h = 0.026
-    table_h = row_h * len(cleaned) + 0.01
+    row_h = 0.022
+    table_h = row_h * len(cleaned) + 0.008
     y_bottom = y_top - table_h
-    if y_bottom < 0.04:
+    if y_bottom < 0.03:
         return y_top  # 페이지에 못 들어가면 패스
 
     # 셀 한글 비율 → fontsize 동적
     avg_text_len = sum(len(c) for row in cleaned for c in row) / max(sum(len(row) for row in cleaned), 1)
-    fontsize = 8.5 if avg_text_len < 18 else 7.5
+    fontsize = 8.0 if avg_text_len < 18 else 7.0
 
     tbl = ax.table(
         cellText=body if has_header else cleaned,
@@ -804,12 +815,19 @@ def _render_inline_styled(ax, x: float, y: float, text: str, *, base_size: float
     """한 줄 안의 **굵게** / `code` / _기울임_ / [X][src] 분할 렌더.
 
     측정 정확도 한계 → 부분 렌더링 실패 시 fallback으로 plain text 한 번에.
+    가드: 미매칭 백틱/asterisk/citation은 raw 노출 안 되게 사전 정리.
     """
     if base_color is None:
         base_color = STYLE["body"]
     text = _strip_emoji(text)
     if not text:
         return
+    # 미매칭 raw 마크업 사전 제거 (segment regex 미캐치 케이스)
+    # 짝수개 백틱만 유지, 홀수개면 모두 제거
+    if text.count("`") % 2 != 0:
+        text = text.replace("`", "")
+    if text.count("**") % 2 != 0:
+        text = text.replace("**", "")
     parts = _MD_INLINE_SEG_RE.split(text)
     cur_x = x
     for part in parts:
@@ -834,9 +852,8 @@ def _render_inline_styled(ax, x: float, y: float, text: str, *, base_size: float
             style = "italic"
             color = STYLE["muted"]
         elif _MD_CITATION_RE.fullmatch(part):
-            content = part
-            color = "#888"
-            size = base_size - 2.0
+            # citation: 시각 노이즈 → 완전 제거 (PM은 본문만 읽음)
+            continue
         else:
             content = part
         kwargs = dict(fontsize=size, color=color, va="top", ha="left", fontweight=weight, fontstyle=style)
@@ -846,15 +863,15 @@ def _render_inline_styled(ax, x: float, y: float, text: str, *, base_size: float
             ax.text(cur_x, y, content, **kwargs)
         except Exception:
             ax.text(cur_x, y, content, fontsize=size, color=color, va="top", ha="left")
-        # monospace 환산 (fontsize=10 기준 영문 0.0065 / 한글 0.012)
         han = sum(1 for c in content if ord(c) > 127)
         ascii_n = len(content) - han
-        cur_x += (ascii_n * 0.0065 + han * 0.012) * (size / 10.0)
+        cur_x += (ascii_n * 0.0058 + han * 0.011) * (size / 10.0)
 
 
 def _new_md_page(plt, title: str, *, title_box: bool = True):
-    fig = plt.figure(figsize=(8.27, 11.69))
-    ax = fig.add_axes([0.06, 0.04, 0.88, 0.92])
+    """Markdown 본문 페이지 1장 생성. title_box=True면 상단 파란 띠 + 흰 타이틀."""
+    fig = plt.figure(figsize=(PAGE_W, PAGE_H))
+    ax = fig.add_axes(CONTENT_AXES)
     ax.set_axis_off()
     ax.set_xlim(0, 1)
     ax.set_ylim(0, 1)
@@ -883,8 +900,7 @@ def _render_markdown_block(pdf, title: str, md_text: str, *, footer: str = "") -
         return _new_md_page(plt, title + suffix)
 
     fig, ax = start_page()
-    y = 0.93
-    BOTTOM = 0.05
+    y = Y_TOP
 
     def new_page():
         nonlocal fig, ax, y
@@ -893,87 +909,84 @@ def _render_markdown_block(pdf, title: str, md_text: str, *, footer: str = "") -
         pdf.savefig(fig)
         plt.close(fig)
         fig, ax = start_page()
-        y = 0.93
+        y = Y_TOP
 
-    for idx, tok in enumerate(tokens):
+    for tok in tokens:
         t = tok["type"]
 
         # widow guard: heading이 페이지 끝 직전이면 강제 새 페이지
-        if t == "heading" and y < 0.18:
+        if t == "heading" and y < 0.14:
             new_page()
 
         if t == "heading":
             level = tok["level"]
-            txt = tok["text"]
+            txt = _strip_emoji(tok["text"])
             if level == 1:
                 if y < 0.10:
                     new_page()
-                ax.add_patch(plt.Rectangle((0, y - 0.040), 1, 0.038, facecolor=STYLE["navy"]))
-                ax.text(0.01, y - 0.010, _strip_emoji(txt), fontsize=14, fontweight="bold",
+                ax.add_patch(plt.Rectangle((0, y - 0.036), 1, 0.034, facecolor=STYLE["navy"]))
+                ax.text(0.01, y - 0.008, txt, fontsize=13, fontweight="bold",
                         color="white", va="center")
-                y -= 0.060
+                y -= 0.048
             elif level == 2:
-                if y < 0.08:
+                if y < 0.07:
                     new_page()
-                ax.add_patch(plt.Rectangle((0.0, y - 0.028), 0.006, 0.026, facecolor=STYLE["navy"]))
-                ax.text(0.015, y, _strip_emoji(txt), fontsize=12.5, fontweight="bold",
+                ax.add_patch(plt.Rectangle((0.0, y - 0.024), 0.006, 0.022, facecolor=STYLE["navy"]))
+                ax.text(0.015, y, txt, fontsize=11.5, fontweight="bold",
                         color=STYLE["navy"], va="top")
-                y -= 0.038
+                y -= 0.030
             else:  # level 3
-                if y < 0.06:
+                if y < 0.05:
                     new_page()
-                ax.text(0.0, y, _strip_emoji(txt), fontsize=10.5, fontweight="bold",
+                ax.text(0.0, y, txt, fontsize=10, fontweight="bold",
                         color=STYLE["ink"], va="top")
-                y -= 0.028
+                y -= 0.022
 
         elif t == "blank":
-            y -= 0.010
+            y -= 0.006
 
         elif t == "bullet":
             indent = tok["indent"]
-            txt = tok["text"]
-            wrapped = _wrap_text_kr(txt, width=int(92 - indent * 6))
+            wrapped = _wrap_text_kr(tok["text"], width=int(100 - indent * 6))
             for j, line in enumerate(wrapped):
-                if y < BOTTOM:
+                if y < Y_BOTTOM:
                     new_page()
                 prefix = "  " * indent + ("• " if j == 0 else "  ")
-                ax.text(0.0, y, prefix, fontsize=10, color=STYLE["body"], va="top")
-                _render_inline_styled(ax, 0.020 + indent * 0.018, y, line,
-                                       base_size=10.0, base_color=STYLE["body"])
-                y -= 0.022
+                ax.text(0.0, y, prefix, fontsize=BODY_SIZE, color=STYLE["body"], va="top")
+                _render_inline_styled(ax, 0.018 + indent * 0.016, y, line,
+                                       base_size=BODY_SIZE, base_color=STYLE["body"])
+                y -= LINE_H
 
         elif t == "blockquote":
-            txt = tok["text"]
-            wrapped = _wrap_text_kr(txt, width=85)
-            block_h = 0.024 * len(wrapped) + 0.008
-            if y - block_h < BOTTOM:
+            wrapped = _wrap_text_kr(tok["text"], width=92)
+            block_h = LINE_H * len(wrapped) + 0.006
+            if y - block_h < Y_BOTTOM:
                 new_page()
             ax.add_patch(plt.Rectangle((0.0, y - block_h), 1.0, block_h, facecolor=STYLE["panel_bg"], zorder=0))
             ax.add_patch(plt.Rectangle((0.0, y - block_h), 0.006, block_h, facecolor=STYLE["muted"]))
-            cy = y - 0.014
+            cy = y - 0.010
             for line in wrapped:
-                ax.text(0.020, cy, line, fontsize=9.5, color=STYLE["muted"],
+                ax.text(0.020, cy, line, fontsize=BODY_SIZE - 0.5, color=STYLE["muted"],
                         fontstyle="italic", va="top")
-                cy -= 0.022
-            y -= block_h + 0.008
+                cy -= LINE_H
+            y -= block_h + 0.005
 
         elif t == "table":
             rows = tok["rows"]
             if not rows:
                 continue
-            est_h = 0.026 * len(rows) + 0.020
-            if y - est_h < BOTTOM:
+            est_h = 0.022 * len(rows) + 0.015
+            if y - est_h < Y_BOTTOM:
                 new_page()
             y = _draw_md_table(ax, rows, y, max_width=1.0)
 
         elif t == "para":
-            txt = tok["text"]
-            wrapped = _wrap_text_kr(txt, width=92)
+            wrapped = _wrap_text_kr(tok["text"], width=100)
             for line in wrapped:
-                if y < BOTTOM:
+                if y < Y_BOTTOM:
                     new_page()
-                _render_inline_styled(ax, 0.0, y, line, base_size=10.0, base_color=STYLE["body"])
-                y -= 0.022
+                _render_inline_styled(ax, 0.0, y, line, base_size=BODY_SIZE, base_color=STYLE["body"])
+                y -= LINE_H
 
     if footer:
         ax.text(0.5, 0.005, footer, fontsize=7, color="#888", ha="center")
@@ -1210,8 +1223,8 @@ def _draw_chart_grid_page(pdf, financials_by_ticker: dict[str, Any], synthesis_t
         return
 
     fig = plt.figure(figsize=(8.27, 11.69))
-    fig.suptitle("Charts — 6-Year Financial Comparison", fontsize=14, fontweight="bold", y=0.985)
-    gs = fig.add_gridspec(3, 2, hspace=0.65, wspace=0.32, top=0.94, bottom=0.04, left=0.08, right=0.96)
+    fig.suptitle("Charts — 6-Year Financial Comparison", fontsize=13, fontweight="bold", y=0.985)
+    gs = fig.add_gridspec(3, 2, hspace=0.75, wspace=0.32, top=0.94, bottom=0.04, left=0.07, right=0.97)
     specs = [
         (charts_mod.chart_capex_absolute,  "9.1 CapEx",          0, 0),
         (charts_mod.chart_capex_yoy,       "9.2 CapEx YoY",      0, 1),
@@ -1235,11 +1248,14 @@ def _draw_chart_grid_page(pdf, financials_by_ticker: dict[str, Any], synthesis_t
             insight = s9[:200] if s9 else ""
         insight_clean = _strip_md_inline_keep_text(insight).strip()
         first_sent = re.split(r"(?<=[.다。])\s+", insight_clean, maxsplit=1)[0] if insight_clean else ""
-        subtitle = first_sent[:70]
-        ax.set_title(f"{title}\n{subtitle}" if subtitle else title,
-                     fontsize=8.5, loc="left", color=STYLE["ink"], pad=4)
-        ax.tick_params(labelsize=7)
-        # legend 작게 + ax에 따라 안 그릴 수도
+        # sub-title은 25자 cap + 한 줄 — 다른 chart 영역 침범 방지
+        subtitle = first_sent[:25]
+        ax.set_title(title, fontsize=9, loc="left", color=STYLE["ink"], pad=8, fontweight="bold")
+        if subtitle:
+            # sub-text는 axis 위쪽에 한 줄, fontsize 작게
+            ax.text(0.0, 1.02, subtitle, transform=ax.transAxes,
+                     fontsize=6.5, color=STYLE["muted"], va="bottom", ha="left")
+        ax.tick_params(labelsize=6.5)
         leg = ax.get_legend()
         if leg is not None:
             for txt in leg.get_texts():
@@ -1440,8 +1456,8 @@ def build_pdf(
         korean_translations = korean_translations or {}
 
         use_v2 = os.getenv("EARNINGS_PDF_V2", "1") == "1"
-        log.info("[Phase 10] build_pdf entry: use_v2=%s editors_pick=%d ko_translations=%d",
-                 use_v2, len(editors_pick_kr or ""), len(korean_translations or {}))
+        log.debug("[pdf] entry v2=%s pick=%d ko=%d",
+                  use_v2, len(editors_pick_kr or ""), len(korean_translations or {}))
 
         with PdfPages(str(output_path)) as pdf:
             if use_v2:

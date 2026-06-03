@@ -23,9 +23,12 @@ _BUCKET_COLOR = {
 
 def sector_return_bars(perf: list[dict], out_dir: Path, filename: str = "07_sector_bars.png",
                        title: str = "미국 섹터·테마 상대강도 (1M 정렬)",
-                       date_iso: str | None = None) -> str | None:
+                       date_iso: str | None = None,
+                       is_korea: bool = False) -> str | None:
     """perf: [{"label","r1m","r3m","r1d","bucket"?}] → 1M 정렬 수평 바.
-    bucket 색상: 주도지속=진녹·새로강해지는=연녹·숨고르기=회·소외빈집=적.
+
+    is_korea=False (미국): bucket 색상 (주도지속=진녹·새로강해지는=연녹·숨고르기=회·소외빈집=적).
+    is_korea=True (KR): bucket 없으니 한국식 양수=적·음수=청 + 별도 legend.
     """
     theme.setup()
     import matplotlib.pyplot as plt
@@ -42,8 +45,11 @@ def sector_return_bars(perf: list[dict], out_dir: Path, filename: str = "07_sect
     y = np.arange(len(rows))
     h = 0.38
     fig, ax = plt.subplots(figsize=(11, max(4.5, 0.42 * len(rows) + 1.5)))
-    c1 = [_BUCKET_COLOR.get(b) or (theme.COLOR_UP if v >= 0 else theme.COLOR_DOWN)
-          for b, v in zip(buckets, r1m)]
+    if is_korea:
+        c1 = [theme.COLOR_UP if v >= 0 else theme.COLOR_DOWN for v in r1m]
+    else:
+        c1 = [_BUCKET_COLOR.get(b) or (theme.COLOR_UP if v >= 0 else theme.COLOR_DOWN)
+              for b, v in zip(buckets, r1m)]
     ax.barh(y + h / 2, r1m, height=h, color=c1)
     ax.barh(y - h / 2, r3m, height=h, color="#bbbbbb", label="3M", alpha=0.8)
     ax.set_yticks(y)
@@ -53,11 +59,21 @@ def sector_return_bars(perf: list[dict], out_dir: Path, filename: str = "07_sect
         ax.text(v + (0.3 if v >= 0 else -0.3), yi + h / 2, f"{v:+.1f}%",
                 va="center", ha="left" if v >= 0 else "right", fontsize=7)
     ax.set_title(title, fontsize=12)
-    # bucket 범례 + 3M 회색
-    legend_handles = [Patch(color=col, label=name) for name, col in _BUCKET_COLOR.items()]
-    legend_handles.append(Patch(color="#bbbbbb", label="3M"))
-    ax.legend(handles=legend_handles, fontsize=7, loc="lower right", ncol=5,
-              framealpha=0.9, columnspacing=1.0)
+    if is_korea:
+        # 한국식 legend — 양수(적)·음수(청)·3M(회)
+        legend_handles = [
+            Patch(color=theme.COLOR_UP, label="1M 양수(적)"),
+            Patch(color=theme.COLOR_DOWN, label="1M 음수(청)"),
+            Patch(color="#bbbbbb", label="3M"),
+        ]
+        ax.legend(handles=legend_handles, fontsize=7, loc="lower right", ncol=3,
+                  framealpha=0.9, columnspacing=1.0)
+    else:
+        # 미국 bucket 범례 + 3M 회색
+        legend_handles = [Patch(color=col, label=name) for name, col in _BUCKET_COLOR.items()]
+        legend_handles.append(Patch(color="#bbbbbb", label="3M"))
+        ax.legend(handles=legend_handles, fontsize=7, loc="lower right", ncol=5,
+                  framealpha=0.9, columnspacing=1.0)
     ax.tick_params(axis="x", labelsize=8)
     theme.stamp(ax, date_iso)
     fig.tight_layout()

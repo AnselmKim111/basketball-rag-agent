@@ -15,6 +15,28 @@ from pathlib import Path
 log = logging.getLogger(__name__)
 
 
+def streak_count(series) -> int:
+    """마지막 값과 같은 부호로 연속된 거래일수 (음수=매도 streak, 양수=매수 streak, 0=동일).
+
+    공용 헬퍼 — report_bot._build_report와 korea_flow_chart.streak_alert_card 둘 다 사용.
+    series: pandas Series (외국인·기관·개인 일별 순매수 등).
+    """
+    if series is None or len(series) == 0:
+        return 0
+    vals = series.values
+    last = vals[-1]
+    if last == 0:
+        return 0
+    sign = 1 if last > 0 else -1
+    cnt = 0
+    for v in vals[::-1]:
+        if (v > 0 and sign > 0) or (v < 0 and sign < 0):
+            cnt += 1
+        else:
+            break
+    return cnt * sign
+
+
 def _state_dir() -> Path:
     for cand in ("/data/report_state", "reports/_state"):
         p = Path(cand)
