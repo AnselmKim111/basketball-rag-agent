@@ -56,6 +56,27 @@ def load_previous(date_iso: str) -> dict | None:
         return None
 
 
+def load_history(date_iso: str, days: int = 14) -> list[dict]:
+    """date_iso 이전 N일의 snapshot list (시간순). 없는 날짜 skip.
+
+    오래된 → 최신 순서 정렬. 게이지·환전 압력 시계열 차트용.
+    """
+    d = _state_dir()
+    try:
+        files = sorted(p.stem for p in d.glob("*.json"))
+    except Exception:
+        return []
+    prev_files = [f for f in files if f < date_iso][-days:]
+    snapshots: list[dict] = []
+    for f in prev_files:
+        try:
+            snap = json.loads((d / f"{f}.json").read_text(encoding="utf-8"))
+            snapshots.append(snap)
+        except Exception:
+            continue
+    return snapshots
+
+
 def build_snapshot(date_iso: str, market_color: dict, theme_summary: dict,
                    theme_rows: list[dict], macro_summary: dict, breadth: dict,
                    korea_summary: dict, rsp_new_high: bool,

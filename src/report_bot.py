@@ -371,6 +371,12 @@ def _build_report():
             + (f" (전일 {int(prev_gauge_score)}, Δ{risk_gauge.get('score') - int(prev_gauge_score):+d})"
                if isinstance(prev_gauge_score, (int, float)) else " (전일 기준선)"),
             "0. 글로벌 위험선호")
+        # 게이지 시계열 history (Risk + FX 14일)
+        gauge_hist = state.load_history(date_iso, days=14)
+        if gauge_hist:
+            add(flow_charts.gauge_history_chart(gauge_hist, risk_gauge, {}, img_dir, date_iso=date_iso),
+                "게이지 시계열", f"Risk·FX 압력 최근 {len(gauge_hist)+1}일 추세",
+                "0. 글로벌 위험선호")
     except Exception:
         log.exception("[report] 글로벌 위험선호 매트릭스 실패 — 생략")
 
