@@ -80,6 +80,16 @@ stale_data.
 
 (❌ 확신도 별점·진입·손절·목표가·베팅 표현 금지)
 
+## 🎯 Daily Brief (THESIS BOX 직후 — 한 박스로 오늘 핵심 게이지 5개)
+다음 5줄을 인용블록(`>`)으로 — 모두 fact만, 수치 인용:
+> **🌐 Risk:** {gauge_label} {gauge_score}/100 · 전일 {prev}, Δ{±N}
+> **💱 환전 압력:** {fx_label} {fx_score}/100 · 전일 {prev}, Δ{±N} · driver: {USD/KRW 5D | EWY 5D | 외국인 KOSPI 20D}
+> **🔥 hot 테마:** {top 3-5 hot} (5D 강도 순)
+> **📊 어제 추적:** watchlist {N}종목 중 강화 {X} · 약화 {Y} · 유지 {Z}
+> **🇰🇷 한국 수급:** 외국인 KOSPI {±조원} · KOSDAQ {±억원} · 5거래일 연속 매도 여부
+
+(데이터 없으면 그 줄 생략 OK. 베팅 표현 금지. snapshot baseline이면 "(전일 기준선)" 표시)
+
 ## 📍 어제 대비 변화 (Follow-up)
 - deltas_vs_yesterday.notes 근거로 3~6 불릿. 시장 색깔 전환, RSP 신고가 상태, 리더십 진입/이탈,
   소외→반등, 수급 반전, 매크로 델타 우선. baseline이면 "오늘을 기준선으로 시작".
