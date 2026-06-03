@@ -116,6 +116,82 @@ def write_report(
         "data_freshness": data_freshness,
     }
 
+    # Top Surprises Today — 오늘 가장 의외적 fact 5개 자동 추출
+    surprises: list[str] = []
+    try:
+        # 1. 어제 약화 → 오늘 가장 강한 반전 (highlights_meta 비교)
+        prev_meta = (prev_snapshot or {}).get("highlights_meta") or []
+        prev_chg_map = {it.get("ticker"): it.get("chg_5d") for it in prev_meta if it.get("ticker")}
+        today_items = []
+        if isinstance(highlights, dict):
+            today_items = list(highlights.get("us") or []) + list(highlights.get("kr") or [])
+        max_reversal = None
+        max_reversal_lapse = None
+        for it in today_items:
+            tkr = it.get("ticker")
+            chg_t = it.get("chg_5d")
+            chg_p = prev_chg_map.get(tkr)
+            if isinstance(chg_t, (int, float)) and isinstance(chg_p, (int, float)):
+                delta = chg_t - float(chg_p)
+                lbl = (it.get("label") or tkr).split("(")[0].strip()
+                if delta > 0 and (max_reversal is None or delta > max_reversal[1]):
+                    max_reversal = (lbl, delta, chg_p, chg_t)
+                if delta < 0 and (max_reversal_lapse is None or delta < max_reversal_lapse[1]):
+                    max_reversal_lapse = (lbl, delta, chg_p, chg_t)
+        if max_reversal:
+            lbl, d, p, t = max_reversal
+            surprises.append(f"📈 최대 반전: {lbl} (어제 {p:+.1f}% → 오늘 {t:+.1f}%, Δ+{d:.1f})")
+        if max_reversal_lapse:
+            lbl, d, p, t = max_reversal_lapse
+            surprises.append(f"📉 최대 lapse: {lbl} (어제 {p:+.1f}% → 오늘 {t:+.1f}%, Δ{d:.1f})")
+
+        # 2. 가장 큰 외국인 streak (절대값 max)
+        max_streak = None
+        for mkt in ("KOSPI", "KOSDAQ"):
+            for inv in ("외국인", "기관", "개인"):
+                s = ((korea_summary or {}).get(mkt) or {}).get(f"{inv}_streak")
+                if isinstance(s, (int, float)) and (max_streak is None or abs(s) > abs(max_streak[2])):
+                    max_streak = (mkt, inv, int(s))
+        if max_streak and abs(max_streak[2]) >= 5:
+            mkt, inv, s = max_streak
+            direction = "매도" if s < 0 else "매수"
+            surprises.append(f"⚠ 최대 streak: {mkt} {inv} {abs(s)}거래일 연속 {direction}")
+
+        # 3. earnings 최대 surprise (절대값)
+        recent_e = (earnings or {}).get("recent") or {}
+        all_e = (recent_e.get("top_beats") or []) + (recent_e.get("top_misses") or [])
+        if all_e:
+            top_surprise = max(all_e, key=lambda x: abs(x.get("surprise_pct") or 0))
+            sym = top_surprise.get("symbol")
+            sp = top_surprise.get("surprise_pct")
+            if sym and isinstance(sp, (int, float)) and abs(sp) >= 10:
+                tag = "beat" if sp > 0 else "miss"
+                surprises.append(f"💥 최대 어닝 surprise: {sym} EPS {sp:+.1f}% {tag}")
+
+        # 4. 게이지 최대 변화 (Risk vs FX 중 큰 변화)
+        r_diff = None; f_diff = None
+        if brief_facts["risk_gauge"]["score"] is not None and brief_facts["risk_gauge"]["prev_score"] is not None:
+            r_diff = brief_facts["risk_gauge"]["score"] - brief_facts["risk_gauge"]["prev_score"]
+        if brief_facts["fx_pressure"]["score"] is not None and brief_facts["fx_pressure"]["prev_score"] is not None:
+            f_diff = brief_facts["fx_pressure"]["score"] - brief_facts["fx_pressure"]["prev_score"]
+        max_gauge_diff = None
+        if r_diff is not None and abs(r_diff) >= 5:
+            max_gauge_diff = ("Risk", r_diff)
+        if f_diff is not None and abs(f_diff) >= 5 and (max_gauge_diff is None or abs(f_diff) > abs(max_gauge_diff[1])):
+            max_gauge_diff = ("FX 압력", f_diff)
+        if max_gauge_diff:
+            name, d = max_gauge_diff
+            arrow = "↑" if d > 0 else "↓"
+            surprises.append(f"🎯 {name} 게이지 {arrow} {abs(d):.0f}점 변화")
+
+        # 5. theme_hot의 최대 5D 강도 테마
+        hot = (theme_momentum or {}).get("hot") or []
+        if hot:
+            surprises.append(f"🔥 hot 테마 #1: {hot[0]}")
+    except Exception:
+        pass
+    brief_facts["top_surprises"] = surprises[:6]
+
     payload = {
         "date": date_iso,
         "market_color": market_color,

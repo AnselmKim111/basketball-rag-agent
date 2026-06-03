@@ -349,12 +349,15 @@ def us_korea_linkage(theme_rows: list[dict], out_dir: Path, filename: str = "33_
 
 def earnings_calendar_grid(upcoming: list[dict], out_dir: Path,
                            filename: str = "35_earnings_calendar.png",
-                           date_iso: str | None = None) -> str | None:
+                           date_iso: str | None = None,
+                           hot_tickers: set[str] | None = None) -> str | None:
     """다가올 어닝 발표 캘린더 — 시총 가로bar + 발표일/EPS est/revision 색상.
 
     upcoming: [{symbol, date, eps_est, revenue_est, market_cap?, revision?, source}]
     bar 색상: revision.buy_delta ≥+2 = 녹색 / ≤-2 = 빨강 / 무변화·없음 = 회색.
+    hot_tickers: hot 테마 매칭 종목 set — outline 두께/색상 강조 (thesis-relevant).
     """
+    hot_tickers = hot_tickers or set()
     if not upcoming:
         return None
     theme.setup()
@@ -399,7 +402,10 @@ def earnings_calendar_grid(upcoming: list[dict], out_dir: Path,
 
     fig, ax = plt.subplots(figsize=(13, max(4.5, 0.55 * len(items) + 1.8)))
     y = np.arange(len(items))
-    ax.barh(y, caps, color=colors, edgecolor="#333", linewidth=0.4, alpha=0.85)
+    # hot 테마 매칭 종목은 outline 두꺼운 노란색 강조
+    edge_colors = ["#fbc02d" if syms[i] in hot_tickers else "#333" for i in range(len(syms))]
+    edge_widths = [2.2 if syms[i] in hot_tickers else 0.4 for i in range(len(syms))]
+    ax.barh(y, caps, color=colors, edgecolor=edge_colors, linewidth=edge_widths, alpha=0.85)
     ax.invert_yaxis()
     ax.set_xlabel("시총 ($B)  ·  바 색상: 분석가 buy 변화 (녹=+2이상 · 적=-2이하 · 회=무변화)",
                   fontsize=9)
@@ -919,6 +925,86 @@ def watchlist_thesis_quadrant(watchlist: dict, out_dir: Path,
 
     ax.set_title("[watchlist thesis quadrant] 14종목 자동 분류 — 강화·약화·디커플링·유지",
                  fontsize=13, fontweight="bold")
+    theme.stamp(ax, date_iso)
+    fig.tight_layout()
+    return theme.save_fig(fig, out_dir, filename)
+
+
+def gauge_history_chart(history: list[dict], today_risk: dict, today_fx: dict,
+                        out_dir: Path, filename: str = "00c_gauge_history.png",
+                        date_iso: str | None = None) -> str | None:
+    """Risk gauge + FX 압력 게이지 N일 시계열.
+
+    history: state.load_history 결과 (오래된 → 최신).
+    today_risk/fx: 오늘 게이지 dict.
+    """
+    if not history and not today_risk and not today_fx:
+        return None
+    theme.setup()
+    import matplotlib.pyplot as plt
+    from datetime import date as _date
+
+    dates = []
+    risk_vals = []
+    fx_vals = []
+    for snap in history:
+        d_str = snap.get("date")
+        if not d_str:
+            continue
+        try:
+            d = _date.fromisoformat(d_str)
+        except Exception:
+            continue
+        dates.append(d)
+        risk_vals.append(snap.get("gauge_score"))
+        fx_vals.append(snap.get("fx_pressure_score"))
+
+    # 오늘 append
+    today_d = None
+    if date_iso:
+        try:
+            today_d = _date.fromisoformat(date_iso)
+        except Exception:
+            today_d = None
+    if today_d is None:
+        today_d = _date.today()
+    dates.append(today_d)
+    risk_vals.append((today_risk or {}).get("score"))
+    fx_vals.append((today_fx or {}).get("score"))
+
+    if not dates or len([v for v in risk_vals if v is not None]) < 1:
+        return None
+
+    fig, ax = plt.subplots(figsize=(13, 5.0))
+    valid_risk = [(d, v) for d, v in zip(dates, risk_vals) if v is not None]
+    valid_fx = [(d, v) for d, v in zip(dates, fx_vals) if v is not None]
+
+    if valid_risk:
+        rd, rv = zip(*valid_risk)
+        ax.plot(rd, rv, color="#2e7d32", linewidth=2.2, marker="o", markersize=6,
+                label="Risk-On 게이지", zorder=4)
+        # 마지막 점 강조
+        ax.scatter([rd[-1]], [rv[-1]], color="#1b5e20", s=120, zorder=5,
+                   edgecolor="white", linewidth=1.5)
+    if valid_fx:
+        fd, fv = zip(*valid_fx)
+        ax.plot(fd, fv, color="#c62828", linewidth=2.2, marker="s", markersize=6,
+                label="환전 압력 게이지", zorder=4)
+        ax.scatter([fd[-1]], [fv[-1]], color="#b71c1c", s=120, zorder=5,
+                   edgecolor="white", linewidth=1.5, marker="s")
+
+    # 임계 라인
+    ax.axhline(50, color="#888", linewidth=0.6, linestyle=":", alpha=0.6)
+    ax.axhspan(0, 30, color="#43a047", alpha=0.06)
+    ax.axhspan(70, 100, color="#c62828", alpha=0.06)
+    ax.set_ylim(0, 100)
+    ax.set_ylabel("점수 (0-100)", fontsize=10)
+    ax.set_title(f"[게이지 시계열] Risk·FX 압력 — 최근 {len(dates)}일",
+                 fontsize=13, fontweight="bold")
+    ax.legend(fontsize=10, loc="upper left")
+    ax.grid(True, alpha=0.25, linestyle=":")
+    ax.tick_params(labelsize=8)
+    fig.autofmt_xdate(rotation=30)
     theme.stamp(ax, date_iso)
     fig.tight_layout()
     return theme.save_fig(fig, out_dir, filename)

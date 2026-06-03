@@ -137,6 +137,28 @@ def list_recent(limit: int = 20) -> list[dict]:
     return out
 
 
+def find_recent_in_range(days_back: int = 7) -> list[dict]:
+    """최근 N일 안에 만들어진 entry들 전체 로드. RecapBot 주간 회고용.
+
+    days_back은 mtime 기준 — file system clock에 의존. created_at(ISO timestamp)이
+    record 안에 있으면 그것도 참고하지만 mtime이 1순위 (저장 직후 mtime은 항상 정확).
+
+    반환: 최근일순(desc) entry full dict 리스트. 빈 리스트면 7일 내 활동 없음.
+    """
+    import time
+    root = _cache_root()
+    cutoff = time.time() - days_back * 86400
+    out: list[dict] = []
+    for p in sorted(root.glob("*.json"), key=lambda x: x.stat().st_mtime, reverse=True):
+        try:
+            if p.stat().st_mtime < cutoff:
+                break  # 정렬 desc라 이후는 모두 더 오래됨 — 조기 종료
+            out.append(json.loads(p.read_text(encoding="utf-8")))
+        except Exception:
+            log.exception("entry %s 로드 실패 (range)", p.name)
+    return out
+
+
 def latest() -> dict | None:
     """가장 최근 entry 전체 로드 (없으면 None). /dive 등에서 사용."""
     root = _cache_root()

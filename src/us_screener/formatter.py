@@ -77,7 +77,7 @@ def _format_section(items: list[dict], emoji: str, title: str,
     items_capped = items_sorted[:cap]
     rest = len(items) - len(items_capped)
     from src.bot_helpers import html_escape
-    lines = [head, "(티커 / 당일 / 연초대비 / EPS YoY)"]
+    lines = [head, "(티커 / 당일 / 연초대비 / EPS YoY · ⚡=7일내 어닝)"]
     for it in items_capped:
         sym = it.get("ticker", "")
         chg = _fmt_pct(it.get("chg_pct", 0.0))
@@ -87,7 +87,9 @@ def _format_section(items: list[dict], emoji: str, title: str,
         url = links.get(sym)
         sym_e = html_escape(sym)
         sym_disp = f'<a href="{url}">{sym_e}</a>' if url else sym_e
-        lines.append(f"{sym_disp} / {chg} / {ytd} / {eps}")
+        em_date = ex.get("earnings_date")
+        em_mark = f" ⚡{em_date[5:]}" if em_date and len(em_date) >= 10 else ""
+        lines.append(f"{sym_disp} / {chg} / {ytd} / {eps}{em_mark}")
     if rest > 0:
         lines.append(f"... 외 {rest}종목")
     return "\n".join(lines) + "\n"
