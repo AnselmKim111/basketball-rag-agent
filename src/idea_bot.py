@@ -51,6 +51,7 @@ from telegram.ext import (
 )
 
 from src import idea_prompts
+from src.idea import scoring as _scoring
 from src.idea import sourcing as _sourcing
 from src.llm_json import parse_json_object as _parse_json
 from src.bot_helpers import (
@@ -1212,6 +1213,24 @@ async def _run_pipeline(
             )
             return
 
+        # ---- (3.5) 손익비 점수: ScreenerBot momentum 신호 합산 + 재정렬
+        top10 = _scoring.sort_by_risk_reward(_scoring.score_top10(top10, days_back=14))
+        mom_hits = sum(1 for c in top10 if (c.get("momentum_score") or 0) > 0)
+        if mom_hits:
+            preview_names = [
+                f"{c.get('name','?')}({c.get('momentum_score',0)})"
+                for c in top10 if (c.get("momentum_score") or 0) > 0
+            ][:5]
+            await send_text_chunked(
+                bot, chat_id,
+                f"📊 3.5단계: 손익비 점수 산출 — momentum 신호 hit {mom_hits}/{len(top10)}: {', '.join(preview_names)}",
+            )
+        else:
+            await send_text_chunked(
+                bot, chat_id,
+                f"📊 3.5단계: 손익비 점수 산출 — momentum hit 0 (op_lev × purity 만으로 정렬)",
+            )
+
         # ---- (4) 종목 리포트 수집
         await send_text_chunked(
             bot, chat_id, f"📈 4단계: top {len(top10)} 종목 리포트 다운로드 (각 {COMPANY_REPORTS_PER_TICKER}건)",
@@ -1236,6 +1255,9 @@ async def _run_pipeline(
         if not synthesis or not synthesis.get("top5"):
             await send_text_chunked(bot, chat_id, "❌ 최종 분석 실패 — 종료")
             return
+
+        # ---- (5.5) synthesis.top5에 손익비·momentum 메타 합치기 (출력용)
+        _attach_scoring_to_top5(synthesis.get("top5") or [], top10)
 
         # ---- (6) 발송
         await _send_results(
@@ -2126,6 +2148,28 @@ async def _send_top1_quarterly_chart(
         log.exception("Top 1 분기 차트 발송 실패")
 
 
+def _attach_scoring_to_top5(top5: list[dict], top10_scored: list[dict]) -> None:
+    """synthesis.top5 각 pick에 risk_reward_score·momentum_meta를 ticker 매칭으로 합치기.
+
+    매칭 키: ticker6 정확. 없으면 정규화 회사명 substring.
+    """
+    by_ticker = {
+        (c.get("ticker6") or "").strip(): c
+        for c in top10_scored if (c.get("ticker6") or "").strip()
+    }
+    for pick in top5:
+        t = (pick.get("ticker6") or "").strip()
+        match = by_ticker.get(t)
+        if not match:
+            continue
+        if "risk_reward_score" in match:
+            pick["risk_reward_score"] = match["risk_reward_score"]
+        if "momentum_score" in match:
+            pick["momentum_score"] = match["momentum_score"]
+        if "momentum_meta" in match:
+            pick["momentum_meta"] = match["momentum_meta"]
+
+
 async def _send_results(
     bot: Bot, chat_id: str,
     synthesis: dict,
@@ -2193,6 +2237,16 @@ async def _send_results(
         )
         if price_brief:
             header += f"   💰 {price_brief}\n"
+        # 손익비 + momentum 신호 노출 (scoring 후 합쳐진 메타)
+        rr = pick.get("risk_reward_score")
+        mom = pick.get("momentum_score") or 0
+        if rr is not None:
+            header += f"   📊 손익비 score: {rr} (momentum +{mom})\n"
+        meta = pick.get("momentum_meta") or {}
+        sigs = meta.get("signals") or []
+        if sigs:
+            latest = meta.get("latest_date") or "?"
+            header += f"   🔥 ScreenerBot 신호: {', '.join(sigs)} (최근 {latest})\n"
         header += "━━━━━━━━━━━━━━━━━━━━"
         await send_text_chunked(bot, chat_id, header)
 
