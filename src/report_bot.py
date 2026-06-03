@@ -419,6 +419,18 @@ def _build_report():
         "테마 로테이션 히트맵", "5일 모멘텀 — 돈이 어디로", "3. 섹터 로테이션 맵", key=True)
     add(rotation_charts.sector_return_bars(theme_rows, img_dir, date_iso=date_iso),
         "섹터·테마 상대강도", "1M/3M 정렬", "3. 섹터 로테이션 맵")
+    # 한국 섹터 ETF 상대강도 (반도체·방산·2차전지·신재생·자동차·헬스케어·벤치마크)
+    try:
+        from src.report.data import fetch_kr_sectors
+        kr_perf = fetch_kr_sectors.fetch_kr_sector_strength()
+        if kr_perf:
+            add(rotation_charts.sector_return_bars(
+                    kr_perf, img_dir, filename="07b_kr_sector_bars.png",
+                    title="한국 섹터 ETF 상대강도 (1M 정렬)", date_iso=date_iso),
+                "한국 섹터 상대강도", "KR ETF 1M/3M — 미국 섹터와 비교",
+                "3. 섹터 로테이션 맵")
+    except Exception:
+        log.exception("[report] KR 섹터 강도 실패 — 생략")
     add(rotation_charts.region_compare(region_etfs, img_dir, date_iso=date_iso),
         "글로벌 지역 비교", "지역 디커플링", "3. 섹터 로테이션 맵")
     # 테마 자금 흐름 시계열 (B: 20일 누적, 좌 유입·우 이탈) — 시간 진화 통찰
