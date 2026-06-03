@@ -91,6 +91,8 @@ stale_data.
 > **📊 어제 추적:** deltas_vs_yesterday에서 watchlist 강화/약화/유지 통계 (있을 때만)
 > **🇰🇷 한국 수급:** brief_facts.korea_streaks 인용 — KOSPI/KOSDAQ × 외국인_streak/기관_streak/개인_streak
 >   (음수 = 매도 streak, ≥5 시 "N거래일 연속 매도" 명시. ≥7 시 ⚠ 격상 표시)
+> **🚨 매크로 alert:** brief_facts.macro_alerts (VIX/10Y/DXY/WTI/USDKRW 임계값 자동 추출).
+>   각 alert 그대로 명시. 빈 dict이면 "매크로 변수 정상 범위"로 한 줄.
 
 (데이터 None이면 그 줄 생략. 베팅 표현 금지. snapshot baseline이면 "(전일 기준선)" 표시)
 
