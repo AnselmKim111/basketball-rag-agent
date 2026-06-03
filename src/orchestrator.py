@@ -51,6 +51,7 @@ from src.category_bots import (
 from src.disclosure_bot import DISCLOSURE_COMMANDS, build_disclosure_app, disclosure_poll_job
 from src.earnings_bot import EARNINGS_COMMANDS, build_earnings_app, earnings_watch_poll_job, earnings_digest_cron_job
 from src.idea_bot import IDEA_COMMANDS, build_idea_app
+from src.recap_bot import RECAP_COMMANDS, build_recap_app, recap_weekly_job
 from src.screener_bot import SCREENER_COMMANDS, build_screener_app, screener_daily_job
 from src.us_screener_bot import US_SCREENER_COMMANDS, build_us_screener_app, us_screener_daily_job
 from src.report_bot import REPORT_COMMANDS, build_report_app, report_daily_job
@@ -251,6 +252,20 @@ BOT_SPECS: list[BotSpec] = [
                 job_id="report_daily",
                 cron={"hour": 8, "minute": 0},
                 description="버터대디봇 시황 리포트 — 매일 08:00 KST",
+            ),
+        ],
+    ),
+    BotSpec(
+        name="recap",
+        token_env="RECAP_BOT_TOKEN",
+        builder=build_recap_app,
+        commands=RECAP_COMMANDS,
+        jobs=[
+            ScheduledJob(
+                func=recap_weekly_job,
+                job_id="recap_weekly",
+                cron={"day_of_week": "sun", "hour": 19, "minute": 0},
+                description="주간 회고 — 매주 일요일 19:00 KST (signal + ideas + themes + sonnet 합성)",
             ),
         ],
     ),
