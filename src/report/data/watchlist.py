@@ -29,6 +29,7 @@ from src.report.data import (
     fetch_ipo,
     fetch_market_caps,
     kr_theme_linkage,
+    us_theme_linkage,
 )
 
 log = logging.getLogger(__name__)
@@ -40,6 +41,7 @@ _CAT_BONUS = {
     "trend_reversal": 0.80,
     "kr_linkage": 0.75,
     "sector_leader": 0.70,
+    "us_theme_leader": 0.65,
     "followup": 0.50,
     "estimate_revision": 0.55,
 }
@@ -52,6 +54,7 @@ _STREAM_CAP = {
     "sector_leader": 12,
     "trend_reversal": 20,
     "kr_linkage": 15,
+    "us_theme_leader": 15,
 }
 
 # trend_reversal로 분류할 screener 시그널 키
@@ -368,6 +371,41 @@ def _stream_kr_theme_linkage(theme_rows: list[dict] | None, top_n_themes: int = 
 
 
 # ------------------------------------------------------------------
+# Stream G — US theme leader (미국 hot 테마 → 핵심 미국 종목)
+# us_screener.db sector_leader 비활성 시 폴백.
+# ------------------------------------------------------------------
+def _stream_us_theme_leader(theme_rows: list[dict] | None, top_n_themes: int = 6) -> list[dict]:
+    if not theme_rows:
+        return []
+    ranked = sorted(
+        [r for r in theme_rows if r.get("r5d") is not None],
+        key=lambda r: -abs(float(r.get("r5d") or 0)),
+    )[:top_n_themes]
+    out: list[dict] = []
+    seen: set[str] = set()
+    for r in ranked:
+        label = r.get("label") or ""
+        r5d = float(r.get("r5d") or 0)
+        for ticker in us_theme_linkage.core_tickers_for_label(label):
+            if ticker in seen:
+                continue
+            seen.add(ticker)
+            cand = _new_candidate(
+                ticker, "US",
+                name=ticker,
+                sector=label.split("(")[0].strip(),
+                market_cap=0,
+                signal_raw={"theme": label, "r5d": r5d, "leader_of": label},
+            )
+            cand["chg_5d"] = r5d
+            cand["signal_strength"] = min(abs(r5d) / 5.0, 2.0)
+            out.append(cand)
+            if len(out) >= _STREAM_CAP["us_theme_leader"]:
+                return out
+    return out
+
+
+# ------------------------------------------------------------------
 # 점수 함수
 # ------------------------------------------------------------------
 def _score(c: dict, max_cap: float) -> float:
@@ -635,6 +673,11 @@ def build_watchlist(date_iso: str, theme_rows: list[dict] | None,
     # screener.db 비어있어도 작동 — KR pool 활성화 보장.
     for c in _stream_kr_theme_linkage(theme_rows):
         _merge_candidate(kr_pool, c, "kr_linkage", strength_add=1.0)
+
+    # US theme leader (미국 hot 테마 → 미국 핵심 종목 hardcoded 매핑)
+    # us_screener.db 비어있어도 sector_leader 폴백 활성화.
+    for c in _stream_us_theme_leader(theme_rows):
+        _merge_candidate(us_pool, c, "us_theme_leader", strength_add=0.9)
 
     # 뉴스 mention 카운트 부착
     _annotate_news_mentions(us_pool, news)

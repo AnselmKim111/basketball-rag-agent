@@ -46,7 +46,7 @@ stale_data.
 각 종목은 다음 키 포함 가능:
 - ticker, market, sector, market_cap, categories(아래)
 - chg_1d / chg_5d / chg_1m, close
-- categories: ["earnings_actual","estimate_revision","ipo","sector_leader","trend_reversal","followup","kr_linkage"] 중 1개 이상
+- categories: ["earnings_actual","estimate_revision","ipo","sector_leader","trend_reversal","followup","kr_linkage","us_theme_leader"] 중 1개 이상
 - earnings_actual: {asof, eps_actual, eps_est, eps_surprise_pct, rev_actual, rev_est, rev_surprise_pct,
   source_consensus("FMP+Finnhub agree"/"출처 충돌, 보수 채택"/"Finnhub only"/"FMP only"), eps_disputed}
   → **이미 발표된 실제 결과** (fact 인용 + reaction 해석)
