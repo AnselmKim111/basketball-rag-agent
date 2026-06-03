@@ -60,11 +60,13 @@ def build_snapshot(date_iso: str, market_color: dict, theme_summary: dict,
                    theme_rows: list[dict], macro_summary: dict, breadth: dict,
                    korea_summary: dict, rsp_new_high: bool,
                    highlights_meta: list[dict] | None = None,
-                   risk_gauge: dict | None = None) -> dict:
+                   risk_gauge: dict | None = None,
+                   fx_pressure: dict | None = None) -> dict:
     """스냅샷 dict 생성 (JSON 직렬화 가능 값만).
 
     highlights_meta: watchlist에서 산출된 종목 메타 (다음날 F/U stream용).
     risk_gauge: {score, label} — §0 위험선호 게이지 어제 대비 delta용.
+    fx_pressure: {score, label} — §4 환전 압력 게이지 어제 대비 delta용.
     """
     leaders = [r["label"] for r in theme_rows
                if r.get("bucket") in ("주도지속", "새로 강해지는")]
@@ -85,6 +87,8 @@ def build_snapshot(date_iso: str, market_color: dict, theme_summary: dict,
         "highlights_meta": highlights_meta or [],
         "gauge_score": (risk_gauge or {}).get("score"),
         "gauge_label": (risk_gauge or {}).get("label"),
+        "fx_pressure_score": (fx_pressure or {}).get("score"),
+        "fx_pressure_label": (fx_pressure or {}).get("label"),
     }
 
 
@@ -138,6 +142,33 @@ def compute_deltas(today: dict, prev: dict | None) -> dict:
     t_lbl = today.get("gauge_label"); p_lbl = prev.get("gauge_label")
     if t_lbl and p_lbl and t_lbl != p_lbl:
         notes.append(f"Risk 라벨 전환: {p_lbl} → {t_lbl}")
+
+    # 6b) 환전 압력 변화 (≥5점 또는 라벨 전환)
+    t_fx = today.get("fx_pressure_score"); p_fx = prev.get("fx_pressure_score")
+    if isinstance(t_fx, (int, float)) and isinstance(p_fx, (int, float)):
+        diff = round(float(t_fx) - float(p_fx), 1)
+        if abs(diff) >= 5:
+            arrow = "↑" if diff > 0 else "↓"
+            notes.append(f"환전 압력 {arrow} {abs(diff):.0f}점 ({p_fx} → {t_fx})")
+    t_fxl = today.get("fx_pressure_label"); p_fxl = prev.get("fx_pressure_label")
+    if t_fxl and p_fxl and t_fxl != p_fxl:
+        notes.append(f"환전 압력 라벨 전환: {p_fxl} → {t_fxl}")
+
+    # 6c) 외국인 연속 매도/매수 streak — ≥5거래일이면 thesis 격상 alert
+    for mkt in ("KOSPI", "KOSDAQ"):
+        for inv in ("외국인", "기관", "개인"):
+            streak = ((today.get("korea") or {}).get(mkt) or {}).get(f"{inv}_streak")
+            if isinstance(streak, (int, float)) and abs(streak) >= 5:
+                direction = "매도" if streak < 0 else "매수"
+                if abs(streak) >= 7:
+                    notes.append(
+                        f"⚠ {mkt} {inv} {abs(int(streak))}거래일 연속 {direction} — "
+                        f"단순 차익실현 → 추세 전환 신호 격상 가능"
+                    )
+                else:
+                    notes.append(
+                        f"{mkt} {inv} {abs(int(streak))}거래일 연속 {direction} — 추세 관찰 임계"
+                    )
 
     # 7) 한국 수급 방향 반전
     for mkt in ("KOSPI", "KOSDAQ"):

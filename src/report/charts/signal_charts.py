@@ -57,12 +57,12 @@ def deconcentration_signal(dfs: dict[str, object], out_dir: Path,
 
 def rsp_spy_ratio(rsp_df, spy_df, out_dir: Path, filename: str = "06_rsp_spy_ratio.png",
                   days: int = 252, date_iso: str | None = None) -> str | None:
-    """RSP/SPY ratio 차트. 상승추세 = 동일가중 outperform = 폭 확산."""
+    """RSP/SPY ratio 차트. 50MA 상향/하향 cross 마커 + outperform streak fact."""
     theme.setup()
     import matplotlib.pyplot as plt
+    import numpy as np
     if rsp_df is None or spy_df is None or len(rsp_df) < 30 or len(spy_df) < 30:
         return None
-    import pandas as pd
     ratio = (rsp_df["Close"] / spy_df["Close"]).dropna().iloc[-days:]
     if len(ratio) < 10:
         return None
@@ -70,8 +70,58 @@ def rsp_spy_ratio(rsp_df, spy_df, out_dir: Path, filename: str = "06_rsp_spy_rat
     fig, ax = plt.subplots(figsize=(12, 4.8))
     ax.plot(ratio.index, ratio.values, color="#d62728", linewidth=1.6, label="RSP/SPY")
     ax.plot(ma50.index, ma50.values, color="#888", linewidth=1.0, alpha=0.8, label="50MA")
+
+    # 50MA cross 시점 마커 (마지막 60일 내)
+    aligned = ratio.align(ma50, join="inner")
+    r_vals = aligned[0].values
+    m_vals = aligned[1].values
+    idx_vals = aligned[0].index
+    cross_marks_up = []
+    cross_marks_dn = []
+    for i in range(1, len(r_vals)):
+        if np.isnan(m_vals[i]) or np.isnan(m_vals[i-1]):
+            continue
+        if r_vals[i-1] < m_vals[i-1] and r_vals[i] >= m_vals[i]:
+            cross_marks_up.append(i)
+        elif r_vals[i-1] > m_vals[i-1] and r_vals[i] <= m_vals[i]:
+            cross_marks_dn.append(i)
+    cutoff = max(0, len(r_vals) - 60)
+    for i in cross_marks_up:
+        if i >= cutoff:
+            ax.scatter(idx_vals[i], r_vals[i], color="#2e7d32", s=60, zorder=5,
+                       marker="^", edgecolor="white", linewidth=1.2)
+    for i in cross_marks_dn:
+        if i >= cutoff:
+            ax.scatter(idx_vals[i], r_vals[i], color="#c62828", s=60, zorder=5,
+                       marker="v", edgecolor="white", linewidth=1.2)
+
+    # outperform streak (RSP가 SPY 대비 5D % outperform 일수)
+    rsp_ret = rsp_df["Close"].pct_change().dropna()
+    spy_ret = spy_df["Close"].pct_change().dropna()
+    rel = (rsp_ret - spy_ret).dropna()
+    streak = 0
+    if len(rel) > 0:
+        last_sign = 1 if rel.iloc[-1] > 0 else -1
+        for v in rel.values[::-1]:
+            if (v > 0 and last_sign > 0) or (v < 0 and last_sign < 0):
+                streak += 1
+            else:
+                break
+        streak *= last_sign
+
     up = float(ratio.iloc[-1]) >= float(ratio.iloc[-20]) if len(ratio) >= 20 else True
+    above_ma = bool(r_vals[-1] >= m_vals[-1]) if not np.isnan(m_vals[-1]) else None
+    parts = []
+    if streak != 0:
+        s_dir = "RSP outperform" if streak > 0 else "SPY outperform"
+        parts.append(f"{s_dir} {abs(streak)}일")
+    if above_ma is True:
+        parts.append("50MA 위")
+    elif above_ma is False:
+        parts.append("50MA 아래")
     note = "↗ 동일가중 우위(폭 확산)" if up else "↘ 시총가중 우위(쏠림)"
+    if parts:
+        note += "  ·  " + " · ".join(parts)
     ax.fill_between(ratio.index, ratio.values, float(ratio.min()),
                     color="#d62728" if up else "#1f77b4", alpha=0.07)
     ax.set_title(f"RSP/SPY 비율 — {note}", fontsize=12,

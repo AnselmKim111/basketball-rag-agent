@@ -43,12 +43,15 @@ def capital_flow_diagram(sources: list[tuple], destinations: list[tuple], out_di
                          filename: str = "40_capital_flow.png",
                          date_iso: str | None = None,
                          gauge_score: int | None = None,
-                         gauge_label: str | None = None) -> str | None:
+                         gauge_label: str | None = None,
+                         fx_score: int | None = None,
+                         fx_label: str | None = None) -> str | None:
     """Sankey식 자금흐름도 (TV 팔레트). 흐름 굵기 = 강도.
 
     sources: [(label, strength)] 자금 이탈처 (적색)
     destinations: [(label, strength)] 자금 유입처 (녹색)
-    gauge_score/label: Risk-On/Off 점수를 허브에 표시.
+    gauge_score/label: 글로벌 Risk-On/Off 점수.
+    fx_score/label: §4 환전 압력 점수 (한국).
     """
     theme.setup()
     import matplotlib.pyplot as plt
@@ -73,14 +76,19 @@ def capital_flow_diagram(sources: list[tuple], destinations: list[tuple], out_di
     C_IN = "#22ab94"   # 녹: 자금 유입
 
     hub = (5.0, 5.0)
-    # 중앙 허브 — Risk 게이지 통합
+    # 중앙 허브 — Risk + FX 게이지 통합
+    hub_lines = []
     if gauge_score is not None:
-        hub_text = f"{gauge_label or ''}\n{gauge_score}/100"
-        hub_fs = 12
-    else:
-        hub_text = "자금\n재편"
-        hub_fs = 11
-    ax.add_patch(FancyBboxPatch((4.05, 4.1), 1.9, 1.8, boxstyle="round,pad=0.08",
+        hub_lines.append(f"Risk {gauge_score}/100")
+        hub_lines.append(gauge_label or "")
+    if fx_score is not None:
+        hub_lines.append(f"FX압력 {fx_score}/100")
+        hub_lines.append(fx_label or "")
+    if not hub_lines:
+        hub_lines = ["자금", "재편"]
+    hub_text = "\n".join([l for l in hub_lines if l])
+    hub_fs = 10 if len(hub_lines) >= 3 else 12
+    ax.add_patch(FancyBboxPatch((4.05, 4.0), 1.9, 2.0, boxstyle="round,pad=0.08",
                  facecolor="#2a2e39", edgecolor="#888", linewidth=1.5))
     ax.text(hub[0], hub[1], hub_text, ha="center", va="center", color="white",
             fontsize=hub_fs, fontweight="bold")
@@ -604,6 +612,312 @@ def followup_tracking_table(prev_highlights: list[dict], out_dir: Path,
         cell.set_facecolor("#37474f")
         cell.set_text_props(color="white", fontweight="bold")
     ax.set_title("[어제 watchlist 추적] 어제 5D → 오늘 5D · 신호 강화·약화·유지",
+                 fontsize=13, fontweight="bold")
+    theme.stamp(ax, date_iso)
+    fig.tight_layout()
+    return theme.save_fig(fig, out_dir, filename)
+
+
+def fx_pressure_gauge(usdkrw_df, ewy_df, foreign_kospi_20d: float | None,
+                      out_dir: Path, filename: str = "10_fx_pressure.png",
+                      prev_pressure: float | None = None,
+                      date_iso: str | None = None) -> tuple[str | None, dict]:
+    """환전 압력 게이지 — USD/KRW 5D + EWY 5D + 외국인 KOSPI 20D 통합 점수.
+
+    반환: (path, gauge_dict). gauge_dict = {score, label, components}.
+
+    압력 점수 (0~100, 기본 50):
+      + USD/KRW 5D ×20 (양수 = 압력 ↑)
+      - EWY 5D ×20 (양수 = 압력 ↓)
+      - 외국인 KOSPI 20D / 1e11 ×4 (음수 = 압력 ↑, 1조 매도 → 약 +40)
+    """
+    if usdkrw_df is None or len(usdkrw_df) < 7:
+        return None, {}
+    theme.setup()
+    import matplotlib.pyplot as plt
+    import numpy as np
+    from matplotlib.patches import Wedge
+
+    # 5D 변화 계산
+    def _pct_5d(df) -> float | None:
+        if df is None or len(df) < 7:
+            return None
+        try:
+            return (float(df["Close"].iloc[-1]) / float(df["Close"].iloc[-6]) - 1) * 100
+        except Exception:
+            return None
+
+    krw_5d = _pct_5d(usdkrw_df) or 0.0
+    ewy_5d = _pct_5d(ewy_df)
+    # 외국인 KOSPI 20D 누적 (억원 단위로 보임)
+    fk = float(foreign_kospi_20d) if isinstance(foreign_kospi_20d, (int, float)) else 0.0
+
+    # 점수 (cap 0-100)
+    score = 50.0
+    score += krw_5d * 20
+    if ewy_5d is not None:
+        score -= ewy_5d * 20
+    # 외국인 매도 (억원, 음수 = 매도): -10000억 = -1조 → +40점
+    score -= fk / 250  # -10000(억원) / 250 = -40 → -(-40) = +40
+    score = max(0.0, min(100.0, score))
+
+    if score >= 75:
+        label = "매우 강함"
+    elif score >= 60:
+        label = "강함"
+    elif score >= 45:
+        label = "중간"
+    elif score >= 30:
+        label = "약함"
+    else:
+        label = "낮음"
+
+    # 게이지(좌) + 컴포넌트 기여도 bar(우) 통합 figure
+    fig, (ax, ax2) = plt.subplots(1, 2, figsize=(15, 5.5),
+                                   gridspec_kw={"width_ratios": [3, 2]})
+    ax.set_xlim(-1.3, 1.3); ax.set_ylim(-0.4, 1.25); ax.axis("off")
+
+    # 5단 색상 (반전 — 압력 ↑ = 빨강)
+    bands = [
+        (0, 30, "#43a047"),    # 낮음 — 녹
+        (30, 45, "#9e9e9e"),   # 약함 — 회
+        (45, 60, "#ef6c00"),   # 중간 — 주황
+        (60, 75, "#d84315"),   # 강함 — 빨강
+        (75, 100, "#b71c1c"),  # 매우 강함 — 진빨강
+    ]
+    for lo, hi, col in bands:
+        ang_lo = 180 - (lo / 100.0) * 180
+        ang_hi = 180 - (hi / 100.0) * 180
+        ax.add_patch(Wedge((0, 0), 1.0, ang_hi, ang_lo, width=0.28,
+                           facecolor=col, edgecolor="white", linewidth=1.5))
+
+    for tick in (0, 25, 50, 75, 100):
+        ang = np.radians(180 - (tick / 100.0) * 180)
+        rx, ry = np.cos(ang), np.sin(ang)
+        ax.plot([rx * 0.72, rx * 0.68], [ry * 0.72, ry * 0.68], color="#222", linewidth=1.2)
+        ax.text(rx * 0.62, ry * 0.62, str(tick), ha="center", va="center",
+                fontsize=9, color="#444")
+
+    ang = np.radians(180 - (score / 100.0) * 180)
+    nx, ny = np.cos(ang) * 0.92, np.sin(ang) * 0.92
+    ax.plot([0, nx], [0, ny], color="#111", linewidth=3, solid_capstyle="round")
+    ax.add_patch(plt.Circle((0, 0), 0.05, facecolor="#111", edgecolor="white", linewidth=1.5))
+
+    ax.text(0, -0.14, f"{int(score)}/100", ha="center", va="center",
+            fontsize=24, fontweight="bold", color="#111")
+    ax.text(0, -0.28, label, ha="center", va="center", fontsize=14, color="#333")
+
+    # 전일 대비 delta
+    if isinstance(prev_pressure, (int, float)):
+        diff = score - float(prev_pressure)
+        arrow = "▲" if diff > 0 else ("▼" if diff < 0 else "·")
+        col = "#c62828" if diff > 0 else ("#2e7d32" if diff < 0 else "#666")
+        ax.text(0, 1.10, f"전일 {int(prev_pressure)}/100  {arrow}{abs(diff):.0f}점",
+                ha="center", va="center", fontsize=11, color=col, fontweight="bold")
+    else:
+        ax.text(0, 1.10, "전일 기준선", ha="center", va="center", fontsize=10, color="#666")
+
+    ax.set_title("[환전 압력 게이지]", fontsize=13, fontweight="bold")
+    theme.stamp(ax, date_iso)
+
+    # 컴포넌트 기여도 bar (우측)
+    contributions = []
+    contributions.append(("USD/KRW 5D", krw_5d * 20))
+    if ewy_5d is not None:
+        contributions.append(("EWY 5D", -ewy_5d * 20))
+    contributions.append(("외국인 KOSPI 20D", -fk / 250))
+    labels_c = [c[0] for c in contributions]
+    vals_c = [c[1] for c in contributions]
+    colors_c = ["#c62828" if v > 0 else ("#2e7d32" if v < 0 else "#9e9e9e") for v in vals_c]
+    y_pos = np.arange(len(labels_c))
+    ax2.barh(y_pos, vals_c, color=colors_c, alpha=0.85, edgecolor="#333", linewidth=0.5)
+    ax2.set_yticks(y_pos)
+    ax2.set_yticklabels(labels_c, fontsize=10, fontweight="bold")
+    ax2.invert_yaxis()
+    ax2.axvline(0, color="#333", linewidth=0.6)
+    ax2.set_xlabel("점수 기여 (+압력 ↑ · -압력 ↓)", fontsize=9)
+    ax2.set_title("컴포넌트 기여도", fontsize=11)
+    ax2.grid(axis="x", linestyle=":", alpha=0.4)
+    for i, v in enumerate(vals_c):
+        if v != 0:
+            ax2.text(v + (0.5 if v >= 0 else -0.5), i, f"{v:+.1f}",
+                     ha="left" if v >= 0 else "right", va="center", fontsize=9)
+    # raw 값 우측 annotation
+    raw_vals = [f"USD/KRW {krw_5d:+.2f}%",
+                f"EWY {ewy_5d:+.2f}%" if ewy_5d is not None else "EWY —",
+                f"{fk:+,.0f}억"]
+    raw_max = max([abs(v) for v in vals_c] + [1])
+    for i, raw_s in enumerate(raw_vals):
+        ax2.text(raw_max * 1.05, i, raw_s, ha="left", va="center",
+                 fontsize=8, color="#555")
+
+    fig.tight_layout()
+    out_path = theme.save_fig(fig, out_dir, filename)
+    gauge_dict = {
+        "score": int(score),
+        "label": label,
+        "components": {
+            "usdkrw_5d": round(krw_5d, 2),
+            "ewy_5d": round(ewy_5d, 2) if ewy_5d is not None else None,
+            "foreign_kospi_20d": round(fk),
+        },
+    }
+    return out_path, gauge_dict
+
+
+def risk_component_breakdown(rows: list[dict], out_dir: Path,
+                             filename: str = "00b_risk_components.png",
+                             date_iso: str | None = None) -> str | None:
+    """6대 자산군별 1D·5D 평균 — Risk gauge 점수의 기여 구조."""
+    if not rows:
+        return None
+    theme.setup()
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    # group별 평균
+    groups: dict[str, list[tuple[float, float]]] = {}
+    for r in rows:
+        g = r.get("group") or "기타"
+        d1 = r.get("d1"); d5 = r.get("d5")
+        if d1 is None and d5 is None:
+            continue
+        groups.setdefault(g, []).append((d1, d5))
+    if not groups:
+        return None
+
+    order = ["주식", "채권", "원자재", "통화", "암호"]
+    items = []
+    for g in order:
+        if g in groups:
+            vals = groups[g]
+            d1_avg = float(np.mean([v[0] for v in vals if v[0] is not None] or [0]))
+            d5_avg = float(np.mean([v[1] for v in vals if v[1] is not None] or [0]))
+            items.append((g, d1_avg, d5_avg))
+    # order 외 자산군
+    for g in groups:
+        if g not in order:
+            vals = groups[g]
+            d1_avg = float(np.mean([v[0] for v in vals if v[0] is not None] or [0]))
+            d5_avg = float(np.mean([v[1] for v in vals if v[1] is not None] or [0]))
+            items.append((g, d1_avg, d5_avg))
+
+    fig, ax = plt.subplots(figsize=(13, max(4, 0.6 * len(items) + 1.8)))
+    y = np.arange(len(items))
+    h = 0.38
+    d1_vals = [it[1] for it in items]
+    d5_vals = [it[2] for it in items]
+
+    def _col(v):
+        if v >= 0.5:
+            return "#1b5e20"
+        if v >= 0:
+            return "#43a047"
+        if v >= -0.5:
+            return "#ef6c00"
+        return "#c62828"
+
+    c1 = [_col(v) for v in d1_vals]
+    c5 = [_col(v) for v in d5_vals]
+    ax.barh(y + h / 2, d1_vals, height=h, color=c1, edgecolor="#333", linewidth=0.4, label="1D")
+    ax.barh(y - h / 2, d5_vals, height=h, color=c5, edgecolor="#333", linewidth=0.4, alpha=0.6, label="5D")
+    ax.set_yticks(y)
+    ax.set_yticklabels([it[0] for it in items], fontsize=11, fontweight="bold")
+    ax.invert_yaxis()
+    ax.axvline(0, color="#333", linewidth=0.6)
+    ax.set_xlabel("평균 등락률 (%)", fontsize=9)
+    ax.grid(axis="x", linestyle=":", alpha=0.4)
+    ax.legend(fontsize=9, loc="lower right")
+    mx = max([abs(v) for v in d1_vals + d5_vals] + [0.5])
+    for i, (g, v1, v5) in enumerate(items):
+        ax.text(v1 + (mx * 0.04 if v1 >= 0 else -mx * 0.04), i + h / 2,
+                f"{v1:+.2f}%", va="center", ha="left" if v1 >= 0 else "right",
+                fontsize=8, color="#222")
+        ax.text(v5 + (mx * 0.04 if v5 >= 0 else -mx * 0.04), i - h / 2,
+                f"{v5:+.2f}%", va="center", ha="left" if v5 >= 0 else "right",
+                fontsize=8, color="#555")
+    ax.set_title("[6대 자산군 1D·5D 평균] Risk 게이지 기여 구조",
+                 fontsize=13, fontweight="bold")
+    theme.stamp(ax, date_iso)
+    fig.tight_layout()
+    return theme.save_fig(fig, out_dir, filename)
+
+
+def watchlist_thesis_quadrant(watchlist: dict, out_dir: Path,
+                              filename: str = "30b_thesis_quadrant.png",
+                              date_iso: str | None = None) -> str | None:
+    """watchlist 14종목 → 4 quadrant 분류 dashboard.
+
+    분류 (auto rule):
+    - 강화: chg_5d ≥ +5% (녹색)
+    - 약화: chg_5d ≤ -5% (빨강)
+    - 디커플링: kr_linkage 카테고리 + theme_linkage.us_theme_r5d와 종목 5D 차이 ≥5%
+    - 유지/노이즈: 그 외 (회색)
+    """
+    if not watchlist:
+        return None
+    items = list(watchlist.get("us") or []) + list(watchlist.get("kr") or [])
+    if not items:
+        return None
+    theme.setup()
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import FancyBboxPatch
+
+    groups: dict[str, list[str]] = {"강화": [], "약화": [], "디커플링": [], "유지": []}
+    for it in items:
+        chg = it.get("chg_5d")
+        label = (it.get("label") or it.get("ticker") or "").split("(")[0].strip()
+        market = it.get("market") or "US"
+        tag = f"{label}({market})"
+        if not isinstance(chg, (int, float)):
+            groups["유지"].append(tag)
+            continue
+        tl = it.get("theme_linkage") or {}
+        us_r5d = tl.get("us_theme_r5d")
+        if isinstance(us_r5d, (int, float)) and "kr_linkage" in (it.get("categories") or []):
+            diff = us_r5d - chg
+            if abs(diff) >= 5:
+                groups["디커플링"].append(f"{tag}  Δ{diff:+.0f}%")
+                continue
+        if chg >= 5:
+            groups["강화"].append(f"{tag}  {chg:+.1f}%")
+        elif chg <= -5:
+            groups["약화"].append(f"{tag}  {chg:+.1f}%")
+        else:
+            groups["유지"].append(f"{tag}  {chg:+.1f}%")
+
+    quad_specs = [
+        ("강화", "#1b5e20", "#c8e6c9", (0.05, 0.55, 0.45, 0.40)),
+        ("약화", "#c62828", "#ffcdd2", (0.55, 0.55, 0.40, 0.40)),
+        ("디커플링", "#ef6c00", "#ffe0b2", (0.05, 0.10, 0.45, 0.40)),
+        ("유지", "#616161", "#eeeeee", (0.55, 0.10, 0.40, 0.40)),
+    ]
+
+    fig, ax = plt.subplots(figsize=(13, 7.5))
+    ax.set_xlim(0, 1); ax.set_ylim(0, 1); ax.axis("off")
+
+    for name, dark, light, (x, y, w, h) in quad_specs:
+        lst = groups[name]
+        # 박스
+        ax.add_patch(FancyBboxPatch((x, y), w, h, boxstyle="round,pad=0.01",
+                     facecolor=light, edgecolor=dark, linewidth=1.5))
+        # 헤더
+        ax.text(x + 0.02, y + h - 0.04, f"{name}  ({len(lst)})",
+                ha="left", va="center", fontsize=14, fontweight="bold", color=dark)
+        # 종목 list
+        max_items = 6
+        for i, item in enumerate(lst[:max_items]):
+            ax.text(x + 0.03, y + h - 0.10 - i * 0.05, f"• {item}",
+                    ha="left", va="center", fontsize=10, color="#222")
+        if len(lst) > max_items:
+            ax.text(x + 0.03, y + h - 0.10 - max_items * 0.05,
+                    f"  ... 외 {len(lst) - max_items}",
+                    ha="left", va="center", fontsize=9, color="#666", style="italic")
+        if not lst:
+            ax.text(x + w / 2, y + h / 2, "—", ha="center", va="center",
+                    fontsize=18, color="#aaa")
+
+    ax.set_title("[watchlist thesis quadrant] 14종목 자동 분류 — 강화·약화·디커플링·유지",
                  fontsize=13, fontweight="bold")
     theme.stamp(ax, date_iso)
     fig.tight_layout()
