@@ -21,8 +21,11 @@
 
 # 입력
 - 사용자 아이디어 본문 + 분해된 mechanisms
-- 30 후보 (각 종목의 mechanism, size_tier, purity_score 포함)
-- 산업 리포트 PDF 텍스트들 (wisereport)
+- 30 후보 (각 종목의 mechanism, size_tier, purity_score, source 포함 — source가
+  'screener'면 ScreenerBot universe 매칭, 'industry_report'면 분석가가 산업 리포트에
+  명시 인용한 종목 = 시장 confirmation, 'perplexity'면 LLM 발굴.)
+- 산업 리포트 PDF 텍스트들 (wisereport). 각 본문 첫 줄에 `[발행 N일 전 · 가중치 X×]`
+  라벨이 있다. 1.5× 라벨(7일 이내) 리포트의 정보를 우선 인용.
 
 # 출력 형식 (엄수)
 **오로지 JSON만 출력**. 자연어 서론·결론 금지. 코드 펜스 ```json 사용 가능.
