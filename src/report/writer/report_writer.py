@@ -36,16 +36,44 @@ def write_report(
     highlights: list[dict] | dict | None = None,
     earnings: dict | None = None,
     stale: list[dict] | None = None,
+    risk_gauge: dict | None = None,
+    fx_gauge: dict | None = None,
+    prev_snapshot: dict | None = None,
 ) -> str:
     """LLM으로 전체 Markdown 리포트 생성 (8섹션 + 전일 대비 팔로업).
 
     chart_list: [{"filename","title","caption_hint","section"}], signals: MarketSignal dicts,
     macro_summary/korea_summary: 요약 dict, theme_momentum: {buckets,hot,cold},
     deltas: 전일 대비 변화, breadth: 시장 폭, highlights: 개별주 [{label,chg,note}].
+    risk_gauge/fx_gauge: §0/§4 게이지 점수 (Daily Brief 박스 명시 fact).
     실패 시 규칙 기반 fallback markdown 반환.
     """
     # highlights는 watchlist 결과 {us:[...], kr:[...]} 또는 legacy list 형태 둘 다 허용
     hl_payload = highlights if isinstance(highlights, dict) else {"legacy": highlights or []}
+
+    # Daily Brief 박스 명시 fact dict — LLM이 정확 수치 인용 보장
+    brief_facts = {
+        "risk_gauge": {
+            "score": (risk_gauge or {}).get("score"),
+            "label": (risk_gauge or {}).get("label"),
+            "prev_score": (prev_snapshot or {}).get("gauge_score"),
+            "prev_label": (prev_snapshot or {}).get("gauge_label"),
+        },
+        "fx_pressure": {
+            "score": (fx_gauge or {}).get("score"),
+            "label": (fx_gauge or {}).get("label"),
+            "components": (fx_gauge or {}).get("components"),
+            "prev_score": (prev_snapshot or {}).get("fx_pressure_score"),
+            "prev_label": (prev_snapshot or {}).get("fx_pressure_label"),
+        },
+        "theme_hot": (theme_momentum or {}).get("hot", [])[:5],
+        "korea_streaks": {
+            mkt: {k: v for k, v in (((korea_summary or {}).get(mkt) or {}).items())
+                  if k.endswith("_streak")}
+            for mkt in ("KOSPI", "KOSDAQ")
+        },
+    }
+
     payload = {
         "date": date_iso,
         "market_color": market_color,
@@ -60,6 +88,7 @@ def write_report(
         "news": (news or [])[:15],
         "earnings": earnings or {},
         "stale_data": stale or [],
+        "brief_facts": brief_facts,
     }
     user_msg = (
         "다음은 오늘 시장 데이터·전일 대비 변화(deltas_vs_yesterday)·생성된 차트 목록이다. "

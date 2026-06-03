@@ -81,14 +81,18 @@ stale_data.
 (❌ 확신도 별점·진입·손절·목표가·베팅 표현 금지)
 
 ## 🎯 Daily Brief (THESIS BOX 직후 — 한 박스로 오늘 핵심 게이지 5개)
-다음 5줄을 인용블록(`>`)으로 — 모두 fact만, 수치 인용:
-> **🌐 Risk:** {gauge_label} {gauge_score}/100 · 전일 {prev}, Δ{±N}
-> **💱 환전 압력:** {fx_label} {fx_score}/100 · 전일 {prev}, Δ{±N} · driver: {USD/KRW 5D | EWY 5D | 외국인 KOSPI 20D}
-> **🔥 hot 테마:** {top 3-5 hot} (5D 강도 순)
-> **📊 어제 추적:** watchlist {N}종목 중 강화 {X} · 약화 {Y} · 유지 {Z}
-> **🇰🇷 한국 수급:** 외국인 KOSPI {±조원} · KOSDAQ {±억원} · 5거래일 연속 매도 여부
+**brief_facts dict에서 정확 수치만 인용**. 추측 금지 — score/label/prev_score/components가 None이면
+그 줄 생략. 5줄을 인용블록(`>`)으로:
+> **🌐 Risk:** brief_facts.risk_gauge.label · brief_facts.risk_gauge.score/100 ·
+>   전일 prev_score → 오늘 score (Δ±N) · 라벨 전환 시 명시
+> **💱 환전 압력:** brief_facts.fx_pressure.label · score/100 · 전일 prev_score → 오늘 score (Δ±N) ·
+>   driver: components 중 절대값 가장 큰 컴포넌트 (예: "외국인 KOSPI 20D -10000억")
+> **🔥 hot 테마:** brief_facts.theme_hot 3-5개 (그대로 list)
+> **📊 어제 추적:** deltas_vs_yesterday에서 watchlist 강화/약화/유지 통계 (있을 때만)
+> **🇰🇷 한국 수급:** brief_facts.korea_streaks 인용 — KOSPI/KOSDAQ × 외국인_streak/기관_streak/개인_streak
+>   (음수 = 매도 streak, ≥5 시 "N거래일 연속 매도" 명시. ≥7 시 ⚠ 격상 표시)
 
-(데이터 없으면 그 줄 생략 OK. 베팅 표현 금지. snapshot baseline이면 "(전일 기준선)" 표시)
+(데이터 None이면 그 줄 생략. 베팅 표현 금지. snapshot baseline이면 "(전일 기준선)" 표시)
 
 ## 📍 어제 대비 변화 (Follow-up)
 - deltas_vs_yesterday.notes 근거로 3~6 불릿. 시장 색깔 전환, RSP 신고가 상태, 리더십 진입/이탈,

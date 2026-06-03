@@ -596,7 +596,9 @@ def _build_report():
                                     korea_summary, news=news, theme_momentum=theme_summary,
                                     deltas=deltas, breadth=breadth,
                                     highlights=watchlist_result,
-                                    earnings=earnings, stale=stale)
+                                    earnings=earnings, stale=stale,
+                                    risk_gauge=risk_gauge, fx_gauge=fx_gauge,
+                                    prev_snapshot=prev)
 
     # headline 추출 (첫 # 라인)
     headline = next((ln.lstrip("# ").strip() for ln in md.splitlines() if ln.startswith("#")), f"{date_iso} 시장 리포트")
