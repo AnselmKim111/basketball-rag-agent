@@ -535,7 +535,9 @@ def _build_report():
     src_ep, dst_ep = theme_momentum.flow_endpoints(theme_rows)
     add(flow_charts.capital_flow_diagram(src_ep, dst_ep, img_dir, date_iso=date_iso,
                                           gauge_score=risk_gauge.get("score"),
-                                          gauge_label=risk_gauge.get("label")),
+                                          gauge_label=risk_gauge.get("label"),
+                                          fx_score=fx_gauge.get("score") if fx_gauge else None,
+                                          fx_label=fx_gauge.get("label") if fx_gauge else None),
         "종합 자금흐름 다이어그램", "Sankey · 굵기=강도 · 허브=Risk 게이지",
         "8. 종합 자금흐름", key=True)
 

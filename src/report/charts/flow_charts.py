@@ -43,12 +43,15 @@ def capital_flow_diagram(sources: list[tuple], destinations: list[tuple], out_di
                          filename: str = "40_capital_flow.png",
                          date_iso: str | None = None,
                          gauge_score: int | None = None,
-                         gauge_label: str | None = None) -> str | None:
+                         gauge_label: str | None = None,
+                         fx_score: int | None = None,
+                         fx_label: str | None = None) -> str | None:
     """Sankey식 자금흐름도 (TV 팔레트). 흐름 굵기 = 강도.
 
     sources: [(label, strength)] 자금 이탈처 (적색)
     destinations: [(label, strength)] 자금 유입처 (녹색)
-    gauge_score/label: Risk-On/Off 점수를 허브에 표시.
+    gauge_score/label: 글로벌 Risk-On/Off 점수.
+    fx_score/label: §4 환전 압력 점수 (한국).
     """
     theme.setup()
     import matplotlib.pyplot as plt
@@ -73,14 +76,19 @@ def capital_flow_diagram(sources: list[tuple], destinations: list[tuple], out_di
     C_IN = "#22ab94"   # 녹: 자금 유입
 
     hub = (5.0, 5.0)
-    # 중앙 허브 — Risk 게이지 통합
+    # 중앙 허브 — Risk + FX 게이지 통합
+    hub_lines = []
     if gauge_score is not None:
-        hub_text = f"{gauge_label or ''}\n{gauge_score}/100"
-        hub_fs = 12
-    else:
-        hub_text = "자금\n재편"
-        hub_fs = 11
-    ax.add_patch(FancyBboxPatch((4.05, 4.1), 1.9, 1.8, boxstyle="round,pad=0.08",
+        hub_lines.append(f"Risk {gauge_score}/100")
+        hub_lines.append(gauge_label or "")
+    if fx_score is not None:
+        hub_lines.append(f"FX압력 {fx_score}/100")
+        hub_lines.append(fx_label or "")
+    if not hub_lines:
+        hub_lines = ["자금", "재편"]
+    hub_text = "\n".join([l for l in hub_lines if l])
+    hub_fs = 10 if len(hub_lines) >= 3 else 12
+    ax.add_patch(FancyBboxPatch((4.05, 4.0), 1.9, 2.0, boxstyle="round,pad=0.08",
                  facecolor="#2a2e39", edgecolor="#888", linewidth=1.5))
     ax.text(hub[0], hub[1], hub_text, ha="center", va="center", color="white",
             fontsize=hub_fs, fontweight="bold")
