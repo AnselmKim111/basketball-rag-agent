@@ -113,8 +113,25 @@ stale_data.
    Risk-On이면 위험자산·주도주 신호가 강화되고, Risk-Off면 채권·금·안전자산 회피 신호 우선.
    **게이지 차트(00_risk_gauge)**: 반원 게이지 + 어제 대비 ±N점 delta. 본문에 1회 인용 —
    "전일 X점 → 오늘 Y점 (Δ+N)" fact 명시. 라벨 전환("중립 → 약 Risk-On") 발생 시 thesis 강화/약화 사슬에서 직접 언급.
-1. 매크로 컨텍스트 — 지수·금리·유가·달러·변동성·BTC. 금리/유가/인플레 기대의 thesis 영향. 지정학이
-   그날 핵심이면 여기서 풀어라(news 기반). 신호 수치: 10Y금리 N%·DXY M·VIX K 같은 임계 — fact 인용.
+1. 매크로 컨텍스트 — 지수·금리·유가·달러·변동성·BTC + 고용. 9차트의 단순 캡션 나열 금지.
+   본문 sub-section 2개로 통합 분석:
+
+   ### 1-A. 지수·금리 (4대 지수 + 1Y rebase + 금리 곡선)
+   관찰: 4대 지수 신고가 위치(52w 100%·99% 등), 1Y 리베이스 1위 지수, 금리 곡선 모양(역전·정상),
+   10Y/30Y 임계. 해석: 금리↔주식 관계 (금리 안정=주식 강세 등), 1Y 리베이스에서 누가 누구를 압도하는지
+   주도주 변화. 시장 신호의 의미: 금리·주식 사슬이 thesis(주도주·broadening 등)와 일치하는지.
+   반박: 금리 급변/주식 false breakout 가능성. takeaway 한 줄.
+
+   ### 1-B. 원자재·달러·변동성·암호·고용 (유가 + DXY + VIX + BTC + 기대인플레 + 실업수당)
+   관찰: WTI/Brent fact, DXY fact, VIX fact, BTC fact, 미시건 1년 기대인플레, 실업수당청구.
+   해석: 유가↔달러↔인플레↔금리 사슬, VIX↔주식 사슬, BTC↔유동성 사슬, 고용↔경기 사슬. 컴포넌트 중
+   thesis driver와 risk factor 분리. 시장 신호의 의미: 매크로 환경이 thesis(예: broadening·소외 반등)에
+   우호적/제약인지. VIX 15·BTC $73k·DXY 99 같은 임계 fact 인용. 반박: VIX 18 돌파 / 유가 $90 돌파 등이
+   thesis 위협 시나리오. takeaway 한 줄.
+
+   각 sub-section은 매 섹션 4부 스키마 (관찰/해석/시장 신호의 의미/반박)를 따르되 짧게 (3-4문장).
+   지정학이 그날 핵심이면 1-A 해석에서 풀어라(news 기반).
+   섹션 끝 통합 takeaway 한 줄 (thesis 강화/약화/일관).
 2. 쏠림 둔화 시그널 — 동일가중(RSP) vs 시총가중(SPY/QQQ/M7), RSP/SPY 비율. breadth로 시장 폭 정량.
    신호 수치: RSP·SPY·RSP/SPY의 신고가 근접/돌파, breadth advancers 비율.
 3. 섹터 로테이션 맵 — theme_momentum.buckets를 "주도지속 → 새로 강해지는 → 숨고르기 → 소외·빈집"으로
