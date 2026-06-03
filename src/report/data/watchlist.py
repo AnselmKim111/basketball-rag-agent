@@ -643,8 +643,18 @@ def build_watchlist(date_iso: str, theme_rows: list[dict] | None,
     # 시총 보강 — 0인 후보에 한해 fetch (KR: FDR/screener.db · US: FMP /stable/quote)
     _backfill_market_caps(us_pool, kr_pool)
 
+    # 카테고리별 카운트 (활성화 진단)
+    def _cat_breakdown(pool: dict) -> dict[str, int]:
+        out: dict[str, int] = {}
+        for c in pool.values():
+            for cat in (c.get("categories") or []):
+                out[cat] = out.get(cat, 0) + 1
+        return out
+
     log.info("[watchlist] 후보 풀 US=%d KR=%d (theme_hot=%s)",
              len(us_pool), len(kr_pool), theme_hot)
+    log.info("[watchlist] US 카테고리 breakdown: %s", _cat_breakdown(us_pool))
+    log.info("[watchlist] KR 카테고리 breakdown: %s", _cat_breakdown(kr_pool))
 
     # Estimate revision 보강 (US 후보 중 시총 큰 상위 20개에만 호출 — Finnhub rate 절약)
     revision_targets = sorted(
