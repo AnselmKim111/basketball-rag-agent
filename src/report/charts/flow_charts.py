@@ -260,9 +260,10 @@ def _fetch_kr_5d(tickers: list[str]) -> dict[str, float]:
                     out[tk] = chg
                     _KR_5D_CACHE[tk] = chg
             except Exception:
+                log.debug("[flow_charts._fetch_kr_5d] %s 계산 실패", tk)
                 continue
     except Exception:
-        pass
+        log.exception("[flow_charts._fetch_kr_5d] fetch 전체 실패")
     return out
 
 
@@ -402,15 +403,17 @@ def earnings_calendar_grid(upcoming: list[dict], out_dir: Path,
 
     fig, ax = plt.subplots(figsize=(13, max(4.5, 0.55 * len(items) + 1.8)))
     y = np.arange(len(items))
-    # hot 테마 매칭 종목은 outline 두꺼운 노란색 강조
-    edge_colors = ["#fbc02d" if syms[i] in hot_tickers else "#333" for i in range(len(syms))]
-    edge_widths = [2.2 if syms[i] in hot_tickers else 0.4 for i in range(len(syms))]
+    # hot 테마 매칭 종목은 outline 두꺼운 진노란색 강조 + ★ marker
+    edge_colors = ["#f57f17" if syms[i] in hot_tickers else "#333" for i in range(len(syms))]
+    edge_widths = [4.0 if syms[i] in hot_tickers else 0.4 for i in range(len(syms))]
     ax.barh(y, caps, color=colors, edgecolor=edge_colors, linewidth=edge_widths, alpha=0.85)
+    # hot 종목 y-tick 라벨 옆에 ★ 추가 (시각 강조)
+    sym_labels = [f"★ {syms[i]}" if syms[i] in hot_tickers else syms[i] for i in range(len(syms))]
+    ax.set_yticklabels(sym_labels, fontsize=10, fontweight="bold")
     ax.invert_yaxis()
     ax.set_xlabel("시총 ($B)  ·  바 색상: 분석가 buy 변화 (녹=+2이상 · 적=-2이하 · 회=무변화)",
                   fontsize=9)
     ax.set_yticks(y)
-    ax.set_yticklabels(syms, fontsize=10, fontweight="bold")
     ax.grid(axis="x", linestyle=":", alpha=0.4)
 
     # 우측 annotation — 발표일 + EPS est + revenue est + revision 요약

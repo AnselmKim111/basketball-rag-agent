@@ -144,9 +144,13 @@ def _stream_followup(prev_snapshot: dict | None) -> list[dict]:
         ticker = (it.get("ticker") or "").upper()
         if not ticker:
             continue
+        # label은 enrichment에서 "NAME(TICKER)" 형식으로 저장됨 → name만 추출.
+        # 그렇지 않으면 매일 followup 거칠 때마다 wrap 누적되어 "NIO(NIO)(NIO)(NIO)" 발생.
+        raw_label = it.get("label") or ticker
+        name = (raw_label.split("(")[0] or ticker).strip()
         out.append(_new_candidate(
             ticker, it.get("market") or "US",
-            name=it.get("label") or ticker,
+            name=name,
             sector=it.get("sector"),
             market_cap=it.get("market_cap"),
         ))
