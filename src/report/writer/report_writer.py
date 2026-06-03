@@ -39,6 +39,7 @@ def write_report(
     risk_gauge: dict | None = None,
     fx_gauge: dict | None = None,
     prev_snapshot: dict | None = None,
+    portfolio: dict | None = None,
 ) -> str:
     """LLM으로 전체 Markdown 리포트 생성 (8섹션 + 전일 대비 팔로업).
 
@@ -207,6 +208,7 @@ def write_report(
         "earnings": earnings or {},
         "stale_data": stale or [],
         "brief_facts": brief_facts,
+        "portfolio": portfolio or {},
     }
     user_msg = (
         "다음은 오늘 시장 데이터·전일 대비 변화(deltas_vs_yesterday)·생성된 차트 목록이다. "
