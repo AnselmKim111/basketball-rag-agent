@@ -101,7 +101,14 @@ def compute_revision(symbol: str) -> dict:
         except Exception:
             pt_new = None
 
-    significant = abs(buy_delta) >= 2 or (pt_new is not None and pt_new > 0)
+    # buy_delta ≥1 또는 대형주(buy_new ≥15) OR price target 존재 OR buy/sell 균형 변화 시 significant.
+    # 무료 Finnhub 키는 pt_new 없음 → trend 위주.
+    significant = (
+        abs(buy_delta) >= 1
+        or buy_new >= 15
+        or sell_new >= 3
+        or (pt_new is not None and pt_new > 0)
+    )
     if not significant:
         return {}
 
