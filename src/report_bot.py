@@ -531,6 +531,28 @@ def _build_report():
     for mkt, fdf in (kr_flows or {}).items():
         korea_summary[mkt] = {inv: round(float(fdf[inv].iloc[-20:].sum()), 0) for inv in fdf.columns}
 
+    # 외국인 연속 매도/매수 streak 계산 (KOSPI·KOSDAQ) — thesis 격상 alert용
+    def _streak(series) -> int:
+        """마지막 값과 같은 부호로 연속된 거래일수 (음수 = 연속 매도)."""
+        if series is None or len(series) == 0:
+            return 0
+        vals = series.values
+        last = vals[-1]
+        if last == 0:
+            return 0
+        sign = 1 if last > 0 else -1
+        cnt = 0
+        for v in vals[::-1]:
+            if (v > 0 and sign > 0) or (v < 0 and sign < 0):
+                cnt += 1
+            else:
+                break
+        return cnt * sign  # 음수 = 매도 streak, 양수 = 매수 streak
+    for mkt, fdf in (kr_flows or {}).items():
+        for inv in ("외국인", "기관", "개인"):
+            if inv in fdf.columns:
+                korea_summary.setdefault(mkt, {})[f"{inv}_streak"] = _streak(fdf[inv])
+
     # ---------- §8 종합 자금흐름 다이어그램 (Sankey, Risk 게이지 허브 통합) ----------
     src_ep, dst_ep = theme_momentum.flow_endpoints(theme_rows)
     add(flow_charts.capital_flow_diagram(src_ep, dst_ep, img_dir, date_iso=date_iso,

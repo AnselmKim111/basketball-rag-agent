@@ -154,6 +154,22 @@ def compute_deltas(today: dict, prev: dict | None) -> dict:
     if t_fxl and p_fxl and t_fxl != p_fxl:
         notes.append(f"환전 압력 라벨 전환: {p_fxl} → {t_fxl}")
 
+    # 6c) 외국인 연속 매도/매수 streak — ≥5거래일이면 thesis 격상 alert
+    for mkt in ("KOSPI", "KOSDAQ"):
+        for inv in ("외국인", "기관", "개인"):
+            streak = ((today.get("korea") or {}).get(mkt) or {}).get(f"{inv}_streak")
+            if isinstance(streak, (int, float)) and abs(streak) >= 5:
+                direction = "매도" if streak < 0 else "매수"
+                if abs(streak) >= 7:
+                    notes.append(
+                        f"⚠ {mkt} {inv} {abs(int(streak))}거래일 연속 {direction} — "
+                        f"단순 차익실현 → 추세 전환 신호 격상 가능"
+                    )
+                else:
+                    notes.append(
+                        f"{mkt} {inv} {abs(int(streak))}거래일 연속 {direction} — 추세 관찰 임계"
+                    )
+
     # 7) 한국 수급 방향 반전
     for mkt in ("KOSPI", "KOSDAQ"):
         for inv in ("외국인", "기관", "개인"):
