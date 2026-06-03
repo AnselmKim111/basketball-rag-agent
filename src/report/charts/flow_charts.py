@@ -349,12 +349,15 @@ def us_korea_linkage(theme_rows: list[dict], out_dir: Path, filename: str = "33_
 
 def earnings_calendar_grid(upcoming: list[dict], out_dir: Path,
                            filename: str = "35_earnings_calendar.png",
-                           date_iso: str | None = None) -> str | None:
+                           date_iso: str | None = None,
+                           hot_tickers: set[str] | None = None) -> str | None:
     """다가올 어닝 발표 캘린더 — 시총 가로bar + 발표일/EPS est/revision 색상.
 
     upcoming: [{symbol, date, eps_est, revenue_est, market_cap?, revision?, source}]
     bar 색상: revision.buy_delta ≥+2 = 녹색 / ≤-2 = 빨강 / 무변화·없음 = 회색.
+    hot_tickers: hot 테마 매칭 종목 set — outline 두께/색상 강조 (thesis-relevant).
     """
+    hot_tickers = hot_tickers or set()
     if not upcoming:
         return None
     theme.setup()
@@ -399,7 +402,10 @@ def earnings_calendar_grid(upcoming: list[dict], out_dir: Path,
 
     fig, ax = plt.subplots(figsize=(13, max(4.5, 0.55 * len(items) + 1.8)))
     y = np.arange(len(items))
-    ax.barh(y, caps, color=colors, edgecolor="#333", linewidth=0.4, alpha=0.85)
+    # hot 테마 매칭 종목은 outline 두꺼운 노란색 강조
+    edge_colors = ["#fbc02d" if syms[i] in hot_tickers else "#333" for i in range(len(syms))]
+    edge_widths = [2.2 if syms[i] in hot_tickers else 0.4 for i in range(len(syms))]
+    ax.barh(y, caps, color=colors, edgecolor=edge_colors, linewidth=edge_widths, alpha=0.85)
     ax.invert_yaxis()
     ax.set_xlabel("시총 ($B)  ·  바 색상: 분석가 buy 변화 (녹=+2이상 · 적=-2이하 · 회=무변화)",
                   fontsize=9)
