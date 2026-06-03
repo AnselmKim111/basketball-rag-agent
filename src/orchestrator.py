@@ -49,7 +49,7 @@ from src.category_bots import (
     market_daily_job,
 )
 from src.disclosure_bot import DISCLOSURE_COMMANDS, build_disclosure_app, disclosure_poll_job
-from src.earnings_bot import EARNINGS_COMMANDS, build_earnings_app, earnings_watch_poll_job
+from src.earnings_bot import EARNINGS_COMMANDS, build_earnings_app, earnings_watch_poll_job, earnings_digest_cron_job
 from src.idea_bot import IDEA_COMMANDS, build_idea_app
 from src.screener_bot import SCREENER_COMMANDS, build_screener_app, screener_daily_job
 from src.us_screener_bot import US_SCREENER_COMMANDS, build_us_screener_app, us_screener_daily_job
@@ -184,6 +184,12 @@ BOT_SPECS: list[BotSpec] = [
                 # 4시간 간격 — Yahoo calendarEvents로 D-1~D+4 윈도 게이팅. AV 25/day 안전.
                 cron={"hour": "0,4,8,12,16,20", "minute": 7},
                 description="어닝콜 watch 자동 감지 — 4h 간격 (calendar 게이팅)",
+            ),
+            ScheduledJob(
+                func=earnings_digest_cron_job,
+                job_id="earnings_digest_weekly",
+                cron={"day_of_week": "mon", "hour": 9, "minute": 0},
+                description="watchlist 주간 digest — 매주 월 09:00 KST (Phase 7F)",
             ),
         ],
     ),

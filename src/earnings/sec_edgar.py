@@ -453,19 +453,203 @@ def fetch_recent_form4(ticker: str, window_days: int = 30) -> InsiderTradeSummar
 
 
 def fmt_insider_summary(summary: InsiderTradeSummary | None) -> str:
-    """텔레그램·payload용 짧은 요약."""
+    """텔레그램·payload용 짧은 요약. Phase 7E: parse_form4_xml 결과 있으면 정량 표시."""
     if summary is None:
         return ""
     if summary.form4_count == 0:
         return f"👥 인사이더({summary.ticker}): 최근 {summary.window_days}일 Form 4 filing 없음"
+    # 정량 집계 (parse_form4_xml가 forms[i]에 'parsed' 키 추가하면 사용)
+    net_buy_d = 0.0
+    net_sell_d = 0.0
+    director_buy = 0
+    officer_sell = 0
+    ceo_cfo_actions: list[str] = []
+    for f in summary.forms:
+        p = f.get("parsed") or {}
+        if not p:
+            continue
+        for tx in (p.get("transactions") or []):
+            amt = tx.get("dollar_value") or 0.0
+            code = tx.get("code", "")
+            rel = (p.get("relationship") or "").lower()
+            officer_title = (p.get("officer_title") or "").lower()
+            if code == "P":  # 매수
+                net_buy_d += amt
+                if "director" in rel:
+                    director_buy += 1
+                if "ceo" in officer_title or "cfo" in officer_title or "chief" in officer_title:
+                    ceo_cfo_actions.append(f"매수 {amt/1e6:.1f}M ({p.get('reporter','?')})")
+            elif code == "S":  # 매도
+                net_sell_d += amt
+                if "officer" in rel:
+                    officer_sell += 1
+                if "ceo" in officer_title or "cfo" in officer_title or "chief" in officer_title:
+                    ceo_cfo_actions.append(f"매도 {amt/1e6:.1f}M ({p.get('reporter','?')})")
     lines = [f"👥 인사이더({summary.ticker}): 최근 {summary.window_days}일 Form 4 {summary.form4_count}건"]
-    for f in summary.forms[:8]:
+    if net_buy_d > 0 or net_sell_d > 0:
+        net = net_buy_d - net_sell_d
+        net_label = f"+${net/1e6:.1f}M (순매수)" if net > 0 else f"-${-net/1e6:.1f}M (순매도)"
+        lines.append(f"  · 정량: 매수 ${net_buy_d/1e6:.1f}M / 매도 ${net_sell_d/1e6:.1f}M / 순 {net_label}")
+        if director_buy:
+            lines.append(f"  · Director 매수 {director_buy}건")
+        if officer_sell:
+            lines.append(f"  · Officer 매도 {officer_sell}건")
+        if ceo_cfo_actions:
+            lines.append(f"  · CEO/CFO 액션: {' · '.join(ceo_cfo_actions[:3])}")
+    # 최근 filing 5건
+    for f in summary.forms[:5]:
         rep = f.get("reporter") or "?"
         filed = f.get("filed") or "?"
-        lines.append(f"  · {filed} — {rep}")
-    if summary.form4_count > 8:
-        lines.append(f"  · … 외 {summary.form4_count - 8}건")
+        p = f.get("parsed") or {}
+        title = p.get("officer_title") or p.get("relationship") or ""
+        codes = ",".join(tx.get("code", "") for tx in (p.get("transactions") or []))
+        lines.append(f"  · {filed} — {rep}" + (f" ({title})" if title else "") + (f" [{codes}]" if codes else ""))
+    if summary.form4_count > 5:
+        lines.append(f"  · … 외 {summary.form4_count - 5}건")
     return "\n".join(lines)
+
+
+# Form 4 transaction code 매핑 (정성 → 정량)
+FORM4_TX_CODES = {
+    "P": "Open Market Purchase",
+    "S": "Open Market Sale",
+    "M": "Option Exercise / Conversion",
+    "A": "Grant / Award",
+    "D": "Disposition (other)",
+    "F": "Tax Withholding",
+    "G": "Gift",
+    "I": "Discretionary Transaction",
+    "J": "Other Acquisition / Disposition",
+    "V": "Voluntary Reporting",
+    "X": "Option Exercise",
+}
+
+
+def parse_form4_xml(primary_doc_url: str) -> dict | None:
+    """Form 4 XML primary document → 구조화 거래 정보 (Phase 7E).
+
+    SEC Form 4는 XML로 제출 (확장자 .xml). primary_doc_url이 .xml이면 직접 파싱,
+    .htm/.html이면 같은 accession 폴더의 form4.xml/primary_doc.xml 추정.
+
+    반환:
+      {
+        "reporter": "John Smith",
+        "relationship": "Director / Officer / 10% Owner ...",
+        "officer_title": "Chief Financial Officer",
+        "transactions": [
+          {"code": "P", "code_label": "Open Market Purchase",
+           "shares": 1000.0, "price_per_share": 142.5, "dollar_value": 142500.0,
+           "transaction_date": "2026-05-15",
+           "shares_owned_after": 12345.0}
+        ]
+      }
+    실패 시 None.
+    """
+    if not primary_doc_url:
+        return None
+    # .htm → .xml 추정 (SEC Form 4는 보통 form4_2026..xml 같이 함께 제출됨)
+    xml_url = primary_doc_url
+    if not xml_url.lower().endswith(".xml"):
+        # 디렉터리 인덱스에서 .xml 파일 찾기
+        try:
+            parts = primary_doc_url.rsplit("/", 1)
+            if len(parts) < 2:
+                return None
+            dir_url = parts[0] + "/"
+            _throttle()
+            with httpx.Client(timeout=DEFAULT_TIMEOUT) as cli:
+                r = cli.get(dir_url, headers={"User-Agent": USER_AGENT})
+                if r.status_code != 200:
+                    return None
+                m = re.search(r'href="([^"]+\.xml)"', r.text)
+                if not m:
+                    return None
+                xml_url = dir_url + m.group(1) if not m.group(1).startswith("http") else m.group(1)
+        except Exception:
+            log.debug("[form4] xml 경로 추정 실패: %s", primary_doc_url)
+            return None
+    try:
+        _throttle()
+        with httpx.Client(timeout=DEFAULT_TIMEOUT) as cli:
+            r = cli.get(xml_url, headers={"User-Agent": USER_AGENT})
+            if r.status_code != 200:
+                return None
+            xml = r.text
+    except Exception:
+        log.debug("[form4] xml fetch 실패: %s", xml_url)
+        return None
+
+    # 가벼운 파싱 — xml.etree (의존성 없음)
+    import xml.etree.ElementTree as ET
+    try:
+        root = ET.fromstring(xml)
+    except Exception:
+        return None
+
+    out: dict = {"reporter": "", "relationship": "", "officer_title": "", "transactions": []}
+    try:
+        owner = root.find(".//reportingOwner/reportingOwnerId/rptOwnerName")
+        if owner is not None and owner.text:
+            out["reporter"] = owner.text.strip()
+        rel = root.find(".//reportingOwner/reportingOwnerRelationship")
+        if rel is not None:
+            flags = []
+            for child in rel:
+                tag = child.tag
+                v = (child.text or "").strip().lower() if child.text else ""
+                if tag == "isDirector" and v == "1":
+                    flags.append("Director")
+                elif tag == "isOfficer" and v == "1":
+                    flags.append("Officer")
+                elif tag == "isTenPercentOwner" and v == "1":
+                    flags.append("10% Owner")
+                elif tag == "isOther" and v == "1":
+                    flags.append("Other")
+                elif tag == "officerTitle":
+                    out["officer_title"] = (child.text or "").strip()
+            out["relationship"] = " / ".join(flags)
+        # nonDerivativeTransaction 위주 (실제 보통주 매매). derivative는 옵션 — skip
+        for tx in root.findall(".//nonDerivativeTransaction"):
+            code_el = tx.find(".//transactionCoding/transactionCode")
+            code = (code_el.text.strip() if code_el is not None and code_el.text else "")
+            shares_el = tx.find(".//transactionAmounts/transactionShares/value")
+            price_el = tx.find(".//transactionAmounts/transactionPricePerShare/value")
+            date_el = tx.find(".//transactionDate/value")
+            shares_after_el = tx.find(".//postTransactionAmounts/sharesOwnedFollowingTransaction/value")
+            shares = float(shares_el.text) if shares_el is not None and shares_el.text else 0.0
+            price = float(price_el.text) if price_el is not None and price_el.text else 0.0
+            dollar = shares * price
+            out["transactions"].append({
+                "code": code,
+                "code_label": FORM4_TX_CODES.get(code, code or "?"),
+                "shares": shares,
+                "price_per_share": price,
+                "dollar_value": dollar,
+                "transaction_date": (date_el.text.strip() if date_el is not None and date_el.text else ""),
+                "shares_owned_after": float(shares_after_el.text) if shares_after_el is not None and shares_after_el.text else None,
+            })
+    except Exception:
+        log.exception("[form4] xml 구조 파싱 실패")
+        return None
+    return out
+
+
+def parse_insider_summary(summary: InsiderTradeSummary | None, cap: int = 10) -> InsiderTradeSummary | None:
+    """Phase 7E — InsiderTradeSummary의 각 form에 parse_form4_xml 결과를 attach.
+
+    cap 건만 파싱 (느림 방지). 실패 form은 parsed=None.
+    """
+    if summary is None or not summary.forms:
+        return summary
+    for f in summary.forms[:cap]:
+        url = f.get("primary_doc_url")
+        if not url:
+            continue
+        try:
+            f["parsed"] = parse_form4_xml(url)
+        except Exception:
+            f["parsed"] = None
+    return summary
 
 
 # ------------------------------------------------------------------
@@ -776,6 +960,9 @@ def _list_recent_10k(ticker: str, max_count: int = 4) -> list[dict]:
 _ITEM_1A_RE = re.compile(r"item\s+1a\.?\s*(?:risk\s+factors)?", re.IGNORECASE)
 _ITEM_1B_RE = re.compile(r"item\s+1b\.?", re.IGNORECASE)
 _ITEM_2_RE = re.compile(r"item\s+2\.?\s*(?:properties)?", re.IGNORECASE)
+_ITEM_7_RE = re.compile(r"item\s+7\.?\s*(?:management.{0,30}analysis)?", re.IGNORECASE)
+_ITEM_7A_RE = re.compile(r"item\s+7a\.?", re.IGNORECASE)
+_ITEM_8_RE = re.compile(r"item\s+8\.?\s*(?:financial\s+statements)?", re.IGNORECASE)
 
 
 def _extract_item_1a(html_text: str) -> str:
@@ -809,6 +996,71 @@ def _extract_item_1a(html_text: str) -> str:
     if len(section) < 200:
         return ""
     return section
+
+
+def _extract_mdna_item_7(html_text: str) -> str:
+    """10-K HTML → Item 7 MD&A 텍스트. 시작=Item 7, 종료=Item 7A 또는 Item 8."""
+    try:
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(html_text, "html.parser")
+        for tag in soup(["script", "style"]):
+            tag.decompose()
+        text = soup.get_text(" ", strip=True)
+    except Exception:
+        return ""
+    if not text:
+        return ""
+    starts = [m.start() for m in _ITEM_7_RE.finditer(text)]
+    # filter: Item 7A 매치는 제외 (Item 7와 별개)
+    starts = [s for s in starts if not _ITEM_7A_RE.match(text[s:s+15])]
+    if not starts:
+        return ""
+    start_idx = starts[1] if len(starts) > 1 else starts[0]
+    after = text[start_idx:]
+    end_match = _ITEM_7A_RE.search(after, pos=200)
+    if not end_match:
+        end_match = _ITEM_8_RE.search(after, pos=200)
+    end_idx = end_match.start() if end_match else min(len(after), 300_000)
+    section = after[:end_idx].strip()
+    if len(section) < 500:
+        return ""
+    return section
+
+
+def fetch_10k_mdna(ticker: str) -> tuple[TenKSnapshot | None, TenKSnapshot | None]:
+    """가장 최근 10-K + 1년 전 10-K → (current, prior) Item 7 MD&A 텍스트.
+
+    `fetch_10k_risk_factors` 패턴 그대로 — 추출 함수만 _extract_mdna_item_7.
+    """
+    ticker = (ticker or "").upper().strip()
+    filings = _list_recent_10k(ticker, max_count=4)
+    if not filings:
+        return (None, None)
+
+    def _fetch_one(meta: dict) -> TenKSnapshot | None:
+        try:
+            _throttle()
+            with httpx.Client(timeout=DEFAULT_TIMEOUT, follow_redirects=True) as cli:
+                r = cli.get(meta["primary_url"], headers={"User-Agent": USER_AGENT})
+                if r.status_code != 200:
+                    return None
+                html = r.text
+        except Exception:
+            return None
+        section = _extract_mdna_item_7(html)
+        if not section:
+            log.info("[mdna] Item 7 추출 실패 (%s acc=%s)", ticker, meta["accession"])
+            return None
+        return TenKSnapshot(
+            accession=meta["accession"], filed=meta["filed"],
+            primary_url=meta["primary_url"],
+            risk_text=section[:80_000],  # LLM 입력 cap
+            risk_chars=len(section),
+        )
+
+    current = _fetch_one(filings[0]) if filings else None
+    prior = _fetch_one(filings[1]) if len(filings) > 1 else None
+    return (current, prior)
 
 
 def fetch_10k_risk_factors(ticker: str) -> tuple[TenKSnapshot | None, TenKSnapshot | None]:
