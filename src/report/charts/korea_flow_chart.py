@@ -107,22 +107,7 @@ def streak_alert_card(kr_flows: dict, out_dir: Path,
     theme.setup()
     import matplotlib.pyplot as plt
     from matplotlib.patches import FancyBboxPatch
-
-    def _streak(series) -> int:
-        if series is None or len(series) == 0:
-            return 0
-        vals = series.values
-        last = vals[-1]
-        if last == 0:
-            return 0
-        sign = 1 if last > 0 else -1
-        cnt = 0
-        for v in vals[::-1]:
-            if (v > 0 and sign > 0) or (v < 0 and sign < 0):
-                cnt += 1
-            else:
-                break
-        return cnt * sign
+    from src.report.state import streak_count
 
     alerts = []  # (market, investor, streak, sum_amount)
     for mkt, fdf in kr_flows.items():
@@ -131,7 +116,7 @@ def streak_alert_card(kr_flows: dict, out_dir: Path,
         for inv in ("외국인", "기관", "개인"):
             if inv not in fdf.columns:
                 continue
-            s = _streak(fdf[inv])
+            s = streak_count(fdf[inv])
             if abs(s) >= min_streak:
                 amount = float(fdf[inv].iloc[-abs(s):].sum())
                 alerts.append((mkt, inv, s, amount))

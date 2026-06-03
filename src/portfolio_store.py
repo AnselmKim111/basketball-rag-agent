@@ -34,11 +34,11 @@ def _portfolio_dir() -> Path:
     return d
 
 
-def _path(chat_id: str | int) -> Path:
-    return _portfolio_dir() / f"{chat_id}.json"
+def _path(chat_id) -> Path:
+    return _portfolio_dir() / f"{str(chat_id)}.json"
 
 
-def load_positions(chat_id: str | int) -> list[dict]:
+def load_positions(chat_id) -> list[dict]:
     p = _path(chat_id)
     if not p.exists():
         return []
@@ -53,7 +53,7 @@ def load_positions(chat_id: str | int) -> list[dict]:
         return []
 
 
-def save_positions(chat_id: str | int, positions: list[dict]) -> bool:
+def save_positions(chat_id, positions: list[dict]) -> bool:
     p = _path(chat_id)
     try:
         with _LOCK:
@@ -65,7 +65,7 @@ def save_positions(chat_id: str | int, positions: list[dict]) -> bool:
         return False
 
 
-def add_position(chat_id: str | int, ticker: str, market: str,
+def add_position(chat_id, ticker: str, market: str,
                  buy_price: float, shares: float) -> dict | None:
     """등록. 같은 ticker 이미 있으면 평단·수량 갱신 (avg)."""
     tkr = (ticker or "").strip().upper()
@@ -105,7 +105,7 @@ def add_position(chat_id: str | int, ticker: str, market: str,
     return new_pos
 
 
-def remove_position(chat_id: str | int, ticker: str) -> bool:
+def remove_position(chat_id, ticker: str) -> bool:
     tkr = (ticker or "").strip().upper()
     if not tkr:
         return False
@@ -118,7 +118,7 @@ def remove_position(chat_id: str | int, ticker: str) -> bool:
     return False
 
 
-def clear_positions(chat_id: str | int) -> bool:
+def clear_positions(chat_id) -> bool:
     p = _path(chat_id)
     if not p.exists():
         return False

@@ -19,21 +19,22 @@ log = logging.getLogger(__name__)
 
 
 def _load_ohlcv(ticker: str, market: str, days: int = 260):
-    """KR은 screener_adapter 우선 → FDR 폴백. US는 FDR."""
+    """KR은 screener_adapter 우선 → FDR 폴백. US는 FDR. 실패 시 log + None."""
     try:
         from src.report.data import screener_adapter
         df = screener_adapter.load_ohlcv_df(ticker, market, days=days)
         if df is not None and len(df) >= 30:
             return df
     except Exception:
-        pass
+        log.debug("[portfolio_enrich] screener_adapter %s/%s fetch 실패", market, ticker)
     try:
         from src.report.data.fetch_prices import fetch_ohlcv
         df = fetch_ohlcv(ticker, days=days)
         if df is not None and len(df) >= 30:
             return df
     except Exception:
-        pass
+        log.debug("[portfolio_enrich] FDR %s fetch 실패", ticker)
+    log.info("[portfolio_enrich] %s/%s OHLCV 미확보 — pnl 계산 skip", market, ticker)
     return None
 
 

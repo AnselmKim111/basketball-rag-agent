@@ -260,9 +260,10 @@ def _fetch_kr_5d(tickers: list[str]) -> dict[str, float]:
                     out[tk] = chg
                     _KR_5D_CACHE[tk] = chg
             except Exception:
+                log.debug("[flow_charts._fetch_kr_5d] %s 계산 실패", tk)
                 continue
     except Exception:
-        pass
+        log.exception("[flow_charts._fetch_kr_5d] fetch 전체 실패")
     return out
 
 

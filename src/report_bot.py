@@ -270,6 +270,40 @@ async def report_daily_job(bot: Bot, override_chat_id: str | None = None) -> Non
     log.info("[report] 발송 완료 (%d명, 단일 PDF)", len(targets))
 
 
+def _build_portfolio_section(portfolio_chat_id, theme_summary, img_dir, date_iso, add) -> dict:
+    """§B 사용자 보유 종목 섹션 — chart 2개 추가 + payload 반환.
+
+    portfolio_chat_id 없거나 portfolio 미등록이면 빈 dict 반환 (§B 자연 생략).
+    enrichment 예외 시 log + 빈 dict — PDF 빌드 영향 없음.
+    """
+    if not portfolio_chat_id:
+        return {}
+    try:
+        from src import portfolio_store
+        from src.report.data import portfolio_enrich
+        from src.report.charts import portfolio_dashboard
+        positions = portfolio_store.load_positions(portfolio_chat_id)
+        if not positions:
+            return {}
+        theme_hot = (theme_summary or {}).get("hot", []) or []
+        payload = portfolio_enrich.enrich_positions(positions, theme_hot=theme_hot)
+        add(portfolio_dashboard.portfolio_summary_card(
+                payload.get("summary") or {}, img_dir, date_iso=date_iso),
+            "내 보유 종목 현황", "종목 수·매수금·평가금·PnL",
+            "B. 내 보유 종목", key=True)
+        add(portfolio_dashboard.portfolio_positions_grid(
+                payload.get("positions") or [], img_dir, date_iso=date_iso),
+            "내 보유 종목 grid", "종목별 매수가·현재가·PnL·thesis 분류",
+            "B. 내 보유 종목", key=True)
+        log.info("[report.portfolio] chat=%s 종목=%d PnL=%s%%",
+                 portfolio_chat_id, payload["summary"]["total_positions"],
+                 payload["summary"].get("total_pnl_pct"))
+        return payload
+    except Exception:
+        log.exception("[report.portfolio] enrichment 실패 — §B 생략")
+        return {}
+
+
 def _build_report(portfolio_chat_id: str | None = None):
     """동기 빌드 (run_in_executor). 8섹션 + 전일 대비 팔로업.
 
@@ -563,30 +597,8 @@ def _build_report(portfolio_chat_id: str | None = None):
         add(_hl_result, "개별 종목 하이라이트", "스토리 종목 (폴백)", "6. 개별 종목")
 
     # ---------- §B 사용자 보유 종목 (portfolio_chat_id 있을 때만) ----------
-    portfolio_payload: dict = {}
-    if portfolio_chat_id:
-        try:
-            from src import portfolio_store
-            from src.report.data import portfolio_enrich
-            from src.report.charts import portfolio_dashboard
-            positions = portfolio_store.load_positions(portfolio_chat_id)
-            if positions:
-                theme_hot = (theme_summary or {}).get("hot", []) or []
-                portfolio_payload = portfolio_enrich.enrich_positions(positions, theme_hot=theme_hot)
-                # 차트 추가
-                add(portfolio_dashboard.portfolio_summary_card(
-                        portfolio_payload.get("summary") or {}, img_dir, date_iso=date_iso),
-                    "내 보유 종목 현황", "종목 수·매수금·평가금·PnL",
-                    "B. 내 보유 종목", key=True)
-                add(portfolio_dashboard.portfolio_positions_grid(
-                        portfolio_payload.get("positions") or [], img_dir, date_iso=date_iso),
-                    "내 보유 종목 grid", "종목별 매수가·현재가·PnL·thesis 분류",
-                    "B. 내 보유 종목", key=True)
-                log.info("[report.portfolio] chat=%s 종목=%d PnL=%s%%",
-                         portfolio_chat_id, portfolio_payload["summary"]["total_positions"],
-                         portfolio_payload["summary"].get("total_pnl_pct"))
-        except Exception:
-            log.exception("[report.portfolio] enrichment 실패 — §B 생략")
+    portfolio_payload = _build_portfolio_section(
+        portfolio_chat_id, theme_summary, img_dir, date_iso, add)
 
     # watchlist thesis quadrant — 14종목 강화/약화/디커플링/유지 자동 분류
     add(flow_charts.watchlist_thesis_quadrant(watchlist_result, img_dir, date_iso=date_iso),
@@ -623,27 +635,12 @@ def _build_report(portfolio_chat_id: str | None = None):
     for mkt, fdf in (kr_flows or {}).items():
         korea_summary[mkt] = {inv: round(float(fdf[inv].iloc[-20:].sum()), 0) for inv in fdf.columns}
 
-    # 외국인 연속 매도/매수 streak 계산 (KOSPI·KOSDAQ) — thesis 격상 alert용
-    def _streak(series) -> int:
-        """마지막 값과 같은 부호로 연속된 거래일수 (음수 = 연속 매도)."""
-        if series is None or len(series) == 0:
-            return 0
-        vals = series.values
-        last = vals[-1]
-        if last == 0:
-            return 0
-        sign = 1 if last > 0 else -1
-        cnt = 0
-        for v in vals[::-1]:
-            if (v > 0 and sign > 0) or (v < 0 and sign < 0):
-                cnt += 1
-            else:
-                break
-        return cnt * sign  # 음수 = 매도 streak, 양수 = 매수 streak
+    # 외국인 연속 매도/매수 streak 계산 (KOSPI·KOSDAQ) — thesis 격상 alert용.
+    # state.streak_count 공용 헬퍼 (korea_flow_chart도 동일 함수 사용).
     for mkt, fdf in (kr_flows or {}).items():
         for inv in ("외국인", "기관", "개인"):
             if inv in fdf.columns:
-                korea_summary.setdefault(mkt, {})[f"{inv}_streak"] = _streak(fdf[inv])
+                korea_summary.setdefault(mkt, {})[f"{inv}_streak"] = state.streak_count(fdf[inv])
 
     # ---------- §8 종합 자금흐름 다이어그램 (Sankey, Risk 게이지 허브 통합) ----------
     src_ep, dst_ep = theme_momentum.flow_endpoints(theme_rows)
