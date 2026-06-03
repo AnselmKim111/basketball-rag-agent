@@ -87,16 +87,61 @@ def fetch_earnings_momentum(days_back: int = 21, days_fwd: int = 12,
     }
 
     # 2) 다가올 주요 실적 일정 + 컨센서스
-    upcoming = []
+    upcoming_by_sym: dict[str, dict] = {}
+    # FMP fwd 우선 (대형주만, revenueEstimated ≥ min_rev)
     for r in fwd:
         est = r.get("epsEstimated")
         rev = r.get("revenueEstimated") or 0
-        if est is None or rev < min_rev:  # 대형주만
+        sym = (r.get("symbol") or "").upper()
+        if not sym or est is None or rev < min_rev:
             continue
-        upcoming.append({"symbol": r.get("symbol"), "date": r.get("date"),
-                         "eps_est": est, "revenue_est": rev})
-    upcoming.sort(key=lambda x: -x["revenue_est"])
-    upcoming = upcoming[:15]
+        upcoming_by_sym[sym] = {"symbol": sym, "date": r.get("date"),
+                                "eps_est": est, "revenue_est": rev, "source": "FMP"}
+    # Finnhub /calendar/earnings 폴백 — FMP 시뮬레이션 환경에서 1개만 오는 경우 대비.
+    # eps_est 있는 종목만 추가, revenue_est 5e8 이상(중대형).
+    try:
+        import requests
+        fh_key = os.getenv("FINNHUB_API_KEY")
+        if fh_key:
+            fh_url = "https://finnhub.io/api/v1/calendar/earnings"
+            r = requests.get(fh_url, params={
+                "from": today.isoformat(),
+                "to": (today + timedelta(days=days_fwd)).isoformat(),
+                "token": fh_key,
+            }, timeout=15)
+            if r.status_code == 200:
+                items = (r.json() or {}).get("earningsCalendar") or []
+                for it in items:
+                    sym = (it.get("symbol") or "").upper()
+                    est = it.get("epsEstimate")
+                    rev = it.get("revenueEstimate") or 0
+                    if not sym or est is None or rev < 5e8:
+                        continue
+                    if sym not in upcoming_by_sym:
+                        upcoming_by_sym[sym] = {
+                            "symbol": sym, "date": it.get("date"),
+                            "eps_est": est, "revenue_est": rev, "source": "Finnhub",
+                        }
+    except Exception:
+        log.exception("[report.earnings] Finnhub /calendar/earnings 폴백 실패")
+
+    upcoming = sorted(upcoming_by_sym.values(), key=lambda x: -x["revenue_est"])[:15]
+
+    # 3) upcoming 종목에 시총 + analyst revision 부착 (forward-looking 신호 강화)
+    if upcoming:
+        try:
+            from src.report.data import fetch_market_caps, fetch_estimate_revisions
+            syms = [u["symbol"] for u in upcoming if u.get("symbol")]
+            caps = fetch_market_caps.fetch_us_market_caps(syms)
+            revs = fetch_estimate_revisions.batch_revisions(syms, cap=15)
+            for u in upcoming:
+                sym = (u.get("symbol") or "").upper()
+                if sym in caps:
+                    u["market_cap"] = caps[sym]
+                if sym in revs:
+                    u["revision"] = revs[sym]
+        except Exception:
+            log.exception("[report.earnings] upcoming 보강 실패")
 
     log.info("[report.earnings] 최근 %d종목(beat율 %s%%) · 예정 %d종목",
              n, recent["beat_rate"], len(upcoming))

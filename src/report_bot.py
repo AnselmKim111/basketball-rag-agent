@@ -333,7 +333,22 @@ def _build_report():
         signals += technical_signals.detect_signals(df, label)
 
     # ---------- §0 글로벌 위험선호 (표지 직후 시각 요약) ----------
+    # screener.db 활성화 진단 — sector_leader/trend_reversal stream 의존
+    try:
+        from src.report.data import screener_adapter
+        us_active = len(screener_adapter.load_active_tickers("US"))
+        kr_active = len(screener_adapter.load_active_tickers("KR"))
+        us_latest = screener_adapter.latest_signal_date("US")
+        kr_latest = screener_adapter.latest_signal_date("KR")
+        log.info("[report] screener.db 상태 — US active=%d (latest=%s) · KR active=%d (latest=%s)",
+                 us_active, us_latest, kr_active, kr_latest)
+    except Exception:
+        log.exception("[report] screener.db 진단 실패")
+
     risk_gauge: dict = {"score": 50, "label": "중립", "signals": {}}
+    # 어제 게이지 점수 미리 fetch (snapshot 있으면) — 게이지 시각화 delta 표시용
+    prev_snapshot_early = state.load_previous(date_iso) or {}
+    prev_gauge_score = prev_snapshot_early.get("gauge_score") if prev_snapshot_early else None
     try:
         from src.report.data import fetch_global_risk
         from src.report.charts import global_risk_matrix
@@ -345,8 +360,35 @@ def _build_report():
                 "0. 글로벌 위험선호", key=True)
             log.info("[report] §0 글로벌 위험선호: %d자산·게이지 %d(%s)",
                      len(risk_rows), risk_gauge.get("score"), risk_gauge.get("label"))
+        # 6대 자산군 1D·5D 평균 — Risk 게이지 기여 구조
+        add(flow_charts.risk_component_breakdown(risk_rows, img_dir, date_iso=date_iso),
+            "6대 자산군 1D·5D", "Risk 게이지 기여 구조 — 자산군별 평균 등락",
+            "0. 글로벌 위험선호")
+        # 게이지 반원 시각화 + 어제 대비 delta
+        add(flow_charts.risk_gauge_visual(risk_gauge, prev_gauge_score, img_dir, date_iso=date_iso),
+            "위험선호 게이지",
+            f"{risk_gauge.get('label')} {risk_gauge.get('score')}/100"
+            + (f" (전일 {int(prev_gauge_score)}, Δ{risk_gauge.get('score') - int(prev_gauge_score):+d})"
+               if isinstance(prev_gauge_score, (int, float)) else " (전일 기준선)"),
+            "0. 글로벌 위험선호")
+        # 게이지 시계열 history (Risk + FX 14일)
+        gauge_hist = state.load_history(date_iso, days=14)
+        if gauge_hist:
+            add(flow_charts.gauge_history_chart(gauge_hist, risk_gauge, {}, img_dir, date_iso=date_iso),
+                "게이지 시계열", f"Risk·FX 압력 최근 {len(gauge_hist)+1}일 추세",
+                "0. 글로벌 위험선호")
     except Exception:
         log.exception("[report] 글로벌 위험선호 매트릭스 실패 — 생략")
+
+    # ---------- Follow-up 추적 표 (어제 watchlist 종목 어제 5D vs 오늘 5D) ----------
+    if prev_snapshot_early.get("highlights_meta"):
+        try:
+            add(flow_charts.followup_tracking_table(
+                    prev_snapshot_early["highlights_meta"], img_dir, date_iso=date_iso),
+                "어제 watchlist 추적", "어제 5D vs 오늘 5D · 강화·약화·유지 분류",
+                "Follow-up", key=True)
+        except Exception:
+            log.exception("[report] Follow-up 추적 표 실패 — 생략")
 
     # ---------- §1 매크로 ----------
     add(index_charts.us_indices_grid(us_idx, img_dir, date_iso=date_iso),
@@ -399,6 +441,28 @@ def _build_report():
         "테마 로테이션 히트맵", "5일 모멘텀 — 돈이 어디로", "3. 섹터 로테이션 맵", key=True)
     add(rotation_charts.sector_return_bars(theme_rows, img_dir, date_iso=date_iso),
         "섹터·테마 상대강도", "1M/3M 정렬", "3. 섹터 로테이션 맵")
+    # 한국 섹터 ETF 상대강도 (반도체·방산·2차전지·신재생·자동차·헬스케어·벤치마크)
+    kr_perf: list = []
+    try:
+        from src.report.data import fetch_kr_sectors
+        kr_perf = fetch_kr_sectors.fetch_kr_sector_strength()
+        if kr_perf:
+            add(rotation_charts.sector_return_bars(
+                    kr_perf, img_dir, filename="07b_kr_sector_bars.png",
+                    title="한국 섹터 ETF 상대강도 (1M 정렬)", date_iso=date_iso),
+                "한국 섹터 상대강도", "KR ETF 1M/3M — 미국 섹터와 비교",
+                "3. 섹터 로테이션 맵")
+    except Exception:
+        log.exception("[report] KR 섹터 강도 실패 — 생략")
+
+    # 미국 ↔ 한국 sector 페어 5D 차이 (디커플링·동조)
+    if kr_perf:
+        try:
+            add(rotation_charts.us_kr_sector_pairs(theme_rows, kr_perf, img_dir, date_iso=date_iso),
+                "미국 ↔ 한국 sector 페어", "5D 차이 — 디커플링·동조 분류",
+                "3. 섹터 로테이션 맵", key=True)
+        except Exception:
+            log.exception("[report] 미국·한국 페어 차트 실패 — 생략")
     add(rotation_charts.region_compare(region_etfs, img_dir, date_iso=date_iso),
         "글로벌 지역 비교", "지역 디커플링", "3. 섹터 로테이션 맵")
     # 테마 자금 흐름 시계열 (B: 20일 누적, 좌 유입·우 이탈) — 시간 진화 통찰
@@ -422,6 +486,30 @@ def _build_report():
         add(flow_charts.usdkrw_ewy_dual(fx["USD/KRW"], ewy, img_dir, date_iso=date_iso),
             "USD/KRW ↔ EWY", "환전 압력 (가설)", "4. IPO·환전 임팩트", key=False)
 
+    # 환전 압력 게이지 (USD/KRW + EWY + 외국인 KOSPI 20D 통합 0~100)
+    fx_gauge: dict = {}
+    if fx.get("USD/KRW") is not None:
+        foreign_kospi_20d = None
+        try:
+            if kr_flows and "KOSPI" in kr_flows:
+                kdf = kr_flows["KOSPI"]
+                if "외국인" in kdf.columns:
+                    foreign_kospi_20d = float(kdf["외국인"].iloc[-20:].sum())
+        except Exception:
+            pass
+        prev_fx_pressure = prev_snapshot_early.get("fx_pressure_score") if prev_snapshot_early else None
+        _fx_path, fx_gauge = flow_charts.fx_pressure_gauge(
+            fx.get("USD/KRW"), ewy, foreign_kospi_20d, img_dir,
+            prev_pressure=prev_fx_pressure, date_iso=date_iso)
+        if _fx_path:
+            cap = f"{fx_gauge.get('label')} {fx_gauge.get('score')}/100"
+            if isinstance(prev_fx_pressure, (int, float)):
+                diff = fx_gauge.get("score", 50) - int(prev_fx_pressure)
+                cap += f" (전일 {int(prev_fx_pressure)}, Δ{diff:+d})"
+            else:
+                cap += " (전일 기준선)"
+            add(_fx_path, "환전 압력 게이지", cap, "4. IPO·환전 임팩트", key=True)
+
     # ---------- §6 개별 종목 하이라이트 — 통합 watchlist (5 stream) ----------
     from src.report.data import watchlist as _wl
     prev_snapshot_for_wl = state.load_previous(date_iso)
@@ -436,6 +524,14 @@ def _build_report():
     n_us = len(watchlist_result.get("us") or [])
     n_kr = len(watchlist_result.get("kr") or [])
     log.info("[report.watchlist] US=%d KR=%d", n_us, n_kr)
+
+    # ---------- §5 어닝 캘린더 (upcoming 시각화) ----------
+    if earnings and isinstance(earnings.get("upcoming"), list) and earnings["upcoming"]:
+        add(flow_charts.earnings_calendar_grid(
+                earnings["upcoming"], img_dir, date_iso=date_iso),
+            "다가올 어닝 캘린더",
+            "시총 큰 순 가로bar · 색상=분석가 buy 변화 (녹·적·회)",
+            "5. 어닝 모멘텀", key=True)
 
     # 차트는 highlights_df (기존) + watchlist enriched 메타 합쳐 카테고리 배지로 표시.
     # watchlist 있으면 US/KR 분리 2장, 없으면 단일 폴백 차트.
@@ -453,11 +549,29 @@ def _build_report():
     elif _hl_result:
         add(_hl_result, "개별 종목 하이라이트", "스토리 종목 (폴백)", "6. 개별 종목")
 
+    # watchlist thesis quadrant — 14종목 강화/약화/디커플링/유지 자동 분류
+    add(flow_charts.watchlist_thesis_quadrant(watchlist_result, img_dir, date_iso=date_iso),
+        "watchlist thesis quadrant", "14종목 자동 분류 — thesis 강도 분포",
+        "6. 개별 종목", key=True)
+
+    # IPO mini-card (OHLCV 없는 신생주 — Yahoo 404 폴백 시각화)
+    _ipo_card_path = stock_highlights.ipo_cards(
+        watchlist_result.get("us") or [], img_dir, date_iso=date_iso)
+    if _ipo_card_path:
+        _basename = _ipo_card_path.split("/")[-1] if isinstance(_ipo_card_path, str) else _ipo_card_path
+        add(_basename, "다가올 IPO 카드",
+            "offer price · 시총 · D-N · status — OHLCV 없는 신생주 폴백",
+            "6. 개별 종목")
+
     # 다음날 F/U용 메타 (state snapshot에 저장)
     highlights_snapshot_meta = _wl.snapshot_tickers(watchlist_result)
 
     # ---------- §7 한국시장 자금흐름 ----------
     korea_summary: dict = {}
+    # streak alert (≥5거래일 연속 매도/매수) — §7 헤더 시각 강조
+    add(korea_flow_chart.streak_alert_card(kr_flows, img_dir, date_iso=date_iso),
+        "한국 수급 streak alert", "5거래일 이상 연속 매도/매수 — thesis 격상 임계",
+        "7. 한국시장 자금흐름", key=True)
     for i, (label, price_df) in enumerate(kr_sizes.items(), 1):
         flows_df = kr_flows.get("KOSDAQ") if "KOSDAQ" in label else kr_flows.get("KOSPI")
         fn = korea_flow_chart.flow_multipanel(price_df, flows_df, label, img_dir, f"32_kr_{i:02d}.png")
@@ -470,11 +584,35 @@ def _build_report():
     for mkt, fdf in (kr_flows or {}).items():
         korea_summary[mkt] = {inv: round(float(fdf[inv].iloc[-20:].sum()), 0) for inv in fdf.columns}
 
+    # 외국인 연속 매도/매수 streak 계산 (KOSPI·KOSDAQ) — thesis 격상 alert용
+    def _streak(series) -> int:
+        """마지막 값과 같은 부호로 연속된 거래일수 (음수 = 연속 매도)."""
+        if series is None or len(series) == 0:
+            return 0
+        vals = series.values
+        last = vals[-1]
+        if last == 0:
+            return 0
+        sign = 1 if last > 0 else -1
+        cnt = 0
+        for v in vals[::-1]:
+            if (v > 0 and sign > 0) or (v < 0 and sign < 0):
+                cnt += 1
+            else:
+                break
+        return cnt * sign  # 음수 = 매도 streak, 양수 = 매수 streak
+    for mkt, fdf in (kr_flows or {}).items():
+        for inv in ("외국인", "기관", "개인"):
+            if inv in fdf.columns:
+                korea_summary.setdefault(mkt, {})[f"{inv}_streak"] = _streak(fdf[inv])
+
     # ---------- §8 종합 자금흐름 다이어그램 (Sankey, Risk 게이지 허브 통합) ----------
     src_ep, dst_ep = theme_momentum.flow_endpoints(theme_rows)
     add(flow_charts.capital_flow_diagram(src_ep, dst_ep, img_dir, date_iso=date_iso,
                                           gauge_score=risk_gauge.get("score"),
-                                          gauge_label=risk_gauge.get("label")),
+                                          gauge_label=risk_gauge.get("label"),
+                                          fx_score=fx_gauge.get("score") if fx_gauge else None,
+                                          fx_label=fx_gauge.get("label") if fx_gauge else None),
         "종합 자금흐름 다이어그램", "Sankey · 굵기=강도 · 허브=Risk 게이지",
         "8. 종합 자금흐름", key=True)
 
@@ -493,8 +631,10 @@ def _build_report():
 
     snapshot = state.build_snapshot(date_iso, rotation, theme_summary, theme_rows,
                                     macro_summary, breadth, korea_summary, rsp_new_high,
-                                    highlights_meta=highlights_snapshot_meta)
-    prev = state.load_previous(date_iso)
+                                    highlights_meta=highlights_snapshot_meta,
+                                    risk_gauge=risk_gauge,
+                                    fx_pressure=fx_gauge)
+    prev = prev_snapshot_early or state.load_previous(date_iso)
     deltas = state.compute_deltas(snapshot, prev)
     state.save_snapshot(date_iso, snapshot)
     log.info("[report] deltas 계산 (baseline=%s, notes=%d)", deltas.get("baseline"), len(deltas.get("notes", [])))
@@ -505,7 +645,9 @@ def _build_report():
                                     korea_summary, news=news, theme_momentum=theme_summary,
                                     deltas=deltas, breadth=breadth,
                                     highlights=watchlist_result,
-                                    earnings=earnings, stale=stale)
+                                    earnings=earnings, stale=stale,
+                                    risk_gauge=risk_gauge, fx_gauge=fx_gauge,
+                                    prev_snapshot=prev)
 
     # headline 추출 (첫 # 라인)
     headline = next((ln.lstrip("# ").strip() for ln in md.splitlines() if ln.startswith("#")), f"{date_iso} 시장 리포트")

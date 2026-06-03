@@ -386,6 +386,201 @@ def _perplexity_summary(client, ticker: str, year: int | None, quarter: int | No
 # ------------------------------------------------------------------
 # 공개 진입점
 # ------------------------------------------------------------------
+# 프로바이더 4.5: SEC 8-K Item 7.01 첨부 (Phase 7A — 무료, 보완)
+# ------------------------------------------------------------------
+def _sec_8k_item_701(ticker: str, year: int | None, quarter: int | None) -> TranscriptDoc | None:
+    """8-K Item 7.01 Reg FD 첨부에 어닝콜 transcript가 포함되는 경우 추출.
+
+    일부 회사는 SEC에 콜 transcript를 직접 첨부. fetch_recent_8k의 EX-99 인덱스에서
+    'transcript' / 'earnings call' 키워드 포함 첨부를 본문 스크레이프.
+    """
+    try:
+        from src.earnings import sec_edgar
+    except Exception:
+        return None
+    try:
+        summary = sec_edgar.fetch_recent_8k(ticker, window_days=120, fetch_ex99_index=True)
+    except Exception:
+        log.exception("[transcript] 8-K 7.01 fetch 실패 (%s)", ticker)
+        return None
+    if summary is None or not summary.events:
+        return None
+    # Item 7.01 (Reg FD) 우선 — 가장 흔히 transcript 첨부
+    target_events = [e for e in summary.events if "7.01" in (e.items or [])] or summary.events
+    for ev in target_events[:8]:  # 최신순으로 들어옴, 상위 8건만
+        for url in (ev.ex99_urls or [])[:3]:
+            url_lower = url.lower()
+            looks = (
+                "transcript" in url_lower or "earnings" in url_lower or "conference" in url_lower
+            )
+            text = sec_edgar._scrape_html_text(url, max_chars=MAX_TRANSCRIPT_CHARS + 5000)
+            if not text:
+                continue
+            if not (looks or _looks_like_transcript(text)) or len(text) < MIN_GROUNDED_CHARS:
+                continue
+            return TranscriptDoc(
+                ticker=ticker.upper(),
+                fiscal_period=(f"Q{quarter} {year}" if (year and quarter) else ""),
+                year=year,
+                quarter=quarter,
+                call_date=ev.filed,
+                full_text=text,
+                source=f"sec:8-K/7.01/{ev.accession}",
+                source_urls=[url, ev.primary_doc_url or ""],
+                grounded=True,
+            )
+    return None
+
+
+# ------------------------------------------------------------------
+# 프로바이더 4.6: IR 사이트 직접 스크레이프 (Phase 7A — 무료, 자동 시드)
+# ------------------------------------------------------------------
+_IR_DOMAINS_CACHE: dict[str, str] | None = None
+_IR_DOMAINS_LOCK = None  # threading lazy import
+
+
+def _load_ir_domains() -> dict[str, str]:
+    """prompts/data/ir_domains.json — {ticker: ir_url} 매핑."""
+    global _IR_DOMAINS_CACHE
+    if _IR_DOMAINS_CACHE is not None:
+        return _IR_DOMAINS_CACHE
+    import json
+    from pathlib import Path
+    path = Path(__file__).resolve().parent.parent.parent / "prompts" / "data" / "ir_domains.json"
+    try:
+        if path.exists():
+            data = json.loads(path.read_text(encoding="utf-8"))
+            _IR_DOMAINS_CACHE = {k.upper(): v for k, v in (data or {}).items() if isinstance(v, str)}
+            return _IR_DOMAINS_CACHE
+    except Exception:
+        log.warning("[transcript] ir_domains.json 로드 실패")
+    _IR_DOMAINS_CACHE = {}
+    return _IR_DOMAINS_CACHE
+
+
+def _save_ir_domain(ticker: str, ir_url: str) -> None:
+    """자동 시드 결과 캐시 (다음 호출 빠르게)."""
+    import json
+    from pathlib import Path
+    global _IR_DOMAINS_CACHE
+    if _IR_DOMAINS_CACHE is None:
+        _load_ir_domains()
+    _IR_DOMAINS_CACHE[ticker.upper()] = ir_url
+    path = Path(__file__).resolve().parent.parent.parent / "prompts" / "data" / "ir_domains.json"
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(_IR_DOMAINS_CACHE, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        log.debug("[transcript] ir_domains.json 저장 실패")
+
+
+def _discover_ir_url(client, ticker: str) -> str | None:
+    """perplexity로 1회 IR base URL 추출. 캐시되어 종목당 1회만."""
+    try:
+        import os
+        from src import summarizer
+    except Exception:
+        return None
+    model = (
+        os.getenv("IDEA_RESEARCH_MODEL")
+        or os.getenv("EARNINGS_RESEARCH_MODEL")
+        or "perplexity/sonar-pro"
+    )
+    try:
+        content = summarizer.chat_with_retry(
+            client,
+            model=model,
+            messages=[
+                {"role": "system", "content":
+                    "Return ONLY the official IR (investor relations) homepage URL of a US ticker. "
+                    "No prose. No markdown. Just the URL, e.g.: https://investor.example.com"},
+                {"role": "user", "content": f"Ticker: {ticker}\nOutput: just the IR homepage URL, nothing else."},
+            ],
+            temperature=0.0,
+            max_tokens=80,
+            context=f"earnings-ir-discover:{ticker}",
+        )
+    except Exception:
+        return None
+    if not content:
+        return None
+    m = re.search(r"https?://[^\s\"<>)\]]+", content)
+    if not m:
+        return None
+    return m.group(0).rstrip(".,;)")
+
+
+def _ir_scrape(client, ticker: str, year: int | None, quarter: int | None) -> TranscriptDoc | None:
+    """회사 IR 사이트 직접 스크레이프. 캐시 hit이면 0 cost, miss이면 perplexity 1회 시드."""
+    cached = _load_ir_domains().get(ticker.upper())
+    base = cached or _discover_ir_url(client, ticker)
+    if not base:
+        return None
+    if not cached and base:
+        _save_ir_domain(ticker, base)
+
+    # 후보 경로 — 회사마다 다르지만 빈번한 패턴
+    base = base.rstrip("/")
+    paths = [
+        "/financial-information/quarterly-results",
+        "/events-and-presentations",
+        "/news-and-events/events",
+        "/news-events/events",
+        "/events-presentations",
+        "/quarterly-results",
+        "/earnings",
+        "/financials/quarterly-results",
+        "/investor-resources/earnings",
+        "/financial-info/quarterly",
+        "",  # IR 홈도
+    ]
+    for path in paths:
+        url = base + path
+        try:
+            text = _scrape_url(url)
+        except Exception:
+            continue
+        if not text:
+            continue
+        # transcript 페이지로 들어가는 링크가 있을 수도 있고, 본문에 직접 있을 수도 있음
+        if _looks_like_transcript(text) and len(text) >= MIN_GROUNDED_CHARS:
+            return TranscriptDoc(
+                ticker=ticker.upper(),
+                fiscal_period=(f"Q{quarter} {year}" if (year and quarter) else ""),
+                year=year, quarter=quarter,
+                full_text=text, source=f"ir-scrape:{base}",
+                source_urls=[url], grounded=True,
+            )
+        # transcript URL 후보가 페이지 내에 있으면 follow (1단계)
+        try:
+            from bs4 import BeautifulSoup
+            import httpx
+            with httpx.Client(timeout=httpx.Timeout(20.0, connect=8.0), follow_redirects=True) as cli:
+                r = cli.get(url, headers={"User-Agent": "Mozilla/5.0"})
+                if r.status_code != 200:
+                    continue
+                soup = BeautifulSoup(r.text, "html.parser")
+                for a in soup.find_all("a", href=True):
+                    href = a["href"]
+                    label = (a.get_text() or "").lower()
+                    if "transcript" not in href.lower() and "transcript" not in label:
+                        continue
+                    full_url = href if href.startswith("http") else (base + ("/" if not href.startswith("/") else "") + href)
+                    text2 = _scrape_url(full_url)
+                    if text2 and _looks_like_transcript(text2) and len(text2) >= MIN_GROUNDED_CHARS:
+                        return TranscriptDoc(
+                            ticker=ticker.upper(),
+                            fiscal_period=(f"Q{quarter} {year}" if (year and quarter) else ""),
+                            year=year, quarter=quarter,
+                            full_text=text2, source=f"ir-scrape:{base}",
+                            source_urls=[full_url], grounded=True,
+                        )
+        except Exception:
+            continue
+    return None
+
+
+# ------------------------------------------------------------------
 def fetch_full_transcript(
     client, ticker: str, year: int | None, quarter: int | None
 ) -> TranscriptDoc | None:
@@ -408,7 +603,7 @@ def fetch_full_transcript(
     if doc:
         log.info("[transcript] %s — API Ninjas grounded (%d자)", ticker, len(doc.full_text))
         return doc
-    # 3) 스크레이프
+    # 3) 일반 스크레이프 (Motley Fool / Seeking Alpha 등 _find_source_urls 기반)
     try:
         doc = _scrape(client, ticker, year, quarter)
     except Exception:
@@ -417,7 +612,25 @@ def fetch_full_transcript(
     if doc:
         log.info("[transcript] %s — %s grounded (%d자)", ticker, doc.source, len(doc.full_text))
         return doc
-    # 4) perplexity 요약 (비grounding)
+    # 3.5) Phase 7A — SEC 8-K Item 7.01 첨부 (무료, 정확)
+    try:
+        doc = _sec_8k_item_701(ticker, year, quarter)
+    except Exception:
+        log.exception("SEC 7.01 단계 실패 (%s)", ticker)
+        doc = None
+    if doc:
+        log.info("[transcript] %s — %s grounded (%d자)", ticker, doc.source, len(doc.full_text))
+        return doc
+    # 3.6) Phase 7A — IR 사이트 직접 스크레이프 (무료, 자동 시드)
+    try:
+        doc = _ir_scrape(client, ticker, year, quarter)
+    except Exception:
+        log.exception("IR scrape 단계 실패 (%s)", ticker)
+        doc = None
+    if doc:
+        log.info("[transcript] %s — %s grounded (%d자)", ticker, doc.source, len(doc.full_text))
+        return doc
+    # 4) perplexity 요약 (비grounding, 최후 폴백)
     doc = _perplexity_summary(client, ticker, year, quarter)
     if doc:
         log.warning("[transcript] %s — perplexity 요약 폴백 (비grounding, %d자)", ticker, len(doc.full_text))

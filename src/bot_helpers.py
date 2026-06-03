@@ -49,6 +49,29 @@ def html_escape(s: str) -> str:
     return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
+def parse_admin_chat_ids(*env_keys: str) -> list[str]:
+    """env 여러 개를 합쳐서 진짜 chat_id(숫자 token)만 추출.
+
+    걸러내는 케이스: '*' wildcard, 주석/공백, 음수·0 등 비정상 값.
+    여러 봇이 동일 패턴이라 한 곳으로 통합 (screener_bot/us_screener_bot/report_bot
+    및 admin_alerts 공통 사용).
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+    for key in env_keys:
+        raw = os.getenv(key, "") or ""
+        for token in raw.split(","):
+            m = re.search(r"-?\d{6,}", token)
+            if not m:
+                continue
+            cid = m.group(0)
+            if cid in seen:
+                continue
+            seen.add(cid)
+            out.append(cid)
+    return out
+
+
 async def send_channel_photo(bot, chat_id, photo, caption=None, parse_mode=None, attempts: int = 4):
     """채널에 사진 게시 — RetryAfter(flood control) 자동 대기·재시도.
 

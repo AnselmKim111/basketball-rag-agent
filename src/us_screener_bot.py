@@ -225,7 +225,7 @@ async def _cmd_screen(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
         return
     try:
-        await update.message.reply_text("🔄 스크리닝 즉시 실행 중... (~2-3분 소요)")
+        await update.message.reply_text("🔄 스크리닝 실행 중 (~2-3분 소요)")
     except Exception:
         log.exception("screen 안내 실패")
     try:
@@ -356,7 +356,7 @@ def _permalink(channel: str, message_id: int) -> str | None:
 
 
 def _chart_caption(ticker: str, item: dict, cats: list[str], rows: list[dict],
-                   ytd, eps, market_cap=None) -> str:
+                   ytd, eps, market_cap=None, earnings_date: str | None = None) -> str:
     from src.us_screener import fundamentals
     from src.bot_helpers import html_escape
     name = html_escape(item.get("name") or ticker)
@@ -374,6 +374,8 @@ def _chart_caption(ticker: str, item: dict, cats: list[str], rows: list[dict],
         f"✝ 최근분기 EPS YoY : {_fmt_pct(eps)}",
         f'✝ <a href="https://finviz.com/quote.ashx?t={ticker}">최신 종목 뉴스 조회</a>',
     ]
+    if earnings_date:
+        lines.insert(3, f"⚡ 다음 어닝 : {html_escape(earnings_date)}")
     return "\n".join(lines)
 
 
@@ -412,6 +414,10 @@ async def _post_charts_and_meta(results: dict, max_tickers: int = 120) -> tuple[
     links: dict[str, str] = {}
     extra: dict[str, dict] = {}
     loop = asyncio.get_event_loop()
+    from src.us_screener import earnings_proximity
+    earnings_map = await loop.run_in_executor(
+        None, lambda: earnings_proximity.fetch_upcoming_earnings(set(by_ticker.keys()), days_fwd=7)
+    )
     posted = 0
     mcap_n = 0
     for t, it in list(by_ticker.items())[:max_tickers]:
@@ -420,7 +426,8 @@ async def _post_charts_and_meta(results: dict, max_tickers: int = 120) -> tuple[
             ytd = fundamentals.ytd_pct(rows)
             f = await loop.run_in_executor(None, lambda t=t: fundamentals.ticker_fundamentals(t))
             eps = f.get("eps_yoy")
-            extra[t] = {"ytd": ytd, "eps_yoy": eps}
+            ed = earnings_map.get(t)
+            extra[t] = {"ytd": ytd, "eps_yoy": eps, "earnings_date": ed}
             # 시가총액: DB값 우선, 없으면 SEC 발행주식수 × 종가($)
             mcap = it.get("market_cap")
             if not mcap and rows and f.get("shares"):
@@ -433,7 +440,8 @@ async def _post_charts_and_meta(results: dict, max_tickers: int = 120) -> tuple[
                         t, rows, title=f"{t} — {it.get('name', '')}"))
                 if png:
                     from src.bot_helpers import send_channel_photo
-                    cap = _chart_caption(t, it, badges[t], rows, ytd, eps, market_cap=mcap)
+                    cap = _chart_caption(t, it, badges[t], rows, ytd, eps, market_cap=mcap,
+                                         earnings_date=ed)
                     msg = await send_channel_photo(chart_bot, channel, png, cap, ParseMode.HTML)
                     if msg:
                         url = _permalink(channel, msg.message_id)
@@ -502,6 +510,15 @@ async def us_screener_daily_job(bot: Bot, override_chat_id: str | None = None) -
         try:
             count = await loop.run_in_executor(None, universe.refresh_universe)
             log.info("[scheduled] universe 갱신 %d종목", count)
+            # 헬스 워치독: 평소 ~516종목(S&P500+Nasdaq100). 베이스라인 미만이면 admin에 ⚠
+            try:
+                from src.admin_alerts import alert_admin, BASELINES
+                if count is not None and count < BASELINES["us_caps"]:
+                    await alert_admin(bot, ("US_SCREENER_ALLOWED_CHAT_IDS", "US_SCREENER_CHAT_ID"),
+                                      "⚠ US universe fetch 급감",
+                                      f"평소 ~516종목, 오늘 {count}종목 — FDR StockListing 포맷 변경 의심")
+            except Exception:
+                log.exception("[scheduled] us 헬스 알림 실패")
         except Exception:
             log.exception("[scheduled] universe 갱신 실패 — 신호 계산은 진행")
 
@@ -635,6 +652,19 @@ async def us_screener_daily_job(bot: Bot, override_chat_id: str | None = None) -
         except Exception:
             log.exception("signal 히스토리 저장 실패")
 
+        # 진행 ping (수동 /screen 한정)
+        if override_chat_id:
+            try:
+                uniq = {it.get("ticker") for items in results.values() for it in items
+                        if it.get("ticker")}
+                if uniq:
+                    eta = max(30, len(uniq) * 3)
+                    await send_text_chunked(
+                        bot, str(override_chat_id),
+                        f"📈 신호 {len(uniq)}개 발견 — 차트 채널 게시 중 (~{eta}초)")
+            except Exception:
+                log.exception("[scheduled] 진행 ping 실패 — 무시")
+
         # 티커별 채널 차트 게시 + ytd/eps 메타 (채널 미설정 시 메타만)
         try:
             links, extra = await _post_charts_and_meta(results)
@@ -642,10 +672,23 @@ async def us_screener_daily_job(bot: Bot, override_chat_id: str | None = None) -
             log.exception("[scheduled] 차트 게시/메타 실패 — 링크 없이 발송")
             links, extra = {}, {}
 
-        # 발송 — formatter에 base_date + stats + links + extra 전달 (4열 하이퍼링크)
+        # 회고: 지난 신호 종목들의 5영업일 후 평균 수익률
+        retro = {}
+        try:
+            from src.us_screener import retrospective as retro_mod
+            retro = await loop.run_in_executor(
+                None, lambda: retro_mod.signal_returns(
+                    days_back=10, days_ahead=5, today_iso=base_date))
+            if retro:
+                log.info("[scheduled] 회고 집계: %s",
+                         {k: f"n={v['n']} avg={v['avg_return_pct']}" for k, v in retro.items()})
+        except Exception:
+            log.exception("[scheduled] 회고 집계 실패 — 회고 없이 발송")
+
+        # 발송 — formatter에 retro 포함
         text = formatter.format_results(
             results, datetime.now(KST), base_date=base_date, stats=stats,
-            links=links, extra=extra,
+            links=links, extra=extra, retro=retro,
         )
         # 모든 대상자에게 broadcast (한 번 계산 → N번 발송)
         sent_count = 0

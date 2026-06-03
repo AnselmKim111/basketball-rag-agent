@@ -77,7 +77,7 @@ def _format_section(items: list[dict], emoji: str, title: str,
     items_capped = items_sorted[:cap]
     rest = len(items) - len(items_capped)
     from src.bot_helpers import html_escape
-    lines = [head, "(티커 / 당일 / 연초대비 / EPS YoY)"]
+    lines = [head, "(티커 / 당일 / 연초대비 / EPS YoY · ⚡=7일내 어닝)"]
     for it in items_capped:
         sym = it.get("ticker", "")
         chg = _fmt_pct(it.get("chg_pct", 0.0))
@@ -87,7 +87,9 @@ def _format_section(items: list[dict], emoji: str, title: str,
         url = links.get(sym)
         sym_e = html_escape(sym)
         sym_disp = f'<a href="{url}">{sym_e}</a>' if url else sym_e
-        lines.append(f"{sym_disp} / {chg} / {ytd} / {eps}")
+        em_date = ex.get("earnings_date")
+        em_mark = f" ⚡{em_date[5:]}" if em_date and len(em_date) >= 10 else ""
+        lines.append(f"{sym_disp} / {chg} / {ytd} / {eps}{em_mark}")
     if rest > 0:
         lines.append(f"... 외 {rest}종목")
     return "\n".join(lines) + "\n"
@@ -120,6 +122,7 @@ def format_results(
     stats: dict | None = None,
     links: dict | None = None,
     extra: dict | None = None,
+    retro: dict | None = None,
 ) -> str:
     parts: list[str] = []
     parts.append(f"🇺🇸 미국 주식 기술적 신호 — {_fmt_kst_header(as_of)}")
@@ -136,6 +139,13 @@ def format_results(
         if skipped_no_base > 0:
             line += f" · {skipped_no_base}종목 base_date 데이터 누락"
         parts.append(line)
+
+    # 회고 (있으면): 지난 신호 종목들의 N영업일 후 평균 수익률
+    if retro:
+        from src.us_screener.retrospective import format_retrospective_line
+        retro_str = format_retrospective_line(retro)
+        if retro_str:
+            parts.append(retro_str)
 
     # 앞에 나온 종목은 뒷 섹션서 제외 (역사적 신고가 → 52주 신고가 순으로 dedup)
     seen: set = set()

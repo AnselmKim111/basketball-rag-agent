@@ -54,6 +54,7 @@ from src import idea_prompts
 from src.bot_helpers import (
     deny_message,
     download_root_for,
+    html_escape,
     is_authorized,
     safe_dirname,
     send_pdf,
@@ -140,8 +141,8 @@ async def _cmd_idea(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     args = " ".join(context.args or []).strip()
     if not args:
         await update.message.reply_text(
-            "사용법: `/idea <아이디어 텍스트>` 또는 슬래시 없이 그냥 입력",
-            parse_mode=ParseMode.MARKDOWN,
+            "사용법: <code>/idea &lt;아이디어 텍스트&gt;</code> 또는 슬래시 없이 그냥 입력",
+            parse_mode=ParseMode.HTML,
         )
         return
     asyncio.create_task(_run_pipeline(update, context, args))
@@ -426,9 +427,9 @@ async def _cmd_dive(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     args = context.args or []
     if not args:
         await update.message.reply_text(
-            "사용법: `/dive <rank>` (예: `/dive 1`) — 가장 최근 idea의 Top N 종목 deepdive\n"
-            "또는: `/dive <rank> <id>` — 특정 entry의 Top N",
-            parse_mode=ParseMode.MARKDOWN,
+            "사용법: <code>/dive &lt;rank&gt;</code> (예: <code>/dive 1</code>) — 가장 최근 idea의 Top N 종목 deepdive\n"
+            "또는: <code>/dive &lt;rank&gt; &lt;id&gt;</code> — 특정 entry의 Top N",
+            parse_mode=ParseMode.HTML,
         )
         return
     try:
@@ -473,11 +474,11 @@ async def _cmd_dive(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     await send_text_chunked(
         bot, chat_id,
-        f"🔍 *Deepdive 자동 체이닝*\n"
-        f"Idea: `{(record.get('idea_text') or '')[:80]}`\n"
-        f"Top {rank}: *{name}* ({ticker})\n"
+        f"🔍 <b>Deepdive 자동 체이닝</b>\n"
+        f"Idea: <code>{html_escape((record.get('idea_text') or '')[:80])}</code>\n"
+        f"Top {rank}: <b>{html_escape(name)}</b> ({html_escape(ticker)})\n"
         f"⏱️ 5-10분 소요 — DART 사업보고서 + IR + 분기차트 통합 분석",
-        parse_mode=ParseMode.MARKDOWN,
+        parse_mode=ParseMode.HTML,
     )
 
     # deepdive _run 호출 — update/context 그대로 전달 (chat_id, bot 사용)
@@ -663,10 +664,10 @@ async def _run_contrarian(
 
     await send_text_chunked(
         bot, chat_id,
-        f"⚠️ *Contrarian 분석* (cached `{record.get('id','?')}`)\n"
-        f"📌 Thesis: {idea_text[:100]}\n"
+        f"⚠️ <b>Contrarian 분석</b> (cached <code>{html_escape(record.get('id','?'))}</code>)\n"
+        f"📌 Thesis: {html_escape(idea_text[:100])}\n"
         f"⏱️ 약 1-2분 — synthesis 프롬프트만 contrarian으로 swap, cache 재사용",
-        parse_mode=ParseMode.MARKDOWN,
+        parse_mode=ParseMode.HTML,
     )
 
     # cached 데이터
@@ -847,9 +848,9 @@ async def _cmd_compare(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     args = context.args or []
     if len(args) < 2:
         await update.message.reply_text(
-            "사용법: `/compare <id1> <id2>` (id 끝 6자리만 입력해도 OK)\n"
-            "예: `/compare 143005 162018`",
-            parse_mode=ParseMode.MARKDOWN,
+            "사용법: <code>/compare &lt;id1&gt; &lt;id2&gt;</code> (id 끝 6자리만 입력해도 OK)\n"
+            "예: <code>/compare 143005 162018</code>",
+            parse_mode=ParseMode.HTML,
         )
         return
     rec1 = idea_cache.find_by_partial_id(args[0])

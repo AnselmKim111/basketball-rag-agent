@@ -27,15 +27,23 @@ log = logging.getLogger(__name__)
 
 _BASE = "https://finnhub.io/api/v1"
 
+# 무료 키 권한 없는 endpoint — 첫 403 후 더 이상 호출 안 함 (로그 노이즈 방지)
+_FORBIDDEN_PATHS: set[str] = set()
+
 
 def _get_json(path: str, params: dict, key: str) -> dict | list | None:
+    if path in _FORBIDDEN_PATHS:
+        return None
     import httpx
     q = "&".join(f"{k}={v}" for k, v in params.items())
     url = f"{_BASE}{path}?{q}&token={key}"
     try:
         r = httpx.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
         if r.status_code in (401, 403):
-            log.info("[estimate_revisions] %s %s — 권한 없음", path, r.status_code)
+            if path not in _FORBIDDEN_PATHS:
+                log.info("[estimate_revisions] %s %s — 권한 없음 (이 endpoint 이후 호출 skip)",
+                         path, r.status_code)
+                _FORBIDDEN_PATHS.add(path)
             return None
         r.raise_for_status()
         return r.json()
@@ -93,7 +101,14 @@ def compute_revision(symbol: str) -> dict:
         except Exception:
             pt_new = None
 
-    significant = abs(buy_delta) >= 2 or (pt_new is not None and pt_new > 0)
+    # buy_delta ≥1 또는 대형주(buy_new ≥15) OR price target 존재 OR buy/sell 균형 변화 시 significant.
+    # 무료 Finnhub 키는 pt_new 없음 → trend 위주.
+    significant = (
+        abs(buy_delta) >= 1
+        or buy_new >= 15
+        or sell_new >= 3
+        or (pt_new is not None and pt_new > 0)
+    )
     if not significant:
         return {}
 
@@ -118,11 +133,21 @@ def batch_revisions(symbols: list[str], cap: int = 20) -> dict[str, dict]:
     if not key:
         return {}
     out: dict[str, dict] = {}
+    trend_hits = 0
+    trend_empty = 0
     for sym in symbols[:cap]:
         try:
+            # 진단: trend fetch 결과 분리 카운트
+            trend = fetch_recommendation_trend(sym, key)
+            if trend:
+                trend_hits += 1
+            else:
+                trend_empty += 1
             rev = compute_revision(sym)
             if rev:
                 out[sym] = rev
         except Exception:
             log.exception("[estimate_revisions] %s 실패", sym)
+    log.info("[estimate_revisions] %d종목 fetch — trend hit=%d empty=%d · significant=%d",
+             min(len(symbols), cap), trend_hits, trend_empty, len(out))
     return out

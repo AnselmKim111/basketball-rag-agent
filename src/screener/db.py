@@ -190,6 +190,56 @@ def has_date(date_str: str) -> bool:
         return cur.fetchone() is not None
 
 
+def recent_signals(days_back: int = 14, exclude_date: Optional[str] = None) -> list[dict]:
+    """최근 days_back 영업일 내 발생 신호 (오름차순 date). exclude_date 명시 시 그 날짜 제외(오늘).
+
+    반환: [{date, ticker, signal, payload(dict)}].
+    """
+    ensure_schema()
+    with _conn() as c:
+        # 영업일 기준 ≈ days_back×1.5 calendar days로 충분히 넓게 → 호출측이 다시 필터
+        from datetime import date, timedelta
+        cutoff = (date.today() - timedelta(days=int(days_back * 1.5))).isoformat()
+        if exclude_date:
+            cur = c.execute(
+                "SELECT date, ticker, signal, payload FROM signals "
+                "WHERE date >= ? AND date != ? ORDER BY date ASC, ticker, signal",
+                (cutoff, exclude_date),
+            )
+        else:
+            cur = c.execute(
+                "SELECT date, ticker, signal, payload FROM signals "
+                "WHERE date >= ? ORDER BY date ASC, ticker, signal",
+                (cutoff,),
+            )
+        rows = cur.fetchall()
+    out = []
+    for r in rows:
+        try:
+            payload = json.loads(r[3]) if r[3] else {}
+        except Exception:
+            payload = {}
+        out.append({"date": r[0], "ticker": r[1], "signal": r[2], "payload": payload})
+    return out
+
+
+def close_after_n_business_days(ticker: str, start_date: str, n: int = 5) -> Optional[int]:
+    """start_date의 ohlcv 인덱스를 찾아 그로부터 n영업일 후 close 반환. 없으면 None.
+    영업일은 DB에 실제 있는 거래일 기준.
+    """
+    ensure_schema()
+    with _conn() as c:
+        cur = c.execute(
+            "SELECT date, close FROM ohlcv WHERE ticker=? AND date >= ? "
+            "ORDER BY date ASC LIMIT ?",
+            (ticker, start_date, n + 1),
+        )
+        rows = cur.fetchall()
+    if len(rows) < n + 1:
+        return None  # 아직 n영업일 안 지남
+    return int(rows[n][1])
+
+
 def delete_older_than(cutoff_date: str) -> int:
     ensure_schema()
     with _conn() as c:

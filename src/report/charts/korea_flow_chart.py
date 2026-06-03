@@ -91,3 +91,76 @@ def flow_multipanel(
 
     fig.tight_layout()
     return theme.save_fig(fig, out_dir, filename)
+
+
+def streak_alert_card(kr_flows: dict, out_dir: Path,
+                      filename: str = "31_kr_streak_alert.png",
+                      min_streak: int = 5,
+                      date_iso: str | None = None) -> str | None:
+    """외국인/기관/개인 연속 매도/매수 streak ≥min_streak 시 카드 표시.
+
+    kr_flows: {market: DataFrame with columns 외국인/기관/개인}
+    카드: ⚠ 진하게 + 종목·일수·방향 + thesis 격상 가능 여부.
+    """
+    if not kr_flows:
+        return None
+    theme.setup()
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import FancyBboxPatch
+
+    def _streak(series) -> int:
+        if series is None or len(series) == 0:
+            return 0
+        vals = series.values
+        last = vals[-1]
+        if last == 0:
+            return 0
+        sign = 1 if last > 0 else -1
+        cnt = 0
+        for v in vals[::-1]:
+            if (v > 0 and sign > 0) or (v < 0 and sign < 0):
+                cnt += 1
+            else:
+                break
+        return cnt * sign
+
+    alerts = []  # (market, investor, streak, sum_amount)
+    for mkt, fdf in kr_flows.items():
+        if fdf is None or len(fdf) < 5:
+            continue
+        for inv in ("외국인", "기관", "개인"):
+            if inv not in fdf.columns:
+                continue
+            s = _streak(fdf[inv])
+            if abs(s) >= min_streak:
+                amount = float(fdf[inv].iloc[-abs(s):].sum())
+                alerts.append((mkt, inv, s, amount))
+    if not alerts:
+        return None
+
+    # 정렬: 가장 큰 streak 먼저
+    alerts.sort(key=lambda x: -abs(x[2]))
+    n = len(alerts)
+    fig, ax = plt.subplots(figsize=(13, max(2.0, 0.85 * n + 1.3)))
+    ax.set_xlim(0, 10); ax.set_ylim(0, n + 0.5); ax.axis("off")
+
+    for i, (mkt, inv, s, amt) in enumerate(alerts):
+        y = n - i - 0.5
+        direction = "매도" if s < 0 else "매수"
+        is_critical = abs(s) >= 7
+        bg = "#c62828" if is_critical else "#ef6c00"
+        ax.add_patch(FancyBboxPatch((0.2, y - 0.36), 9.6, 0.72, boxstyle="round,pad=0.06",
+                     facecolor=bg, edgecolor="white", linewidth=1.2, alpha=0.92))
+        badge = "⚠ 격상" if is_critical else "관찰"
+        text = (f"{badge}  ·  {mkt} {inv}  ·  {abs(int(s))}거래일 연속 {direction}  ·  "
+                f"누적 {amt:+,.0f}억원")
+        if is_critical:
+            text += "  →  단순 차익실현 → 추세 전환 신호 격상 가능"
+        ax.text(0.5, y, text, ha="left", va="center", fontsize=10.5,
+                fontweight="bold", color="white")
+
+    ax.set_title("[한국 수급 streak alert] 5거래일 이상 연속 매도/매수 종목",
+                 fontsize=13, fontweight="bold")
+    theme.stamp(ax, date_iso)
+    fig.tight_layout()
+    return theme.save_fig(fig, out_dir, filename)

@@ -27,7 +27,9 @@ from src.report.data import (
     fetch_earnings_surprise,
     fetch_estimate_revisions,
     fetch_ipo,
+    fetch_market_caps,
     kr_theme_linkage,
+    us_theme_linkage,
 )
 
 log = logging.getLogger(__name__)
@@ -39,6 +41,7 @@ _CAT_BONUS = {
     "trend_reversal": 0.80,
     "kr_linkage": 0.75,
     "sector_leader": 0.70,
+    "us_theme_leader": 0.65,
     "followup": 0.50,
     "estimate_revision": 0.55,
 }
@@ -51,6 +54,7 @@ _STREAM_CAP = {
     "sector_leader": 12,
     "trend_reversal": 20,
     "kr_linkage": 15,
+    "us_theme_leader": 15,
 }
 
 # trend_reversal로 분류할 screener 시그널 키
@@ -303,6 +307,34 @@ def _stream_trend_reversal(market: str) -> list[dict]:
 
 
 # ------------------------------------------------------------------
+# 시총 backfill — 0인 후보 일괄 fetch
+# ------------------------------------------------------------------
+def _backfill_market_caps(us_pool: dict, kr_pool: dict) -> None:
+    us_missing = [c["ticker"] for c in us_pool.values() if not (c.get("market_cap") or 0)]
+    kr_missing = [c["ticker"] for c in kr_pool.values() if not (c.get("market_cap") or 0)]
+    if us_missing:
+        try:
+            caps = fetch_market_caps.fetch_us_market_caps(us_missing)
+            for c in us_pool.values():
+                if not (c.get("market_cap") or 0):
+                    cap = caps.get(c["ticker"].upper())
+                    if cap:
+                        c["market_cap"] = cap
+        except Exception:
+            log.exception("[watchlist] US 시총 backfill 실패")
+    if kr_missing:
+        try:
+            kr_caps = fetch_market_caps.fetch_kr_market_caps()
+            for c in kr_pool.values():
+                if not (c.get("market_cap") or 0):
+                    cap = kr_caps.get(c["ticker"])
+                    if cap:
+                        c["market_cap"] = cap
+        except Exception:
+            log.exception("[watchlist] KR 시총 backfill 실패")
+
+
+# ------------------------------------------------------------------
 # Stream F — KR theme linkage (미국 hot 테마 → 한국 수혜주 매핑)
 # screener.db 비어있어도 작동. theme_rows의 r5d 강도를 chg_5d로 사용.
 # ------------------------------------------------------------------
@@ -334,6 +366,41 @@ def _stream_kr_theme_linkage(theme_rows: list[dict] | None, top_n_themes: int = 
             cand["signal_strength"] = min(abs(r5d) / 5.0, 2.0)  # 5%당 1.0, max 2.0
             out.append(cand)
             if len(out) >= _STREAM_CAP["kr_linkage"]:
+                return out
+    return out
+
+
+# ------------------------------------------------------------------
+# Stream G — US theme leader (미국 hot 테마 → 핵심 미국 종목)
+# us_screener.db sector_leader 비활성 시 폴백.
+# ------------------------------------------------------------------
+def _stream_us_theme_leader(theme_rows: list[dict] | None, top_n_themes: int = 6) -> list[dict]:
+    if not theme_rows:
+        return []
+    ranked = sorted(
+        [r for r in theme_rows if r.get("r5d") is not None],
+        key=lambda r: -abs(float(r.get("r5d") or 0)),
+    )[:top_n_themes]
+    out: list[dict] = []
+    seen: set[str] = set()
+    for r in ranked:
+        label = r.get("label") or ""
+        r5d = float(r.get("r5d") or 0)
+        for ticker in us_theme_linkage.core_tickers_for_label(label):
+            if ticker in seen:
+                continue
+            seen.add(ticker)
+            cand = _new_candidate(
+                ticker, "US",
+                name=ticker,
+                sector=label.split("(")[0].strip(),
+                market_cap=0,
+                signal_raw={"theme": label, "r5d": r5d, "leader_of": label},
+            )
+            cand["chg_5d"] = r5d
+            cand["signal_strength"] = min(abs(r5d) / 5.0, 2.0)
+            out.append(cand)
+            if len(out) >= _STREAM_CAP["us_theme_leader"]:
                 return out
     return out
 
@@ -607,12 +674,30 @@ def build_watchlist(date_iso: str, theme_rows: list[dict] | None,
     for c in _stream_kr_theme_linkage(theme_rows):
         _merge_candidate(kr_pool, c, "kr_linkage", strength_add=1.0)
 
+    # US theme leader (미국 hot 테마 → 미국 핵심 종목 hardcoded 매핑)
+    # us_screener.db 비어있어도 sector_leader 폴백 활성화.
+    for c in _stream_us_theme_leader(theme_rows):
+        _merge_candidate(us_pool, c, "us_theme_leader", strength_add=0.9)
+
     # 뉴스 mention 카운트 부착
     _annotate_news_mentions(us_pool, news)
     _annotate_news_mentions(kr_pool, news)
 
+    # 시총 보강 — 0인 후보에 한해 fetch (KR: FDR/screener.db · US: FMP /stable/quote)
+    _backfill_market_caps(us_pool, kr_pool)
+
+    # 카테고리별 카운트 (활성화 진단)
+    def _cat_breakdown(pool: dict) -> dict[str, int]:
+        out: dict[str, int] = {}
+        for c in pool.values():
+            for cat in (c.get("categories") or []):
+                out[cat] = out.get(cat, 0) + 1
+        return out
+
     log.info("[watchlist] 후보 풀 US=%d KR=%d (theme_hot=%s)",
              len(us_pool), len(kr_pool), theme_hot)
+    log.info("[watchlist] US 카테고리 breakdown: %s", _cat_breakdown(us_pool))
+    log.info("[watchlist] KR 카테고리 breakdown: %s", _cat_breakdown(kr_pool))
 
     # Estimate revision 보강 (US 후보 중 시총 큰 상위 20개에만 호출 — Finnhub rate 절약)
     revision_targets = sorted(
