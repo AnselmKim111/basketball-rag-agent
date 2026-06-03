@@ -155,6 +155,7 @@ async def send_text_chunked(
                         parse_mode, chat_id)
             try:
                 await bot.send_message(chat_id=chat_id, text=body)
+                log.info("send_message plain 폴백 성공 (chat_id=%s)", chat_id)
             except Exception:
                 log.exception("send_message 최종 실패 (chat_id=%s)", chat_id)
                 break
