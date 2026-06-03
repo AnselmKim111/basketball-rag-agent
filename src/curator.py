@@ -29,7 +29,7 @@ from telegram import Bot
 
 from src.bot_helpers import (
     MissingWisereportCreds,
-    html_escape,
+    _summarize_pdfs_parallel,
     safe_dirname,
     send_pdf,
     send_text_chunked,
@@ -143,10 +143,17 @@ class CandidateItem:
 # ------------------------------------------------------------------
 # Stage 0: 후보 풀 수집 (wisereport list-only)
 # ------------------------------------------------------------------
-def _collect_pool_blocking(mode: CuratorMode, days_back: int) -> list[CandidateItem]:
+def _collect_pool_blocking(
+    mode: CuratorMode,
+    days_back: int,
+    industry_gics: str | None = None,
+) -> list[CandidateItem]:
     """blocking — wisereport 세션 한 번 열어 mode.sources 카테고리 메타 수집.
 
     각 카테고리에서 popular + latest 두 번 호출 → dedup → 합침. PDF 다운 안 함.
+    industry_gics가 주어지면 list_top_reports에 그대로 전달 — wisereport 서버가
+    해당 산업 리포트만 돌려줘 풀이 깨끗해진다 (종목 큐레이션에서 "/curate 소부장"
+    같은 산업 한정 호출).
     """
     wr_id, wr_pw = wisereport_creds()
     pool: list[CandidateItem] = []
@@ -169,6 +176,7 @@ def _collect_pool_blocking(mode: CuratorMode, days_back: int) -> list[CandidateI
                         sort_by=sort_by,    # type: ignore[arg-type]
                         limit=base_limit,
                         days_back=days_back,
+                        industry_gics=industry_gics,
                     )
                 except Exception:
                     log.exception("list_top_reports 실패 (%s/%s)", category, sort_by)
@@ -187,15 +195,23 @@ def _collect_pool_blocking(mode: CuratorMode, days_back: int) -> list[CandidateI
     def _sort_key(c: CandidateItem) -> str:
         return getattr(c.item, "date", "") or getattr(c.item, "date_short", "") or ""
     pool.sort(key=_sort_key, reverse=True)
-    log.info("curator pool 수집 완료 [%s]: %d items (%s)", mode.name, len(pool), cat_breakdown)
+    log.info(
+        "curator pool 수집 완료 [%s]: %d items (%s)%s",
+        mode.name, len(pool), cat_breakdown,
+        f" [industry_gics={industry_gics}]" if industry_gics else "",
+    )
     return pool
 
 
 async def collect_candidate_pool(
-    mode: CuratorMode, days_back: int = DEFAULT_DAYS_BACK,
+    mode: CuratorMode,
+    days_back: int = DEFAULT_DAYS_BACK,
+    industry_gics: str | None = None,
 ) -> list[CandidateItem]:
     loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, _collect_pool_blocking, mode, days_back)
+    return await loop.run_in_executor(
+        None, _collect_pool_blocking, mode, days_back, industry_gics,
+    )
 
 
 # ------------------------------------------------------------------
@@ -237,22 +253,40 @@ def _build_meta_block(pool: list[CandidateItem]) -> str:
     return "\n".join(c.meta_line(i + 1) for i, c in enumerate(pool))
 
 
-async def recon_today(pool: list[CandidateItem], mode: CuratorMode) -> str:
-    """후보 메타로 오늘 시황 컨텍스트 추출. 실패 시 빈 string."""
+async def recon_today(
+    pool: list[CandidateItem], mode: CuratorMode,
+    industry_name: str | None = None,
+) -> str:
+    """후보 메타로 오늘 시황 컨텍스트 추출. 실패 시 빈 string.
+
+    industry_name이 주어지면 recon_focus 앞단에 산업 한정 지시 prepend — sonnet이
+    그 산업 내부 동향에 집중한 시황 분석을 내놓도록.
+    """
     if not pool:
         return ""
     loop = asyncio.get_running_loop()
     client = get_client()
     today = datetime.now(KST).strftime("%Y-%m-%d")
+    effective_focus = mode.recon_focus
+    if industry_name:
+        effective_focus = (
+            f"**산업 한정**: '{industry_name}' 산업에 속하는 종목·테마·정책만 분석. "
+            "다른 산업은 사이드 멘트로도 다루지 말 것. "
+            + mode.recon_focus
+        )
     prompt = RECON_PROMPT.format(
         date=today,
         days=DEFAULT_DAYS_BACK,
         n=len(pool),
-        recon_focus=mode.recon_focus,
+        recon_focus=effective_focus,
         meta_block=_build_meta_block(pool),
     )
     model = os.getenv(SYNTHESIS_MODEL_ENV) or DEFAULT_SYNTHESIS_MODEL
-    log.info("curator recon 호출 [%s]: model=%s, n=%d", mode.name, model, len(pool))
+    log.info(
+        "curator recon 호출 [%s]: model=%s, n=%d%s",
+        mode.name, model, len(pool),
+        f", industry={industry_name}" if industry_name else "",
+    )
     text = await loop.run_in_executor(
         None,
         lambda: chat_with_retry(
@@ -344,18 +378,32 @@ def _extract_json(text: str) -> dict | None:
 
 async def curate_picks(
     pool: list[CandidateItem], recon_text: str, n: int, mode: CuratorMode,
+    industry_name: str | None = None,
 ) -> list[tuple[CandidateItem, str]]:
-    """Top N 선별 + 각 이유. 실패 시 빈 리스트 → 호출자가 fallback (인기순)."""
+    """Top N 선별 + 각 이유. 실패 시 빈 리스트 → 호출자가 fallback (인기순).
+
+    industry_name이 주어지면 curate_focus 앞단에 산업 한정 강제 — 풀은 이미 GICS
+    필터로 깨끗하지만, 일부 종합 리포트가 다른 산업 종목을 함께 다룰 수 있어
+    이중 안전장치.
+    """
     if not pool:
         return []
     n = max(1, min(n, len(pool)))
     loop = asyncio.get_running_loop()
     client = get_client()
+    effective_focus = mode.curate_focus
+    if industry_name:
+        effective_focus = (
+            f"**필수 — 산업 한정**: 반드시 '{industry_name}' 산업에 속하는 종목 리포트만 "
+            "선별. 풀에 다른 산업이 섞여 있어도 무시. "
+            "전혀 매칭 안 되면 picks 빈 리스트 반환. "
+            + mode.curate_focus
+        )
     prompt = CURATE_PROMPT.format(
         n=n,
         recon=recon_text or "(시황 컨텍스트 없음)",
         meta_block=_build_meta_block(pool),
-        curate_focus=mode.curate_focus,
+        curate_focus=effective_focus,
         date_today=datetime.now(KST).strftime("%Y-%m-%d"),
     )
     model = os.getenv(SYNTHESIS_MODEL_ENV) or DEFAULT_SYNTHESIS_MODEL
@@ -394,17 +442,22 @@ async def curate_picks(
 # ------------------------------------------------------------------
 # Stage 3: deliver — 선별된 리포트 다운로드 + 요약 + 발송
 # ------------------------------------------------------------------
-def _download_and_summarize_blocking(
+def _download_picks_blocking(
     picks: list[tuple[CandidateItem, str]],
     download_root: Path,
-) -> list[tuple[CandidateItem, str, Path | None, str]]:
-    """blocking — 선별 항목만 PDF 다운 + 요약. 빈 결과 가능."""
+) -> list[tuple[CandidateItem, str, Path | None]]:
+    """blocking — 선별 항목만 wisereport에서 PDF 다운로드.
+
+    LLM 요약은 호출자가 `_summarize_pdfs_parallel` 로 lock 밖에서 병렬 처리한다
+    (이전에는 같은 함수 안에 sequential 요약이 묶여 있어 PIPELINE_LOCK을 5-10분
+    잡았다). 다운로드 실패한 pick은 path=None — 호출자가 graceful skip.
+
+    한 wisereport 세션 안에서 cli.download_reports 한 번 호출이 sequential을
+    보장 (wisereport 서버 동시 다운로드 거부 방지).
+    """
     wr_id, wr_pw = wisereport_creds()
     target_dir = download_root / safe_dirname("curated")
     target_dir.mkdir(parents=True, exist_ok=True)
-
-    out: list[tuple[CandidateItem, str, Path | None, str]] = []
-    sum_client = get_client()
 
     with WisereportClient(
         user_id=wr_id,
@@ -422,35 +475,32 @@ def _download_and_summarize_blocking(
             log.exception("curator 다운로드 실패")
             saved = []
 
-    # 요약
-    saved_by_id = {p.stem.split("_")[0] if "_" in p.stem else p.stem: p for p in saved}
-    # rpt_id로 매핑이 안전하지 않을 수 있어서 — items 순서 보장된 saved 가정
+    # picks 순서 보존: 다운로드 실패분은 path=None
+    out: list[tuple[CandidateItem, str, Path | None]] = []
     for (c, reason), p in zip(picks, saved + [None] * (len(picks) - len(saved))):
-        if not p:
-            out.append((c, reason, None, "(다운로드 실패)"))
-            continue
-        try:
-            s = summarize_pdf(sum_client, p)
-            out.append((c, reason, p, s.summary_text))
-        except OpenRouterCreditExhausted:
-            out.append((c, reason, p, "(요약 실패: OpenRouter 토큰 부족)"))
-        except Exception as e:
-            out.append((c, reason, p, f"(요약 실패: {e!r})"))
+        out.append((c, reason, p))
     return out
 
 
-async def run_curated(bot: Bot, chat_id: str, n: int = 10, mode: CuratorMode = MARKET_MODE) -> None:
+async def run_curated(
+    bot: Bot, chat_id: str, n: int = 10,
+    mode: CuratorMode = MARKET_MODE,
+    industry_name: str | None = None,
+    industry_gics: str | None = None,
+) -> None:
     """전체 큐레이션 파이프라인 + 발송.
 
-    PIPELINE_LOCK 안에서 wisereport 세션 사용. LLM 호출은 lock 밖에서 가능하지만
-    단순화 위해 모든 단계를 lock 안에서 진행.
-    """
-    if PIPELINE_LOCK.locked():
-        await send_text_chunked(
-            bot, chat_id,
-            "⏳ 다른 작업 진행 중 — 끝나면 큐레이션 시작합니다",
-        )
+    PIPELINE_LOCK은 wisereport 접근 두 구간(Stage 0 메타 수집, Stage 3a PDF
+    다운로드)에서만 짧게 잡는다. Sonnet 호출(Stage 1, 2)·LLM 요약(Stage 3b)·
+    텔레그램 발송(Stage 3c)은 모두 lock 밖이라 다른 봇이 두 wisereport 구간
+    사이에 즉시 끼어들어 자기 wisereport 작업을 할 수 있다.
 
+    이전 동작: 단일 lock 블록 5-15분 → 다른 봇 모두 큐 대기.
+    이후 동작: lock 점유 총합 1-3분 (Stage 0 ~30초 + Stage 3a 30-60초).
+
+    industry_name + industry_gics 가 주어지면 wisereport 풀 수집 자체를 해당 산업
+    GICS 로 제한 → 풀이 깨끗해져 sonnet 선별 결과도 그 산업 종목만 나온다.
+    """
     try:
         wisereport_creds()  # 자격증명 사전 체크 — lock 안에서 죽으면 lock 시간 낭비
     except MissingWisereportCreds:
@@ -459,103 +509,147 @@ async def run_curated(bot: Bot, chat_id: str, n: int = 10, mode: CuratorMode = M
 
     started = datetime.now(KST).strftime("%Y-%m-%d %H:%M")
     src_label = " · ".join(mode.sources.keys())
+    scope_label = f"{mode.label} · *{industry_name}* 산업 한정" if industry_name else mode.label
     await send_text_chunked(
         bot, chat_id,
-        f"🔍 *오늘의 {mode.label} 큐레이션 시작* ({started})\n"
+        f"🔍 *오늘의 {scope_label} 큐레이션 시작* ({started})\n"
         f"3단계 분석 진행 — Top {n} 선별까지 5-15분 소요\n"
-        f"  1️⃣ 후보 풀 수집 ({src_label})\n"
+        f"  1️⃣ 후보 풀 수집 ({src_label})"
+        + (f" — GICS={industry_gics}" if industry_gics else "") + "\n"
         f"  2️⃣ AI 분석 → 주도 영역\n"
         f"  3️⃣ AI 큐레이션 → Top {n} + 선별 이유",
         parse_mode="Markdown",
     )
 
+    # ─── lock window 1: Stage 0 (wisereport 메타 수집, 15-30초) ───
+    if PIPELINE_LOCK.locked():
+        await send_text_chunked(
+            bot, chat_id,
+            f"⏳ *{scope_label}*: wisereport 사용 중 — 다운로드만 잠시 대기 (요약은 즉시 병렬 진행)",
+            parse_mode="Markdown",
+        )
     async with PIPELINE_LOCK:
-        # Stage 0
         try:
-            pool = await collect_candidate_pool(mode)
+            pool = await collect_candidate_pool(mode, industry_gics=industry_gics)
         except Exception:
             log.exception("curator Stage 0 실패 [%s]", mode.name)
             await send_text_chunked(bot, chat_id, "❌ wisereport 후보 수집 실패")
             return
-        if not pool:
-            await send_text_chunked(bot, chat_id, "❌ 후보 풀 비어있음 — 다시 시도하세요")
-            return
+    # ─── lock 해제 — 다음 봇이 즉시 wisereport 접근 가능 ───
+
+    if not pool:
+        msg = (
+            f"❌ '{industry_name}' 산업 후보 풀이 비어있습니다 — "
+            "지난 7일 내 발행 리포트가 없습니다. 더 큰 산업명으로 재시도해 보세요."
+        ) if industry_name else "❌ 후보 풀 비어있음 — 다시 시도하세요"
+        await send_text_chunked(bot, chat_id, msg)
+        return
+    ind_tag = f" ({industry_name})" if industry_name else ""
+    await send_text_chunked(
+        bot, chat_id,
+        f"✅ 후보 풀 {len(pool)}건 수집 완료{ind_tag} — {mode.label} 분석 중...",
+    )
+
+    # ─── Stage 1: sonnet recon (lock 밖, 1-3분) ───
+    try:
+        recon_text = await recon_today(pool, mode, industry_name=industry_name)
+    except Exception:
+        log.exception("curator Stage 1 실패 [%s]", mode.name)
+        recon_text = ""
+    if recon_text:
         await send_text_chunked(
             bot, chat_id,
-            f"✅ 후보 풀 {len(pool)}건 수집 완료 — {mode.label} 분석 중...",
+            f"📊 *오늘의 {mode.label} 분석*\n\n{recon_text}",
+            parse_mode="Markdown",
+        )
+    else:
+        await send_text_chunked(
+            bot, chat_id,
+            "⚠️ 분석 실패 — 큐레이션은 계속 진행 (인기순 폴백 가능)",
         )
 
-        # Stage 1
-        try:
-            recon_text = await recon_today(pool, mode)
-        except Exception:
-            log.exception("curator Stage 1 실패 [%s]", mode.name)
-            recon_text = ""
-        if recon_text:
+    # ─── Stage 2: sonnet curate picks (lock 밖, 1-2분) ───
+    try:
+        picks = await curate_picks(
+            pool, recon_text, n, mode, industry_name=industry_name,
+        )
+    except Exception:
+        log.exception("curator Stage 2 실패 [%s]", mode.name)
+        picks = [(c, "(큐레이션 실패 폴백)") for c in pool[:n]]
+    if not picks:
+        if industry_name:
             await send_text_chunked(
                 bot, chat_id,
-                f"📊 *오늘의 {mode.label} 분석*\n\n{recon_text}",
-                parse_mode="Markdown",
+                f"❌ '{industry_name}' 산업 후보 0건 — sonnet이 매칭 종목을 못 찾았습니다.\n"
+                "더 큰 산업명으로 재시도하거나 며칠 후 다시 시도해 주세요.",
             )
         else:
-            await send_text_chunked(
-                bot, chat_id,
-                "⚠️ 분석 실패 — 큐레이션은 계속 진행 (인기순 폴백 가능)",
-            )
-
-        # Stage 2
-        try:
-            picks = await curate_picks(pool, recon_text, n, mode)
-        except Exception:
-            log.exception("curator Stage 2 실패 [%s]", mode.name)
-            picks = [(c, "(큐레이션 실패 폴백)") for c in pool[:n]]
-        if not picks:
             await send_text_chunked(bot, chat_id, "❌ 큐레이션 실패 — 후보 0")
-            return
+        return
 
-        # 큐레이션 헤더 (HTML — 뉴스 타이틀의 Markdown 특수문자 파싱 깨짐 방지)
-        header_lines = [f"🎯 <b>Top {len(picks)} 큐레이션</b>\n"]
-        for i, (c, reason) in enumerate(picks, start=1):
-            header_lines.append(
-                f"<b>{i}. [{html_escape(c.category)}] {html_escape(c.item.title)}</b>\n"
-                f"  📅 {html_escape(c.date_short)}  💡 {html_escape(reason)}"
-            )
+    # 큐레이션 헤더
+    header_lines = [f"🎯 *Top {len(picks)} 큐레이션*\n"]
+    for i, (c, reason) in enumerate(picks, start=1):
+        header_lines.append(
+            f"*{i}. [{c.category}] {c.item.title}*\n"
+            f"  📅 {c.date_short}  💡 {reason}"
+        )
+    await send_text_chunked(
+        bot, chat_id,
+        "\n\n".join(header_lines),
+        parse_mode="Markdown",
+    )
+
+    # ─── lock window 2: Stage 3a (PDF 다운로드만, 30-60초) ───
+    download_root = Path(os.environ.get("DOWNLOAD_DIR", "./downloads"))
+    await send_text_chunked(
+        bot, chat_id,
+        f"📥 선별 {len(picks)}건 PDF 다운로드 시작 (요약은 다운 직후 병렬)",
+    )
+    if PIPELINE_LOCK.locked():
         await send_text_chunked(
             bot, chat_id,
-            "\n\n".join(header_lines),
-            parse_mode="HTML",
+            "⏳ wisereport 사용 중 — 다운로드만 잠시 대기",
         )
-
-        # Stage 3 — 다운로드 + 요약 + PDF
-        download_root = Path(os.environ.get("DOWNLOAD_DIR", "./downloads"))
-        await send_text_chunked(
-            bot, chat_id,
-            f"📥 선별 {len(picks)}건 PDF 다운로드 + 요약 시작 — 각 1분 소요",
-        )
-
-        loop = asyncio.get_running_loop()
+    loop = asyncio.get_running_loop()
+    async with PIPELINE_LOCK:
         try:
-            results = await loop.run_in_executor(
-                None, _download_and_summarize_blocking, picks, download_root,
+            downloaded = await loop.run_in_executor(
+                None, _download_picks_blocking, picks, download_root,
             )
         except Exception:
-            log.exception("curator Stage 3 실패")
-            await send_text_chunked(bot, chat_id, "❌ 다운로드/요약 단계 실패 — 로그 확인")
+            log.exception("curator Stage 3a 실패")
+            await send_text_chunked(bot, chat_id, "❌ 다운로드 단계 실패 — 로그 확인")
             return
+    # ─── lock 해제 ───
 
-        # 발송 — 각 항목 요약 + PDF (HTML)
-        for i, (c, reason, path, summary) in enumerate(results, start=1):
-            header = (
-                f"🔖 <b>{i}/{len(results)}</b> [{html_escape(c.category)}] {html_escape(c.item.title)}\n"
-                f"📅 {html_escape(c.date_short)}  💡 {html_escape(reason)}"
-            )
-            await send_text_chunked(bot, chat_id, header, parse_mode="HTML")
-            await send_text_chunked(bot, chat_id, summary)
-            if path:
-                await send_pdf(bot, chat_id, path, caption=c.item.title)
+    # ─── Stage 3b: LLM 요약 N개 병렬 (lock 밖) ───
+    valid_paths = [p for _, _, p in downloaded if p]
+    summaries_for_valid = await _summarize_pdfs_parallel(
+        valid_paths, short_summary=False, label=f"curator-{mode.name}",
+    )
+    # downloaded 순서대로 요약 매핑 (None 자리에는 (다운로드 실패) 자리 채움)
+    sit = iter(summaries_for_valid)
+    results: list[tuple[CandidateItem, str, Path | None, str]] = []
+    for c, reason, path in downloaded:
+        if path is None:
+            results.append((c, reason, None, "(다운로드 실패)"))
+        else:
+            results.append((c, reason, path, next(sit, "(요약 실패: 알 수 없음)")))
 
-        finished = datetime.now(KST).strftime("%H:%M")
-        await send_text_chunked(
-            bot, chat_id,
-            f"✅ 큐레이션 완료 ({finished}) — Top {len(results)}건 발송",
+    # ─── Stage 3c: 텔레그램 순차 발송 (lock 밖, 순서 보존) ───
+    for i, (c, reason, path, summary) in enumerate(results, start=1):
+        header = (
+            f"🔖 *{i}/{len(results)}* [{c.category}] {c.item.title}\n"
+            f"📅 {c.date_short}  💡 {reason}"
         )
+        await send_text_chunked(bot, chat_id, header, parse_mode="Markdown")
+        await send_text_chunked(bot, chat_id, summary)
+        if path:
+            await send_pdf(bot, chat_id, path, caption=c.item.title)
+
+    finished = datetime.now(KST).strftime("%H:%M")
+    await send_text_chunked(
+        bot, chat_id,
+        f"✅ 큐레이션 완료 ({finished}) — Top {len(results)}건 발송",
+    )

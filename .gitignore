@@ -5,6 +5,9 @@
 CLAUDE.local.md
 .claude/settings.local.json
 
+# Claude Code 개인 설정 (팀 공유 X)
+.claude/settings.local.json
+
 # Downloaded reports (do not commit user data)
 downloads/
 output/
@@ -40,3 +43,6 @@ playwright-report/
 *.swo
 .DS_Store
 CLAUDE.md
+
+# Claude Code local settings (per-user)
+.claude/settings.local.json

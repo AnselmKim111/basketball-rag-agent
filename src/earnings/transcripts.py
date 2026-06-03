@@ -241,13 +241,16 @@ def format_transcript_text(tr: dict[str, Any]) -> str:
 
     qa = tr.get("qa_highlights") or []
     if qa:
-        lines.append("❓ Q&A")
-        for item in qa[:10]:
+        lines.append("❓ Q&A (Top 5 + significance)")
+        for item in qa[:5]:
             a = (item.get("analyst") or "?").strip()
             q = (item.get("question") or "").strip()
             ans = (item.get("answer_summary") or "").strip()
+            sig = (item.get("significance") or "").strip()
             lines.append(f"  Q ({a}): {q}")
             lines.append(f"  A: {ans}")
+            if sig:
+                lines.append(f"  ▸ 함의: {sig}")
         lines.append("")
 
     cap = tr.get("capital_allocation")

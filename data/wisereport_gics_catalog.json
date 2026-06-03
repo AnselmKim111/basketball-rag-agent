@@ -1,0 +1,197 @@
+[
+  {
+    "name_ko": "반도체 소재·부품·장비",
+    "wisereport_query": "반도체 장비",
+    "aliases": ["소부장", "반도체 소부장", "반도체 장비", "반도체 소재", "반도체 부품", "반도체 후공정 장비", "반도체 전공정 장비"]
+  },
+  {
+    "name_ko": "반도체 (종합)",
+    "wisereport_query": "반도체",
+    "aliases": ["반도체", "메모리", "메모리 반도체", "비메모리", "시스템 반도체", "파운드리", "팹리스", "DRAM", "낸드", "HBM"]
+  },
+  {
+    "name_ko": "디스플레이",
+    "wisereport_query": "디스플레이",
+    "aliases": ["디스플레이", "OLED", "LCD", "마이크로LED", "QD-OLED", "디스플레이 패널"]
+  },
+  {
+    "name_ko": "디스플레이 소재·부품·장비",
+    "wisereport_query": "디스플레이 장비",
+    "aliases": ["디스플레이 소부장", "디스플레이 장비", "디스플레이 소재", "OLED 소재", "OLED 소부장"]
+  },
+  {
+    "name_ko": "2차전지·배터리",
+    "wisereport_query": "2차전지",
+    "aliases": ["2차전지", "이차전지", "배터리", "전기차 배터리", "리튬이온", "ESS", "BMS"]
+  },
+  {
+    "name_ko": "2차전지 소재",
+    "wisereport_query": "2차전지 소재",
+    "aliases": ["배터리 소재", "양극재", "음극재", "전해질", "분리막", "동박", "전구체", "2차전지 소부장", "배터리 소부장"]
+  },
+  {
+    "name_ko": "전기차·자율주행",
+    "wisereport_query": "전기차",
+    "aliases": ["전기차", "EV", "자율주행", "ADAS", "자동차 전장", "전장부품"]
+  },
+  {
+    "name_ko": "자동차",
+    "wisereport_query": "자동차",
+    "aliases": ["자동차", "완성차", "OEM"]
+  },
+  {
+    "name_ko": "자동차 부품",
+    "wisereport_query": "자동차 부품",
+    "aliases": ["자동차 부품", "자동차 소부장", "타이어", "차량 부품"]
+  },
+  {
+    "name_ko": "조선·해양",
+    "wisereport_query": "조선",
+    "aliases": ["조선", "조선업", "선박", "해양플랜트", "LNG선", "FPSO"]
+  },
+  {
+    "name_ko": "방산·우주·항공",
+    "wisereport_query": "방산",
+    "aliases": ["방산", "방위산업", "K-방산", "항공", "우주", "위성", "발사체", "스페이스"]
+  },
+  {
+    "name_ko": "원자력·전력",
+    "wisereport_query": "원자력",
+    "aliases": ["원전", "원자력", "SMR", "전력", "전력기기", "송배전", "그리드", "변압기"]
+  },
+  {
+    "name_ko": "신재생에너지",
+    "wisereport_query": "신재생",
+    "aliases": ["신재생", "태양광", "풍력", "수소", "친환경 에너지", "그린수소"]
+  },
+  {
+    "name_ko": "정유·석유화학",
+    "wisereport_query": "정유",
+    "aliases": ["정유", "석유화학", "오일", "에너지", "원유"]
+  },
+  {
+    "name_ko": "화학",
+    "wisereport_query": "화학",
+    "aliases": ["화학", "기초소재", "정밀화학", "특수화학"]
+  },
+  {
+    "name_ko": "철강·비철금속",
+    "wisereport_query": "철강",
+    "aliases": ["철강", "비철금속", "구리", "아연", "알루미늄"]
+  },
+  {
+    "name_ko": "건설·건자재",
+    "wisereport_query": "건설",
+    "aliases": ["건설", "건자재", "토목", "주택", "시멘트"]
+  },
+  {
+    "name_ko": "조선기자재",
+    "wisereport_query": "조선기자재",
+    "aliases": ["조선기자재", "조선 부품"]
+  },
+  {
+    "name_ko": "기계·산업장비",
+    "wisereport_query": "기계",
+    "aliases": ["기계", "산업기계", "공작기계", "산업장비"]
+  },
+  {
+    "name_ko": "로봇·자동화",
+    "wisereport_query": "로봇",
+    "aliases": ["로봇", "협동로봇", "휴머노이드", "산업자동화", "FA"]
+  },
+  {
+    "name_ko": "AI·소프트웨어",
+    "wisereport_query": "AI",
+    "aliases": ["AI", "인공지능", "LLM", "생성형 AI", "소프트웨어", "SW", "AI 인프라"]
+  },
+  {
+    "name_ko": "데이터센터·서버",
+    "wisereport_query": "데이터센터",
+    "aliases": ["데이터센터", "DC", "AI 서버", "서버", "클라우드 인프라"]
+  },
+  {
+    "name_ko": "광통신·네트워크 장비",
+    "wisereport_query": "광통신",
+    "aliases": ["광통신", "CPO", "옵틱스", "네트워크 장비", "스위치", "광모듈"]
+  },
+  {
+    "name_ko": "통신서비스",
+    "wisereport_query": "통신",
+    "aliases": ["통신", "이동통신", "5G", "6G"]
+  },
+  {
+    "name_ko": "인터넷·플랫폼",
+    "wisereport_query": "인터넷",
+    "aliases": ["인터넷", "플랫폼", "네이버", "카카오", "광고"]
+  },
+  {
+    "name_ko": "게임",
+    "wisereport_query": "게임",
+    "aliases": ["게임", "모바일게임", "콘솔", "PC게임"]
+  },
+  {
+    "name_ko": "엔터테인먼트·미디어",
+    "wisereport_query": "엔터테인먼트",
+    "aliases": ["엔터", "엔터테인먼트", "K-POP", "K팝", "미디어", "콘텐츠"]
+  },
+  {
+    "name_ko": "제약",
+    "wisereport_query": "제약",
+    "aliases": ["제약", "신약", "오리지널", "제네릭"]
+  },
+  {
+    "name_ko": "바이오·바이오시밀러",
+    "wisereport_query": "바이오",
+    "aliases": ["바이오", "바이오시밀러", "CDMO", "위탁생산", "항체"]
+  },
+  {
+    "name_ko": "헬스케어·의료기기",
+    "wisereport_query": "의료기기",
+    "aliases": ["의료기기", "헬스케어", "진단", "MRI", "임플란트"]
+  },
+  {
+    "name_ko": "화장품·뷰티",
+    "wisereport_query": "화장품",
+    "aliases": ["화장품", "K뷰티", "K-뷰티", "코스메틱", "뷰티"]
+  },
+  {
+    "name_ko": "음식료·식음료",
+    "wisereport_query": "음식료",
+    "aliases": ["음식료", "식품", "식음료", "음료", "F&B"]
+  },
+  {
+    "name_ko": "유통·리테일",
+    "wisereport_query": "유통",
+    "aliases": ["유통", "리테일", "백화점", "이커머스", "편의점", "면세점"]
+  },
+  {
+    "name_ko": "은행",
+    "wisereport_query": "은행",
+    "aliases": ["은행", "금융지주"]
+  },
+  {
+    "name_ko": "증권",
+    "wisereport_query": "증권",
+    "aliases": ["증권", "브로커리지"]
+  },
+  {
+    "name_ko": "보험",
+    "wisereport_query": "보험",
+    "aliases": ["보험", "생보", "손보"]
+  },
+  {
+    "name_ko": "운송·물류",
+    "wisereport_query": "운송",
+    "aliases": ["운송", "물류", "해운", "항공운송", "택배", "포워딩"]
+  },
+  {
+    "name_ko": "지주사",
+    "wisereport_query": "지주",
+    "aliases": ["지주", "지주사", "홀딩스"]
+  },
+  {
+    "name_ko": "리츠·부동산",
+    "wisereport_query": "리츠",
+    "aliases": ["리츠", "REITs", "부동산"]
+  }
+]

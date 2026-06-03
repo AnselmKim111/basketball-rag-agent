@@ -249,6 +249,58 @@ def enforce_min_length(text: str | None, min_chars: int = 8000) -> tuple[bool, i
 
 
 # ------------------------------------------------------------------
+# 4) 미공개 셀 lint (Phase 8 Track Q)
+# ------------------------------------------------------------------
+_UNDISCLOSED_RE = re.compile(r"(수치|정량)\s*미공개|\(\s*미공개\s*\)")
+
+
+def verify_no_undisclosed(synthesis_text: str | None) -> GateResult:
+    """합성 본문에 '수치 미공개' / '정량 미공개' / '(미공개)' 가 등장하는지.
+
+    표 셀에 비정량 산문을 채우는 게 가장 흔한 환각 회피 패턴 — 차단해야 PM이 표를 읽을 수 있다.
+    """
+    result = GateResult(layer="undisclosed_lint")
+    if not synthesis_text:
+        return result
+    matches = list(_UNDISCLOSED_RE.finditer(synthesis_text))
+    result.total_checked = 1
+    if matches:
+        for m in matches[:10]:
+            ctx_start = max(0, m.start() - 40)
+            ctx_end = min(len(synthesis_text), m.end() + 40)
+            result.violations.append(ViolationReport(
+                layer="undisclosed_lint",
+                field=f"pos={m.start()}",
+                fragment=synthesis_text[ctx_start:ctx_end].replace("\n", " "),
+                reason="undisclosed_cell_phrase",
+            ))
+        result.violation_ratio = 1.0
+        result.passed = False
+    return result
+
+
+# ------------------------------------------------------------------
+# 5) Truncation 감지 (Phase 8 Track Q)
+# ------------------------------------------------------------------
+_SAFE_END_CHARS = set(".다요?)」』』。」?!*]")  # 자연스러운 종결
+_SECTION_RE = re.compile(r"^##\s", re.MULTILINE)
+
+
+def looks_truncated(text: str | None, expected_sections: int = 8) -> tuple[bool, str]:
+    """합성 본문이 잘렸을 가능성. 반환: (잘림_의심, 사유)."""
+    if not text or len(text) < 200:
+        return True, f"len<200 ({len(text or '')})"
+    tail = text.rstrip()
+    last = tail[-1] if tail else ""
+    if last not in _SAFE_END_CHARS:
+        return True, f"tail_char={last!r}"
+    sections = len(_SECTION_RE.findall(text))
+    if sections < expected_sections:
+        return True, f"sections={sections}<{expected_sections}"
+    return False, ""
+
+
+# ------------------------------------------------------------------
 # 메시지 헬퍼
 # ------------------------------------------------------------------
 def fmt_quality_summary(

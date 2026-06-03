@@ -56,8 +56,8 @@ def _format_billions(x, _):
 # ------------------------------------------------------------------
 # 차트 빌더
 # ------------------------------------------------------------------
-def chart_capex_absolute(financials_by_ticker: dict[str, Any]) -> Optional[Any]:
-    """CapEx 6년치 grouped bar. financials_by_ticker: {ticker: CompanyFinancials}."""
+def chart_capex_absolute(financials_by_ticker: dict[str, Any], ax: Optional[Any] = None) -> Optional[Any]:
+    """CapEx 6년치 grouped bar. ax 지정 시 그 ax에 그리고 None 반환 (grid 모드)."""
     try:
         plt = setup_matplotlib_safe()
         from matplotlib.ticker import FuncFormatter
@@ -71,7 +71,12 @@ def chart_capex_absolute(financials_by_ticker: dict[str, Any]) -> Optional[Any]:
         years = sorted(years_set)[-6:]
         tickers = list(financials_by_ticker.keys())
 
-        fig, ax = plt.subplots(figsize=(11, 6.5))
+        if ax is None:
+            fig, ax = plt.subplots(figsize=(11, 6.5))
+            return_fig = True
+        else:
+            fig = ax.figure
+            return_fig = False
         n = len(tickers)
         bar_w = 0.8 / max(n, 1)
         import numpy as np
@@ -94,22 +99,30 @@ def chart_capex_absolute(financials_by_ticker: dict[str, Any]) -> Optional[Any]:
         ax.set_xticks(xs)
         ax.set_xticklabels([f"FY{fy}" for fy in years])
         ax.set_ylabel("CapEx (USD)")
-        ax.set_title("CapEx — 6-Year Comparison", fontsize=13, fontweight="bold", pad=12)
+        if return_fig:
+            ax.set_title("CapEx — 6-Year Comparison", fontsize=13, fontweight="bold", pad=12)
         ax.yaxis.set_major_formatter(FuncFormatter(_format_billions))
         ax.grid(True, axis="y", alpha=0.25, linestyle="--")
         ax.legend(loc="best", fontsize=9, ncol=min(n, 4))
-        fig.tight_layout()
-        return fig
+        if return_fig:
+            fig.tight_layout()
+            return fig
+        return None
     except Exception:
         log.exception("chart_capex_absolute 실패")
         return None
 
 
-def chart_capex_yoy(financials_by_ticker: dict[str, Any]) -> Optional[Any]:
+def chart_capex_yoy(financials_by_ticker: dict[str, Any], ax: Optional[Any] = None) -> Optional[Any]:
     """CapEx YoY 증감률 (%) line."""
     try:
         plt = setup_matplotlib_safe()
-        fig, ax = plt.subplots(figsize=(11, 6.5))
+        if ax is None:
+            fig, ax = plt.subplots(figsize=(11, 6.5))
+            return_fig = True
+        else:
+            fig = ax.figure
+            return_fig = False
         any_drawn = False
         for i, (t, fin) in enumerate(financials_by_ticker.items()):
             yoy = fin.capex_yoy_change()
@@ -130,23 +143,27 @@ def chart_capex_yoy(financials_by_ticker: dict[str, Any]) -> Optional[Any]:
             any_drawn = True
 
         if not any_drawn:
-            plt.close(fig)
+            if return_fig:
+                plt.close(fig)
             return None
 
         ax.axhline(y=0, color="black", linewidth=0.6, alpha=0.5)
         ax.set_xlabel("Fiscal Year")
         ax.set_ylabel("CapEx YoY Change (%)")
-        ax.set_title("CapEx — Year-over-Year Growth Rate", fontsize=13, fontweight="bold", pad=12)
+        if return_fig:
+            ax.set_title("CapEx — Year-over-Year Growth Rate", fontsize=13, fontweight="bold", pad=12)
         ax.grid(True, alpha=0.25, linestyle="--")
         ax.legend(loc="best", fontsize=9, ncol=min(len(financials_by_ticker), 4))
-        fig.tight_layout()
-        return fig
+        if return_fig:
+            fig.tight_layout()
+            return fig
+        return None
     except Exception:
         log.exception("chart_capex_yoy 실패")
         return None
 
 
-def chart_fcf(financials_by_ticker: dict[str, Any]) -> Optional[Any]:
+def chart_fcf(financials_by_ticker: dict[str, Any], ax: Optional[Any] = None) -> Optional[Any]:
     """FCF 6년치 grouped bar."""
     try:
         plt = setup_matplotlib_safe()
@@ -163,7 +180,12 @@ def chart_fcf(financials_by_ticker: dict[str, Any]) -> Optional[Any]:
         years = sorted(years_set)[-6:]
         tickers = list(fcf_by_t.keys())
 
-        fig, ax = plt.subplots(figsize=(11, 6.5))
+        if ax is None:
+            fig, ax = plt.subplots(figsize=(11, 6.5))
+            return_fig = True
+        else:
+            fig = ax.figure
+            return_fig = False
         n = len(tickers)
         bar_w = 0.8 / max(n, 1)
         xs = np.arange(len(years))
@@ -184,23 +206,31 @@ def chart_fcf(financials_by_ticker: dict[str, Any]) -> Optional[Any]:
         ax.set_xticks(xs)
         ax.set_xticklabels([f"FY{fy}" for fy in years])
         ax.set_ylabel("FCF (USD) = OCF − CapEx")
-        ax.set_title("Free Cash Flow — 6-Year Comparison", fontsize=13, fontweight="bold", pad=12)
+        if return_fig:
+            ax.set_title("Free Cash Flow — 6-Year Comparison", fontsize=13, fontweight="bold", pad=12)
         ax.yaxis.set_major_formatter(FuncFormatter(_format_billions))
         ax.axhline(y=0, color="black", linewidth=0.6, alpha=0.5)
         ax.grid(True, axis="y", alpha=0.25, linestyle="--")
         ax.legend(loc="best", fontsize=9, ncol=min(n, 4))
-        fig.tight_layout()
-        return fig
+        if return_fig:
+            fig.tight_layout()
+            return fig
+        return None
     except Exception:
         log.exception("chart_fcf 실패")
         return None
 
 
-def chart_ocf_capex_ratio(financials_by_ticker: dict[str, Any]) -> Optional[Any]:
+def chart_ocf_capex_ratio(financials_by_ticker: dict[str, Any], ax: Optional[Any] = None) -> Optional[Any]:
     """OCF / CapEx 비율 line. 1보다 크면 영업현금흐름이 자본지출보다 많은 흑자 흐름."""
     try:
         plt = setup_matplotlib_safe()
-        fig, ax = plt.subplots(figsize=(11, 6.5))
+        if ax is None:
+            fig, ax = plt.subplots(figsize=(11, 6.5))
+            return_fig = True
+        else:
+            fig = ax.figure
+            return_fig = False
         any_drawn = False
         for i, (t, fin) in enumerate(financials_by_ticker.items()):
             r = fin.ocf_capex_ratio()
@@ -221,27 +251,36 @@ def chart_ocf_capex_ratio(financials_by_ticker: dict[str, Any]) -> Optional[Any]
             any_drawn = True
 
         if not any_drawn:
-            plt.close(fig)
+            if return_fig:
+                plt.close(fig)
             return None
 
         ax.axhline(y=1.0, color="red", linewidth=1.2, linestyle="--", alpha=0.6, label="OCF = CapEx (break-even)")
         ax.set_xlabel("Fiscal Year")
         ax.set_ylabel("OCF / CapEx Ratio (×)")
-        ax.set_title("OCF / CapEx Ratio — Cash Generation vs Reinvestment", fontsize=13, fontweight="bold", pad=12)
+        if return_fig:
+            ax.set_title("OCF / CapEx Ratio — Cash Generation vs Reinvestment", fontsize=13, fontweight="bold", pad=12)
         ax.grid(True, alpha=0.25, linestyle="--")
         ax.legend(loc="best", fontsize=9, ncol=min(len(financials_by_ticker) + 1, 5))
-        fig.tight_layout()
-        return fig
+        if return_fig:
+            fig.tight_layout()
+            return fig
+        return None
     except Exception:
         log.exception("chart_ocf_capex_ratio 실패")
         return None
 
 
-def chart_capex_intensity(financials_by_ticker: dict[str, Any]) -> Optional[Any]:
+def chart_capex_intensity(financials_by_ticker: dict[str, Any], ax: Optional[Any] = None) -> Optional[Any]:
     """CapEx Intensity = CapEx / Revenue (%) line."""
     try:
         plt = setup_matplotlib_safe()
-        fig, ax = plt.subplots(figsize=(11, 6.5))
+        if ax is None:
+            fig, ax = plt.subplots(figsize=(11, 6.5))
+            return_fig = True
+        else:
+            fig = ax.figure
+            return_fig = False
         any_drawn = False
         for i, (t, fin) in enumerate(financials_by_ticker.items()):
             rev_by_fy = {p.fy: p.val for p in fin.revenue}
@@ -268,22 +307,26 @@ def chart_capex_intensity(financials_by_ticker: dict[str, Any]) -> Optional[Any]
             any_drawn = True
 
         if not any_drawn:
-            plt.close(fig)
+            if return_fig:
+                plt.close(fig)
             return None
 
         ax.set_xlabel("Fiscal Year")
         ax.set_ylabel("CapEx / Revenue (%)")
-        ax.set_title("CapEx Intensity — Reinvestment Rate", fontsize=13, fontweight="bold", pad=12)
+        if return_fig:
+            ax.set_title("CapEx Intensity — Reinvestment Rate", fontsize=13, fontweight="bold", pad=12)
         ax.grid(True, alpha=0.25, linestyle="--")
         ax.legend(loc="best", fontsize=9, ncol=min(len(financials_by_ticker), 4))
-        fig.tight_layout()
-        return fig
+        if return_fig:
+            fig.tight_layout()
+            return fig
+        return None
     except Exception:
         log.exception("chart_capex_intensity 실패")
         return None
 
 
-def chart_revenue(financials_by_ticker: dict[str, Any]) -> Optional[Any]:
+def chart_revenue(financials_by_ticker: dict[str, Any], ax: Optional[Any] = None) -> Optional[Any]:
     """Revenue 6년치 grouped bar (참고용)."""
     try:
         plt = setup_matplotlib_safe()
@@ -299,7 +342,12 @@ def chart_revenue(financials_by_ticker: dict[str, Any]) -> Optional[Any]:
         years = sorted(years_set)[-6:]
         tickers = list(financials_by_ticker.keys())
 
-        fig, ax = plt.subplots(figsize=(11, 6.5))
+        if ax is None:
+            fig, ax = plt.subplots(figsize=(11, 6.5))
+            return_fig = True
+        else:
+            fig = ax.figure
+            return_fig = False
         n = len(tickers)
         bar_w = 0.8 / max(n, 1)
         xs = np.arange(len(years))
@@ -320,12 +368,15 @@ def chart_revenue(financials_by_ticker: dict[str, Any]) -> Optional[Any]:
         ax.set_xticks(xs)
         ax.set_xticklabels([f"FY{fy}" for fy in years])
         ax.set_ylabel("Revenue (USD)")
-        ax.set_title("Revenue — 6-Year Comparison", fontsize=13, fontweight="bold", pad=12)
+        if return_fig:
+            ax.set_title("Revenue — 6-Year Comparison", fontsize=13, fontweight="bold", pad=12)
         ax.yaxis.set_major_formatter(FuncFormatter(_format_billions))
         ax.grid(True, axis="y", alpha=0.25, linestyle="--")
         ax.legend(loc="best", fontsize=9, ncol=min(n, 4))
-        fig.tight_layout()
-        return fig
+        if return_fig:
+            fig.tight_layout()
+            return fig
+        return None
     except Exception:
         log.exception("chart_revenue 실패")
         return None

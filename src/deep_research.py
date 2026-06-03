@@ -478,8 +478,11 @@ async def run(bot: Bot, chat_id: str, query: str) -> None:
 
     download_root = Path(os.environ.get("DOWNLOAD_DIR", "./downloads")) / "deep_research" / ticker
 
+    # ─── Stage 1: 3축 병렬 수집 — wisereport 직렬화를 위해 lock 안에서 gather ───
+    # dart·web은 wisereport와 별개이지만 같은 gather에 있어 lock 점유는 gather
+    # 종료까지(보통 wisereport=60-90초). Stage 2(synthesize 2-3분)·Stage 3(발송)은
+    # lock 밖이라 다른 봇이 그 시간 동안 자기 wisereport 작업을 할 수 있음.
     async with PIPELINE_LOCK:
-        # Stage 1: 3축 병렬 수집
         dart_task = asyncio.create_task(_collect_dart(ticker, corp_code, corp_name, download_root / "dart"))
         wise_task = asyncio.create_task(_collect_wisereport(ticker, download_root / "wisereport"))
         web_task = asyncio.create_task(_collect_web(corp_name, ticker))
@@ -491,33 +494,34 @@ async def run(bot: Bot, chat_id: str, query: str) -> None:
             log.exception("Stage 1 병렬 수집 최상위 예외")
             await send_text_chunked(bot, chat_id, "❌ 데이터 수집 단계 실패 — 로그 확인")
             return
+    # ─── lock 해제 ───
 
-        log.info(
-            "deep_research [%s] Stage 1 완료: dart_err=%r wise_err=%r web_err=%r reports=%d",
-            ticker, dart_data.error or "OK", wise_data.error or "OK", web_data.error or "OK",
-            len(wise_data.reports),
+    log.info(
+        "deep_research [%s] Stage 1 완료: dart_err=%r wise_err=%r web_err=%r reports=%d",
+        ticker, dart_data.error or "OK", wise_data.error or "OK", web_data.error or "OK",
+        len(wise_data.reports),
+    )
+
+    # 모두 실패 시 종료
+    if dart_data.error and wise_data.error and web_data.error:
+        await send_text_chunked(
+            bot, chat_id,
+            f"❌ 모든 데이터 축 실패\nDART: {dart_data.error}\nwisereport: {wise_data.error}\nweb: {web_data.error}",
         )
+        return
 
-        # 모두 실패 시 종료
-        if dart_data.error and wise_data.error and web_data.error:
-            await send_text_chunked(
-                bot, chat_id,
-                f"❌ 모든 데이터 축 실패\nDART: {dart_data.error}\nwisereport: {wise_data.error}\nweb: {web_data.error}",
-            )
-            return
+    # Stage 2: 합성 (lock 밖, sonnet 2-3분)
+    try:
+        report_md = await _synthesize(corp_name, ticker, dart_data, wise_data, web_data)
+    except Exception:
+        log.exception("Stage 2 synthesis 최상위 예외")
+        report_md = f"# {corp_name} ({ticker}) — 합성 실패\n\n원본 데이터 발송 폴백."
 
-        # Stage 2: 합성
-        try:
-            report_md = await _synthesize(corp_name, ticker, dart_data, wise_data, web_data)
-        except Exception:
-            log.exception("Stage 2 synthesis 최상위 예외")
-            report_md = f"# {corp_name} ({ticker}) — 합성 실패\n\n원본 데이터 발송 폴백."
+    elapsed = int((datetime.now(KST) - started).total_seconds() / 60)
 
-        elapsed = int((datetime.now(KST) - started).total_seconds() / 60)
-
-        # Stage 3: 발송
-        try:
-            await _deliver(bot, chat_id, corp_name, ticker, report_md, dart_data, wise_data, elapsed)
-        except Exception:
-            log.exception("Stage 3 발송 최상위 예외")
-            await send_text_chunked(bot, chat_id, "⚠️ 일부 발송 실패 — 로그 확인")
+    # Stage 3: 발송 (lock 밖)
+    try:
+        await _deliver(bot, chat_id, corp_name, ticker, report_md, dart_data, wise_data, elapsed)
+    except Exception:
+        log.exception("Stage 3 발송 최상위 예외")
+        await send_text_chunked(bot, chat_id, "⚠️ 일부 발송 실패 — 로그 확인")
