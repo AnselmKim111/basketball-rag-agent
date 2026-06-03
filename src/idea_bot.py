@@ -1695,11 +1695,15 @@ async def _collect_industry_reports(
                     all_paths.extend(saved)
                     seen_rpt_ids.update(it.rpt_id for it in items)
 
+                    # filename → sch_dt 매핑 — recency 라벨 주입용
+                    sch_by_name = {p.name: getattr(items[i], "sch_dt", "") for i, p in enumerate(saved) if i < len(items)}
+                    from src.idea.recency import label as _recency_label
                     for p in saved:
                         try:
                             t = summarizer._extract_pdf_text(p, max_chars=INDUSTRY_TEXT_MAX)
                             if t.strip():
-                                text_by_name[p.name] = t
+                                tag = _recency_label(sch_by_name.get(p.name, ""))
+                                text_by_name[p.name] = f"{tag}\n{t}"
                         except Exception:
                             log.exception("산업 PDF 텍스트 추출 실패: %s", p)
         except Exception:
@@ -1909,11 +1913,14 @@ async def _collect_company_reports(
                         continue
                     paths_by_ticker[ticker] = saved
                     texts: dict[str, str] = {}
+                    sch_by_name = {p.name: getattr(items[i], "sch_dt", "") for i, p in enumerate(saved) if i < len(items)}
+                    from src.idea.recency import label as _recency_label
                     for p in saved:
                         try:
                             t = summarizer._extract_pdf_text(p, max_chars=COMPANY_TEXT_MAX)
                             if t.strip():
-                                texts[p.name] = t
+                                tag = _recency_label(sch_by_name.get(p.name, ""))
+                                texts[p.name] = f"{tag}\n{t}"
                         except Exception:
                             log.exception("종목 PDF 텍스트 추출 실패: %s", p)
                     texts_by_ticker[ticker] = texts
