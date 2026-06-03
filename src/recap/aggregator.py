@@ -76,27 +76,18 @@ def collect_signal_section(
             "empty_reason": "최근 7일 signal hit 0건 — screener_daily 실행 여부 확인",
         }
 
-    # ticker → name 매핑 (있는 만큼만)
+    # ticker → name 매핑: 헤비 ticker는 get_ticker_name (caching) 활용. 매번 SELECT
+    # 한 번이지만 RLock + SQLite이라 빠르고, 풀로드 시 메모리 비용도 작음.
     ticker_to_name: dict[str, str] = {}
-    try:
-        with db._conn() as c:  # type: ignore[attr-defined]
-            cur = c.execute("SELECT ticker, name FROM tickers")
-            for t, n in cur.fetchall():
-                ticker_to_name[t] = n or ""
-    except Exception:
-        log.exception("[recap] ticker name 매핑 실패 (영향 없음)")
 
-    # ticker별 ohlcv 캐시 (lookback + horizon 충분히)
-    ohlcv_cache: dict[str, list[dict]] = {}
-
-    def _get_ohlcv(t: str) -> list[dict]:
-        if t not in ohlcv_cache:
-            try:
-                ohlcv_cache[t] = db.load_ohlcv(t, days=lookback_days + horizon_days + 5)
-            except Exception:
-                log.exception("[recap] ohlcv load 실패: %s", t)
-                ohlcv_cache[t] = []
-        return ohlcv_cache[t]
+    def _name_of(t: str) -> str:
+        if t in ticker_to_name:
+            return ticker_to_name[t]
+        try:
+            ticker_to_name[t] = db.get_ticker_name(t) or ""
+        except Exception:
+            ticker_to_name[t] = ""
+        return ticker_to_name[t]
 
     hits: list[TickerHit] = []
     for row in rows:
@@ -105,14 +96,26 @@ def collect_signal_section(
         hit_date = row["date"]
         payload = row.get("payload") or {}
         hit_close = float(payload.get("close") or 0.0)
-        # payload에 close 없으면 ohlcv에서 보강
-        ohlcv = _get_ohlcv(ticker)
-        if not hit_close and ohlcv:
-            hit_close = _close_lookup(ohlcv).get(hit_date, 0.0)
-        horizon_close, horizon_date = _horizon_close(ohlcv, hit_date, horizon_days)
+        # payload에 close 없으면 ohlcv lookup 보강 — hit 시점 close
+        if not hit_close:
+            try:
+                latest = db.load_ohlcv(ticker, days=lookback_days + horizon_days + 5)
+                hit_close = _close_lookup(latest).get(hit_date, 0.0)
+            except Exception:
+                log.exception("[recap] hit_close load 실패: %s", ticker)
+        # horizon close — 전용 SQL 헬퍼 사용 (ohlcv 풀로드 회피)
+        horizon_close = 0.0
+        horizon_date = ""
+        try:
+            hc = db.close_after_n_business_days(ticker, hit_date, horizon_days)
+            if hc is not None:
+                horizon_close = float(hc)
+                # horizon_date는 hit_date + N영업일 — DB 함수에 노출 안 됨, 빈 string 유지.
+        except Exception:
+            log.exception("[recap] horizon_close 조회 실패: %s", ticker)
         hits.append(TickerHit(
             ticker=ticker,
-            name=ticker_to_name.get(ticker, ""),
+            name=_name_of(ticker),
             signal=signal,
             hit_date=hit_date,
             hit_close=hit_close,
@@ -221,7 +224,8 @@ def collect_theme_section(days_back: int = 14) -> dict[str, Any]:
     days_back=14: 지난 7일 vs 그 전 7일 비교로 떠오르는·식는 테마 도출.
     wisereport 접근이라 PIPELINE_LOCK 안에서 호출자가 가져야 함.
     """
-    from datetime import datetime, timezone, timedelta
+    from datetime import datetime
+    from src.bot_helpers import KST
     from src.curator import MARKET_MODE, _collect_pool_blocking
 
     try:
@@ -230,7 +234,6 @@ def collect_theme_section(days_back: int = 14) -> dict[str, Any]:
         log.exception("[recap] curator pool 수집 실패")
         return {"recent": {}, "previous": {}, "rising": [], "fading": [], "empty_reason": "wisereport pool 수집 실패"}
 
-    KST = timezone(timedelta(hours=9))
     today = datetime.now(KST).date()
     mid_cutoff = today - timedelta(days=days_back // 2)
 

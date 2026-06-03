@@ -75,6 +75,7 @@ def ensure_schema() -> None:
               payload   TEXT NOT NULL,
               PRIMARY KEY (date, ticker, signal)
             );
+            CREATE INDEX IF NOT EXISTS idx_signals_date ON signals(date);
             CREATE TABLE IF NOT EXISTS fundamentals (
               ticker     TEXT PRIMARY KEY,
               eps_yoy    REAL,
@@ -92,8 +93,22 @@ def ensure_schema() -> None:
                 c.execute(col_def)
             except sqlite3.OperationalError:
                 pass  # 이미 존재
+        # 스키마 버전 시드 — 향후 migration 토대 (현재는 활용 없음, 기록만).
+        c.execute(
+            "INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', '1')"
+        )
     _INITIALIZED = True
     log.info("[screener.db] 스키마 준비 완료 path=%s", DB_PATH)
+
+
+def get_connection():
+    """RLock + WAL이 적용된 DB 커넥션 context manager.
+
+    `_conn()` 의 public alias — 외부 모듈은 이걸 import 해서 직접 SQL이 필요한
+    경우 사용. 내부 헬퍼 함수(load_ohlcv, get_ticker_name 등) 가 있으면 그걸
+    먼저 쓰는 게 우선이고, ad-hoc SQL이 필요할 때만 이걸 쓴다.
+    """
+    return _conn()
 
 
 # ------------------------------------------------------------------
@@ -191,36 +206,16 @@ def has_date(date_str: str) -> bool:
 
 
 def recent_signals(days_back: int = 14, exclude_date: Optional[str] = None) -> list[dict]:
-    """최근 days_back 영업일 내 발생 신호 (오름차순 date). exclude_date 명시 시 그 날짜 제외(오늘).
+    """**Deprecated** — `load_signals_in_range(start, end, exclude_date)` 사용 권장.
 
-    반환: [{date, ticker, signal, payload(dict)}].
+    호환 위해 보존. days_back×1.5 calendar days로 오버페치하던 근사 로직을 제거하고
+    표준 함수에 위임. 결과 정렬은 표준 함수가 (date, signal, ticker) — 기존 호출자는
+    그래도 동작 (정렬 순서 의존 거의 없음).
     """
-    ensure_schema()
-    with _conn() as c:
-        # 영업일 기준 ≈ days_back×1.5 calendar days로 충분히 넓게 → 호출측이 다시 필터
-        from datetime import date, timedelta
-        cutoff = (date.today() - timedelta(days=int(days_back * 1.5))).isoformat()
-        if exclude_date:
-            cur = c.execute(
-                "SELECT date, ticker, signal, payload FROM signals "
-                "WHERE date >= ? AND date != ? ORDER BY date ASC, ticker, signal",
-                (cutoff, exclude_date),
-            )
-        else:
-            cur = c.execute(
-                "SELECT date, ticker, signal, payload FROM signals "
-                "WHERE date >= ? ORDER BY date ASC, ticker, signal",
-                (cutoff,),
-            )
-        rows = cur.fetchall()
-    out = []
-    for r in rows:
-        try:
-            payload = json.loads(r[3]) if r[3] else {}
-        except Exception:
-            payload = {}
-        out.append({"date": r[0], "ticker": r[1], "signal": r[2], "payload": payload})
-    return out
+    from datetime import date as _date, timedelta as _td
+    start = (_date.today() - _td(days=int(days_back * 1.5))).isoformat()
+    end = _date.today().isoformat()
+    return load_signals_in_range(start, end, exclude_date=exclude_date)
 
 
 def close_after_n_business_days(ticker: str, start_date: str, n: int = 5) -> Optional[int]:
@@ -418,24 +413,35 @@ def save_signals(date_str: str, results: dict[str, list[dict]]) -> int:
     return len(rows)
 
 
-def load_signals_in_range(start_date: str, end_date: str) -> list[dict]:
+def load_signals_in_range(
+    start_date: str, end_date: str,
+    exclude_date: Optional[str] = None,
+) -> list[dict]:
     """signals 테이블에서 date BETWEEN start AND end 행 전부 (RecapBot용).
 
-    날짜 문자열은 'YYYY-MM-DD' 또는 'YYYYMMDD' 둘 다 처리 — 호출자가 date 객체로
-    가지고 있어 toisoformat()으로 넘기는 패턴이 자연스럽지만, signals 테이블
-    저장 형식이 호출자(screener_daily_job)에 따라 다를 수 있어 양쪽 형식 모두 매칭.
+    `idx_signals_date` 인덱스 위에서 즉시 sargable. exclude_date 지정 시 그 날짜
+    제외 (보통 '오늘' — recent_signals 호환).
 
     반환: [{date, ticker, signal, payload(dict)}, ...] — payload는 JSON 디코딩.
-    payload 디코딩 실패 시 raw string 보존.
+    디코딩 실패 시 {"raw": <text>}.
     """
     ensure_schema()
     out: list[dict] = []
     with _conn() as c:
-        cur = c.execute(
-            "SELECT date, ticker, signal, payload FROM signals "
-            "WHERE date >= ? AND date <= ? ORDER BY date ASC, signal ASC, ticker ASC",
-            (start_date, end_date),
-        )
+        if exclude_date:
+            cur = c.execute(
+                "SELECT date, ticker, signal, payload FROM signals "
+                "WHERE date >= ? AND date <= ? AND date != ? "
+                "ORDER BY date ASC, signal ASC, ticker ASC",
+                (start_date, end_date, exclude_date),
+            )
+        else:
+            cur = c.execute(
+                "SELECT date, ticker, signal, payload FROM signals "
+                "WHERE date >= ? AND date <= ? "
+                "ORDER BY date ASC, signal ASC, ticker ASC",
+                (start_date, end_date),
+            )
         for date_v, ticker, signal, payload in cur.fetchall():
             try:
                 payload_obj = json.loads(payload) if payload else {}
