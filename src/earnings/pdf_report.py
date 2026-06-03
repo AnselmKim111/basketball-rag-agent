@@ -41,6 +41,22 @@ def _strip_emoji(s: str) -> str:
     return _EMOJI_RE.sub("", s or "").strip()
 
 
+# ------------------------------------------------------------------
+# Phase 10 — 네이버 톤 스타일 상수
+# ------------------------------------------------------------------
+STYLE = {
+    "navy":     "#0b3d91",
+    "accent":   "#c0392b",
+    "ink":      "#1a1a1a",
+    "body":     "#222222",
+    "muted":    "#555555",
+    "panel_bg": "#f4f6fa",
+    "zebra":    "#f5f7fa",
+    "green":    "#1b5e20",
+    "red":      "#b71c1c",
+}
+
+
 def _wrap_text(text: str, width: int = 95) -> list[str]:
     """단어 단위 wrap (영문/한글 혼합 OK). 이모지 제거."""
     import textwrap
@@ -636,6 +652,754 @@ def _draw_financial_table(pdf, financials_by_ticker: dict[str, Any]) -> None:
     plt.close(fig)
 
 
+# ==================================================================
+# Phase 10 — Markdown 토큰 파서 + 시각 강조 렌더러
+# ==================================================================
+_MD_HEADING_RE = re.compile(r"^(#{1,3})\s+(.+?)\s*$")
+_MD_TABLE_SEP_RE = re.compile(r"^:?-+:?$")
+_MD_BLOCKQUOTE_RE = re.compile(r"^>\s*(.*)$")
+_MD_BULLET_RE = re.compile(r"^(\s*)[\-\*•·]\s+(.+)$")
+_MD_INLINE_SEG_RE = re.compile(r"(\*\*[^*\n]+\*\*|\[[A-Z0-9.\-_]+\]\[[a-z_0-9\-]+\]|`[^`\n]+`|_[^_\n]+_)")
+_MD_CITATION_RE = re.compile(r"\[[A-Z0-9.\-_]+\]\[[a-z_0-9\-]+\]")
+
+
+def _md_tokenize(text: str) -> list[dict]:
+    """라인 단위 markdown → 토큰 리스트.
+
+    토큰 타입: heading(level 1-3) / bullet(indent) / blockquote / table / para / blank.
+    표는 연속 table_row를 묶어서 단일 table 토큰으로.
+    """
+    tokens: list[dict] = []
+    pending_rows: list[list[str]] = []
+    pending_align: list[str] = []
+
+    def _flush_table():
+        nonlocal pending_rows, pending_align
+        if pending_rows:
+            tokens.append({
+                "type": "table",
+                "rows": pending_rows,
+                "align": pending_align or ["left"] * len(pending_rows[0]),
+            })
+            pending_rows = []
+            pending_align = []
+
+    for raw in (text or "").splitlines():
+        line = _strip_emoji(raw.rstrip())
+        # 표 행 (| ... |)
+        stripped = line.strip()
+        if stripped.startswith("|") and stripped.endswith("|") and stripped.count("|") >= 2:
+            cells = [c.strip() for c in stripped.strip("|").split("|")]
+            if all(_MD_TABLE_SEP_RE.match(c.replace(" ", "")) for c in cells if c):
+                pending_align = ["left"] * len(cells)
+                continue
+            pending_rows.append(cells)
+            continue
+        else:
+            _flush_table()
+
+        # 헤딩
+        m = _MD_HEADING_RE.match(line)
+        if m:
+            tokens.append({"type": "heading", "level": len(m.group(1)), "text": m.group(2).strip()})
+            continue
+
+        # blockquote
+        m = _MD_BLOCKQUOTE_RE.match(line)
+        if m:
+            tokens.append({"type": "blockquote", "text": m.group(1)})
+            continue
+
+        # bullet
+        m = _MD_BULLET_RE.match(line)
+        if m:
+            indent = min(len(m.group(1)) // 2, 3)
+            tokens.append({"type": "bullet", "indent": indent, "text": m.group(2).strip()})
+            continue
+
+        # blank
+        if not stripped:
+            tokens.append({"type": "blank"})
+            continue
+
+        # para
+        tokens.append({"type": "para", "text": line})
+
+    _flush_table()
+    return tokens
+
+
+def _clean_md_inline(text: str) -> str:
+    """표 셀 안 markdown 인라인 마크업 제거 (matplotlib table은 rich text 미지원)."""
+    s = text or ""
+    s = _MD_CITATION_RE.sub("", s)
+    s = re.sub(r"\*\*([^*]+)\*\*", r"\1", s)
+    s = re.sub(r"`([^`]+)`", r"\1", s)
+    s = re.sub(r"_([^_]+)_", r"\1", s)
+    return s.strip()
+
+
+def _strip_md_inline_keep_text(text: str) -> str:
+    """굵게/인용/citation 마크업만 제거, 텍스트 그대로 유지 (graceful fallback)."""
+    s = text or ""
+    s = _MD_CITATION_RE.sub(lambda m: "", s)
+    s = re.sub(r"\*\*([^*]+)\*\*", r"\1", s)
+    s = re.sub(r"`([^`]+)`", r"\1", s)
+    s = re.sub(r"_([^_]+)_", r"\1", s)
+    return s
+
+
+def _wrap_text_kr(text: str, width: int = 95) -> list[str]:
+    """한글 비율 고려 wrap (citation·강조 마크업은 사전 제거 후)."""
+    return _wrap_text(_strip_md_inline_keep_text(text), width=width)
+
+
+def _draw_md_table(ax, rows: list[list[str]], y_top: float, *, max_width: float = 1.0) -> float:
+    """matplotlib table로 markdown 표 렌더링. 반환: 표 끝 y 좌표."""
+    import matplotlib.pyplot as plt
+    if not rows:
+        return y_top
+    cleaned = [[_clean_md_inline(c)[:60] for c in row] for row in rows]
+    n_cols = max(len(r) for r in cleaned)
+    cleaned = [r + [""] * (n_cols - len(r)) for r in cleaned]
+
+    header, *body = cleaned
+    has_header = bool(body)
+
+    row_h = 0.026
+    table_h = row_h * len(cleaned) + 0.01
+    y_bottom = y_top - table_h
+    if y_bottom < 0.04:
+        return y_top  # 페이지에 못 들어가면 패스
+
+    # 셀 한글 비율 → fontsize 동적
+    avg_text_len = sum(len(c) for row in cleaned for c in row) / max(sum(len(row) for row in cleaned), 1)
+    fontsize = 8.5 if avg_text_len < 18 else 7.5
+
+    tbl = ax.table(
+        cellText=body if has_header else cleaned,
+        colLabels=header if has_header else None,
+        loc="upper left",
+        cellLoc="left",
+        colColours=[STYLE["navy"]] * n_cols if has_header else None,
+        bbox=[0.0, y_bottom, max_width, table_h],
+    )
+    tbl.auto_set_font_size(False)
+    tbl.set_fontsize(fontsize)
+    if has_header:
+        for j in range(n_cols):
+            cell = tbl[0, j]
+            cell.set_text_props(color="white", fontweight="bold")
+    for i in range(1, len(cleaned) if has_header else len(cleaned) + 1):
+        for j in range(n_cols):
+            try:
+                if i % 2 == 0:
+                    tbl[i, j].set_facecolor(STYLE["zebra"])
+            except KeyError:
+                pass
+    return y_bottom - 0.012
+
+
+def _render_inline_styled(ax, x: float, y: float, text: str, *, base_size: float = 10.0, base_color: str = None) -> None:
+    """한 줄 안의 **굵게** / `code` / _기울임_ / [X][src] 분할 렌더.
+
+    측정 정확도 한계 → 부분 렌더링 실패 시 fallback으로 plain text 한 번에.
+    """
+    if base_color is None:
+        base_color = STYLE["body"]
+    text = _strip_emoji(text)
+    if not text:
+        return
+    parts = _MD_INLINE_SEG_RE.split(text)
+    cur_x = x
+    for part in parts:
+        if not part:
+            continue
+        weight = "normal"
+        color = base_color
+        size = base_size
+        family = None
+        style = "normal"
+        if part.startswith("**") and part.endswith("**") and len(part) > 4:
+            content = part[2:-2]
+            weight = "bold"
+            color = STYLE["ink"]
+        elif part.startswith("`") and part.endswith("`") and len(part) > 2:
+            content = part[1:-1]
+            family = "monospace"
+            color = STYLE["muted"]
+            size = base_size - 0.5
+        elif part.startswith("_") and part.endswith("_") and len(part) > 2:
+            content = part[1:-1]
+            style = "italic"
+            color = STYLE["muted"]
+        elif _MD_CITATION_RE.fullmatch(part):
+            content = part
+            color = "#888"
+            size = base_size - 2.0
+        else:
+            content = part
+        kwargs = dict(fontsize=size, color=color, va="top", ha="left", fontweight=weight, fontstyle=style)
+        if family:
+            kwargs["family"] = family
+        try:
+            ax.text(cur_x, y, content, **kwargs)
+        except Exception:
+            ax.text(cur_x, y, content, fontsize=size, color=color, va="top", ha="left")
+        # monospace 환산 (fontsize=10 기준 영문 0.0065 / 한글 0.012)
+        han = sum(1 for c in content if ord(c) > 127)
+        ascii_n = len(content) - han
+        cur_x += (ascii_n * 0.0065 + han * 0.012) * (size / 10.0)
+
+
+def _new_md_page(plt, title: str, *, title_box: bool = True):
+    fig = plt.figure(figsize=(8.27, 11.69))
+    ax = fig.add_axes([0.06, 0.04, 0.88, 0.92])
+    ax.set_axis_off()
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    if title and title_box:
+        ax.add_patch(plt.Rectangle((0, 0.96), 1, 0.04, facecolor=STYLE["navy"], zorder=0))
+        ax.text(0.01, 0.98, _strip_emoji(title), fontsize=14, fontweight="bold",
+                va="center", ha="left", color="white")
+    return fig, ax
+
+
+def _render_markdown_block(pdf, title: str, md_text: str, *, footer: str = "") -> None:
+    """Markdown 본문 → 시각 강조 렌더링. 페이지 자동 분할."""
+    import matplotlib.pyplot as plt
+    if not md_text:
+        return
+    tokens = _md_tokenize(md_text)
+    if not tokens:
+        return
+
+    page_n = 0
+
+    def start_page():
+        nonlocal page_n
+        page_n += 1
+        suffix = f" (cont. {page_n})" if page_n > 1 else ""
+        return _new_md_page(plt, title + suffix)
+
+    fig, ax = start_page()
+    y = 0.93
+    BOTTOM = 0.05
+
+    def new_page():
+        nonlocal fig, ax, y
+        if footer:
+            ax.text(0.5, 0.005, footer, fontsize=7, color="#888", ha="center")
+        pdf.savefig(fig)
+        plt.close(fig)
+        fig, ax = start_page()
+        y = 0.93
+
+    for idx, tok in enumerate(tokens):
+        t = tok["type"]
+
+        # widow guard: heading이 페이지 끝 직전이면 강제 새 페이지
+        if t == "heading" and y < 0.18:
+            new_page()
+
+        if t == "heading":
+            level = tok["level"]
+            txt = tok["text"]
+            if level == 1:
+                if y < 0.10:
+                    new_page()
+                ax.add_patch(plt.Rectangle((0, y - 0.040), 1, 0.038, facecolor=STYLE["navy"]))
+                ax.text(0.01, y - 0.010, _strip_emoji(txt), fontsize=14, fontweight="bold",
+                        color="white", va="center")
+                y -= 0.060
+            elif level == 2:
+                if y < 0.08:
+                    new_page()
+                ax.add_patch(plt.Rectangle((0.0, y - 0.028), 0.006, 0.026, facecolor=STYLE["navy"]))
+                ax.text(0.015, y, _strip_emoji(txt), fontsize=12.5, fontweight="bold",
+                        color=STYLE["navy"], va="top")
+                y -= 0.038
+            else:  # level 3
+                if y < 0.06:
+                    new_page()
+                ax.text(0.0, y, _strip_emoji(txt), fontsize=10.5, fontweight="bold",
+                        color=STYLE["ink"], va="top")
+                y -= 0.028
+
+        elif t == "blank":
+            y -= 0.010
+
+        elif t == "bullet":
+            indent = tok["indent"]
+            txt = tok["text"]
+            wrapped = _wrap_text_kr(txt, width=int(92 - indent * 6))
+            for j, line in enumerate(wrapped):
+                if y < BOTTOM:
+                    new_page()
+                prefix = "  " * indent + ("• " if j == 0 else "  ")
+                ax.text(0.0, y, prefix, fontsize=10, color=STYLE["body"], va="top")
+                _render_inline_styled(ax, 0.020 + indent * 0.018, y, line,
+                                       base_size=10.0, base_color=STYLE["body"])
+                y -= 0.022
+
+        elif t == "blockquote":
+            txt = tok["text"]
+            wrapped = _wrap_text_kr(txt, width=85)
+            block_h = 0.024 * len(wrapped) + 0.008
+            if y - block_h < BOTTOM:
+                new_page()
+            ax.add_patch(plt.Rectangle((0.0, y - block_h), 1.0, block_h, facecolor=STYLE["panel_bg"], zorder=0))
+            ax.add_patch(plt.Rectangle((0.0, y - block_h), 0.006, block_h, facecolor=STYLE["muted"]))
+            cy = y - 0.014
+            for line in wrapped:
+                ax.text(0.020, cy, line, fontsize=9.5, color=STYLE["muted"],
+                        fontstyle="italic", va="top")
+                cy -= 0.022
+            y -= block_h + 0.008
+
+        elif t == "table":
+            rows = tok["rows"]
+            if not rows:
+                continue
+            est_h = 0.026 * len(rows) + 0.020
+            if y - est_h < BOTTOM:
+                new_page()
+            y = _draw_md_table(ax, rows, y, max_width=1.0)
+
+        elif t == "para":
+            txt = tok["text"]
+            wrapped = _wrap_text_kr(txt, width=92)
+            for line in wrapped:
+                if y < BOTTOM:
+                    new_page()
+                _render_inline_styled(ax, 0.0, y, line, base_size=10.0, base_color=STYLE["body"])
+                y -= 0.022
+
+    if footer:
+        ax.text(0.5, 0.005, footer, fontsize=7, color="#888", ha="center")
+    pdf.savefig(fig)
+    plt.close(fig)
+
+
+# ==================================================================
+# Phase 10-B — Editor's Pick 파서 + 표지 V2
+# ==================================================================
+def _parse_editors_pick(text: str) -> dict[str, Any]:
+    """Editor's Pick markdown 본문에서 TL;DR 박스 데이터 추출.
+
+    구조: ## Verdict / ## 시장 기대 vs 진짜 중요했던 것 / ## 주가 ... / ## 검증 트리거
+    실패 시 raw 첫 800자를 'raw' 키에 담아 반환 (graceful fallback).
+    """
+    out: dict[str, Any] = {"verdict_lines": [], "real_signal": "", "trigger": "", "raw": ""}
+    if not text:
+        return out
+    cleaned = _strip_emoji(text)
+
+    # § Verdict 섹션
+    m = re.search(r"##\s*Verdict[^\n]*\n(.+?)(?=\n##\s|\Z)", cleaned, re.DOTALL | re.IGNORECASE)
+    if m:
+        body = m.group(1).strip()
+        for raw_line in body.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            stripped = _strip_md_inline_keep_text(line)
+            stripped = re.sub(r"^[\-\*•·]\s+", "", stripped).strip()
+            if stripped:
+                out["verdict_lines"].append(stripped[:220])
+            if len(out["verdict_lines"]) >= 4:
+                break
+
+    # § 시장 기대 vs 진짜 중요했던 것 — 첫 항목 첫 문장
+    m = re.search(r"##\s*시장\s*기대[^\n]*\n(.+?)(?=\n##\s|\Z)", cleaned, re.DOTALL)
+    if m:
+        body = m.group(1).strip()
+        first_item = re.search(r"(?:\*\*|^)1[.\)]\s*(.+?)(?:\n\n|\n\*\*2|\Z)", body, re.DOTALL)
+        if first_item:
+            txt = _strip_md_inline_keep_text(first_item.group(1)).strip()
+            sentence = re.split(r"(?<=[.다。])\s+", txt, maxsplit=1)[0]
+            out["real_signal"] = sentence[:200]
+
+    # § 검증 트리거 — 첫 항목
+    m = re.search(r"##\s*(?:다음\s*분기\s*)?검증\s*트리거[^\n]*\n(.+?)(?=\n##\s|\Z)", cleaned, re.DOTALL)
+    if m:
+        body = m.group(1).strip()
+        first = re.search(r"(?:^|\n)\s*1[.\)]\s*(.+?)(?:\n\s*2[.\)]|\Z)", body, re.DOTALL)
+        if first:
+            txt = _strip_md_inline_keep_text(first.group(1)).strip()
+            out["trigger"] = txt.splitlines()[0][:200]
+
+    if not (out["verdict_lines"] or out["real_signal"] or out["trigger"]):
+        out["raw"] = _strip_md_inline_keep_text(cleaned)[:800]
+    return out
+
+
+def _draw_cover_v2(
+    pdf,
+    *,
+    tickers: list[str],
+    fiscal_period: str,
+    editors_pick_kr: str,
+    synthesis_text: str,
+    transcripts: dict[str, dict],
+    consensus_by_ticker: dict[str, Any],
+    consensus_delta_by_ticker: dict[str, list],
+    market_reaction_by_ticker: dict[str, Any],
+    custom_question: str = "",
+) -> None:
+    """Phase 10-B 통합 표지: 헤더 + TL;DR 박스 + KPI grid + bull/bear."""
+    import matplotlib.pyplot as plt
+    fig = plt.figure(figsize=(8.27, 11.69))
+    ax = fig.add_axes([0, 0, 1, 1])
+    ax.set_axis_off()
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+
+    # 상단 파란 띠
+    ax.add_patch(plt.Rectangle((0, 0.92), 1, 0.08, facecolor=STYLE["navy"], zorder=0))
+    ax.text(0.5, 0.965, "US Earnings Brief", fontsize=22, fontweight="bold",
+            va="center", ha="center", color="white")
+    ax.text(0.5, 0.935, f"{', '.join(tickers[:6])} · {fiscal_period}",
+            fontsize=11, va="center", ha="center", color="#cfe1ff")
+
+    # TL;DR 박스 (회색 배경 + 좌측 파란 바)
+    pick = _parse_editors_pick(editors_pick_kr)
+    box_top = 0.89
+    box_bottom = 0.66
+    box_h = box_top - box_bottom
+    ax.add_patch(plt.Rectangle((0.04, box_bottom), 0.92, box_h, facecolor=STYLE["panel_bg"], zorder=0))
+    ax.add_patch(plt.Rectangle((0.04, box_bottom), 0.010, box_h, facecolor=STYLE["navy"]))
+    ax.text(0.060, box_top - 0.020, "TL;DR — PM 30초",
+            fontsize=11, fontweight="bold", color=STYLE["navy"], va="top")
+
+    y = box_top - 0.050
+    if pick["verdict_lines"]:
+        for line in pick["verdict_lines"][:3]:
+            wrapped = _wrap_text_kr(line, width=78)
+            for j, w in enumerate(wrapped[:2]):
+                ax.text(0.060, y, ("▸ " if j == 0 else "   ") + w,
+                        fontsize=9.5, fontweight="bold" if j == 0 else "normal",
+                        color=STYLE["ink"], va="top")
+                y -= 0.020
+            y -= 0.005
+    elif pick.get("raw"):
+        for ln in _wrap_text_kr(pick["raw"], width=78)[:8]:
+            ax.text(0.060, y, ln, fontsize=9, color=STYLE["body"], va="top")
+            y -= 0.020
+
+    if pick["real_signal"]:
+        y -= 0.005
+        ax.text(0.060, y, "▶ 진짜 중요했던 것", fontsize=9, fontweight="bold",
+                color=STYLE["accent"], va="top")
+        y -= 0.020
+        for ln in _wrap_text_kr(pick["real_signal"], width=78)[:2]:
+            ax.text(0.060, y, ln, fontsize=9, color=STYLE["body"], va="top")
+            y -= 0.020
+
+    if pick["trigger"]:
+        y -= 0.005
+        ax.text(0.060, y, "▶ 검증 트리거", fontsize=9, fontweight="bold",
+                color=STYLE["green"], va="top")
+        y -= 0.020
+        for ln in _wrap_text_kr(pick["trigger"], width=78)[:2]:
+            ax.text(0.060, y, ln, fontsize=9, color=STYLE["body"], va="top")
+            y -= 0.020
+
+    # KPI 압축 그리드 (Decision 페이지 핵심만 통합)
+    ax.text(0.04, 0.62, "KPI SNAPSHOT", fontsize=11, fontweight="bold", color=STYLE["navy"], va="top")
+    y = 0.60
+    for t in tickers[:3]:
+        tr = transcripts.get(t, {}) or {}
+        mr = market_reaction_by_ticker.get(t)
+        deltas = _pick_consensus_delta(consensus_delta_by_ticker.get(t) or [])
+        hn = tr.get("headline_numbers") or {}
+        rev_actual = hn.get("revenue_actual") or "—"
+        eps_actual = hn.get("eps_actual") or "—"
+        rev_yoy = hn.get("revenue_yoy") or "—"
+        ret1 = _fmt_pct(getattr(mr, "ret_1d", None)) if mr else "—"
+        ret5 = _fmt_pct(getattr(mr, "ret_5d", None)) if mr else "—"
+        ax.text(0.04, y, _strip_emoji(t), fontsize=11, fontweight="bold", color=STYLE["navy"], va="top")
+        y -= 0.020
+        rows = [
+            ("Rev / YoY", f"{rev_actual} · {rev_yoy}"),
+            ("EPS", str(eps_actual)),
+            ("Rev 컨센 delta", deltas["revenue"][:72]),
+            ("주가 1d / 5d", f"{ret1} / {ret5}"),
+        ]
+        for label, val in rows:
+            ax.text(0.06, y, label, fontsize=8.5, color=STYLE["muted"], va="top")
+            ax.text(0.30, y, _strip_emoji(_clean_md_inline(str(val))),
+                    fontsize=8.5, color=STYLE["ink"], va="top")
+            y -= 0.018
+        y -= 0.008
+        if y < 0.20:
+            break
+
+    # 하단 bull/bear 박스 (Decision 페이지에서 흡수)
+    surprises = _extract_section(synthesis_text, "4")
+    risks = _extract_section(synthesis_text, "6")
+    box_y = 0.05
+    box_h2 = 0.12
+    ax.add_patch(plt.Rectangle((0.04, box_y), 0.44, box_h2, facecolor="#e6f4ea",
+                                 edgecolor="#2e7d32", linewidth=0.8))
+    ax.text(0.06, box_y + box_h2 - 0.012, "BULL THESIS",
+            fontsize=9, fontweight="bold", color=STYLE["green"], va="top")
+    ax.add_patch(plt.Rectangle((0.52, box_y), 0.44, box_h2, facecolor="#fdeaea",
+                                 edgecolor="#c62828", linewidth=0.8))
+    ax.text(0.54, box_y + box_h2 - 0.012, "BEAR / COUNTER",
+            fontsize=9, fontweight="bold", color=STYLE["red"], va="top")
+
+    def _first_bullets(text: str, n: int = 3) -> list[str]:
+        if not text:
+            return []
+        bullets = re.findall(r"^[\-\*•]\s+(.+)$", text, flags=re.MULTILINE)
+        if bullets:
+            return bullets[:n]
+        return [s.strip() for s in text.split("\n") if s.strip()][:n]
+
+    for i, b in enumerate(_first_bullets(surprises, 3)):
+        cleaned = _strip_md_inline_keep_text(b)
+        wrapped = _wrap_text_kr(cleaned, width=58)
+        if wrapped:
+            ax.text(0.06, box_y + box_h2 - 0.026 - i * 0.024, "• " + wrapped[0][:55],
+                    fontsize=7.8, color=STYLE["green"], va="top")
+    for i, b in enumerate(_first_bullets(risks, 3)):
+        cleaned = _strip_md_inline_keep_text(b)
+        wrapped = _wrap_text_kr(cleaned, width=58)
+        if wrapped:
+            ax.text(0.54, box_y + box_h2 - 0.026 - i * 0.024, "• " + wrapped[0][:55],
+                    fontsize=7.8, color=STYLE["red"], va="top")
+
+    now = datetime.now(KST).strftime("%Y-%m-%d %H:%M KST")
+    ax.text(0.5, 0.02, f"생성: {now} · SEC EDGAR · Yahoo · Alpha Vantage",
+            fontsize=7.5, ha="center", color="#888")
+    if custom_question:
+        wrapped = _wrap_text_kr("추가 분석: " + custom_question, width=80)
+        if wrapped:
+            ax.text(0.5, 0.005, wrapped[0][:90], fontsize=7, ha="center",
+                    color=STYLE["muted"], style="italic")
+    pdf.savefig(fig)
+    plt.close(fig)
+
+
+# ==================================================================
+# Phase 10-C — Chart Grid 1페이지 (6개 차트 3×2)
+# ==================================================================
+def _draw_chart_grid_page(pdf, financials_by_ticker: dict[str, Any], synthesis_text: str) -> None:
+    import matplotlib.pyplot as plt
+    from src.earnings import charts as charts_mod
+
+    n_tickers = len(financials_by_ticker)
+    if n_tickers > 5:
+        # 종목 6+개면 grid 가독성 망함 → 차트당 1p 폴백 (figsize 절반)
+        specs = [
+            (charts_mod.chart_capex_absolute,  "9.1 CapEx"),
+            (charts_mod.chart_capex_yoy,       "9.2 CapEx YoY"),
+            (charts_mod.chart_fcf,             "9.3 FCF"),
+            (charts_mod.chart_ocf_capex_ratio, "9.4 OCF/CapEx"),
+            (charts_mod.chart_capex_intensity, "9.5 CapEx Intensity"),
+            (charts_mod.chart_revenue,         "9.6 Revenue"),
+        ]
+        for builder, title in specs:
+            fig = builder(financials_by_ticker)
+            if fig is None:
+                continue
+            fig.set_size_inches(8.27, 5.0)
+            pdf.savefig(fig, bbox_inches="tight")
+            plt.close(fig)
+        return
+
+    fig = plt.figure(figsize=(8.27, 11.69))
+    fig.suptitle("Charts — 6-Year Financial Comparison", fontsize=14, fontweight="bold", y=0.985)
+    gs = fig.add_gridspec(3, 2, hspace=0.65, wspace=0.32, top=0.94, bottom=0.04, left=0.08, right=0.96)
+    specs = [
+        (charts_mod.chart_capex_absolute,  "9.1 CapEx",          0, 0),
+        (charts_mod.chart_capex_yoy,       "9.2 CapEx YoY",      0, 1),
+        (charts_mod.chart_fcf,             "9.3 FCF",            1, 0),
+        (charts_mod.chart_ocf_capex_ratio, "9.4 OCF/CapEx",      1, 1),
+        (charts_mod.chart_capex_intensity, "9.5 CapEx Intensity",2, 0),
+        (charts_mod.chart_revenue,         "9.6 Revenue",        2, 1),
+    ]
+    for builder, title, r, c in specs:
+        ax = fig.add_subplot(gs[r, c])
+        try:
+            builder(financials_by_ticker, ax=ax)
+        except Exception:
+            log.exception("grid 차트 실패 (%s)", title)
+            ax.set_visible(False)
+            continue
+        sect_id = title.split(" ")[0]
+        insight = _extract_section(synthesis_text or "", sect_id)
+        if not insight:
+            s9 = _extract_section(synthesis_text or "", "9")
+            insight = s9[:200] if s9 else ""
+        insight_clean = _strip_md_inline_keep_text(insight).strip()
+        first_sent = re.split(r"(?<=[.다。])\s+", insight_clean, maxsplit=1)[0] if insight_clean else ""
+        subtitle = first_sent[:70]
+        ax.set_title(f"{title}\n{subtitle}" if subtitle else title,
+                     fontsize=8.5, loc="left", color=STYLE["ink"], pad=4)
+        ax.tick_params(labelsize=7)
+        # legend 작게 + ax에 따라 안 그릴 수도
+        leg = ax.get_legend()
+        if leg is not None:
+            for txt in leg.get_texts():
+                txt.set_fontsize(6)
+    pdf.savefig(fig)
+    plt.close(fig)
+
+
+# ==================================================================
+# Phase 10-D — 종목별 KPI 페이지 + 한글 Q&A 페이지
+# ==================================================================
+def _draw_ticker_kpi_page(
+    pdf,
+    *,
+    ticker: str,
+    tr: dict,
+    mr: Any,
+    consensus: Any,
+    consensus_delta: list,
+) -> None:
+    """종목별 1페이지: 헤더 + KPI 표 + 세그먼트 + 톤·자본배분 + 서프라이즈 + Top 3 Q&A."""
+    import matplotlib.pyplot as plt
+    fig = plt.figure(figsize=(8.27, 11.69))
+    ax = fig.add_axes([0, 0, 1, 1])
+    ax.set_axis_off()
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+
+    # 상단 배너
+    ax.add_patch(plt.Rectangle((0, 0.95), 1, 0.05, facecolor=STYLE["navy"], zorder=0))
+    company = tr.get("company_name", "") or ""
+    period = tr.get("fiscal_period", "") or ""
+    ax.text(0.04, 0.975, f"{ticker} — {company}", fontsize=14, fontweight="bold",
+            va="center", color="white")
+    ax.text(0.96, 0.975, period, fontsize=10, va="center", ha="right", color="#cfe1ff")
+
+    hn = tr.get("headline_numbers") or {}
+    guidance = tr.get("guidance") or {}
+    deltas = _pick_consensus_delta(consensus_delta or [])
+
+    # KPI 표 (2열)
+    y = 0.92
+    ax.text(0.04, y, "Key Numbers", fontsize=11, fontweight="bold", color=STYLE["navy"], va="top")
+    y -= 0.022
+    kpi_rows = [
+        ("Revenue (actual)", str(hn.get("revenue_actual") or "—")),
+        ("Revenue YoY", str(hn.get("revenue_yoy") or "—")),
+        ("Revenue 컨센 delta", deltas["revenue"][:80]),
+        ("EPS (actual)", str(hn.get("eps_actual") or "—")),
+        ("EPS 컨센 delta", deltas["eps"][:80]),
+        ("Operating margin", str(hn.get("operating_margin") or "—")),
+        ("Net income", str(hn.get("net_income") or "—")),
+        ("FCF (분기)", str(hn.get("fcf_quarter") or "—")),
+        ("Buyback / Dividend", str(hn.get("buyback_dividend") or "—")),
+        ("Next-Q 가이드", str(guidance.get("next_quarter_revenue") or "—")[:80]),
+        ("FY 가이드", str(guidance.get("fy_revenue") or "—")[:80]),
+        ("Capex commentary", str(guidance.get("capex_commentary") or "—")[:80]),
+    ]
+    for label, val in kpi_rows:
+        ax.text(0.05, y, label, fontsize=8.8, color=STYLE["muted"], va="top")
+        ax.text(0.32, y, _strip_emoji(_clean_md_inline(val)), fontsize=8.8, color=STYLE["ink"], va="top")
+        y -= 0.018
+    y -= 0.005
+
+    # 시장 반응
+    ax.text(0.04, y, "Market Reaction", fontsize=11, fontweight="bold", color=STYLE["navy"], va="top")
+    y -= 0.022
+    if mr is not None:
+        ax.text(0.05, y, f"T+1d {_fmt_pct(getattr(mr, 'ret_1d', None))}  ·  "
+                f"T+5d {_fmt_pct(getattr(mr, 'ret_5d', None))}  ·  "
+                f"T+30d {_fmt_pct(getattr(mr, 'ret_30d', None))}  ·  "
+                f"α5d {_fmt_pct(getattr(mr, 'alpha_5d', None))}",
+                fontsize=9, color=STYLE["ink"], va="top")
+        y -= 0.020
+        revs = getattr(mr, "target_revisions", []) or []
+        if revs:
+            ax.text(0.05, y, f"Target revisions ({len(revs)} firms):",
+                    fontsize=8.5, color=STYLE["muted"], va="top")
+            y -= 0.018
+            for r in revs[:3]:
+                ln = f"  {r.get('date','?')} {r.get('firm','?')[:24]}: {r.get('from_grade','?')} → {r.get('to_grade','?')} ({r.get('action','?')})"
+                ax.text(0.05, y, _strip_emoji(ln)[:100], fontsize=8.0, color=STYLE["body"], va="top")
+                y -= 0.016
+    else:
+        ax.text(0.05, y, "—", fontsize=9, color=STYLE["muted"], va="top")
+        y -= 0.020
+    y -= 0.005
+
+    # 세그먼트 (top 4)
+    segments = tr.get("segments") or []
+    if segments:
+        ax.text(0.04, y, "Segments", fontsize=11, fontweight="bold", color=STYLE["navy"], va="top")
+        y -= 0.022
+        for seg in segments[:4]:
+            name = seg.get("name") if isinstance(seg, dict) else str(seg)
+            rev = seg.get("revenue") if isinstance(seg, dict) else None
+            yoy = seg.get("yoy") if isinstance(seg, dict) else None
+            note = seg.get("note") or seg.get("callout") if isinstance(seg, dict) else None
+            line = f"{name or '?'}: {rev or '—'} · YoY {yoy or '—'}"
+            if note:
+                line += f" — {_strip_md_inline_keep_text(str(note))[:60]}"
+            ax.text(0.05, y, _strip_emoji(line)[:110], fontsize=8.8, color=STYLE["ink"], va="top")
+            y -= 0.018
+        y -= 0.005
+
+    # 경영진 톤
+    tone = tr.get("management_tone") or {}
+    overall = tone.get("overall") if isinstance(tone, dict) else None
+    if overall:
+        ax.text(0.04, y, "Management Tone", fontsize=11, fontweight="bold", color=STYLE["navy"], va="top")
+        y -= 0.022
+        for ln in _wrap_text_kr(_strip_md_inline_keep_text(str(overall)), width=92)[:3]:
+            ax.text(0.05, y, ln, fontsize=9, color=STYLE["body"], va="top")
+            y -= 0.020
+        y -= 0.005
+
+    # 서프라이즈 & 리스크
+    surprises = tr.get("surprises_and_risks") or []
+    if surprises:
+        ax.text(0.04, y, "Surprises & Risks", fontsize=11, fontweight="bold", color=STYLE["navy"], va="top")
+        y -= 0.022
+        for item in surprises[:5]:
+            txt = item if isinstance(item, str) else (item.get("text") or item.get("desc") or str(item))
+            cleaned = _strip_md_inline_keep_text(str(txt))
+            wrapped = _wrap_text_kr(cleaned, width=90)
+            if not wrapped:
+                continue
+            ax.text(0.05, y, "• " + wrapped[0][:90], fontsize=9, color=STYLE["body"], va="top")
+            y -= 0.020
+            for w in wrapped[1:2]:
+                ax.text(0.075, y, w[:90], fontsize=9, color=STYLE["body"], va="top")
+                y -= 0.020
+            if y < 0.10:
+                break
+
+    pdf.savefig(fig)
+    plt.close(fig)
+
+
+def _draw_ticker_qna_page(pdf, ticker: str, company: str, period: str, korean_md: str) -> None:
+    """종목별 한글 번역 본문 (Phase 9 `_step_translate_transcript` 결과)을 markdown 렌더."""
+    title = f"{ticker} — {company} · {period} · 한글 번역"
+    _render_markdown_block(pdf, title, korean_md, footer=ticker)
+
+
+# ==================================================================
+# Phase 10-G — PDF lint (마크다운 잔존 검사)
+# ==================================================================
+def _lint_pdf(path: Path) -> dict:
+    """raw markdown 잔존 검사. pdfminer 없으면 skip."""
+    try:
+        from pdfminer.high_level import extract_text  # type: ignore
+        text = extract_text(str(path))
+    except Exception:
+        return {"ok": True, "reason": "pdfminer unavailable"}
+    md_hits = len(re.findall(r"^##\s|\*\*\w|\[[A-Z]+\]\[[a-z_]+\]", text, re.MULTILINE))
+    pages = text.count("\f") + 1 if text else 0
+    return {"ok": md_hits < 5, "md_hits": md_hits, "pages": pages}
+
+
 # ------------------------------------------------------------------
 # build_pdf — 전체 페이지 오케스트레이션 (Phase 8 신규 순서)
 # ------------------------------------------------------------------
@@ -656,8 +1420,11 @@ def build_pdf(
     market_reaction_by_ticker: dict[str, Any] | None = None,
     counter_summary: str = "",
     meta_text: str = "",
+    # Phase 10 신규 인자 (V2 — Phase 9 결과 재활용, 모두 backward-compat)
+    korean_translations: dict[str, str] | None = None,
+    editors_pick_kr: str = "",
 ) -> Path | None:
-    """전체 PDF 빌드 (Phase 8 PM Decision Document)."""
+    """전체 PDF 빌드. EARNINGS_PDF_V2=1 (기본): Phase 10 가독성 surgery 경로 / =0: 기존 V1."""
     try:
         from matplotlib.backends.backend_pdf import PdfPages
         from src.earnings import charts
@@ -670,127 +1437,210 @@ def build_pdf(
         consensus_by_ticker = consensus_by_ticker or {}
         consensus_delta_by_ticker = consensus_delta_by_ticker or {}
         market_reaction_by_ticker = market_reaction_by_ticker or {}
+        korean_translations = korean_translations or {}
+
+        use_v2 = os.getenv("EARNINGS_PDF_V2", "1") == "1"
 
         with PdfPages(str(output_path)) as pdf:
-            # p.1 — Decision Page (verdict + KPI grid + bull/bear)
-            _draw_decision_page(
-                pdf,
-                tickers=tickers,
-                fiscal_period=fiscal_period,
-                synthesis_text=industry_summary_kr or "",
-                transcripts=transcripts,
-                consensus_by_ticker=consensus_by_ticker,
-                consensus_delta_by_ticker=consensus_delta_by_ticker,
-                market_reaction_by_ticker=market_reaction_by_ticker,
-            )
-
-            # p.2 — Market Reaction
-            _draw_market_reaction_page(
-                pdf,
-                tickers=tickers,
-                market_reaction_by_ticker=market_reaction_by_ticker,
-                consensus_delta_by_ticker=consensus_delta_by_ticker,
-                synthesis_text=industry_summary_kr or "",
-            )
-
-            # p.3 — 표지 (간단)
-            _draw_cover(pdf, tickers, fiscal_period, custom_question)
-
-            # p.4-N — Evidence (synthesis §0~§10)
-            if industry_summary_kr:
-                _draw_long_text_pages(
+            if use_v2:
+                # ====================================================
+                # Phase 10 V2 — 네이버 톤 · 11p 압축
+                # ====================================================
+                # p.1 — Cover + TL;DR + KPI + bull/bear (통합)
+                _draw_cover_v2(
                     pdf,
-                    "Evidence — 산업 분위기 & 인사이트 (Opus)",
-                    industry_summary_kr,
-                    footer_prefix="Evidence",
+                    tickers=tickers,
+                    fiscal_period=fiscal_period,
+                    editors_pick_kr=editors_pick_kr,
+                    synthesis_text=industry_summary_kr or "",
+                    transcripts=transcripts,
+                    consensus_by_ticker=consensus_by_ticker,
+                    consensus_delta_by_ticker=consensus_delta_by_ticker,
+                    market_reaction_by_ticker=market_reaction_by_ticker,
+                    custom_question=custom_question,
                 )
 
-            # Verify cross-check
-            if verify_lines:
-                _draw_long_text_pages(
+                # p.2 — Market Reaction
+                _draw_market_reaction_page(
                     pdf,
-                    "숫자 교차검증 — 어닝콜 ↔ SEC EDGAR",
-                    "\n".join(verify_lines),
-                    footer_prefix="Verify",
+                    tickers=tickers,
+                    market_reaction_by_ticker=market_reaction_by_ticker,
+                    consensus_delta_by_ticker=consensus_delta_by_ticker,
+                    synthesis_text=industry_summary_kr or "",
                 )
 
-            # Meta synthesis (§9 Perspective Consensus & Conflicts)
-            if meta_text:
-                _draw_long_text_pages(
-                    pdf,
-                    "Perspective Consensus & Conflicts (Bull/Bear/Neutral Meta)",
-                    meta_text,
-                    footer_prefix="Meta",
-                )
-
-            # Charts with interpretation — 차트당 1쪽 + 캡션 페이지
-            if financials_by_ticker:
-                chart_specs = [
-                    (charts.chart_capex_absolute, "9.1 CapEx (Absolute) — 6-Year"),
-                    (charts.chart_capex_yoy, "9.2 CapEx YoY Growth"),
-                    (charts.chart_fcf, "9.3 Free Cash Flow — 6-Year"),
-                    (charts.chart_ocf_capex_ratio, "9.4 OCF / CapEx Ratio"),
-                    (charts.chart_capex_intensity, "9.5 CapEx Intensity"),
-                    (charts.chart_revenue, "9.6 Revenue — 6-Year"),
-                ]
-                for builder, title in chart_specs:
-                    fig = builder(financials_by_ticker)
-                    if fig is None:
-                        continue
-                    # synthesis §9.x 본문에서 해당 차트 해석 추출
-                    sect_id = title.split(" ")[0]  # "9.1", "9.2", ...
-                    interp = _extract_section(industry_summary_kr or "", sect_id)
-                    if not interp:
-                        # 폴백: §9 전체에서 첫 문단
-                        s9 = _extract_section(industry_summary_kr or "", "9")
-                        if s9 and sect_id in s9:
-                            idx = s9.find(sect_id)
-                            # 다음 9.x 까지
-                            rest = s9[idx:]
-                            nxt = re.search(r"\n\*\*9\.\d", rest[1:])
-                            interp = rest[: nxt.start() + 1 if nxt else len(rest)][:1200]
-                    _draw_chart_interpretation_page(
-                        pdf, fig, title=title, interpretation=interp,
-                        footer=f"{title} · PDF p.charts",
+                # p.3 — Editor's Pick 한글 본문 (Phase 9 Opus 재활용)
+                if editors_pick_kr:
+                    _render_markdown_block(
+                        pdf,
+                        "Editor's Pick — 시장 기대 vs 진짜 중요했던 것",
+                        editors_pick_kr,
+                        footer="Editor's Pick",
                     )
 
-            # Counter-thesis (있을 때)
-            if counter_summary:
-                _draw_long_text_pages(
-                    pdf,
-                    "Counter-thesis (자동 반박 — Opus)",
-                    counter_summary,
-                    footer_prefix="Counter",
+                # p.4+ — Evidence (Opus 비교 합성 markdown 시각 강조 렌더)
+                if industry_summary_kr:
+                    _render_markdown_block(
+                        pdf,
+                        "Evidence — 산업 분위기 & 인사이트",
+                        industry_summary_kr,
+                        footer="Evidence",
+                    )
+
+                # p.N — Chart Grid (12p → 1p)
+                if financials_by_ticker:
+                    _draw_chart_grid_page(pdf, financials_by_ticker, industry_summary_kr or "")
+
+                # Verify cross-check (있을 때)
+                if verify_lines:
+                    _render_markdown_block(
+                        pdf,
+                        "숫자 교차검증 — 어닝콜 ↔ SEC EDGAR",
+                        "\n".join("- " + ln for ln in verify_lines),
+                        footer="Verify",
+                    )
+
+                # Counter + Meta (있으면 합쳐서 1-2페이지)
+                combined = []
+                if counter_summary:
+                    combined.append("# Counter-thesis (자동 반박)\n\n" + counter_summary)
+                if meta_text:
+                    combined.append("# Perspective Consensus & Conflicts (Meta)\n\n" + meta_text)
+                if combined:
+                    _render_markdown_block(
+                        pdf,
+                        "Counter-thesis & Multi-Perspective Meta",
+                        "\n\n".join(combined),
+                        footer="Counter + Meta",
+                    )
+
+                # 종목별 KPI + 한글 Q&A (1-2p / 종목)
+                for ticker in tickers:
+                    tr = transcripts.get(ticker)
+                    if not tr:
+                        continue
+                    _draw_ticker_kpi_page(
+                        pdf,
+                        ticker=ticker,
+                        tr=tr,
+                        mr=market_reaction_by_ticker.get(ticker),
+                        consensus=consensus_by_ticker.get(ticker),
+                        consensus_delta=consensus_delta_by_ticker.get(ticker) or [],
+                    )
+                    ko = korean_translations.get(ticker)
+                    if ko:
+                        _draw_ticker_qna_page(
+                            pdf,
+                            ticker=ticker,
+                            company=tr.get("company_name", "") or "",
+                            period=tr.get("fiscal_period", "") or "",
+                            korean_md=ko,
+                        )
+                    else:
+                        # Fallback V1: format_transcript_text 한글 요약
+                        try:
+                            from src.earnings.transcripts import format_transcript_text
+                            body = format_transcript_text(tr)
+                            _render_markdown_block(
+                                pdf,
+                                f"{ticker} — {tr.get('company_name', '')} · {tr.get('fiscal_period', '')}",
+                                body,
+                                footer=ticker,
+                            )
+                        except Exception:
+                            log.exception("V1 폴백 format_transcript_text 실패 (%s)", ticker)
+
+                # 커스텀 분석 (있을 때)
+                if custom_question and custom_answer_kr:
+                    _render_markdown_block(
+                        pdf,
+                        f"커스텀 분석 — {custom_question[:60]}",
+                        custom_answer_kr,
+                        footer="Custom Analysis",
+                    )
+
+                # Appendix — 재무 raw 표
+                if financials_by_ticker:
+                    _draw_financial_table(pdf, financials_by_ticker)
+
+            else:
+                # ====================================================
+                # V1 (legacy, EARNINGS_PDF_V2=0) — 23p 기존 흐름 보존
+                # ====================================================
+                _draw_decision_page(
+                    pdf, tickers=tickers, fiscal_period=fiscal_period,
+                    synthesis_text=industry_summary_kr or "", transcripts=transcripts,
+                    consensus_by_ticker=consensus_by_ticker,
+                    consensus_delta_by_ticker=consensus_delta_by_ticker,
+                    market_reaction_by_ticker=market_reaction_by_ticker,
                 )
-
-            # 종목별 어닝콜 핵심 — Top Q&A 5 + significance
-            for ticker in tickers:
-                tr = transcripts.get(ticker)
-                if not tr:
-                    continue
-                from src.earnings.transcripts import format_transcript_text
-                body = format_transcript_text(tr)
-                _draw_long_text_pages(
-                    pdf,
-                    f"{ticker} — {tr.get('company_name', '')} · {tr.get('fiscal_period', '')}",
-                    body,
-                    footer_prefix=ticker,
+                _draw_market_reaction_page(
+                    pdf, tickers=tickers,
+                    market_reaction_by_ticker=market_reaction_by_ticker,
+                    consensus_delta_by_ticker=consensus_delta_by_ticker,
+                    synthesis_text=industry_summary_kr or "",
                 )
+                _draw_cover(pdf, tickers, fiscal_period, custom_question)
+                if industry_summary_kr:
+                    _draw_long_text_pages(pdf, "Evidence — 산업 분위기 & 인사이트 (Opus)",
+                                          industry_summary_kr, footer_prefix="Evidence")
+                if verify_lines:
+                    _draw_long_text_pages(pdf, "숫자 교차검증 — 어닝콜 ↔ SEC EDGAR",
+                                          "\n".join(verify_lines), footer_prefix="Verify")
+                if meta_text:
+                    _draw_long_text_pages(pdf, "Perspective Consensus & Conflicts (Bull/Bear/Neutral Meta)",
+                                          meta_text, footer_prefix="Meta")
+                if financials_by_ticker:
+                    chart_specs = [
+                        (charts.chart_capex_absolute, "9.1 CapEx (Absolute) — 6-Year"),
+                        (charts.chart_capex_yoy, "9.2 CapEx YoY Growth"),
+                        (charts.chart_fcf, "9.3 Free Cash Flow — 6-Year"),
+                        (charts.chart_ocf_capex_ratio, "9.4 OCF / CapEx Ratio"),
+                        (charts.chart_capex_intensity, "9.5 CapEx Intensity"),
+                        (charts.chart_revenue, "9.6 Revenue — 6-Year"),
+                    ]
+                    for builder, title in chart_specs:
+                        fig = builder(financials_by_ticker)
+                        if fig is None:
+                            continue
+                        sect_id = title.split(" ")[0]
+                        interp = _extract_section(industry_summary_kr or "", sect_id)
+                        _draw_chart_interpretation_page(
+                            pdf, fig, title=title, interpretation=interp,
+                            footer=f"{title} · PDF p.charts",
+                        )
+                if counter_summary:
+                    _draw_long_text_pages(pdf, "Counter-thesis (자동 반박 — Opus)",
+                                          counter_summary, footer_prefix="Counter")
+                for ticker in tickers:
+                    tr = transcripts.get(ticker)
+                    if not tr:
+                        continue
+                    from src.earnings.transcripts import format_transcript_text
+                    _draw_long_text_pages(
+                        pdf,
+                        f"{ticker} — {tr.get('company_name', '')} · {tr.get('fiscal_period', '')}",
+                        format_transcript_text(tr), footer_prefix=ticker,
+                    )
+                if custom_question and custom_answer_kr:
+                    _draw_long_text_pages(pdf, f"커스텀 분석 — {custom_question[:60]}",
+                                          custom_answer_kr, footer_prefix="Custom Analysis")
+                if financials_by_ticker:
+                    _draw_financial_table(pdf, financials_by_ticker)
 
-            # 커스텀 분석 (있는 경우)
-            if custom_question and custom_answer_kr:
-                _draw_long_text_pages(
-                    pdf,
-                    f"커스텀 분석 — {custom_question[:60]}",
-                    custom_answer_kr,
-                    footer_prefix="Custom Analysis",
-                )
+        # Phase 10-G lint (v2일 때만)
+        lint_info = ""
+        if use_v2:
+            try:
+                lint = _lint_pdf(output_path)
+                lint_info = f" lint={lint}"
+                if not lint.get("ok"):
+                    log.warning("PDF lint 경고: %s", lint)
+            except Exception:
+                log.exception("PDF lint 실패")
 
-            # 부록 — 재무 raw 표
-            if financials_by_ticker:
-                _draw_financial_table(pdf, financials_by_ticker)
-
-        log.info("PDF 생성 완료: %s (%d bytes)", output_path, output_path.stat().st_size)
+        log.info("PDF 생성 완료: %s (%d bytes) v2=%s%s",
+                 output_path, output_path.stat().st_size, use_v2, lint_info)
         return output_path
     except Exception:
         log.exception("PDF 빌드 실패")

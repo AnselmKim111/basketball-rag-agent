@@ -1216,10 +1216,13 @@ async def _run_pipeline(
     # ============================================================
 
     # 메시지 2 (종목당): 어닝콜 한글 번역 (Sonnet 1회/종목)
+    # Phase 10: 번역 결과를 dict로 누적 → PDF에도 함께 전달 (LLM 호출 0회 추가)
     log.info("[Phase 9] 한글 번역 합성 시작 (%d ticker)", len(transcripts))
+    korean_translations: dict[str, str] = {}
     for t, tr in transcripts.items():
         ko = await _step_translate_transcript(t, tr)
         if ko:
+            korean_translations[t] = ko
             try:
                 await send_text_chunked(bot, chat_id, ko, parse_mode="Markdown")
             except Exception:
@@ -1253,6 +1256,7 @@ async def _run_pipeline(
         log.warning("[Phase 9] Editor's Pick 합성 실패 — 메시지 스킵")
 
     # 메시지 4: PDF 빌드 + 발송 (모든 deep dive 포함)
+    # Phase 10: korean_translations + editors_pick (Phase 9 결과 재활용) 함께 전달
     log.info("[Phase 9] PDF 빌드 …")
     pdf_path = await _step_build_pdf(
         tickers=list(transcripts.keys()),
@@ -1268,6 +1272,8 @@ async def _run_pipeline(
         market_reaction_by_ticker=market_reaction_by_ticker,
         counter_summary=counter_summary,
         meta_text=meta_text,
+        korean_translations=korean_translations,
+        editors_pick_kr=pick or "",
     )
     if pdf_path and pdf_path.exists():
         await send_pdf(
@@ -2497,6 +2503,8 @@ async def _step_build_pdf(
     market_reaction_by_ticker: dict[str, Any] | None = None,
     counter_summary: str = "",
     meta_text: str = "",
+    korean_translations: dict[str, str] | None = None,
+    editors_pick_kr: str = "",
 ) -> Path | None:
     """PDF 빌드 (blocking → run_in_executor)."""
     from src.earnings import pdf_report
@@ -2531,6 +2539,8 @@ async def _step_build_pdf(
             market_reaction_by_ticker=market_reaction_by_ticker or {},
             counter_summary=counter_summary,
             meta_text=meta_text,
+            korean_translations=korean_translations or {},
+            editors_pick_kr=editors_pick_kr,
         )
 
     try:
