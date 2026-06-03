@@ -519,6 +519,10 @@ def _build_report():
 
     # ---------- §7 한국시장 자금흐름 ----------
     korea_summary: dict = {}
+    # streak alert (≥5거래일 연속 매도/매수) — §7 헤더 시각 강조
+    add(korea_flow_chart.streak_alert_card(kr_flows, img_dir, date_iso=date_iso),
+        "한국 수급 streak alert", "5거래일 이상 연속 매도/매수 — thesis 격상 임계",
+        "7. 한국시장 자금흐름", key=True)
     for i, (label, price_df) in enumerate(kr_sizes.items(), 1):
         flows_df = kr_flows.get("KOSDAQ") if "KOSDAQ" in label else kr_flows.get("KOSPI")
         fn = korea_flow_chart.flow_multipanel(price_df, flows_df, label, img_dir, f"32_kr_{i:02d}.png")
