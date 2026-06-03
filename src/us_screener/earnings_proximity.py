@@ -12,6 +12,8 @@ import logging
 import os
 from datetime import date, timedelta
 
+from src.report.data.fetch_earnings import _calendar
+
 log = logging.getLogger(__name__)
 
 
@@ -19,18 +21,13 @@ def fetch_upcoming_earnings(tickers: set[str], days_fwd: int = 7) -> dict[str, s
     """티커 set 중 today ~ today+days_fwd 어닝 예정자만 {ticker: "YYYY-MM-DD"} 반환.
 
     동일 ticker가 윈도 내 여러 번 등장하면 가장 빠른 date 선택.
+    FMP_API_KEY 없거나 fetch 실패 시 빈 dict (graceful degrade).
     """
     if not tickers:
         return {}
     key = os.getenv("FMP_API_KEY")
     if not key:
         log.info("[earnings_proximity] FMP_API_KEY 없음 — ⚡ 마커 생략")
-        return {}
-
-    try:
-        from src.report.data.fetch_earnings import _calendar
-    except Exception:
-        log.exception("[earnings_proximity] _calendar import 실패")
         return {}
 
     today = date.today()
