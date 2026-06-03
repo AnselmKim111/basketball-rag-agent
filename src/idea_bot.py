@@ -2257,7 +2257,7 @@ async def _send_results(
         header += "━━━━━━━━━━━━━━━━━━━━"
         await send_text_chunked(bot, chat_id, header)
 
-        # 5단계 추론 요약 헤더 (사업부/폭/기울기) — thesis 위에 짧게 노출
+        # 5단계 추론 요약 헤더 (사업부/폭/기울기/손익비/trigger) — thesis 위에 짧게 노출
         summary_header = ""
         if business_unit:
             summary_header += f"🏢 사업부: {business_unit}\n"
@@ -2265,6 +2265,15 @@ async def _send_results(
             summary_header += f"📐 폭(magnitude): {magnitude}\n"
         if gradient_timing:
             summary_header += f"⏱️ 기울기/시점: {gradient_timing}\n"
+        rr_note = pick.get("risk_reward_note") or ""
+        if rr_note:
+            summary_header += f"⚖️ 손익비: {rr_note}\n"
+        next_trig = pick.get("next_trigger_quarter") or ""
+        if next_trig:
+            summary_header += f"📅 다음 trigger: {next_trig}\n"
+        mom_sig = pick.get("momentum_signals") or ""
+        if mom_sig:
+            summary_header += f"🔥 모멘텀 confirmation: {mom_sig}\n"
         if summary_header:
             summary_header += "\n"
 
