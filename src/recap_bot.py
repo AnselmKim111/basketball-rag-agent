@@ -262,12 +262,15 @@ async def _synthesize_recap(data: dict) -> str:
     return await loop.run_in_executor(None, _blocking)
 
 
+from src.llm_models import synthesis_model as _make_synthesis, narrow_model as _make_narrow
+
+
 def _synthesis_model() -> str:
-    return os.getenv(SYNTHESIS_MODEL_ENV) or os.getenv("OPENROUTER_MODEL") or "anthropic/claude-sonnet-4.5"
+    return _make_synthesis(SYNTHESIS_MODEL_ENV)
 
 
 def _narrow_model() -> str:
-    return os.getenv(NARROW_MODEL_ENV) or os.getenv("OPENROUTER_MODEL") or "anthropic/claude-haiku-4.5"
+    return _make_narrow(NARROW_MODEL_ENV)
 
 
 # ------------------------------------------------------------------

@@ -2313,42 +2313,23 @@ async def _send_results(
 #   _narrow_model()    → IDEA_NARROW_MODEL (haiku 등) — 30→10 점수화 (큰 출력)
 #   _synthesis_model() → IDEA_SYNTHESIS_MODEL (sonnet 등) — 1.5+5 단계 진짜 지능
 # ------------------------------------------------------------------
-def _summary_model() -> str:
-    """0.5단계 parse 등 단순 추출용 — 가장 저렴한 OPENROUTER_MODEL 사용.
-
-    PDF 요약·DART 파싱·deepdive 요약과 같은 티어. kimi-k2.6 등 갓성비 모델 권장.
-    """
-    return os.getenv("OPENROUTER_MODEL") or "moonshotai/kimi-k2.6"
+# 모델 티어 헬퍼는 src/llm_models.py 로 이전. 아래는 호환 alias.
+from src.llm_models import (
+    summary_model as _summary_model,
+    maybe_raise_credit as _maybe_raise_credit,
+)
 
 
 def _synthesis_model() -> str:
-    """1.5단계 중요도 평가 + 5단계 최종 Top 5 합성 — 가장 지능 필요. 기본 claude-sonnet."""
-    explicit = os.getenv(SYNTHESIS_MODEL_ENV)
-    if explicit:
-        return explicit
-    return os.getenv("OPENROUTER_MODEL") or "anthropic/claude-sonnet-4.5"
+    """1.5 importance + 5 synthesis — sonnet 기본."""
+    from src.llm_models import synthesis_model
+    return synthesis_model(SYNTHESIS_MODEL_ENV)
 
 
 def _narrow_model() -> str:
-    """3단계 30→10 narrowing — 정형화된 스코어링이라 평소 모델로 충분.
-
-    명시값(IDEA_NARROW_MODEL) 없으면 OPENROUTER_MODEL(평소 모델) 사용.
-    """
-    explicit = os.getenv(NARROW_MODEL_ENV)
-    if explicit:
-        return explicit
-    return os.getenv("OPENROUTER_MODEL") or "anthropic/claude-sonnet-4.5"
-
-
-def _maybe_raise_credit(e: Exception) -> None:
-    """OpenRouter 키 한도/결제 오류면 OpenRouterCreditExhausted 재라이즈.
-
-    그렇지 않으면 no-op. 모든 LLM 호출의 except 블록에서 가장 먼저 호출하면
-    credit error를 silent 실패 대신 사용자에게 명확히 전달.
-    """
-    from src import summarizer
-    if isinstance(e, summarizer.APIStatusError) and summarizer._is_credit_error(e):
-        raise summarizer.OpenRouterCreditExhausted(str(e)) from e
+    """3 narrow + parse 폴백 — haiku 기본."""
+    from src.llm_models import narrow_model
+    return narrow_model(NARROW_MODEL_ENV)
 
 
 # JSON 파서는 src/llm_json.py 로 이전 — `_parse_json`은 그 모듈의 `parse_json_object` 별칭.

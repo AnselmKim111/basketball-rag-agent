@@ -2766,32 +2766,23 @@ def _build_synthesis_payload(
 # ------------------------------------------------------------------
 # 모델 티어 / 프롬프트 / 메시지 헬퍼
 # ------------------------------------------------------------------
-def _summary_model() -> str:
-    """0단계 parse — 갓성비 (kimi)."""
-    return os.getenv("OPENROUTER_MODEL") or "moonshotai/kimi-k2.6"
+# 모델 티어는 src/llm_models.py 공유. EarningsBot은 chained env 사용.
+from src.llm_models import summary_model as _summary_model, chained_model
 
 
 def _extract_model() -> str:
-    """종목별 전문 심층추출 — sonnet (긴 입력 정밀 읽기, 비용 절충).
-
-    EARNINGS_EXTRACT_MODEL > IDEA_NARROW_MODEL > sonnet 기본.
-    """
-    return (
-        os.getenv("EARNINGS_EXTRACT_MODEL")
-        or os.getenv("IDEA_NARROW_MODEL")
-        or "anthropic/claude-sonnet-4.5"
+    """종목별 전문 심층추출 — sonnet (긴 입력 정밀 읽기, 비용 절충)."""
+    return chained_model(
+        ["EARNINGS_EXTRACT_MODEL", "IDEA_NARROW_MODEL"],
+        "anthropic/claude-sonnet-4.5",
     )
 
 
 def _synthesis_model() -> str:
-    """최종 비교 합성 + 커스텀 분석 — Opus (딥리서치급 추론).
-
-    EARNINGS_SYNTHESIS_MODEL > IDEA_SYNTHESIS_MODEL > opus 기본.
-    """
-    return (
-        os.getenv("EARNINGS_SYNTHESIS_MODEL")
-        or os.getenv("IDEA_SYNTHESIS_MODEL")
-        or "anthropic/claude-opus-4.7"
+    """최종 비교 합성 + 커스텀 분석 — Opus (딥리서치급 추론)."""
+    return chained_model(
+        ["EARNINGS_SYNTHESIS_MODEL", "IDEA_SYNTHESIS_MODEL"],
+        "anthropic/claude-opus-4.7",
     )
 
 
