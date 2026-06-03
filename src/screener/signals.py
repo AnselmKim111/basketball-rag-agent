@@ -19,13 +19,10 @@ from __future__ import annotations
 
 import logging
 import os
-from datetime import datetime, timedelta, timezone
-from typing import Iterable, Optional
 
 from src.screener import db, universe
 
 log = logging.getLogger(__name__)
-KST = timezone(timedelta(hours=9))
 
 # 임계값 — env 오버라이드 가능
 DEFAULT_NEAR_BREAKOUT_LOWER = 0.95
