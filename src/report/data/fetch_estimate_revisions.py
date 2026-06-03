@@ -133,11 +133,21 @@ def batch_revisions(symbols: list[str], cap: int = 20) -> dict[str, dict]:
     if not key:
         return {}
     out: dict[str, dict] = {}
+    trend_hits = 0
+    trend_empty = 0
     for sym in symbols[:cap]:
         try:
+            # 진단: trend fetch 결과 분리 카운트
+            trend = fetch_recommendation_trend(sym, key)
+            if trend:
+                trend_hits += 1
+            else:
+                trend_empty += 1
             rev = compute_revision(sym)
             if rev:
                 out[sym] = rev
         except Exception:
             log.exception("[estimate_revisions] %s 실패", sym)
+    log.info("[estimate_revisions] %d종목 fetch — trend hit=%d empty=%d · significant=%d",
+             min(len(symbols), cap), trend_hits, trend_empty, len(out))
     return out
