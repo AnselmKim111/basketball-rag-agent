@@ -1153,6 +1153,23 @@ async def _run_pipeline(
             bot, chat_id, f"  ✅ 산업 리포트 {len(industry_pdfs)}건 수집",
         )
 
+        # ---- (2.5) 산업리포트 인용 종목 추출 → pool 재빌드 (mentioned_picks 추가)
+        if industry_texts:
+            before = len(candidates)
+            pool2 = _sourcing.build_candidate_pool(
+                research, parsed,
+                industry_texts=industry_texts,
+                target_size=60,
+            )
+            if pool2 and len(pool2) > before:
+                added = len(pool2) - before
+                await send_text_chunked(
+                    bot, chat_id,
+                    f"📑 2.5단계: 산업리포트 인용 종목 +{added}개 → pool {len(pool2)}개",
+                )
+                candidates = pool2
+                research["candidates"] = pool2
+
         # ---- (3) 30 → 10 narrow
         await send_text_chunked(bot, chat_id, "🎯 3단계: 영업레버리지 4축 점수로 30→10 narrowing")
         narrow = await _narrow_candidates(idea_text, research, industry_texts, candidates)

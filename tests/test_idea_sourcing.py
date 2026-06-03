@@ -229,3 +229,106 @@ def test_build_candidate_pool_target_size_cap():
     with patch("src.idea.sourcing.screener_query.is_available", return_value=False):
         pool = sourcing.build_candidate_pool(research, {"constraints": {}}, target_size=5)
     assert len(pool) == 5
+
+
+def test_extract_mentioned_tickers_empty_input():
+    from src.idea import sourcing
+    assert sourcing.extract_mentioned_tickers({}) == []
+
+
+def test_extract_mentioned_tickers_skips_short_text():
+    """본문 200자 미만이면 LLM 호출 안 함."""
+    from src.idea import sourcing
+    with patch("src.idea.sourcing._load_extract_prompt", return_value="dummy_prompt"):
+        out = sourcing.extract_mentioned_tickers({"짧은리포트": "짧음"})
+    assert out == []
+
+
+def _install_fake_summarizer(response: str):
+    """src.summarizer를 fake 모듈로 교체 — both sys.modules와 src 패키지 attribute."""
+    import sys
+    import types
+    import src
+    fake = types.ModuleType("src.summarizer")
+    fake.get_client = lambda: object()
+    fake.chat_with_retry = lambda *a, **k: response
+    sys.modules["src.summarizer"] = fake
+    setattr(src, "summarizer", fake)
+    return fake
+
+
+def _uninstall_fake_summarizer():
+    import sys
+    import src
+    sys.modules.pop("src.summarizer", None)
+    if hasattr(src, "summarizer"):
+        delattr(src, "summarizer")
+
+
+def test_extract_mentioned_tickers_parses_llm_response():
+    """LLM이 mentioned 리스트 주면 정상 변환."""
+    from src.idea import sourcing
+    long_text = "분석가 의견: 한미반도체와 리노공업이 주력 추천. " * 50
+    fake_llm_response = (
+        '{"mentioned": ['
+        ' {"name": "한미반도체", "ticker6": "042700", "rationale": "TC본더 독점"},'
+        ' {"name": "리노공업", "ticker6": "058470", "rationale": "테스트핀 1위"}'
+        ']}'
+    )
+    with patch("src.idea.sourcing._load_extract_prompt", return_value="dummy"):
+        _install_fake_summarizer(fake_llm_response)
+        try:
+            out = sourcing.extract_mentioned_tickers({"반도체장비_2026Q1": long_text})
+        finally:
+            _uninstall_fake_summarizer()
+    assert len(out) == 2
+    names = [c["name"] for c in out]
+    assert "한미반도체" in names and "리노공업" in names
+    for c in out:
+        assert c["source"] == "industry_report"
+        assert c["industry"] == "반도체장비_2026Q1"
+        assert c["purity_score"] == 7  # 분석가 인용 = confirmation
+
+
+def test_extract_mentioned_tickers_drops_invalid_ticker():
+    """ticker6이 6자리 아니면 빈 문자열로 교정."""
+    from src.idea import sourcing
+    long_text = "분석가 의견: 한미반도체 추천. " * 50
+    fake_llm_response = (
+        '{"mentioned": ['
+        ' {"name": "비상장사", "ticker6": "ABCDEF", "rationale": "테스트"}'
+        ']}'
+    )
+    with patch("src.idea.sourcing._load_extract_prompt", return_value="dummy"):
+        _install_fake_summarizer(fake_llm_response)
+        try:
+            out = sourcing.extract_mentioned_tickers({"리포트A": long_text})
+        finally:
+            _uninstall_fake_summarizer()
+    assert len(out) == 1
+    assert out[0]["ticker6"] == ""  # invalid → blank
+
+
+def test_build_candidate_pool_with_industry_texts():
+    """industry_texts 제공 시 mentioned_picks도 통합."""
+    from src.idea import sourcing
+    research = {
+        "candidates": [
+            {"name": "한미반도체", "ticker6": "042700", "mcap_estimate_krw_eok": 50000},
+        ],
+        "industries": [{"name": "반도체"}],
+    }
+    fake_mentioned = [
+        {"name": "ISC", "ticker6": "095340", "industry": "반도체", "mechanism": "테스트소켓",
+         "source": "industry_report", "mcap_estimate_krw_eok": 0, "purity_score": 7,
+         "mechanism_link": "리포트 인용", "size_tier": ""},
+    ]
+    with patch("src.idea.sourcing.screener_query.is_available", return_value=False), \
+         patch("src.idea.sourcing.extract_mentioned_tickers", return_value=fake_mentioned):
+        pool = sourcing.build_candidate_pool(
+            research, {"constraints": {}},
+            industry_texts={"리포트A": "텍스트"},
+            target_size=10,
+        )
+    names = [c["name"] for c in pool]
+    assert "한미반도체" in names and "ISC" in names

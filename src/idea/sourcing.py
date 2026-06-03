@@ -2,7 +2,7 @@
 
 기존 perplexity research 결과(LLM 추측)를 다음 소스로 보강·교차검증:
   - 1b. ScreenerBot universe (screener.db tickers) — 시총·섹터 정확 (LLM 추측 폐기)
-  - 1c. 산업 리포트에서 분석가 인용 종목 추출 (LLM 한 번 더)  ← Step 3
+  - 1c. 산업 리포트에서 분석가 인용 종목 추출 (LLM 한 번 더)
   - 1d. DART 최근 30일 공시 + idea 키워드 cross-ref            ← Step 4
 
 원칙:
@@ -16,12 +16,19 @@ from __future__ import annotations
 
 import logging
 import re
+from pathlib import Path
 from typing import Any
 
 from src.cross_bot import screener_query
 from src.idea.tickers import names_match, normalize_name
+from src.llm_json import parse_json_object
+from src.llm_models import narrow_model, summary_model
 
 log = logging.getLogger(__name__)
+
+# 산업리포트 텍스트는 길어서 한 번 호출당 cap
+_MENTIONED_TEXT_CAP = 18000
+_PROMPT_PATH = Path(__file__).resolve().parents[2] / "prompts" / "idea_extract_mentioned.txt"
 
 
 # ------------------------------------------------------------------
@@ -184,44 +191,147 @@ def enrich_with_screener_data(candidates: list[dict]) -> list[dict]:
 
 
 # ------------------------------------------------------------------
+# Source 1c. 산업 리포트 텍스트 → 분석가 인용 종목 (LLM 한 번 더)
+# ------------------------------------------------------------------
+def _load_extract_prompt() -> str:
+    try:
+        return _PROMPT_PATH.read_text(encoding="utf-8")
+    except Exception:
+        log.exception("[sourcing] idea_extract_mentioned 프롬프트 로드 실패")
+        return ""
+
+
+def extract_mentioned_tickers(industry_texts: dict[str, str]) -> list[dict]:
+    """산업 리포트 텍스트들에서 분석가가 명시 인용한 종목 추출.
+
+    LLM(summary tier — kimi, narrow tier 폴백)이 리포트 1건씩 읽어 회사명·ticker6 추출.
+    환각 방지: ticker6은 본문에 6자리로 명시된 경우만, 회사명은 본문 그대로.
+
+    인자:
+      industry_texts: {report_label: text}  ← _collect_industry_reports 산출과 동일 포맷.
+
+    반환: [{name, ticker6, rationale, source: 'industry_report', industry: report_label}]
+      ticker6은 본문 명시된 경우만. screener_query.get_ticker_name으로 사후 교정 시도.
+      LLM/PDF 실패는 graceful — 빈 리스트.
+    """
+    if not industry_texts:
+        return []
+
+    prompt = _load_extract_prompt()
+    if not prompt:
+        return []
+
+    try:
+        from src import summarizer
+        client = summarizer.get_client()
+    except Exception:
+        log.info("[sourcing] OpenRouter client 미가용 — 산업리포트 인용 추출 skip")
+        return []
+
+    out: list[dict] = []
+    for label, text in industry_texts.items():
+        if not text or len(text.strip()) < 200:
+            continue
+        snippet = text[:_MENTIONED_TEXT_CAP]
+        user_msg = (
+            f"리포트 제목/식별자: {label}\n\n"
+            f"본문 (cap {_MENTIONED_TEXT_CAP}자):\n{snippet}\n\n"
+            f"위 본문에서 분석가가 명시 인용한 종목을 시스템 프롬프트 형식대로 JSON 출력."
+        )
+        try:
+            content = summarizer.chat_with_retry(
+                client,
+                model=summary_model(),
+                fallback_model=narrow_model(),
+                max_tokens=2500,
+                temperature=0.0,
+                messages=[
+                    {"role": "system", "content": prompt},
+                    {"role": "user", "content": user_msg},
+                ],
+                context=f"idea_extract_mentioned[{label[:30]}]",
+            )
+        except Exception:
+            log.exception("[sourcing] 산업리포트 인용 추출 실패: %s", label)
+            continue
+        obj = parse_json_object(content) or {}
+        mentioned = obj.get("mentioned") or []
+        if not isinstance(mentioned, list):
+            continue
+        for m in mentioned:
+            if not isinstance(m, dict):
+                continue
+            name = (m.get("name") or "").strip()
+            if not name:
+                continue
+            ticker = (m.get("ticker6") or "").strip()
+            if not re.match(r"^\d{6}$", ticker):
+                ticker = ""
+            rationale = (m.get("rationale") or "").strip()
+            out.append({
+                "name": name,
+                "ticker6": ticker,
+                "industry": label,
+                "mechanism": rationale,
+                "mechanism_link": f"산업리포트 '{label}' 인용",
+                "size_tier": "",            # narrow LLM에서 평가
+                "mcap_estimate_krw_eok": 0,  # enrich로 보강
+                "purity_score": 7,           # 인용된 종목은 분석가 의견 = 시장 confirmation
+                "source": "industry_report",
+            })
+    log.info("[sourcing] 산업리포트 인용 추출: %d개 (리포트 %d건)", len(out), len(industry_texts))
+    return out
+
+
+# ------------------------------------------------------------------
 # 통합: candidate pool 빌드
 # ------------------------------------------------------------------
 def build_candidate_pool(
     research: dict,
     parsed: dict,
+    industry_texts: dict[str, str] | None = None,
     target_size: int = 60,
 ) -> list[dict]:
-    """research(perplexity) + screener universe 통합 dedup pool.
+    """research(perplexity) + screener universe + 산업리포트 인용 통합 dedup pool.
 
-    추후 Step 3 (산업리포트 인용) + Step 4 (DART 공시) 가 추가될 예정 — 시그니처
-    안정 유지.
+    추후 Step 4 (DART 공시) 가 추가될 예정 — 시그니처 안정 유지.
 
-    target_size: 합쳐서 N개 cap (시총 desc 우선).
+    인자:
+      research: perplexity research 결과 (candidates·industries)
+      parsed: idea parse 결과 (constraints)
+      industry_texts: optional, _collect_industry_reports 산출. 있으면 1c 활성.
+      target_size: 합쳐서 N개 cap (시총 desc 우선).
     """
     research_candidates = list(research.get("candidates") or [])
     industries = list(research.get("industries") or [])
     constraints = (parsed or {}).get("constraints") or {}
 
-    # 1단계: research candidates를 enrich (정확 시총·섹터)
+    # 1a) research candidates를 enrich (정확 시총·섹터)
     research_candidates = enrich_with_screener_data(research_candidates)
     for c in research_candidates:
         c.setdefault("source", "perplexity")
 
-    # 2단계: screener universe에서 추가 발굴
+    # 1b) screener universe에서 추가 발굴
     screener_picks = from_screener_universe(constraints, industries, max_picks=max(target_size, 30))
 
-    # 3단계: 합쳐서 dedup
-    pool = _dedup_candidates(research_candidates + screener_picks)
+    # 1c) 산업리포트 인용 종목 (있는 경우만)
+    mentioned_picks: list[dict] = []
+    if industry_texts:
+        mentioned_picks = extract_mentioned_tickers(industry_texts)
+        mentioned_picks = enrich_with_screener_data(mentioned_picks)
 
-    # 4단계: 시총 desc로 정렬 (정확 시총 우선 — screener·perplexity 둘 다 사용)
+    # 합쳐서 dedup
+    pool = _dedup_candidates(research_candidates + screener_picks + mentioned_picks)
+
+    # 시총 desc로 정렬 (정확 시총 우선 — screener·perplexity·인용 다 사용)
     pool.sort(key=lambda c: int(c.get("mcap_estimate_krw_eok") or 0), reverse=True)
 
-    # 5단계: target_size 상한
+    # target_size 상한
     pool = pool[:target_size]
     log.info(
-        "[sourcing] candidate pool: research %d + screener %d → dedup %d → top %d",
-        len(research_candidates), len(screener_picks),
-        len(research_candidates) + len(screener_picks),
+        "[sourcing] candidate pool: research %d + screener %d + mentioned %d → dedup %d → top %d",
+        len(research_candidates), len(screener_picks), len(mentioned_picks),
+        len(research_candidates) + len(screener_picks) + len(mentioned_picks),
         len(pool),
     )
     return pool
