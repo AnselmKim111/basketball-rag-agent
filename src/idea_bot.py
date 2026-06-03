@@ -1559,6 +1559,7 @@ async def _collect_industry_reports(
     def _blocking() -> tuple[list[Path], dict[str, str]]:
         from src.wisereport import WisereportClient
         from src import summarizer
+        from src.bot_helpers import wisereport_creds, MissingWisereportCreds
 
         all_paths: list[Path] = []
         text_by_name: dict[str, str] = {}
@@ -1566,9 +1567,14 @@ async def _collect_industry_reports(
         general_pool_used = False  # 일반 industry top reports는 한 번만
 
         try:
+            wr_id, wr_pw = wisereport_creds()
+        except MissingWisereportCreds:
+            log.exception("wisereport 자격 증명 누락 — 산업 리포트 수집 스킵")
+            return all_paths, text_by_name
+        try:
             with WisereportClient(
-                user_id=os.environ["WISEREPORT_ID"],
-                password=os.environ["WISEREPORT_PW"],
+                user_id=wr_id,
+                password=wr_pw,
                 download_root=target_dir,
                 headless=True,
                 ignore_https_errors=os.environ.get("IGNORE_HTTPS_ERRORS", "false").lower() == "true",
@@ -1883,14 +1889,20 @@ async def _collect_company_reports(
     def _blocking() -> tuple[dict[str, list[Path]], dict[str, dict[str, str]]]:
         from src.wisereport import WisereportClient
         from src import summarizer
+        from src.bot_helpers import wisereport_creds, MissingWisereportCreds
 
         paths_by_ticker: dict[str, list[Path]] = {}
         texts_by_ticker: dict[str, dict[str, str]] = {}
 
         try:
+            wr_id, wr_pw = wisereport_creds()
+        except MissingWisereportCreds:
+            log.exception("wisereport 자격 증명 누락 — 종목 리포트 수집 스킵")
+            return paths_by_ticker, texts_by_ticker
+        try:
             with WisereportClient(
-                user_id=os.environ["WISEREPORT_ID"],
-                password=os.environ["WISEREPORT_PW"],
+                user_id=wr_id,
+                password=wr_pw,
                 download_root=target_dir,
                 headless=True,
                 ignore_https_errors=os.environ.get("IGNORE_HTTPS_ERRORS", "false").lower() == "true",
