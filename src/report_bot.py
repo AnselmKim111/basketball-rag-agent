@@ -333,6 +333,18 @@ def _build_report():
         signals += technical_signals.detect_signals(df, label)
 
     # ---------- §0 글로벌 위험선호 (표지 직후 시각 요약) ----------
+    # screener.db 활성화 진단 — sector_leader/trend_reversal stream 의존
+    try:
+        from src.report.data import screener_adapter
+        us_active = len(screener_adapter.load_active_tickers("US"))
+        kr_active = len(screener_adapter.load_active_tickers("KR"))
+        us_latest = screener_adapter.latest_signal_date("US")
+        kr_latest = screener_adapter.latest_signal_date("KR")
+        log.info("[report] screener.db 상태 — US active=%d (latest=%s) · KR active=%d (latest=%s)",
+                 us_active, us_latest, kr_active, kr_latest)
+    except Exception:
+        log.exception("[report] screener.db 진단 실패")
+
     risk_gauge: dict = {"score": 50, "label": "중립", "signals": {}}
     # 어제 게이지 점수 미리 fetch (snapshot 있으면) — 게이지 시각화 delta 표시용
     prev_snapshot_early = state.load_previous(date_iso) or {}
