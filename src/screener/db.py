@@ -368,6 +368,38 @@ def save_signals(date_str: str, results: dict[str, list[dict]]) -> int:
     return len(rows)
 
 
+def load_signals_in_range(start_date: str, end_date: str) -> list[dict]:
+    """signals 테이블에서 date BETWEEN start AND end 행 전부 (RecapBot용).
+
+    날짜 문자열은 'YYYY-MM-DD' 또는 'YYYYMMDD' 둘 다 처리 — 호출자가 date 객체로
+    가지고 있어 toisoformat()으로 넘기는 패턴이 자연스럽지만, signals 테이블
+    저장 형식이 호출자(screener_daily_job)에 따라 다를 수 있어 양쪽 형식 모두 매칭.
+
+    반환: [{date, ticker, signal, payload(dict)}, ...] — payload는 JSON 디코딩.
+    payload 디코딩 실패 시 raw string 보존.
+    """
+    ensure_schema()
+    out: list[dict] = []
+    with _conn() as c:
+        cur = c.execute(
+            "SELECT date, ticker, signal, payload FROM signals "
+            "WHERE date >= ? AND date <= ? ORDER BY date ASC, signal ASC, ticker ASC",
+            (start_date, end_date),
+        )
+        for date_v, ticker, signal, payload in cur.fetchall():
+            try:
+                payload_obj = json.loads(payload) if payload else {}
+            except (json.JSONDecodeError, TypeError):
+                payload_obj = {"raw": payload}
+            out.append({
+                "date": date_v,
+                "ticker": ticker,
+                "signal": signal,
+                "payload": payload_obj,
+            })
+    return out
+
+
 # ------------------------------------------------------------------
 # 진단
 # ------------------------------------------------------------------
