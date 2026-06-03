@@ -942,7 +942,8 @@ async def _run_pipeline(
     bot: Bot = context.bot
     chat_id = str(update.effective_chat.id)
 
-    await _safe_reply(update, "📞 어닝콜 분석 시작 — 0단계: 입력 파싱 …")
+    # Phase 9 — 메시지 1: 시작 알림 (한 줄)
+    await _safe_reply(update, "📞 어닝콜 분석 시작 — 약 5-10분 소요 (결과는 한 번에 발송)")
 
     # 0) 파싱
     parsed = await _step_parse(user_text)
@@ -964,15 +965,14 @@ async def _run_pipeline(
     tickers: list[str] = []
     if mode == "tickers":
         tickers = [t.upper() for t in (parsed.get("tickers") or []) if t]
-        await _safe_send(
-            bot, chat_id,
-            f"🧭 회사 직접 지정 모드 — {', '.join(tickers) or '비어 있음'}\n"
-            f"  분기: {fiscal_period or '최근 분기'}\n"
-            + (f"  커스텀 질문: {custom_question}\n" if custom_question else ""),
+        # 진행 알림 제거 — 시작 알림 1줄로 충분
+        log.info(
+            "[Phase 9] tickers 모드: %s, 분기=%s, custom=%s",
+            tickers, fiscal_period, custom_question[:50] if custom_question else "(none)",
         )
     elif mode == "criteria":
         criteria = (parsed.get("criteria") or user_text).strip()
-        await _safe_send(bot, chat_id, f"🌐 1단계: 조건 → 티커 확장 (perplexity) …\n  조건: {criteria}")
+        # criteria 모드는 LLM이 ticker 확장하니 결과만 1줄 노출
         expansion = await _step_expand_criteria(criteria)
         if expansion is None:
             await _safe_send(bot, chat_id, "⚠️ 조건 → 티커 확장 실패. 회사를 직접 적어 주세요. (예: AAPL MSFT)")
@@ -983,30 +983,25 @@ async def _run_pipeline(
             await _safe_send(
                 bot, chat_id,
                 "⚠️ 조건에 맞는 미국 상장사를 찾지 못했습니다.\n"
-                "(어닝콜봇은 SEC EDGAR 기반 — 미국 상장사만 분석합니다.)\n"
                 + (f"\n💡 {expansion.get('exclusion_notes')}" if expansion.get("exclusion_notes") else ""),
             )
             return
-        # 최대 8개
         tickers = tickers[:8]
-        # 사용자에게 확장 결과 보여주기
-        interp = expansion.get("interpreted_criteria") or criteria
         period_guess = expansion.get("target_fiscal_period")
         if period_guess and not fiscal_period:
             fiscal_period = period_guess
-        lines = [f"  · 해석: {interp}"]
-        for r in rows[:8]:
-            reason = r.get("reason_for_inclusion") or ""
-            lines.append(f"  · {r.get('ticker')} — {r.get('company_name', '')}: {reason}")
-        await _safe_send(bot, chat_id, "🌐 확장 결과:\n" + "\n".join(lines))
+        # 확장 결과 한 줄 (어떤 ticker로 갔는지 사용자 검증 필요)
+        await _safe_send(
+            bot, chat_id,
+            f"🌐 조건 확장: {', '.join(tickers)} — 분석 진행 …",
+        )
     else:  # custom_only — 회사 미상
         await _safe_send(
             bot, chat_id,
             "⚠️ 분석 대상을 찾지 못했습니다.\n\n"
             "입력 예시:\n"
             "  • 회사 지정: AAPL MSFT GOOGL 2026 1Q\n"
-            "  • 조건: 빅테크 2026 1Q / capex 상위 5\n"
-            "  • 커스텀: MSFT GOOGL 어디가 경쟁 우위?\n\n"
+            "  • 조건: 빅테크 2026 1Q / capex 상위 5\n\n"
             "사용법: /help",
         )
         return
@@ -1025,9 +1020,8 @@ async def _run_pipeline(
         f"Q{fiscal_quarter} {fiscal_year}" if (fiscal_year and fiscal_quarter) else "the most recent reported quarter"
     )
 
-    # 3) SEC + 컨센 + 생태계 + Form 4 + 8-K + 10-K Risk diff + 10-K MD&A diff
-    #    (먼저 7-track 병렬 수집)
-    await _safe_send(bot, chat_id, "📊 7-track 수집 중 (SEC·컨센·생태계·인사이더·8-K·10-K Risk·MD&A) …")
+    # Phase 9 — 백그라운드: 7-track fetch (텔레그램 알림 X, 로그만)
+    log.info("[Phase 9] 7-track fetch 시작 (tickers=%s, fiscal=%s)", tickers, fiscal_label)
     (
         financials, consensus_by_ticker, ecosystem_by_ticker,
         insider_by_ticker, events_8k_by_ticker, risk_diff_by_ticker,
@@ -1042,233 +1036,114 @@ async def _run_pipeline(
         _step_fetch_mdna_diff(tickers),
     )
     if not financials:
-        await _safe_send(bot, chat_id, "⚠️ SEC EDGAR 데이터를 못 가져왔습니다 — 차트·검증 제한됩니다.")
-    if consensus_by_ticker:
-        got_c = sum(1 for v in consensus_by_ticker.values() if v is not None)
-        got_e = sum(1 for v in (ecosystem_by_ticker or {}).values() if v is not None)
-        got_i = sum(1 for v in (insider_by_ticker or {}).values() if v is not None)
-        got_k = sum(1 for v in (events_8k_by_ticker or {}).values() if v is not None)
-        got_r = sum(
-            1 for v in (risk_diff_by_ticker or {}).values()
-            if v and not v.get("diff_skipped")
-        )
-        got_md = sum(
-            1 for v in (mdna_diff_by_ticker or {}).values()
-            if v and not v.get("diff_skipped")
-        )
-        await _safe_send(
-            bot, chat_id,
-            f"  📐 컨센 {got_c}/{len(tickers)} · 🌐 생태계 {got_e}/{len(tickers)} · "
-            f"👥 인사이더 {got_i}/{len(tickers)} · 📂 8-K {got_k}/{len(tickers)} · "
-            f"📜 10-K Risk {got_r}/{len(tickers)} · 📊 MD&A {got_md}/{len(tickers)}"
-        )
+        log.warning("[Phase 9] SEC EDGAR 데이터 fetch 실패 — 차트·검증 제한")
+    log.info(
+        "[Phase 9] 7-track 완료: consensus=%d/%d ecosystem=%d/%d insider=%d/%d 8k=%d/%d risk=%d mdna=%d",
+        sum(1 for v in (consensus_by_ticker or {}).values() if v is not None), len(tickers),
+        sum(1 for v in (ecosystem_by_ticker or {}).values() if v is not None), len(tickers),
+        sum(1 for v in (insider_by_ticker or {}).values() if v is not None), len(tickers),
+        sum(1 for v in (events_8k_by_ticker or {}).values() if v is not None), len(tickers),
+        sum(1 for v in (risk_diff_by_ticker or {}).values() if v and not v.get("diff_skipped")),
+        sum(1 for v in (mdna_diff_by_ticker or {}).values() if v and not v.get("diff_skipped")),
+    )
 
-    # 2+3) 종목별: 진짜 전문 확보 → 심층추출 → 숫자 교차검증 + 컨센서스 delta + 분기간 diff
+    # Phase 9 — 종목별 extract (텔레그램 알림 X, 로그만)
     transcripts: dict[str, dict] = {}
     verify_by_ticker: dict[str, list] = {}
     consensus_delta_by_ticker: dict[str, list] = {}
     diff_by_ticker: dict[str, dict] = {}
-    # risk_diff_by_ticker는 위 6-track gather에서 채워짐 (Track I)
-    await _safe_send(
-        bot, chat_id,
-        f"📞 어닝콜 전문 확보 + 심층추출 시작 ({len(tickers)}개, {fiscal_label})\n"
-        f"  진짜 전문에 grounding → 종목별 deep read (종목당 1-2분)",
-    )
+    log.info("[Phase 9] 종목별 extract 시작 (%d ticker)", len(tickers))
     for idx, t in enumerate(tickers, 1):
-        await _safe_send(bot, chat_id, f"  ⏳ ({idx}/{len(tickers)}) {t} 전문 확보 + 심층 분석 중 …")
+        log.info("[Phase 9] (%d/%d) %s extract 중 …", idx, len(tickers), t)
         tr = await _step_deep_extract(t, fiscal_year, fiscal_quarter, fiscal_label)
         if tr is None:
-            await _safe_send(bot, chat_id, f"  ⚠️ ({idx}/{len(tickers)}) {t} 전문 확보 실패 — 스킵")
+            log.warning("[Phase 9] (%d/%d) %s 전문 확보 실패 — 스킵", idx, len(tickers), t)
             continue
-        # 숫자 교차검증 (SEC와 대조)
         vres = await _step_verify(tr, financials.get(t), fiscal_year, fiscal_quarter)
         verify_by_ticker[t] = vres
         tr["_verify"] = [v.message for v in vres]
-        # 컨센서스 delta (beat/miss/inline)
         snap = (consensus_by_ticker or {}).get(t)
         if snap is not None:
             from src.earnings.verify import compute_consensus_delta
             deltas = compute_consensus_delta(tr, snap)
             consensus_delta_by_ticker[t] = deltas
             tr["_consensus_deltas"] = [d.message for d in deltas]
-            tr["_consensus_snap"] = snap   # synthesis payload용 (직렬화는 따로)
+            tr["_consensus_snap"] = snap
         transcripts[t] = tr
-        # 분기간 diff (Track C — history에 이전 분기 있을 때만)
         diff = await _step_compute_diff(t, tr, fiscal_year, fiscal_quarter, prior_n=4)
         if diff:
             diff_by_ticker[t] = diff
             tr["_diff"] = diff
-        # 즉시 텔레그램 발송 (전문 심층요약 + 검증결과 + 컨센 delta + 컨센 snapshot + diff 요약)
-        from src.earnings.transcripts import format_transcript_text
-        from src.earnings.verify import format_results, format_consensus_deltas
-        from src.earnings.consensus import fmt_consensus_text
-        body = format_transcript_text(tr)
-        vtext = format_results(vres)
-        if vtext:
-            body += "\n\n" + vtext
-        if snap is not None:
-            ctext = format_consensus_deltas(consensus_delta_by_ticker.get(t) or [])
-            if ctext:
-                body += "\n\n" + ctext
-            body += "\n\n" + fmt_consensus_text(snap)
-        if diff:
-            body += "\n\n" + _format_diff_text(diff)
-        # 생태계 맵 (Track D)
-        eco = (ecosystem_by_ticker or {}).get(t)
-        if eco:
-            from src.earnings.ecosystem import fmt_ecosystem_text
-            body += "\n\n" + fmt_ecosystem_text(t, eco)
-        # 인사이더 매매 (Track F)
-        insider = (insider_by_ticker or {}).get(t)
-        if insider is not None:
-            from src.earnings.sec_edgar import fmt_insider_summary
-            itxt = fmt_insider_summary(insider)
-            if itxt:
-                body += "\n\n" + itxt
-        # NLP 시그널 (Track K — 정규식, LLM 0회)
-        sig = tr.get("_signals")
-        if sig:
-            from src.earnings.nlp_signals import fmt_signals_text
-            body += "\n\n" + fmt_signals_text(sig)
-        # 8-K 머티어리얼 이벤트 (Track H)
-        events_8k = (events_8k_by_ticker or {}).get(t)
-        if events_8k is not None:
-            from src.earnings.sec_edgar import fmt_8k_summary
-            etxt = fmt_8k_summary(events_8k)
-            if etxt:
-                body += "\n\n" + etxt
-        # 10-K Risk diff (Track I)
-        rd = (risk_diff_by_ticker or {}).get(t)
-        if rd:
-            rdtxt = _fmt_risk_diff_text(rd)
-            if rdtxt:
-                body += "\n\n" + rdtxt
-        # 10-K MD&A diff (Phase 7E)
-        mdr = (mdna_diff_by_ticker or {}).get(t)
-        if mdr:
-            mdtxt = _fmt_mdna_diff_text(mdr)
-            if mdtxt:
-                body += "\n\n" + mdtxt
-        await send_text_chunked(bot, chat_id, body)
 
     if not transcripts:
         await _safe_send(bot, chat_id, "⚠️ 모든 종목의 전문 확보 실패. 잠시 후 재시도 권장.")
         return
 
     grounded_n = sum(1 for tr in transcripts.values() if tr.get("grounded"))
-    await _safe_send(
-        bot, chat_id,
-        f"  ✅ {len(transcripts)}개 분석 완료 (전문 grounding {grounded_n}/{len(transcripts)})",
-    )
+    log.info("[Phase 9] extract 완료: %d/%d, grounded %d/%d",
+             len(transcripts), len(tickers), grounded_n, len(transcripts))
 
-    # 5.7) Hyperscaler capex 모자이크 walker (Track L — 외부 fetch 0회, history만)
+    # Hyperscaler capex walker (외부 fetch 0회)
     hyper_walker = _build_hyperscaler_capex_table(
         quarters=4,
         ecosystem_by_ticker=ecosystem_by_ticker,
         analyzed_tickers=list(transcripts.keys()),
     )
     if hyper_walker.get("applicable"):
-        await _safe_send(bot, chat_id, fmt_hyperscaler_text(hyper_walker))
+        log.info("[Phase 9] hyperscaler walker applicable: %d", len(hyper_walker.get("table") or []))
 
-    # 5.8) Phase 8 Track M — 시장 반응 fetch (주가 reaction · alpha · 옵션 · target revision)
-    await _safe_send(bot, chat_id, "📈 시장 반응 데이터 수집 중 (주가 reaction · target revision)…")
+    # 시장 반응 fetch
+    log.info("[Phase 9] 시장 반응 fetch 시작")
     market_reaction_by_ticker = await _step_fetch_market_reaction(
         list(transcripts.keys()), transcripts, consensus_by_ticker,
     )
-    if market_reaction_by_ticker:
-        got_mr = sum(
-            1 for v in market_reaction_by_ticker.values()
-            if v is not None and getattr(v, "ret_1d", None) is not None
-        )
-        await _safe_send(bot, chat_id, f"  📈 시장 반응 {got_mr}/{len(transcripts)} (가격·alpha·target revision)")
+    got_mr = sum(
+        1 for v in (market_reaction_by_ticker or {}).values()
+        if v is not None and getattr(v, "ret_1d", None) is not None
+    )
+    log.info("[Phase 9] 시장 반응 완료: %d/%d", got_mr, len(transcripts))
 
-    # 6) 비교 합성 (Opus, 딥리서치급 — 컨센서스 delta·정성 서프라이즈 강제 인용)
-    await _safe_send(bot, chat_id, "🧠 비교 합성 중 (Opus, 인용·시나리오 기반 10000자+)…")
+    # 비교 합성 (Opus) — 텔레그램 발송 X, PDF용으로만
+    log.info("[Phase 9] 비교 합성 (Opus) 시작 …")
     industry_summary, synthesis_gate_meta = await _step_synthesize_industry(
         transcripts, financials, fiscal_label, verify_by_ticker,
         consensus_by_ticker, consensus_delta_by_ticker, diff_by_ticker,
         ecosystem_by_ticker, insider_by_ticker, events_8k_by_ticker, risk_diff_by_ticker,
         hyper_walker, market_reaction_by_ticker,
     )
-    if industry_summary:
-        # 합성 결과엔 [TICKER] 인용·표·# 헤더가 있어 텔레그램 Markdown 파싱이 깨짐 → 평문 발송
-        await send_text_chunked(bot, chat_id, industry_summary)
-    else:
+    if not industry_summary:
         industry_summary = "(비교 합성 실패 — PDF에는 차트·전문만 포함)"
+    log.info("[Phase 9] 비교 합성 완료: %d자, attempts=%d",
+             len(industry_summary), (synthesis_gate_meta or {}).get("attempts", 1))
 
-    # 6.05) Phase 7B 환각 검증 결과 노출 — extract 위반 + synthesis 위반 + 길이
-    try:
-        from src.earnings.quality_gate import fmt_quality_summary, GateResult
-        ex_results: dict[str, GateResult] = {}
-        for t, tr in transcripts.items():
-            ge = tr.get("_gate_extract")
-            if not ge:
-                continue
-            r = GateResult(layer="extract")
-            r.total_checked = ge.get("total", 0)
-            r.violation_ratio = ge.get("ratio", 0.0)
-            r.passed = ge.get("passed", True)
-            r.violations = [None] * ge.get("violations", 0)  # 카운트만 필요
-            ex_results[t] = r
-        syn_r = GateResult(layer="synthesis")
-        if synthesis_gate_meta:
-            syn_r.total_checked = synthesis_gate_meta.get("citation_total", 0)
-            syn_r.violation_ratio = synthesis_gate_meta.get("citation_ratio", 0.0)
-            syn_r.passed = synthesis_gate_meta.get("citation_passed", True)
-            syn_r.violations = [None] * synthesis_gate_meta.get("citation_violations", 0)
-        chars = (synthesis_gate_meta or {}).get("synthesis_chars")
-        summary_line = fmt_quality_summary(ex_results, syn_r, chars)
-        attempts = (synthesis_gate_meta or {}).get("attempts", 1)
-        if summary_line:
-            if attempts > 1:
-                summary_line += f"\n  🔄 합성 재시도: {attempts}회 (초기 검증 실패 → 자동 재요청)"
-            await _safe_send(bot, chat_id, summary_line)
-    except Exception:
-        log.exception("[quality_gate] 텔레그램 요약 발송 실패")
-
-    # 6.4) Phase 7D — Multi-Perspective Synthesis (sonnet 3 + opus 1 메타)
-    await _safe_send(bot, chat_id, "🎭 Multi-Perspective 합성 중 — bull/bear/neutral 3시각 (sonnet 병렬)…")
+    # Multi-Perspective + Meta (Sonnet x3 + Opus x1) — 텔레그램 발송 X, PDF용으로만
+    log.info("[Phase 9] Multi-Perspective + Meta 합성 …")
     perspectives = await _step_multi_perspective(
         transcripts, financials, fiscal_label, verify_by_ticker,
         consensus_by_ticker, consensus_delta_by_ticker, diff_by_ticker,
         ecosystem_by_ticker, insider_by_ticker, events_8k_by_ticker, risk_diff_by_ticker,
         hyper_walker, market_reaction_by_ticker,
     )
-    # 3개 시각 각각 발송 (확장 정보 — 사용자가 원하면 borrow)
-    if perspectives.get("bull"):
-        await send_text_chunked(bot, chat_id, perspectives["bull"])
-    if perspectives.get("bear"):
-        await send_text_chunked(bot, chat_id, perspectives["bear"])
-    if perspectives.get("neutral"):
-        await send_text_chunked(bot, chat_id, perspectives["neutral"])
-    # 메타 합성 — opus 1회 (3개 모두 비어 있지 않을 때만)
     meta_text = ""
     if any(perspectives.values()):
-        await _safe_send(bot, chat_id, "🧬 §9 Perspective Consensus & Conflicts 메타 합성 (Opus)…")
         meta_text = await _step_meta_synthesis(perspectives) or ""
-        if meta_text:
-            await send_text_chunked(bot, chat_id, meta_text)
 
-    # 6.5) Counter-thesis 자동 합성 (Track E) — 동일 payload + opus 1회 추가
-    await _safe_send(bot, chat_id, "🛡️ Counter-thesis 자동 반박 합성 중 (Opus)…")
+    # Counter-thesis (Opus) — 텔레그램 발송 X, PDF용으로만
+    log.info("[Phase 9] Counter-thesis 합성 …")
     counter_summary = await _step_synthesize_counter(
         transcripts, financials, fiscal_label, verify_by_ticker,
         consensus_by_ticker, consensus_delta_by_ticker, diff_by_ticker,
         ecosystem_by_ticker, insider_by_ticker, events_8k_by_ticker, risk_diff_by_ticker,
         hyper_walker, market_reaction_by_ticker,
-    )
-    if counter_summary:
-        await send_text_chunked(bot, chat_id, counter_summary)
-    else:
-        counter_summary = ""
+    ) or ""
 
-    # 6.7) Pre vs Actual diff (Track G) — pre-call 캐시가 있으면 1회 opus 비교
+    # Pre vs Actual diff — 텔레그램 발송 X, PDF에 함께 (있을 때만)
+    pre_vs_actual_by_ticker: dict[str, str] = {}
     if fiscal_year and fiscal_quarter:
         from src.earnings import precall as _precall
         for t, tr in transcripts.items():
             if not _precall.exists(t, fiscal_year, fiscal_quarter):
                 continue
-            await _safe_send(bot, chat_id, f"🔄 {t} — pre-call 캐시 발견 → pre vs actual diff 합성 중 (Opus)…")
             try:
                 pa_text = await _step_synthesize_pre_vs_actual(
                     t, fiscal_year, fiscal_quarter, fiscal_label, tr,
@@ -1278,35 +1153,33 @@ async def _run_pipeline(
                 log.exception("[pre-vs-actual] 합성 실패 (%s)", t)
                 pa_text = None
             if pa_text:
-                await send_text_chunked(bot, chat_id, pa_text)
+                pre_vs_actual_by_ticker[t] = pa_text
 
-    # 6.8) Phase 7C — predictions INSERT + retrospective (이전 분기 prediction이 있을 때만)
+    # Predictions INSERT + Retrospective — 텔레그램 발송 X, PDF에 함께 (있을 때만)
+    retrospective_by_ticker: dict[str, str] = {}
     if fiscal_year and fiscal_quarter:
         for t, tr in transcripts.items():
-            # 6.8a) 현재 분기 prediction 5-10건 추출 → DB INSERT
             try:
                 n = await _step_extract_predictions(
                     t, fiscal_year, fiscal_quarter,
                     industry_summary or "", counter_summary or "",
                 )
                 if n > 0:
-                    log.info("[Phase7C] %s — %d predictions INSERTED FY%sQ%s", t, n, fiscal_year, fiscal_quarter)
+                    log.info("[Phase9] %s — %d predictions INSERTED FY%sQ%s", t, n, fiscal_year, fiscal_quarter)
             except Exception:
-                log.exception("[Phase7C] predictions extract 실패 (%s)", t)
-            # 6.8b) 직전 분기 unverified prediction 회고 (있을 때만)
+                log.exception("[Phase9] predictions extract 실패 (%s)", t)
             try:
                 retro = await _step_retrospective(
                     t, fiscal_year, fiscal_quarter, tr,
                     consensus_by_ticker.get(t), consensus_delta_by_ticker.get(t),
                 )
                 if retro:
-                    await _safe_send(bot, chat_id, f"📈 {t} — 직전 분기 thesis 회고 합성 완료")
-                    await send_text_chunked(bot, chat_id, retro)
-                    tr["_retrospective"] = retro  # history 영속화용
+                    retrospective_by_ticker[t] = retro
+                    tr["_retrospective"] = retro
             except Exception:
-                log.exception("[Phase7C] retrospective 실패 (%s)", t)
+                log.exception("[Phase9] retrospective 실패 (%s)", t)
 
-    # 6.6) longitudinal history 영속화 (Track C) — 합성·counter 끝난 시점에 1회.
+    # Longitudinal history 영속화
     if fiscal_year and fiscal_quarter:
         from src.earnings import history
         for t, tr in transcripts.items():
@@ -1326,10 +1199,10 @@ async def _run_pipeline(
             except Exception:
                 log.exception("[earnings/history] save_call 실패 (%s)", t)
 
-    # 7) 커스텀 분석 (있을 때, Opus)
+    # 커스텀 분석 (있을 때, Opus) — 텔레그램 발송 X, PDF에 함께
     custom_answer = ""
     if custom_question:
-        await _safe_send(bot, chat_id, f"🎯 커스텀 질문 심층 답변 중 (Opus) — {custom_question[:80]}")
+        log.info("[Phase 9] 커스텀 분석 합성 (Opus): %s", custom_question[:80])
         custom_answer = await _step_synthesize_custom(
             custom_question, transcripts, financials, fiscal_label, verify_by_ticker,
             consensus_by_ticker, consensus_delta_by_ticker, diff_by_ticker,
@@ -1337,11 +1210,50 @@ async def _run_pipeline(
             hyper_walker=hyper_walker,
             market_reaction_by_ticker=market_reaction_by_ticker,
         ) or ""
-        if custom_answer:
-            await send_text_chunked(bot, chat_id, "🎯 커스텀 분석\n\n" + custom_answer)
 
-    # 8) PDF 빌드 + 발송
-    await _safe_send(bot, chat_id, "📄 PDF 보고서 생성 중 (PM Decision Document — p.1 verdict + p.2 시장 반응)…")
+    # ============================================================
+    # Phase 9 — 텔레그램 송출: 정확히 [한글번역 × N] + [Editor's Pick] + [PDF]
+    # ============================================================
+
+    # 메시지 2 (종목당): 어닝콜 한글 번역 (Sonnet 1회/종목)
+    log.info("[Phase 9] 한글 번역 합성 시작 (%d ticker)", len(transcripts))
+    for t, tr in transcripts.items():
+        ko = await _step_translate_transcript(t, tr)
+        if ko:
+            try:
+                await send_text_chunked(bot, chat_id, ko, parse_mode="Markdown")
+            except Exception:
+                log.exception("[Phase 9] 한글 번역 발송 실패 (Markdown 파싱 가능성) — 평문 재시도 (%s)", t)
+                try:
+                    await send_text_chunked(bot, chat_id, ko)
+                except Exception:
+                    log.exception("[Phase 9] 평문 재시도도 실패 (%s)", t)
+        else:
+            log.warning("[Phase 9] %s 한글 번역 실패 — 메시지 스킵", t)
+
+    # 메시지 3: Editor's Pick (Opus 1회) — 시장 기대 vs 진짜 중요한 것
+    log.info("[Phase 9] Editor's Pick 합성 (Opus) …")
+    pick = await _step_editors_pick(
+        transcripts, financials, fiscal_label, verify_by_ticker,
+        consensus_by_ticker, consensus_delta_by_ticker, diff_by_ticker,
+        ecosystem_by_ticker, insider_by_ticker, events_8k_by_ticker, risk_diff_by_ticker,
+        hyper_walker, market_reaction_by_ticker,
+        industry_summary=industry_summary, counter_summary=counter_summary, meta_text=meta_text,
+    )
+    if pick:
+        try:
+            await send_text_chunked(bot, chat_id, pick, parse_mode="Markdown")
+        except Exception:
+            log.exception("[Phase 9] Editor's Pick Markdown 발송 실패 — 평문 재시도")
+            try:
+                await send_text_chunked(bot, chat_id, pick)
+            except Exception:
+                log.exception("[Phase 9] Editor's Pick 평문 재시도도 실패")
+    else:
+        log.warning("[Phase 9] Editor's Pick 합성 실패 — 메시지 스킵")
+
+    # 메시지 4: PDF 빌드 + 발송 (모든 deep dive 포함)
+    log.info("[Phase 9] PDF 빌드 …")
     pdf_path = await _step_build_pdf(
         tickers=list(transcripts.keys()),
         fiscal_period=fiscal_label,
@@ -1360,12 +1272,15 @@ async def _run_pipeline(
     if pdf_path and pdf_path.exists():
         await send_pdf(
             bot, chat_id, pdf_path,
-            caption=f"📄 어닝콜 비교 분석 — {', '.join(tickers[:6])} · {fiscal_label}",
+            caption=(
+                f"📄 전체 deep dive — {', '.join(tickers[:6])} · {fiscal_label}\n"
+                "(synthesis · multi-perspective · counter · meta · 차트 · 재무)"
+            ),
         )
         log.info("[earnings: send_results 완료] PDF=%s tickers=%s grounded=%d/%d",
                  pdf_path.name, tickers, grounded_n, len(transcripts))
     else:
-        await _safe_send(bot, chat_id, "⚠️ PDF 생성 실패 — 텔레그램 텍스트만 확인해 주세요.")
+        await _safe_send(bot, chat_id, "⚠️ PDF 생성 실패 — 위 텔레그램 메시지만 확인해 주세요.")
         log.warning("[earnings: PDF 실패] tickers=%s", tickers)
 
 
@@ -2395,6 +2310,122 @@ async def _step_synthesize_counter(
         content = await loop.run_in_executor(None, _call)
     except Exception:
         log.exception("counter-thesis 합성 실패")
+        return None
+    return content or None
+
+
+# ------------------------------------------------------------------
+# Phase 9 — Editor's Pick (시장 기대 vs 진짜 중요한 것, Opus 1회)
+# ------------------------------------------------------------------
+async def _step_editors_pick(
+    transcripts: dict[str, dict],
+    financials: dict[str, Any],
+    fiscal_period: str,
+    verify_by_ticker: dict[str, list],
+    consensus_by_ticker: dict[str, Any] | None = None,
+    consensus_delta_by_ticker: dict[str, list] | None = None,
+    diff_by_ticker: dict[str, dict] | None = None,
+    ecosystem_by_ticker: dict[str, Any] | None = None,
+    insider_by_ticker: dict[str, Any] | None = None,
+    events_8k_by_ticker: dict[str, Any] | None = None,
+    risk_diff_by_ticker: dict[str, Any] | None = None,
+    hyper_walker: dict | None = None,
+    market_reaction_by_ticker: dict[str, Any] | None = None,
+    industry_summary: str = "",
+    counter_summary: str = "",
+    meta_text: str = "",
+) -> str | None:
+    """Phase 9 — PM Decision Brief 한 장 (Opus 1회). 1200-2000자 압축 합성.
+
+    합성·counter·meta가 끝난 뒤 호출 — 모든 컨텍스트가 모인 상태에서 PM이 30초에 의사결정할
+    Editor's Pick 출력. 텔레그램 메시지로 발송.
+    """
+    from src import summarizer
+    system = _load_prompt("earnings_editors_pick")
+    if not system:
+        log.warning("earnings_editors_pick.txt 로드 실패 — Editor's Pick 스킵")
+        return None
+    base_payload = _build_synthesis_payload(
+        transcripts, financials, fiscal_period, verify_by_ticker,
+        consensus_by_ticker, consensus_delta_by_ticker, diff_by_ticker,
+        ecosystem_by_ticker, insider_by_ticker, events_8k_by_ticker, risk_diff_by_ticker,
+        hyper_walker, market_reaction_by_ticker,
+    )
+    # 합성·counter·meta excerpt 첨가 — Editor's Pick은 이 결과의 가장 응축된 결론을 받아야 함
+    extras: list[str] = []
+    if industry_summary:
+        extras.append("## (참고) 비교합성 본문 excerpt (Opus 합성, 3000자):\n" + industry_summary[:3000])
+    if counter_summary:
+        extras.append("## (참고) Counter-thesis excerpt (Opus, 2000자):\n" + counter_summary[:2000])
+    if meta_text:
+        extras.append("## (참고) Multi-perspective meta excerpt (Opus, 1500자):\n" + meta_text[:1500])
+    user_payload = base_payload + ("\n\n" + "\n\n".join(extras) if extras else "")
+    loop = asyncio.get_running_loop()
+
+    def _call():
+        client = summarizer.get_client()
+        return summarizer.chat_with_retry(
+            client,
+            model=_synthesis_model(),  # Opus
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user_payload},
+            ],
+            temperature=0.3,
+            max_tokens=2800,
+            context="earnings-editors-pick",
+        )
+    try:
+        content = await loop.run_in_executor(None, _call)
+    except Exception:
+        log.exception("[Phase 9] Editor's Pick 합성 실패")
+        return None
+    return content or None
+
+
+# ------------------------------------------------------------------
+# Phase 9 — 어닝콜 한글 번역 (Sonnet 1회/종목)
+# ------------------------------------------------------------------
+async def _step_translate_transcript(ticker: str, tr: dict) -> str | None:
+    """Phase 9 — 종목별 extract → 자연스러운 한국어 본문 + 굵게/기울임 강조.
+
+    텔레그램 메시지로 발송 (parse_mode=Markdown). 3500-5500자 목표.
+    """
+    from src import summarizer
+    system = _load_prompt("earnings_transcript_korean")
+    if not system:
+        log.warning("earnings_transcript_korean.txt 로드 실패 — 번역 스킵 (%s)", ticker)
+        return None
+    # extract JSON 전체를 LLM에 그대로 (verbatim·인용 정보 보존 위해 트림 최소)
+    safe_tr = {
+        k: v for k, v in (tr or {}).items()
+        if not k.startswith("_") and k not in ("raw_text", "_consensus_snap")
+    }
+    user_payload = (
+        f"# 종목: {ticker}\n"
+        f"# 분기: {safe_tr.get('fiscal_period') or '?'}\n"
+        f"# Grounded: {safe_tr.get('grounded', False)}\n\n"
+        f"## 추출 JSON\n{json.dumps(safe_tr, ensure_ascii=False)[:18000]}"
+    )
+    loop = asyncio.get_running_loop()
+
+    def _call():
+        client = summarizer.get_client()
+        return summarizer.chat_with_retry(
+            client,
+            model=_extract_model(),  # Sonnet — 번역 작업이라 충분
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user_payload},
+            ],
+            temperature=0.2,
+            max_tokens=6500,
+            context=f"earnings-translate-{ticker}",
+        )
+    try:
+        content = await loop.run_in_executor(None, _call)
+    except Exception:
+        log.exception("[Phase 9] 한글 번역 실패 (%s)", ticker)
         return None
     return content or None
 
