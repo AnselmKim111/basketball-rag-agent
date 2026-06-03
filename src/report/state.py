@@ -59,10 +59,12 @@ def load_previous(date_iso: str) -> dict | None:
 def build_snapshot(date_iso: str, market_color: dict, theme_summary: dict,
                    theme_rows: list[dict], macro_summary: dict, breadth: dict,
                    korea_summary: dict, rsp_new_high: bool,
-                   highlights_meta: list[dict] | None = None) -> dict:
+                   highlights_meta: list[dict] | None = None,
+                   risk_gauge: dict | None = None) -> dict:
     """스냅샷 dict 생성 (JSON 직렬화 가능 값만).
 
     highlights_meta: watchlist에서 산출된 종목 메타 (다음날 F/U stream용).
+    risk_gauge: {score, label} — §0 위험선호 게이지 어제 대비 delta용.
     """
     leaders = [r["label"] for r in theme_rows
                if r.get("bucket") in ("주도지속", "새로 강해지는")]
@@ -81,6 +83,8 @@ def build_snapshot(date_iso: str, market_color: dict, theme_summary: dict,
         "breadth": breadth,
         "korea": korea_summary,
         "highlights_meta": highlights_meta or [],
+        "gauge_score": (risk_gauge or {}).get("score"),
+        "gauge_label": (risk_gauge or {}).get("label"),
     }
 
 
@@ -124,7 +128,18 @@ def compute_deltas(today: dict, prev: dict | None) -> dict:
         if isinstance(tv, (int, float)) and isinstance(pv, (int, float)) and pv:
             deltas_num[k] = round(tv - pv, 2)
 
-    # 6) 한국 수급 방향 반전
+    # 6) Risk 게이지 변화 (≥5점 또는 라벨 전환)
+    t_g = today.get("gauge_score"); p_g = prev.get("gauge_score")
+    if isinstance(t_g, (int, float)) and isinstance(p_g, (int, float)):
+        diff = round(float(t_g) - float(p_g), 1)
+        if abs(diff) >= 5:
+            arrow = "↑" if diff > 0 else "↓"
+            notes.append(f"Risk 게이지 {arrow} {abs(diff):.0f}점 ({p_g} → {t_g})")
+    t_lbl = today.get("gauge_label"); p_lbl = prev.get("gauge_label")
+    if t_lbl and p_lbl and t_lbl != p_lbl:
+        notes.append(f"Risk 라벨 전환: {p_lbl} → {t_lbl}")
+
+    # 7) 한국 수급 방향 반전
     for mkt in ("KOSPI", "KOSDAQ"):
         for inv in ("외국인", "기관", "개인"):
             tv = ((today.get("korea") or {}).get(mkt) or {}).get(inv)

@@ -431,3 +431,180 @@ def earnings_calendar_grid(upcoming: list[dict], out_dir: Path,
     theme.stamp(ax, date_iso)
     fig.tight_layout()
     return theme.save_fig(fig, out_dir, filename)
+
+
+def risk_gauge_visual(gauge: dict, prev_gauge_score: float | None,
+                      out_dir: Path, filename: str = "00_risk_gauge.png",
+                      date_iso: str | None = None) -> str | None:
+    """위험선호 반원 게이지 — 0~100 + 어제 대비 delta + 라벨.
+
+    gauge: {score, label, signals?}
+    prev_gauge_score: 어제 점수 (없으면 baseline 표시).
+    """
+    if not gauge or gauge.get("score") is None:
+        return None
+    theme.setup()
+    import matplotlib.pyplot as plt
+    import numpy as np
+    from matplotlib.patches import Wedge, FancyBboxPatch
+
+    score = float(gauge.get("score") or 50)
+    label = gauge.get("label") or ""
+    score = max(0.0, min(100.0, score))
+
+    fig, ax = plt.subplots(figsize=(12, 5.5))
+    ax.set_xlim(-1.3, 1.3); ax.set_ylim(-0.4, 1.25); ax.axis("off")
+
+    # 배경 5단 구간 (Risk-Off → Risk-On)
+    bands = [
+        (0, 30, "#c62828", "Risk-Off"),
+        (30, 45, "#ef6c00", "약 Risk-Off"),
+        (45, 55, "#9e9e9e", "중립"),
+        (55, 75, "#43a047", "약 Risk-On"),
+        (75, 100, "#1b5e20", "Risk-On"),
+    ]
+    for lo, hi, col, _ in bands:
+        # 0=180°(좌), 100=0°(우)
+        ang_lo = 180 - (lo / 100.0) * 180
+        ang_hi = 180 - (hi / 100.0) * 180
+        ax.add_patch(Wedge((0, 0), 1.0, ang_hi, ang_lo, width=0.28,
+                           facecolor=col, edgecolor="white", linewidth=1.5))
+
+    # 눈금 0/25/50/75/100
+    for tick in (0, 25, 50, 75, 100):
+        ang = np.radians(180 - (tick / 100.0) * 180)
+        rx, ry = np.cos(ang), np.sin(ang)
+        ax.plot([rx * 0.72, rx * 0.68], [ry * 0.72, ry * 0.68], color="#222", linewidth=1.2)
+        ax.text(rx * 0.62, ry * 0.62, str(tick), ha="center", va="center",
+                fontsize=9, color="#444")
+
+    # 바늘
+    ang = np.radians(180 - (score / 100.0) * 180)
+    nx, ny = np.cos(ang) * 0.92, np.sin(ang) * 0.92
+    ax.plot([0, nx], [0, ny], color="#111", linewidth=3, solid_capstyle="round")
+    ax.add_patch(plt.Circle((0, 0), 0.05, facecolor="#111", edgecolor="white", linewidth=1.5))
+
+    # 점수 텍스트 (중앙 아래)
+    ax.text(0, -0.18, f"{int(score)}/100", ha="center", va="center",
+            fontsize=26, fontweight="bold", color="#111")
+    ax.text(0, -0.32, label, ha="center", va="center", fontsize=14, color="#333")
+
+    # 어제 대비 delta
+    if isinstance(prev_gauge_score, (int, float)):
+        diff = score - float(prev_gauge_score)
+        arrow = "▲" if diff > 0 else ("▼" if diff < 0 else "·")
+        col = "#2e7d32" if diff > 0 else ("#c62828" if diff < 0 else "#666")
+        ax.text(0, 1.10, f"전일 {int(prev_gauge_score)}/100  {arrow}{abs(diff):.0f}점",
+                ha="center", va="center", fontsize=11, color=col, fontweight="bold")
+    else:
+        ax.text(0, 1.10, "전일 기준선 (snapshot 없음)",
+                ha="center", va="center", fontsize=10, color="#666")
+
+    ax.set_title("[위험선호 게이지] 0=Risk-Off · 50=중립 · 100=Risk-On",
+                 fontsize=13, fontweight="bold")
+    theme.stamp(ax, date_iso)
+    fig.tight_layout()
+    return theme.save_fig(fig, out_dir, filename)
+
+
+def followup_tracking_table(prev_highlights: list[dict], out_dir: Path,
+                            filename: str = "01_followup_table.png",
+                            date_iso: str | None = None) -> str | None:
+    """어제 watchlist 종목별 어제 5D → 오늘 5D 추적 표.
+
+    prev_highlights: snapshot.highlights_meta (어제 종목 list).
+    각 ticker 오늘 5D 재 fetch (cache 활용) → 표.
+    """
+    if not prev_highlights:
+        return None
+    theme.setup()
+    import matplotlib.pyplot as plt
+
+    # ticker별 오늘 5D fetch
+    from src.report.data import screener_adapter
+    from src.report.data.fetch_prices import fetch_ohlcv
+
+    def _today_5d(tkr: str, market: str) -> float | None:
+        try:
+            df = screener_adapter.load_ohlcv_df(tkr, market, days=15)
+            if df is None or len(df) < 6:
+                try:
+                    df = fetch_ohlcv(tkr, days=15)
+                except Exception:
+                    df = None
+            if df is None or len(df) < 6:
+                return None
+            close = df["Close"]
+            last = float(close.iloc[-1]); ref = float(close.iloc[-6])
+            return (last / ref - 1) * 100 if ref else None
+        except Exception:
+            return None
+
+    rows = []
+    for it in prev_highlights[:14]:  # 최대 14종목
+        tkr = it.get("ticker")
+        if not tkr:
+            continue
+        mkt = it.get("market") or "US"
+        prev_5d = it.get("chg_5d")
+        today_5d = _today_5d(tkr, mkt)
+        if today_5d is None:
+            today_5d_str = "N/A"
+            delta = None
+            cls = "—"
+        else:
+            today_5d_str = f"{today_5d:+.1f}%"
+            if prev_5d is not None:
+                delta = today_5d - float(prev_5d)
+                if delta >= 1:
+                    cls = "강화"
+                elif delta <= -1:
+                    cls = "약화"
+                else:
+                    cls = "유지"
+            else:
+                delta = None
+                cls = "신규"
+        rows.append({
+            "label": (it.get("label") or tkr).split("(")[0].strip(),
+            "ticker": tkr,
+            "market": mkt,
+            "sector": (it.get("sector") or "")[:14],
+            "prev_5d": f"{float(prev_5d):+.1f}%" if isinstance(prev_5d, (int, float)) else "—",
+            "today_5d": today_5d_str,
+            "delta": f"{delta:+.1f}" if delta is not None else "—",
+            "cls": cls,
+        })
+    if not rows:
+        return None
+
+    fig, ax = plt.subplots(figsize=(13, max(2.5, 0.45 * len(rows) + 1.5)))
+    ax.axis("off")
+    headers = ["종목", "티커", "시장", "섹터", "어제 5D", "오늘 5D", "Δ", "분류"]
+    cell_text = [[r["label"], r["ticker"], r["market"], r["sector"],
+                  r["prev_5d"], r["today_5d"], r["delta"], r["cls"]] for r in rows]
+    table = ax.table(cellText=cell_text, colLabels=headers, loc="center",
+                     cellLoc="center", colLoc="center")
+    table.auto_set_font_size(False)
+    table.set_fontsize(9)
+    table.scale(1, 1.5)
+    # 분류 색상
+    cls_col = {"강화": "#c8e6c9", "약화": "#ffcdd2", "유지": "#f5f5f5",
+               "신규": "#e3f2fd", "—": "#fafafa"}
+    for i, r in enumerate(rows, start=1):
+        for j in range(len(headers)):
+            cell = table[(i, j)]
+            if j == 7:  # 분류 셀
+                cell.set_facecolor(cls_col.get(r["cls"], "#fafafa"))
+            elif j == 6 and r["cls"] in ("강화", "약화"):
+                cell.set_facecolor("#e8f5e9" if r["cls"] == "강화" else "#ffebee")
+    # 헤더 진한 색
+    for j in range(len(headers)):
+        cell = table[(0, j)]
+        cell.set_facecolor("#37474f")
+        cell.set_text_props(color="white", fontweight="bold")
+    ax.set_title("[어제 watchlist 추적] 어제 5D → 오늘 5D · 신호 강화·약화·유지",
+                 fontsize=13, fontweight="bold")
+    theme.stamp(ax, date_iso)
+    fig.tight_layout()
+    return theme.save_fig(fig, out_dir, filename)

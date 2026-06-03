@@ -334,6 +334,9 @@ def _build_report():
 
     # ---------- §0 글로벌 위험선호 (표지 직후 시각 요약) ----------
     risk_gauge: dict = {"score": 50, "label": "중립", "signals": {}}
+    # 어제 게이지 점수 미리 fetch (snapshot 있으면) — 게이지 시각화 delta 표시용
+    prev_snapshot_early = state.load_previous(date_iso) or {}
+    prev_gauge_score = prev_snapshot_early.get("gauge_score") if prev_snapshot_early else None
     try:
         from src.report.data import fetch_global_risk
         from src.report.charts import global_risk_matrix
@@ -345,8 +348,25 @@ def _build_report():
                 "0. 글로벌 위험선호", key=True)
             log.info("[report] §0 글로벌 위험선호: %d자산·게이지 %d(%s)",
                      len(risk_rows), risk_gauge.get("score"), risk_gauge.get("label"))
+        # 게이지 반원 시각화 + 어제 대비 delta
+        add(flow_charts.risk_gauge_visual(risk_gauge, prev_gauge_score, img_dir, date_iso=date_iso),
+            "위험선호 게이지",
+            f"{risk_gauge.get('label')} {risk_gauge.get('score')}/100"
+            + (f" (전일 {int(prev_gauge_score)}, Δ{risk_gauge.get('score') - int(prev_gauge_score):+d})"
+               if isinstance(prev_gauge_score, (int, float)) else " (전일 기준선)"),
+            "0. 글로벌 위험선호")
     except Exception:
         log.exception("[report] 글로벌 위험선호 매트릭스 실패 — 생략")
+
+    # ---------- Follow-up 추적 표 (어제 watchlist 종목 어제 5D vs 오늘 5D) ----------
+    if prev_snapshot_early.get("highlights_meta"):
+        try:
+            add(flow_charts.followup_tracking_table(
+                    prev_snapshot_early["highlights_meta"], img_dir, date_iso=date_iso),
+                "어제 watchlist 추적", "어제 5D vs 오늘 5D · 강화·약화·유지 분류",
+                "Follow-up", key=True)
+        except Exception:
+            log.exception("[report] Follow-up 추적 표 실패 — 생략")
 
     # ---------- §1 매크로 ----------
     add(index_charts.us_indices_grid(us_idx, img_dir, date_iso=date_iso),
@@ -510,8 +530,9 @@ def _build_report():
 
     snapshot = state.build_snapshot(date_iso, rotation, theme_summary, theme_rows,
                                     macro_summary, breadth, korea_summary, rsp_new_high,
-                                    highlights_meta=highlights_snapshot_meta)
-    prev = state.load_previous(date_iso)
+                                    highlights_meta=highlights_snapshot_meta,
+                                    risk_gauge=risk_gauge)
+    prev = prev_snapshot_early or state.load_previous(date_iso)
     deltas = state.compute_deltas(snapshot, prev)
     state.save_snapshot(date_iso, snapshot)
     log.info("[report] deltas 계산 (baseline=%s, notes=%d)", deltas.get("baseline"), len(deltas.get("notes", [])))
