@@ -672,7 +672,9 @@ def fx_pressure_gauge(usdkrw_df, ewy_df, foreign_kospi_20d: float | None,
     else:
         label = "낮음"
 
-    fig, ax = plt.subplots(figsize=(12, 5.5))
+    # 게이지(좌) + 컴포넌트 기여도 bar(우) 통합 figure
+    fig, (ax, ax2) = plt.subplots(1, 2, figsize=(15, 5.5),
+                                   gridspec_kw={"width_ratios": [3, 2]})
     ax.set_xlim(-1.3, 1.3); ax.set_ylim(-0.4, 1.25); ax.axis("off")
 
     # 5단 색상 (반전 — 압력 ↑ = 빨강)
@@ -705,15 +707,6 @@ def fx_pressure_gauge(usdkrw_df, ewy_df, foreign_kospi_20d: float | None,
             fontsize=24, fontweight="bold", color="#111")
     ax.text(0, -0.28, label, ha="center", va="center", fontsize=14, color="#333")
 
-    # 컴포넌트 텍스트 (좌하단)
-    parts = [
-        f"USD/KRW 5D {krw_5d:+.2f}%",
-        f"EWY 5D {ewy_5d:+.2f}%" if ewy_5d is not None else "EWY 5D —",
-        f"외국인 KOSPI 20D {fk:+,.0f}억" if fk else "외국인 20D —",
-    ]
-    ax.text(-1.25, -0.35, "  ·  ".join(parts), ha="left", va="center",
-            fontsize=9, color="#555")
-
     # 전일 대비 delta
     if isinstance(prev_pressure, (int, float)):
         diff = score - float(prev_pressure)
@@ -724,9 +717,40 @@ def fx_pressure_gauge(usdkrw_df, ewy_df, foreign_kospi_20d: float | None,
     else:
         ax.text(0, 1.10, "전일 기준선", ha="center", va="center", fontsize=10, color="#666")
 
-    ax.set_title("[환전 압력 게이지] USD/KRW + EWY + 외국인 KOSPI 통합",
-                 fontsize=13, fontweight="bold")
+    ax.set_title("[환전 압력 게이지]", fontsize=13, fontweight="bold")
     theme.stamp(ax, date_iso)
+
+    # 컴포넌트 기여도 bar (우측)
+    contributions = []
+    contributions.append(("USD/KRW 5D", krw_5d * 20))
+    if ewy_5d is not None:
+        contributions.append(("EWY 5D", -ewy_5d * 20))
+    contributions.append(("외국인 KOSPI 20D", -fk / 250))
+    labels_c = [c[0] for c in contributions]
+    vals_c = [c[1] for c in contributions]
+    colors_c = ["#c62828" if v > 0 else ("#2e7d32" if v < 0 else "#9e9e9e") for v in vals_c]
+    y_pos = np.arange(len(labels_c))
+    ax2.barh(y_pos, vals_c, color=colors_c, alpha=0.85, edgecolor="#333", linewidth=0.5)
+    ax2.set_yticks(y_pos)
+    ax2.set_yticklabels(labels_c, fontsize=10, fontweight="bold")
+    ax2.invert_yaxis()
+    ax2.axvline(0, color="#333", linewidth=0.6)
+    ax2.set_xlabel("점수 기여 (+압력 ↑ · -압력 ↓)", fontsize=9)
+    ax2.set_title("컴포넌트 기여도", fontsize=11)
+    ax2.grid(axis="x", linestyle=":", alpha=0.4)
+    for i, v in enumerate(vals_c):
+        if v != 0:
+            ax2.text(v + (0.5 if v >= 0 else -0.5), i, f"{v:+.1f}",
+                     ha="left" if v >= 0 else "right", va="center", fontsize=9)
+    # raw 값 우측 annotation
+    raw_vals = [f"USD/KRW {krw_5d:+.2f}%",
+                f"EWY {ewy_5d:+.2f}%" if ewy_5d is not None else "EWY —",
+                f"{fk:+,.0f}억"]
+    raw_max = max([abs(v) for v in vals_c] + [1])
+    for i, raw_s in enumerate(raw_vals):
+        ax2.text(raw_max * 1.05, i, raw_s, ha="left", va="center",
+                 fontsize=8, color="#555")
+
     fig.tight_layout()
     out_path = theme.save_fig(fig, out_dir, filename)
     gauge_dict = {
