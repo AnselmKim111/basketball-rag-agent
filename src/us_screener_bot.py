@@ -356,7 +356,7 @@ def _permalink(channel: str, message_id: int) -> str | None:
 
 
 def _chart_caption(ticker: str, item: dict, cats: list[str], rows: list[dict],
-                   ytd, eps, market_cap=None) -> str:
+                   ytd, eps, market_cap=None, earnings_date: str | None = None) -> str:
     from src.us_screener import fundamentals
     from src.bot_helpers import html_escape
     name = html_escape(item.get("name") or ticker)
@@ -374,6 +374,8 @@ def _chart_caption(ticker: str, item: dict, cats: list[str], rows: list[dict],
         f"✝ 최근분기 EPS YoY : {_fmt_pct(eps)}",
         f'✝ <a href="https://finviz.com/quote.ashx?t={ticker}">최신 종목 뉴스 조회</a>',
     ]
+    if earnings_date:
+        lines.insert(3, f"⚡ 다음 어닝 : {html_escape(earnings_date)}")
     return "\n".join(lines)
 
 
@@ -412,6 +414,10 @@ async def _post_charts_and_meta(results: dict, max_tickers: int = 120) -> tuple[
     links: dict[str, str] = {}
     extra: dict[str, dict] = {}
     loop = asyncio.get_event_loop()
+    from src.us_screener import earnings_proximity
+    earnings_map = await loop.run_in_executor(
+        None, lambda: earnings_proximity.fetch_upcoming_earnings(set(by_ticker.keys()), days_fwd=7)
+    )
     posted = 0
     mcap_n = 0
     for t, it in list(by_ticker.items())[:max_tickers]:
@@ -420,7 +426,8 @@ async def _post_charts_and_meta(results: dict, max_tickers: int = 120) -> tuple[
             ytd = fundamentals.ytd_pct(rows)
             f = await loop.run_in_executor(None, lambda t=t: fundamentals.ticker_fundamentals(t))
             eps = f.get("eps_yoy")
-            extra[t] = {"ytd": ytd, "eps_yoy": eps}
+            ed = earnings_map.get(t)
+            extra[t] = {"ytd": ytd, "eps_yoy": eps, "earnings_date": ed}
             # 시가총액: DB값 우선, 없으면 SEC 발행주식수 × 종가($)
             mcap = it.get("market_cap")
             if not mcap and rows and f.get("shares"):
@@ -433,7 +440,8 @@ async def _post_charts_and_meta(results: dict, max_tickers: int = 120) -> tuple[
                         t, rows, title=f"{t} — {it.get('name', '')}"))
                 if png:
                     from src.bot_helpers import send_channel_photo
-                    cap = _chart_caption(t, it, badges[t], rows, ytd, eps, market_cap=mcap)
+                    cap = _chart_caption(t, it, badges[t], rows, ytd, eps, market_cap=mcap,
+                                         earnings_date=ed)
                     msg = await send_channel_photo(chart_bot, channel, png, cap, ParseMode.HTML)
                     if msg:
                         url = _permalink(channel, msg.message_id)
