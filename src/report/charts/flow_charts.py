@@ -608,3 +608,126 @@ def followup_tracking_table(prev_highlights: list[dict], out_dir: Path,
     theme.stamp(ax, date_iso)
     fig.tight_layout()
     return theme.save_fig(fig, out_dir, filename)
+
+
+def fx_pressure_gauge(usdkrw_df, ewy_df, foreign_kospi_20d: float | None,
+                      out_dir: Path, filename: str = "10_fx_pressure.png",
+                      prev_pressure: float | None = None,
+                      date_iso: str | None = None) -> tuple[str | None, dict]:
+    """환전 압력 게이지 — USD/KRW 5D + EWY 5D + 외국인 KOSPI 20D 통합 점수.
+
+    반환: (path, gauge_dict). gauge_dict = {score, label, components}.
+
+    압력 점수 (0~100, 기본 50):
+      + USD/KRW 5D ×20 (양수 = 압력 ↑)
+      - EWY 5D ×20 (양수 = 압력 ↓)
+      - 외국인 KOSPI 20D / 1e11 ×4 (음수 = 압력 ↑, 1조 매도 → 약 +40)
+    """
+    if usdkrw_df is None or len(usdkrw_df) < 7:
+        return None, {}
+    theme.setup()
+    import matplotlib.pyplot as plt
+    import numpy as np
+    from matplotlib.patches import Wedge
+
+    # 5D 변화 계산
+    def _pct_5d(df) -> float | None:
+        if df is None or len(df) < 7:
+            return None
+        try:
+            return (float(df["Close"].iloc[-1]) / float(df["Close"].iloc[-6]) - 1) * 100
+        except Exception:
+            return None
+
+    krw_5d = _pct_5d(usdkrw_df) or 0.0
+    ewy_5d = _pct_5d(ewy_df)
+    # 외국인 KOSPI 20D 누적 (억원 단위로 보임)
+    fk = float(foreign_kospi_20d) if isinstance(foreign_kospi_20d, (int, float)) else 0.0
+
+    # 점수 (cap 0-100)
+    score = 50.0
+    score += krw_5d * 20
+    if ewy_5d is not None:
+        score -= ewy_5d * 20
+    # 외국인 매도 (억원, 음수 = 매도): -10000억 = -1조 → +40점
+    score -= fk / 250  # -10000(억원) / 250 = -40 → -(-40) = +40
+    score = max(0.0, min(100.0, score))
+
+    if score >= 75:
+        label = "매우 강함"
+    elif score >= 60:
+        label = "강함"
+    elif score >= 45:
+        label = "중간"
+    elif score >= 30:
+        label = "약함"
+    else:
+        label = "낮음"
+
+    fig, ax = plt.subplots(figsize=(12, 5.5))
+    ax.set_xlim(-1.3, 1.3); ax.set_ylim(-0.4, 1.25); ax.axis("off")
+
+    # 5단 색상 (반전 — 압력 ↑ = 빨강)
+    bands = [
+        (0, 30, "#43a047"),    # 낮음 — 녹
+        (30, 45, "#9e9e9e"),   # 약함 — 회
+        (45, 60, "#ef6c00"),   # 중간 — 주황
+        (60, 75, "#d84315"),   # 강함 — 빨강
+        (75, 100, "#b71c1c"),  # 매우 강함 — 진빨강
+    ]
+    for lo, hi, col in bands:
+        ang_lo = 180 - (lo / 100.0) * 180
+        ang_hi = 180 - (hi / 100.0) * 180
+        ax.add_patch(Wedge((0, 0), 1.0, ang_hi, ang_lo, width=0.28,
+                           facecolor=col, edgecolor="white", linewidth=1.5))
+
+    for tick in (0, 25, 50, 75, 100):
+        ang = np.radians(180 - (tick / 100.0) * 180)
+        rx, ry = np.cos(ang), np.sin(ang)
+        ax.plot([rx * 0.72, rx * 0.68], [ry * 0.72, ry * 0.68], color="#222", linewidth=1.2)
+        ax.text(rx * 0.62, ry * 0.62, str(tick), ha="center", va="center",
+                fontsize=9, color="#444")
+
+    ang = np.radians(180 - (score / 100.0) * 180)
+    nx, ny = np.cos(ang) * 0.92, np.sin(ang) * 0.92
+    ax.plot([0, nx], [0, ny], color="#111", linewidth=3, solid_capstyle="round")
+    ax.add_patch(plt.Circle((0, 0), 0.05, facecolor="#111", edgecolor="white", linewidth=1.5))
+
+    ax.text(0, -0.14, f"{int(score)}/100", ha="center", va="center",
+            fontsize=24, fontweight="bold", color="#111")
+    ax.text(0, -0.28, label, ha="center", va="center", fontsize=14, color="#333")
+
+    # 컴포넌트 텍스트 (좌하단)
+    parts = [
+        f"USD/KRW 5D {krw_5d:+.2f}%",
+        f"EWY 5D {ewy_5d:+.2f}%" if ewy_5d is not None else "EWY 5D —",
+        f"외국인 KOSPI 20D {fk:+,.0f}억" if fk else "외국인 20D —",
+    ]
+    ax.text(-1.25, -0.35, "  ·  ".join(parts), ha="left", va="center",
+            fontsize=9, color="#555")
+
+    # 전일 대비 delta
+    if isinstance(prev_pressure, (int, float)):
+        diff = score - float(prev_pressure)
+        arrow = "▲" if diff > 0 else ("▼" if diff < 0 else "·")
+        col = "#c62828" if diff > 0 else ("#2e7d32" if diff < 0 else "#666")
+        ax.text(0, 1.10, f"전일 {int(prev_pressure)}/100  {arrow}{abs(diff):.0f}점",
+                ha="center", va="center", fontsize=11, color=col, fontweight="bold")
+    else:
+        ax.text(0, 1.10, "전일 기준선", ha="center", va="center", fontsize=10, color="#666")
+
+    ax.set_title("[환전 압력 게이지] USD/KRW + EWY + 외국인 KOSPI 통합",
+                 fontsize=13, fontweight="bold")
+    theme.stamp(ax, date_iso)
+    fig.tight_layout()
+    out_path = theme.save_fig(fig, out_dir, filename)
+    gauge_dict = {
+        "score": int(score),
+        "label": label,
+        "components": {
+            "usdkrw_5d": round(krw_5d, 2),
+            "ewy_5d": round(ewy_5d, 2) if ewy_5d is not None else None,
+            "foreign_kospi_20d": round(fk),
+        },
+    }
+    return out_path, gauge_dict

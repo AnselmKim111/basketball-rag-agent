@@ -125,6 +125,11 @@ stale_data.
    숨고르기 K개 / 소외·빈집 L개" fact 인용 + 자금 흐름 narrative.
 4. IPO·환전 임팩트 — DXY·USD/KRW↔EWY 동조. "매그7·한국 메모리 매도→환전→IPO 청약 현금" 류 가설은
    반드시 '가설' 표기. 신호 수치: USD/KRW 임계·EWY 지지/저항 — fact만.
+   **환전 압력 게이지(10_fx_pressure)**: USD/KRW 5D + EWY 5D + 외국인 KOSPI 20D 통합 0~100점.
+   본문에 1회 인용 — "환전 압력 X/100 (전일 Y, Δ±Z)" fact + 라벨(낮음/약함/중간/강함/매우 강함)을
+   thesis 강화/약화 사슬에 직접 연결. ≥60점 = "강함" 이상이면 한국 자금 이탈·IPO 청약 압력
+   가설 강화. ≤30점이면 가설 무효 가능성. signals.components(usdkrw_5d/ewy_5d/foreign_kospi_20d)
+   세 컴포넌트 중 어느 것이 압력의 핵심 driver인지 명시.
 5. 어닝 모멘텀 — earnings 기반.
    - **최근 실적**: beat율·평균 서프라이즈로 모멘텀 판단, top beats/misses 인용.
    - **다가올 일정** (earnings.upcoming = 다음 ~12일 발표 예정 15개까지): 시총 큰 순 5-10개를 다음 형식으로 listing —

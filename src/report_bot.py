@@ -442,6 +442,30 @@ def _build_report():
         add(flow_charts.usdkrw_ewy_dual(fx["USD/KRW"], ewy, img_dir, date_iso=date_iso),
             "USD/KRW ↔ EWY", "환전 압력 (가설)", "4. IPO·환전 임팩트", key=False)
 
+    # 환전 압력 게이지 (USD/KRW + EWY + 외국인 KOSPI 20D 통합 0~100)
+    fx_gauge: dict = {}
+    if fx.get("USD/KRW") is not None:
+        foreign_kospi_20d = None
+        try:
+            if kr_flows and "KOSPI" in kr_flows:
+                kdf = kr_flows["KOSPI"]
+                if "외국인" in kdf.columns:
+                    foreign_kospi_20d = float(kdf["외국인"].iloc[-20:].sum())
+        except Exception:
+            pass
+        prev_fx_pressure = prev_snapshot_early.get("fx_pressure_score") if prev_snapshot_early else None
+        _fx_path, fx_gauge = flow_charts.fx_pressure_gauge(
+            fx.get("USD/KRW"), ewy, foreign_kospi_20d, img_dir,
+            prev_pressure=prev_fx_pressure, date_iso=date_iso)
+        if _fx_path:
+            cap = f"{fx_gauge.get('label')} {fx_gauge.get('score')}/100"
+            if isinstance(prev_fx_pressure, (int, float)):
+                diff = fx_gauge.get("score", 50) - int(prev_fx_pressure)
+                cap += f" (전일 {int(prev_fx_pressure)}, Δ{diff:+d})"
+            else:
+                cap += " (전일 기준선)"
+            add(_fx_path, "환전 압력 게이지", cap, "4. IPO·환전 임팩트", key=True)
+
     # ---------- §6 개별 종목 하이라이트 — 통합 watchlist (5 stream) ----------
     from src.report.data import watchlist as _wl
     prev_snapshot_for_wl = state.load_previous(date_iso)
@@ -531,7 +555,8 @@ def _build_report():
     snapshot = state.build_snapshot(date_iso, rotation, theme_summary, theme_rows,
                                     macro_summary, breadth, korea_summary, rsp_new_high,
                                     highlights_meta=highlights_snapshot_meta,
-                                    risk_gauge=risk_gauge)
+                                    risk_gauge=risk_gauge,
+                                    fx_pressure=fx_gauge)
     prev = prev_snapshot_early or state.load_previous(date_iso)
     deltas = state.compute_deltas(snapshot, prev)
     state.save_snapshot(date_iso, snapshot)
