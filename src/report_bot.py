@@ -348,6 +348,10 @@ def _build_report():
                 "0. 글로벌 위험선호", key=True)
             log.info("[report] §0 글로벌 위험선호: %d자산·게이지 %d(%s)",
                      len(risk_rows), risk_gauge.get("score"), risk_gauge.get("label"))
+        # 6대 자산군 1D·5D 평균 — Risk 게이지 기여 구조
+        add(flow_charts.risk_component_breakdown(risk_rows, img_dir, date_iso=date_iso),
+            "6대 자산군 1D·5D", "Risk 게이지 기여 구조 — 자산군별 평균 등락",
+            "0. 글로벌 위험선호")
         # 게이지 반원 시각화 + 어제 대비 delta
         add(flow_charts.risk_gauge_visual(risk_gauge, prev_gauge_score, img_dir, date_iso=date_iso),
             "위험선호 게이지",

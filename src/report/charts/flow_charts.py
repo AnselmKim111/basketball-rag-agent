@@ -763,3 +763,81 @@ def fx_pressure_gauge(usdkrw_df, ewy_df, foreign_kospi_20d: float | None,
         },
     }
     return out_path, gauge_dict
+
+
+def risk_component_breakdown(rows: list[dict], out_dir: Path,
+                             filename: str = "00b_risk_components.png",
+                             date_iso: str | None = None) -> str | None:
+    """6대 자산군별 1D·5D 평균 — Risk gauge 점수의 기여 구조."""
+    if not rows:
+        return None
+    theme.setup()
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    # group별 평균
+    groups: dict[str, list[tuple[float, float]]] = {}
+    for r in rows:
+        g = r.get("group") or "기타"
+        d1 = r.get("d1"); d5 = r.get("d5")
+        if d1 is None and d5 is None:
+            continue
+        groups.setdefault(g, []).append((d1, d5))
+    if not groups:
+        return None
+
+    order = ["주식", "채권", "원자재", "통화", "암호"]
+    items = []
+    for g in order:
+        if g in groups:
+            vals = groups[g]
+            d1_avg = float(np.mean([v[0] for v in vals if v[0] is not None] or [0]))
+            d5_avg = float(np.mean([v[1] for v in vals if v[1] is not None] or [0]))
+            items.append((g, d1_avg, d5_avg))
+    # order 외 자산군
+    for g in groups:
+        if g not in order:
+            vals = groups[g]
+            d1_avg = float(np.mean([v[0] for v in vals if v[0] is not None] or [0]))
+            d5_avg = float(np.mean([v[1] for v in vals if v[1] is not None] or [0]))
+            items.append((g, d1_avg, d5_avg))
+
+    fig, ax = plt.subplots(figsize=(13, max(4, 0.6 * len(items) + 1.8)))
+    y = np.arange(len(items))
+    h = 0.38
+    d1_vals = [it[1] for it in items]
+    d5_vals = [it[2] for it in items]
+
+    def _col(v):
+        if v >= 0.5:
+            return "#1b5e20"
+        if v >= 0:
+            return "#43a047"
+        if v >= -0.5:
+            return "#ef6c00"
+        return "#c62828"
+
+    c1 = [_col(v) for v in d1_vals]
+    c5 = [_col(v) for v in d5_vals]
+    ax.barh(y + h / 2, d1_vals, height=h, color=c1, edgecolor="#333", linewidth=0.4, label="1D")
+    ax.barh(y - h / 2, d5_vals, height=h, color=c5, edgecolor="#333", linewidth=0.4, alpha=0.6, label="5D")
+    ax.set_yticks(y)
+    ax.set_yticklabels([it[0] for it in items], fontsize=11, fontweight="bold")
+    ax.invert_yaxis()
+    ax.axvline(0, color="#333", linewidth=0.6)
+    ax.set_xlabel("평균 등락률 (%)", fontsize=9)
+    ax.grid(axis="x", linestyle=":", alpha=0.4)
+    ax.legend(fontsize=9, loc="lower right")
+    mx = max([abs(v) for v in d1_vals + d5_vals] + [0.5])
+    for i, (g, v1, v5) in enumerate(items):
+        ax.text(v1 + (mx * 0.04 if v1 >= 0 else -mx * 0.04), i + h / 2,
+                f"{v1:+.2f}%", va="center", ha="left" if v1 >= 0 else "right",
+                fontsize=8, color="#222")
+        ax.text(v5 + (mx * 0.04 if v5 >= 0 else -mx * 0.04), i - h / 2,
+                f"{v5:+.2f}%", va="center", ha="left" if v5 >= 0 else "right",
+                fontsize=8, color="#555")
+    ax.set_title("[6대 자산군 1D·5D 평균] Risk 게이지 기여 구조",
+                 fontsize=13, fontweight="bold")
+    theme.stamp(ax, date_iso)
+    fig.tight_layout()
+    return theme.save_fig(fig, out_dir, filename)
