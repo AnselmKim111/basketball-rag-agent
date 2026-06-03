@@ -1440,6 +1440,8 @@ def build_pdf(
         korean_translations = korean_translations or {}
 
         use_v2 = os.getenv("EARNINGS_PDF_V2", "1") == "1"
+        log.info("[Phase 10] build_pdf entry: use_v2=%s editors_pick=%d ko_translations=%d",
+                 use_v2, len(editors_pick_kr or ""), len(korean_translations or {}))
 
         with PdfPages(str(output_path)) as pdf:
             if use_v2:
