@@ -1815,12 +1815,26 @@ async def _send_narrow_summary(bot: Bot, chat_id: str, narrow: dict) -> None:
 async def _send_scatter_chart(
     bot: Bot, chat_id: str, idea_text: str, all30_scored: list[dict],
 ) -> None:
-    """30종목 4축 산점도 PNG 발송. 차트 생성/발송 어느 단계 실패해도 봇은 계속."""
+    """30종목 4축 산점도 PNG 발송. 차트 생성/발송 어느 단계 실패해도 봇은 계속.
+
+    ScreenerBot signal hit 종목은 ★ 빨간 외곽선으로 강조.
+    """
     loop = asyncio.get_running_loop()
+
+    # ScreenerBot 신호 hit 종목 ticker 집합 (14일)
+    momentum_tickers: set[str] = set()
+    try:
+        from src.cross_bot import screener_query
+        if screener_query.is_available():
+            by_ticker = screener_query.get_recent_signals(days_back=14)
+            momentum_tickers = set(by_ticker.keys())
+    except Exception:
+        log.exception("산점도용 momentum_tickers 수집 실패 — 강조 없이 진행")
+
     try:
         from src import idea_chart
         png_bytes = await loop.run_in_executor(
-            None, idea_chart.build, idea_text, all30_scored,
+            None, idea_chart.build, idea_text, all30_scored, momentum_tickers,
         )
     except Exception:
         log.exception("산점도 생성 단계 실패 — 차트 스킵")
@@ -1828,15 +1842,23 @@ async def _send_scatter_chart(
     if not png_bytes:
         log.info("산점도 PNG 비어있음 — 스킵 (all30_scored=%d개)", len(all30_scored))
         return
+    caption = (
+        "📊 30 후보 4축 산점도\n"
+        "X=매출가속, Y=고정비비중, 점크기=마진민감도, 색=가동률여유\n"
+        "오른쪽 위 + 큰 점 + 진한 색 = 영업레버리지 강한 zone"
+    )
+    if momentum_tickers:
+        hit_in_chart = sum(
+            1 for it in all30_scored
+            if (it.get("ticker6") or "").strip() in momentum_tickers
+        )
+        if hit_in_chart > 0:
+            caption += f"\n★ ScreenerBot 신호 hit: {hit_in_chart}종목 빨간 외곽선 강조"
     try:
         await bot.send_photo(
             chat_id=chat_id,
             photo=png_bytes,
-            caption=(
-                "📊 30 후보 4축 산점도\n"
-                "X=매출가속, Y=고정비비중, 점크기=마진민감도, 색=가동률여유\n"
-                "오른쪽 위 + 큰 점 + 진한 색 = 영업레버리지 강한 zone"
-            ),
+            caption=caption,
         )
     except Exception:
         log.exception("산점도 텔레그램 발송 실패 — 무시하고 계속")
