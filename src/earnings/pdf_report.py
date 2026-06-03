@@ -42,7 +42,7 @@ def _strip_emoji(s: str) -> str:
 
 
 # ------------------------------------------------------------------
-# Phase 10 — 네이버 톤 스타일 상수
+# Phase 10 — 네이버 톤 스타일 상수 + 페이지 레이아웃
 # ------------------------------------------------------------------
 STYLE = {
     "navy":     "#0b3d91",
@@ -55,6 +55,17 @@ STYLE = {
     "green":    "#1b5e20",
     "red":      "#b71c1c",
 }
+
+# A4 페이지 좌표 (inches). matplotlib axis 좌표는 fig 내부 비율(0~1).
+PAGE_W, PAGE_H = 8.27, 11.69
+# 본문 axis (좌표 기준). add_axes([left, bottom, width, height])
+CONTENT_AXES = [0.06, 0.04, 0.88, 0.92]
+# 본문 진입 시 y 시작 / 본문 하한 (BOTTOM 미만 시 새 페이지)
+Y_TOP = 0.93
+Y_BOTTOM = 0.03
+# Markdown 본문 렌더 기본값
+BODY_SIZE = 9.0
+LINE_H = 0.0175
 
 
 def _wrap_text(text: str, width: int = 95) -> list[str]:
@@ -742,7 +753,7 @@ def _clean_md_inline(text: str) -> str:
 def _strip_md_inline_keep_text(text: str) -> str:
     """굵게/인용/citation 마크업만 제거, 텍스트 그대로 유지 (graceful fallback)."""
     s = text or ""
-    s = _MD_CITATION_RE.sub(lambda m: "", s)
+    s = _MD_CITATION_RE.sub("", s)
     s = re.sub(r"\*\*([^*]+)\*\*", r"\1", s)
     s = re.sub(r"`([^`]+)`", r"\1", s)
     s = re.sub(r"_([^_]+)_", r"\1", s)
@@ -858,8 +869,9 @@ def _render_inline_styled(ax, x: float, y: float, text: str, *, base_size: float
 
 
 def _new_md_page(plt, title: str, *, title_box: bool = True):
-    fig = plt.figure(figsize=(8.27, 11.69))
-    ax = fig.add_axes([0.06, 0.04, 0.88, 0.92])
+    """Markdown 본문 페이지 1장 생성. title_box=True면 상단 파란 띠 + 흰 타이틀."""
+    fig = plt.figure(figsize=(PAGE_W, PAGE_H))
+    ax = fig.add_axes(CONTENT_AXES)
     ax.set_axis_off()
     ax.set_xlim(0, 1)
     ax.set_ylim(0, 1)
@@ -888,8 +900,7 @@ def _render_markdown_block(pdf, title: str, md_text: str, *, footer: str = "") -
         return _new_md_page(plt, title + suffix)
 
     fig, ax = start_page()
-    y = 0.93
-    BOTTOM = 0.03
+    y = Y_TOP
 
     def new_page():
         nonlocal fig, ax, y
@@ -898,12 +909,9 @@ def _render_markdown_block(pdf, title: str, md_text: str, *, footer: str = "") -
         pdf.savefig(fig)
         plt.close(fig)
         fig, ax = start_page()
-        y = 0.93
+        y = Y_TOP
 
-    BODY_SIZE = 9.0
-    LINE_H = 0.0175
-
-    for idx, tok in enumerate(tokens):
+    for tok in tokens:
         t = tok["type"]
 
         # widow guard: heading이 페이지 끝 직전이면 강제 새 페이지
@@ -912,25 +920,25 @@ def _render_markdown_block(pdf, title: str, md_text: str, *, footer: str = "") -
 
         if t == "heading":
             level = tok["level"]
-            txt = tok["text"]
+            txt = _strip_emoji(tok["text"])
             if level == 1:
                 if y < 0.10:
                     new_page()
                 ax.add_patch(plt.Rectangle((0, y - 0.036), 1, 0.034, facecolor=STYLE["navy"]))
-                ax.text(0.01, y - 0.008, _strip_emoji(txt), fontsize=13, fontweight="bold",
+                ax.text(0.01, y - 0.008, txt, fontsize=13, fontweight="bold",
                         color="white", va="center")
                 y -= 0.048
             elif level == 2:
                 if y < 0.07:
                     new_page()
                 ax.add_patch(plt.Rectangle((0.0, y - 0.024), 0.006, 0.022, facecolor=STYLE["navy"]))
-                ax.text(0.015, y, _strip_emoji(txt), fontsize=11.5, fontweight="bold",
+                ax.text(0.015, y, txt, fontsize=11.5, fontweight="bold",
                         color=STYLE["navy"], va="top")
                 y -= 0.030
             else:  # level 3
                 if y < 0.05:
                     new_page()
-                ax.text(0.0, y, _strip_emoji(txt), fontsize=10, fontweight="bold",
+                ax.text(0.0, y, txt, fontsize=10, fontweight="bold",
                         color=STYLE["ink"], va="top")
                 y -= 0.022
 
@@ -939,10 +947,9 @@ def _render_markdown_block(pdf, title: str, md_text: str, *, footer: str = "") -
 
         elif t == "bullet":
             indent = tok["indent"]
-            txt = tok["text"]
-            wrapped = _wrap_text_kr(txt, width=int(100 - indent * 6))
+            wrapped = _wrap_text_kr(tok["text"], width=int(100 - indent * 6))
             for j, line in enumerate(wrapped):
-                if y < BOTTOM:
+                if y < Y_BOTTOM:
                     new_page()
                 prefix = "  " * indent + ("• " if j == 0 else "  ")
                 ax.text(0.0, y, prefix, fontsize=BODY_SIZE, color=STYLE["body"], va="top")
@@ -951,10 +958,9 @@ def _render_markdown_block(pdf, title: str, md_text: str, *, footer: str = "") -
                 y -= LINE_H
 
         elif t == "blockquote":
-            txt = tok["text"]
-            wrapped = _wrap_text_kr(txt, width=92)
+            wrapped = _wrap_text_kr(tok["text"], width=92)
             block_h = LINE_H * len(wrapped) + 0.006
-            if y - block_h < BOTTOM:
+            if y - block_h < Y_BOTTOM:
                 new_page()
             ax.add_patch(plt.Rectangle((0.0, y - block_h), 1.0, block_h, facecolor=STYLE["panel_bg"], zorder=0))
             ax.add_patch(plt.Rectangle((0.0, y - block_h), 0.006, block_h, facecolor=STYLE["muted"]))
@@ -970,15 +976,14 @@ def _render_markdown_block(pdf, title: str, md_text: str, *, footer: str = "") -
             if not rows:
                 continue
             est_h = 0.022 * len(rows) + 0.015
-            if y - est_h < BOTTOM:
+            if y - est_h < Y_BOTTOM:
                 new_page()
             y = _draw_md_table(ax, rows, y, max_width=1.0)
 
         elif t == "para":
-            txt = tok["text"]
-            wrapped = _wrap_text_kr(txt, width=100)
+            wrapped = _wrap_text_kr(tok["text"], width=100)
             for line in wrapped:
-                if y < BOTTOM:
+                if y < Y_BOTTOM:
                     new_page()
                 _render_inline_styled(ax, 0.0, y, line, base_size=BODY_SIZE, base_color=STYLE["body"])
                 y -= LINE_H
@@ -1451,8 +1456,8 @@ def build_pdf(
         korean_translations = korean_translations or {}
 
         use_v2 = os.getenv("EARNINGS_PDF_V2", "1") == "1"
-        log.info("[Phase 10] build_pdf entry: use_v2=%s editors_pick=%d ko_translations=%d",
-                 use_v2, len(editors_pick_kr or ""), len(korean_translations or {}))
+        log.debug("[pdf] entry v2=%s pick=%d ko=%d",
+                  use_v2, len(editors_pick_kr or ""), len(korean_translations or {}))
 
         with PdfPages(str(output_path)) as pdf:
             if use_v2:
