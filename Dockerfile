@@ -14,6 +14,9 @@ RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
 # 소스 코드 + 편집 가능 프롬프트
+# Phase 10 cache buster (Docker layer cache 강제 invalidate)
+ARG CACHEBUST=phase10-2026-06-03-0410
+RUN echo "cache buster: ${CACHEBUST}"
 COPY src ./src
 COPY prompts ./prompts
 
