@@ -30,11 +30,15 @@ EMBED_DIM = 1536  # text-embedding-3-small 기본 차원
 
 KST = timezone(timedelta(hours=9))
 
-# OpenAI embeddings: 1 request당 max 300K tokens cap (max_tokens_per_request).
-# 한국어 ~3 chars/token이라 12000 chars × 50 = 600K chars / 3 = 200K tokens 정도.
-# 안전 마진 유지 (BadRequestError 발생 시 자동 분할 재시도도 추가).
+# OpenAI text-embedding-3-small 제약:
+#   1) 단일 input max 8192 tokens
+#   2) 1 request 누적 max 300K tokens
+# 한국어 ~3 chars/token, 영어/숫자 mixed ~1 char/token. 보수적으로 1 char=1 token 가정.
+# → 단일 input 6000 chars cap → 영어 100% 케이스도 6000 tokens < 8192.
+# → batch 50 × 6000 chars = 300K chars / 3 = 100K tokens (한국어 기준), 영어도 300K = cap 경계.
+# 안전 마진 + BadRequestError 발생 시 자동 분할·truncate 재시도도 추가.
 DEFAULT_BATCH_SIZE = 50
-DEFAULT_MAX_TOKENS_PER_INPUT = 4000  # text-embedding-3-small은 8191 max, 4000으로 cap
+DEFAULT_MAX_TOKENS_PER_INPUT = 2000  # 6000 chars 보수적 cap
 
 
 class EmbeddingError(RuntimeError):
@@ -118,15 +122,25 @@ def embed_texts(
                     f"[{provider}] embeddings endpoint 미지원 또는 모델 '{model}' 없음. "
                     "OPENAI_API_KEY 설정 권장."
                 ) from e
-            # 300K tokens cap 초과 — 절반으로 분할 재시도
+            # 300K tokens/request cap 초과 — batch 절반으로 분할 재시도
             if "max_tokens_per_request" in msg or "max tokens per request" in msg.lower():
                 if len(chunk) <= 1:
                     log.warning("[embedding] 단일 텍스트가 300K 초과 — skip idx=%d", chunk[0][0])
                     return
                 mid = len(chunk) // 2
-                log.info("[embedding] batch %d → %d+%d로 분할 (tokens cap)", len(chunk), mid, len(chunk) - mid)
+                log.info("[embedding] batch %d → %d+%d로 분할 (300K cap)", len(chunk), mid, len(chunk) - mid)
                 _call_with_split(chunk[:mid])
                 _call_with_split(chunk[mid:])
+                return
+            # 단일 input이 8192 tokens 초과 — 모든 input을 절반으로 truncate 후 재시도
+            if "maximum input length" in msg or "8192 tokens" in msg or "max_tokens" in msg.lower():
+                # 평균보다 긴 input들이 있다는 신호 — 일률적으로 절반 truncate
+                truncated = [(idx, t[: max(1000, len(t) // 2)]) for idx, t in chunk]
+                avg_old = sum(len(t) for _, t in chunk) // max(1, len(chunk))
+                avg_new = sum(len(t) for _, t in truncated) // max(1, len(truncated))
+                log.info("[embedding] input 길이 초과 — avg %d→%d chars truncate 재시도", avg_old, avg_new)
+                # truncate 후에도 token cap이면 또 split될 것
+                _call_with_split(truncated)
                 return
             raise
         for (orig_idx, _txt), data in zip(chunk, resp.data):
