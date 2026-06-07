@@ -39,13 +39,16 @@
 ## 3. 배포 흐름
 
 - **개발 브랜치**: `claude/idea-bot-stock-analysis-i6HuR`
-- **Railway 추적 브랜치**: `claude/wisereport-auto-downloader-C7C8l` (다른 세션과 공유)
-- **푸시 패턴**: 두 브랜치 모두에 푸시
-  ```
+- **Railway 실제 watch 브랜치 (2026-06-07 확인)**: `claude/stock-screening-feature-2Jo4X`
+  → `deployment(id).meta.branch`로 확인. 이 브랜치에 push 안 하면 deploy 안 됨.
+- **보조 브랜치**: `claude/wisereport-auto-downloader-C7C8l` (다른 세션 공유용)
+- **푸시 패턴**: 세 브랜치 모두에 push 필수:
+  ```bash
+  git push origin claude/idea-bot-stock-analysis-i6HuR:claude/stock-screening-feature-2Jo4X  # deploy 트리거
   git push origin claude/idea-bot-stock-analysis-i6HuR:claude/wisereport-auto-downloader-C7C8l
   git push origin claude/idea-bot-stock-analysis-i6HuR
   ```
-- **다른 세션 충돌 시**: `git fetch + git merge --no-edit` 후 재푸시
+- **다른 세션 충돌 시**: `git fetch origin <branch> + git merge --no-edit FETCH_HEAD` 후 재푸시.
 
 ## 4. 자동 검증 도구
 
