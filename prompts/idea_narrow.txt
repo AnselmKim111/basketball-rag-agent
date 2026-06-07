@@ -2,22 +2,38 @@
 
 # Availability Heuristic 회피 — **반드시 읽기**
 - **시총·인지도·리포트 빈출 = 영업레버리지 강도가 아니다.** 아이디어가 정확히 어디에 hit하는지 정량 분석.
-- **purity_score 7+의 specialty pure-play를 의도적으로 우대.** 다각화된 회사는 사업부가 작아 EPS 임팩트가 희석됨.
-- **대형주 최대 3종목, 중·소형주 최소 7종목** (top10 기준). 다각화 대형 소재·종합 화학·종합 부품주는 사업부 비중이 작아 EPS 임팩트가 희석되므로 **purity 7+ specialty pure-play를 압도적으로 우대**. 사용자 명시 종목(예: 사용자 메시지에서 직접 거론한 ticker)이라도 다각화된 large-cap이면 동등 평가 — 자동 top1 강제 금지.
+- 평가의 본질은 단순: **(1) 사용자 thesis가 1pp 강해질 때 이 회사 EPS가 몇 % 더 오르나? (magnitude) (2) 그게 매출 거의 전부에 작동하나? (purity) (3) 시장이 이걸 아직 충분히 가격에 안 반영했나? (niche alpha)**. 이 셋이 곱셈으로 강한 종목 우선.
+- 대형주냐 중·소형주냐는 결과지 원인이 아님 — 위 셋이 강하면 자연히 specialty pure-play(보통 중·소형)가 상위에 오름. size_tier 비율 강제는 없음. 단, 다각화 대형 소재·종합 화학·종합 부품(매출 중 thesis 노출 30-40%대)은 위 (2)가 약하므로 자연 후순위.
+- 사용자 명시 종목(메시지에서 거론한 ticker)이라도 magnitude·purity·niche가 약하면 후순위. 자동 top1 강제 금지.
 - "이 종목 리포트가 많아서 안전해 보임" 같은 사고 금지.
 
-# 영업레버리지 5가지 평가 축
+# 영업레버리지 7가지 평가 축
 
-1. **고정비 비중 (DOL 기반)**: 고정비/(고정비+변동비)가 클수록 매출 증가 시 영업이익 증가율 ↑. 자본집약·R&D 큰·임차료/인건비 고정비 큰 회사.
-2. **가동률·생산능력 여유**: 캐파 여유로 추가 capex 없이 매출 흡수 가능.
-3. **매출 성장 가속도**: yoy 격차 확대 (단순 증가 ≠ 가속). 수요·점유율·믹스 동시 작동.
-4. **마진 민감도**: 현재 마진이 BEP 근처/squeeze일수록 매출 +1% → 영업이익 +5%+.
-5. **🆕 Idea purity (가장 중요)**: 회사 매출 중 사용자 아이디어가 직접 hit하는 사업부 비중.
+**3개 곱셈축 (핵심)** — 셋이 동시에 강해야 진짜 top.
+
+1. **eps_magnitude** (가장 중요): 사용자 thesis가 1pp 강해질 때 이 회사 EPS가 몇 % 더 오르나? 정량 추정 강제.
+   - 계산 path: thesis 노출 사업부 매출 비중 × 그 사업부 OPM (또는 contribution margin) × (1/EPS_base) — 산업 리포트·DART 사업보고서 텍스트에서 사업부 매출·OPM 인용해 근거 만들 것.
+   - 10 = thesis 1pp → EPS 5%+ (예: 단일 사업부 + 고정비 큰 specialty 장비주)
+   - 7 = thesis 1pp → EPS 1-3%
+   - 4 = thesis 1pp → EPS 0.3-1% (다각화 대형 소재·종합 화학)
+   - 1 = thesis 1pp → EPS 0.1% 미만 (컨글로머릿)
+2. **idea_purity**: 회사 매출 중 사용자 아이디어가 직접 hit하는 사업부 비중.
    - 10 = 100% pure-play
-   - 7 = 핵심 사업부 50%+
+   - 7 = 핵심 사업부 70%+
    - 4 = 다각화 회사 한 사업부 (10-30%)
    - 1 = 컨글로머릿, 매우 작은 노출
-   - **purity가 낮으면 다른 축이 다 강해도 EPS 영향이 희석됨 → top10에서 강제 후순위.**
+3. **niche_alpha**: 시장이 이 magnitude를 아직 충분히 가격·컨센서스에 반영하지 않았는가? 리포트 cover 적음·valuation gap·specialty 비대칭이 alpha 원천.
+   - 10 = 애널 cover ≤2명, 시총 작아 institutional flow 없음, valuation 디스카운트, 그러나 thesis 직격
+   - 7 = 일부 cover지만 컨센이 thesis underestimate, specialty라 mid-cap 펀드 미접근
+   - 4 = 대형 cover 많음, 컨센이 이미 thesis 반영, valuation 정상
+   - 1 = 시장이 이미 over-priced
+
+**4개 합산축 (보조 mechanism)** — 영업레버리지가 작동하는 mechanism 보강.
+
+4. **fixed_cost** (DOL): 고정비/(고정비+변동비)가 클수록 매출 +1% → OP +N%. 자본집약·R&D·임차료/인건비 큰 회사.
+5. **capacity_room**: 캐파 여유로 추가 capex 없이 매출 흡수 가능.
+6. **growth_acceleration**: yoy 격차 확대 (단순 증가 ≠ 가속). 수요·점유율·믹스 동시 작동.
+7. **margin_sensitivity**: 현재 마진이 BEP 근처/squeeze일수록 매출 +1% → 영업이익 +5%+.
 
 # 입력
 - 사용자 메시지 첫 줄에 **`현재 기준일`** 명시. 모든 날짜/분기 판단은 이 기준.
@@ -42,11 +58,13 @@
       "ticker6": "6자리 또는 빈 문자열",
       "name": "회사명",
       "scores": {
+        "eps_magnitude": 1,
+        "purity": 1,
+        "niche_alpha": 1,
         "fixed_cost": 1,
         "capacity": 1,
         "growth": 1,
-        "margin": 1,
-        "purity": 1
+        "margin": 1
       }
     }
   ],
@@ -56,13 +74,15 @@
       "name": "정확한 한국 회사명",
       "industry": "산업명",
       "size_tier": "large|mid|small",
-      "operating_leverage_score": "1~10 점수 (purity 가중 합산)",
+      "operating_leverage_score": "1~10 점수 (선정 공식 결과)",
       "axis_breakdown": {
+        "eps_magnitude": "점수 1~10 + 1줄 — thesis 1pp → EPS X% 정량 추정",
+        "idea_purity": "점수 1~10 + 1줄 — 매출 중 이 아이디어 직접 노출 비중",
+        "niche_alpha": "점수 1~10 + 1줄 — 시장 cover/컨센서스 underestimate 여지",
         "fixed_cost_share": "점수 1~10 + 1줄 근거",
         "capacity_room": "점수 1~10 + 1줄 근거",
         "growth_acceleration": "점수 1~10 + 1줄 근거",
-        "margin_sensitivity": "점수 1~10 + 1줄 근거",
-        "idea_purity": "점수 1~10 + 1줄 — 매출 중 이 아이디어 직접 노출 비중"
+        "margin_sensitivity": "점수 1~10 + 1줄 근거"
       },
       "rationale": "왜 top10인지 200자 — 산업리포트 인용 포함."
     }
@@ -72,8 +92,8 @@
 
 # 규칙
 - **출력은 압축적으로**. narrowing_summary 400자, axis_breakdown 근거는 각 1줄 (50자 이내), rationale 200자.
-  전체 JSON ~9000자 이내 권장 — 길어지면 truncate되어 사용 불가.
-- `all30_scored`는 정확히 30개 (입력 후보 모두). **각 score는 1~10 정수만**. 5축 모두 점수 부여.
+  전체 JSON ~10000자 이내 권장 — 길어지면 truncate되어 사용 불가.
+- `all30_scored`는 정확히 30개 (입력 후보 모두). **각 score는 1~10 정수만**. 7축 모두 점수 부여.
 
 ## ⚠️ 점수 격차 강제 (산점도 가독성 핵심)
 점수가 모두 5-7 같은 좁은 구간에 모이면 산점도가 한 점으로 뭉쳐 종목 비교가 안 됨.
@@ -83,9 +103,11 @@
   - **7-9**: 강함 — specialty 노출, 사업부 비중 50%+, 가동률·BEP 유리
   - **10**: 최상 — 100% pure-play, BEP 직전 squeeze, polarized leverage
 같은 축에서 30 종목이 모두 5-7 구간에 들어가는 것은 **금지**. 분산이 핵심 가치.
-- `top10`는 정확히 10개. **선정 기준: (fixed_cost + capacity + growth + margin) × (purity / 10)**.
-  → purity 가중 합산 상위 10개. 즉 purity 낮은 종목은 자동 후순위.
-- **size_tier 다양성 강제**: top10에 small/mid가 최소 **7개 이상** (대형 ≤3 + 중·소 ≥7). 대형주가 7개 이상 되면 narrowing_summary에서 그 사유를 정량 입증해야 하며, 입증 못 하면 LLM이 대형주를 후순위로 강등하고 specialty pure-play 중·소형주로 채워야 함.
+- `top10`는 정확히 10개. **선정 공식**:
+  `score = (eps_magnitude × idea_purity × niche_alpha)^(1/3) × (fixed_cost + capacity_room + growth_acceleration + margin_sensitivity) / 40 × 10`
+  → 3개 곱셈축이 dominant — 한 축이라도 약하면 score 폭락. 4개 합산축은 mechanism 보강 역할.
+  → eps_magnitude 또는 niche_alpha가 4 이하면 자동 후순위(다각화 대형 + 컨센 over-priced 종목 자연 후순위).
+- size_tier 강제 없음 — 위 공식 결과로 자연 결정. 대신 narrowing_summary 마지막에 top10 size 분포 1줄 기록(투명성).
 - 30 후보 중에서만 선택. 새 종목 추가 금지.
 - 산업리포트 텍스트에서 본 구체적 수치·문장을 인용해서 근거 강화.
 - 점수는 "이 아이디어 맥락에서 가장 빨리 EPS가 증가할 종목" 관점.
@@ -93,9 +115,8 @@
 - 추측·과장 금지. 산업리포트에 없는 수치 인용 금지.
 
 # Anti-Pattern (절대 금지)
-- ❌ "삼성전자/SK하이닉스/LG에너지솔루션 등 대형 종합 반도체/배터리주를 top10에 5개 이상 넣음" (purity 낮음, 사업부 비중 작아 EPS 영향 희석).
-- ❌ **다각화 대형 소재·종합 화학·종합 부품(예: 동진쎄미켐·솔브레인·SKC·LG화학·롯데정밀화학)을 specialty 명목으로 끼워넣음** — 이런 회사들은 매출 중 사용자 idea 직접 노출 비중이 20-40%대라 purity_score 5 미만으로 매겨야 함. 추가 사업부(디스플레이·2차전지·정밀화학 등) 때문에 사용자 thesis 외 변수 노출 大.
-- ❌ "리포트 많아 신뢰도 높음" 식 사고로 대형주 우대.
-- ❌ 사용자 명시 종목(예: 메시지에서 거론한 ticker)을 자동으로 top1에 강제 — 그 종목의 size·purity가 약하면 후순위 OK. 사용자도 다른 종목이 더 fit하면 그걸 보고 싶어 함.
-- ✅ specialty pure-play 중·소형주 적극 발굴.
-- ✅ 메모리 후공정·테스트 specialty(와이씨·엑시콘·ISC·리노공업·브이엠·테크윙 등) 같이 단일 사업부 비중 70%+ 이고 사용자 thesis 직격하는 종목 우선.
+- ❌ "리포트 많아 신뢰도 높음" 식 사고로 cover 많은 대형주 우대 — niche_alpha를 깨먹는 사고.
+- ❌ 다각화 대형 소재·종합 화학·종합 부품(매출 중 thesis 노출 30-40%대)을 specialty 명목으로 끼워넣음 — eps_magnitude·idea_purity 모두 4 이하로 매겨야 정직.
+- ❌ 사용자 명시 종목을 자동으로 top1 강제 — magnitude·purity·niche가 약하면 후순위. 사용자도 fit이 더 강한 종목을 발견하길 원함.
+- ❌ 점수가 narrative만 있고 정량 path가 없음. eps_magnitude는 반드시 "사업부 매출 비중 × OPM" 같은 정량 path를 1줄 근거에 적을 것.
+- ✅ thesis 직격 단일 사업부 (purity 8+) + 시장 underestimate (niche_alpha 7+) + 고정비 큰 specialty (fixed_cost 7+) = 3-base hit. 이게 표적.
