@@ -42,6 +42,30 @@ def get_universe() -> list[dict]:
         return []
 
 
+def _sector_match(filter_s: str, row_s: str) -> bool:
+    """양방향 + 첫 단어 substring 매칭.
+
+    sect 필터링은 IdeaBot에서 "반도체 장비"/"반도체 테스트" 같은 sub-sector
+    label을 보내는 반면, screener.db의 sector는 보통 "반도체" 같은 generic.
+    단방향 substring("반도체 테스트" in "반도체"=False)이면 0건이 나옴.
+
+    매칭 룰 (대소문자 무시 가정 — 호출자가 lower로 전달):
+      1) filter ⊆ row  ("반도체" ⊆ "반도체/IT부품")
+      2) row ⊆ filter  ("반도체" ⊆ "반도체 테스트")     ← 역방향
+      3) filter의 첫 단어 ⊆ row  ("반도체 테스트" → "반도체")  ← head 매칭
+    """
+    if not filter_s or not row_s:
+        return False
+    if filter_s in row_s:
+        return True
+    if row_s in filter_s:
+        return True
+    head = filter_s.split()[0] if filter_s.split() else filter_s
+    if head and head in row_s:
+        return True
+    return False
+
+
 def get_universe_filtered(
     market_cap_max_won: Optional[int] = None,
     market_cap_min_won: Optional[int] = None,
@@ -67,7 +91,7 @@ def get_universe_filtered(
             continue
         if sect_lower:
             sect = (r.get("sector") or "").lower()
-            if not any(s in sect for s in sect_lower):
+            if not any(_sector_match(s, sect) for s in sect_lower):
                 continue
         if mkt_lower:
             mkt = (r.get("market") or "").lower()
