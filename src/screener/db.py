@@ -85,9 +85,16 @@ def ensure_schema() -> None:
             """
         )
         # market_cap, sector 컬럼 추가 (기존 DB 호환). SQLite ALTER는 IF NOT EXISTS 미지원.
+        # universe scan(IdeaBot)을 위한 business_text + embedding 컬럼.
         for col_def in (
             "ALTER TABLE tickers ADD COLUMN market_cap INTEGER",
             "ALTER TABLE tickers ADD COLUMN sector TEXT",
+            "ALTER TABLE tickers ADD COLUMN business_text TEXT",        # DART 사업의 내용
+            "ALTER TABLE tickers ADD COLUMN business_text_dt TEXT",     # 추출일(YYYY-MM-DD)
+            "ALTER TABLE tickers ADD COLUMN business_report_no TEXT",   # 원본 rcept_no
+            "ALTER TABLE tickers ADD COLUMN embedding BLOB",            # float32 vector
+            "ALTER TABLE tickers ADD COLUMN embedding_model TEXT",      # 모델 식별
+            "ALTER TABLE tickers ADD COLUMN embedding_dt TEXT",         # 임베딩 생성일
         ):
             try:
                 c.execute(col_def)
@@ -328,6 +335,117 @@ def get_ticker_name(ticker: str) -> Optional[str]:
         cur = c.execute("SELECT name FROM tickers WHERE ticker=?", (ticker,))
         row = cur.fetchone()
     return row[0] if row else None
+
+
+# ------------------------------------------------------------------
+# Universe scan용 — business_text + embedding 저장/조회
+# ------------------------------------------------------------------
+def upsert_business_text(
+    ticker: str,
+    text: str,
+    extracted_dt: str,
+    report_no: Optional[str] = None,
+) -> None:
+    """ticker에 대해 DART 사업의 내용 텍스트 + 추출일 + rcept_no 저장.
+
+    embedding은 별도 (텍스트 갱신되면 stale 임베딩은 비우는 게 정직).
+    """
+    ensure_schema()
+    with _conn() as c:
+        c.execute(
+            "UPDATE tickers SET business_text=?, business_text_dt=?, business_report_no=?, "
+            "embedding=NULL, embedding_model=NULL, embedding_dt=NULL "
+            "WHERE ticker=?",
+            (text, extracted_dt, report_no, ticker),
+        )
+
+
+def upsert_embedding(
+    ticker: str,
+    embedding: bytes,        # np.float32.tobytes()
+    model: str,
+    embedding_dt: str,
+) -> None:
+    ensure_schema()
+    with _conn() as c:
+        c.execute(
+            "UPDATE tickers SET embedding=?, embedding_model=?, embedding_dt=? "
+            "WHERE ticker=?",
+            (embedding, model, embedding_dt, ticker),
+        )
+
+
+def get_business_text_row(ticker: str) -> Optional[dict]:
+    """단일 ticker의 business_text + 임베딩 메타."""
+    ensure_schema()
+    with _conn() as c:
+        cur = c.execute(
+            "SELECT business_text, business_text_dt, business_report_no, "
+            "embedding, embedding_model, embedding_dt "
+            "FROM tickers WHERE ticker=?",
+            (ticker,),
+        )
+        row = cur.fetchone()
+    if not row:
+        return None
+    return {
+        "business_text": row[0],
+        "business_text_dt": row[1],
+        "business_report_no": row[2],
+        "embedding": row[3],
+        "embedding_model": row[4],
+        "embedding_dt": row[5],
+    }
+
+
+def get_universe_for_scan(
+    require_embedding: bool = True,
+    min_market_cap_won: Optional[int] = None,
+) -> list[dict]:
+    """universe scan용 — embedding(또는 business_text) 보유 종목만 반환.
+
+    반환: [{ticker, name, sector, market_cap, business_text, embedding(bytes),
+            embedding_model, embedding_dt}].
+    """
+    ensure_schema()
+    sql = (
+        "SELECT ticker, name, market, market_cap, sector, business_text, "
+        "embedding, embedding_model, embedding_dt FROM tickers WHERE is_active=1"
+    )
+    args: list = []
+    if require_embedding:
+        sql += " AND embedding IS NOT NULL"
+    else:
+        sql += " AND business_text IS NOT NULL"
+    if min_market_cap_won is not None:
+        sql += " AND market_cap IS NOT NULL AND market_cap >= ?"
+        args.append(int(min_market_cap_won))
+    sql += " ORDER BY ticker"
+    with _conn() as c:
+        cur = c.execute(sql, args)
+        return [
+            {
+                "ticker": r[0], "name": r[1], "market": r[2],
+                "market_cap": r[3], "sector": r[4],
+                "business_text": r[5], "embedding": r[6],
+                "embedding_model": r[7], "embedding_dt": r[8],
+            }
+            for r in cur.fetchall()
+        ]
+
+
+def universe_scan_stats() -> dict:
+    """진단용 — business_text/embedding 보유 종목 카운트."""
+    ensure_schema()
+    with _conn() as c:
+        active = c.execute("SELECT COUNT(*) FROM tickers WHERE is_active=1").fetchone()[0]
+        with_text = c.execute(
+            "SELECT COUNT(*) FROM tickers WHERE is_active=1 AND business_text IS NOT NULL"
+        ).fetchone()[0]
+        with_embed = c.execute(
+            "SELECT COUNT(*) FROM tickers WHERE is_active=1 AND embedding IS NOT NULL"
+        ).fetchone()[0]
+    return {"active": active, "with_business_text": with_text, "with_embedding": with_embed}
 
 
 # ------------------------------------------------------------------

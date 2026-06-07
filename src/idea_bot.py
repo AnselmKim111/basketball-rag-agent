@@ -1109,7 +1109,7 @@ async def _run_pipeline(
 
         # ---- (1b) 다중 소스 candidate pool: research + screener universe + (TODO 산업리포트·DART)
         # screener.db universe로 시총 정확 보강 + 누락된 specialty 발굴.
-        pool = _sourcing.build_candidate_pool(research, parsed, target_size=60)
+        pool = _sourcing.build_candidate_pool(research, parsed, target_size=60, thesis_text=idea_text)
         if pool:
             added = len(pool) - len(candidates)
             if added > 0:
@@ -1165,6 +1165,7 @@ async def _run_pipeline(
                 research, parsed,
                 industry_texts=industry_texts,
                 target_size=60,
+                thesis_text=idea_text,
             )
             if pool2 and len(pool2) > before:
                 added = len(pool2) - before

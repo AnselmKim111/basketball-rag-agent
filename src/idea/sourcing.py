@@ -286,21 +286,78 @@ def extract_mentioned_tickers(industry_texts: dict[str, str]) -> list[dict]:
 # ------------------------------------------------------------------
 # 통합: candidate pool 빌드
 # ------------------------------------------------------------------
+def _universe_scan_picks(
+    thesis_text: str,
+    research: dict,
+    target_size: int,
+) -> list[dict]:
+    """universe-wide deterministic scan — env IDEA_UNIVERSE_SCAN=1 이고 임베딩
+    bootstrap 완료된 경우만 활성. 실패 시 빈 리스트 (sourcing은 graceful).
+    """
+    import os
+    if os.getenv("IDEA_UNIVERSE_SCAN", "1") != "1":
+        return []
+    if not thesis_text:
+        return []
+    try:
+        from src.idea import thesis_scorer
+    except Exception:
+        log.exception("[sourcing] thesis_scorer import 실패")
+        return []
+    if not thesis_scorer.is_universe_scan_ready():
+        log.info("[sourcing] universe_scan 미준비 — bootstrap_universe_embeddings.py 미실행")
+        return []
+    try:
+        # cosine top 300 → LLM refine → top target_size 정렬
+        scored = thesis_scorer.score_universe(
+            thesis_text=thesis_text,
+            research=research,
+            top_n_cosine=thesis_scorer.DEFAULT_TOP_N_COSINE,
+            top_n_final=max(target_size, 60),
+            use_llm_refine=True,
+        )
+    except Exception:
+        log.exception("[sourcing] universe_scan 예외 — 폴백")
+        return []
+    if scored:
+        # mid/median 통계 1줄 (산점도 안정성 진단)
+        try:
+            cs = [c.get("cosine_score") or 0 for c in scored]
+            um = [c.get("universe_match") or 0 for c in scored]
+            cs_sorted = sorted(cs)
+            um_sorted = sorted(um)
+            log.info(
+                "[sourcing] universe_scan deterministic top%d "
+                "(cosine median=%.3f, universe_match median=%.2f)",
+                len(scored),
+                cs_sorted[len(cs_sorted) // 2] if cs_sorted else 0,
+                um_sorted[len(um_sorted) // 2] if um_sorted else 0,
+            )
+        except Exception:
+            pass
+    return scored
+
+
 def build_candidate_pool(
     research: dict,
     parsed: dict,
     industry_texts: dict[str, str] | None = None,
     target_size: int = 60,
+    thesis_text: str | None = None,
 ) -> list[dict]:
     """research(perplexity) + screener universe + 산업리포트 인용 통합 dedup pool.
 
-    추후 Step 4 (DART 공시) 가 추가될 예정 — 시그니처 안정 유지.
+    Universe scan 통합 (env IDEA_UNIVERSE_SCAN=1 + 임베딩 bootstrap 완료 시):
+      - Universe scan을 1순위 source로 (deterministic top60).
+      - perplexity/mentioned는 universe_scan에 없는 종목만 augment (외국주·신규상장
+        같은 DART 미수록 종목 보완).
 
     인자:
       research: perplexity research 결과 (candidates·industries)
       parsed: idea parse 결과 (constraints)
       industry_texts: optional, _collect_industry_reports 산출. 있으면 1c 활성.
       target_size: 합쳐서 N개 cap (시총 desc 우선).
+      thesis_text: optional, universe_scan 활성 시 thesis 임베딩 입력.
     """
     research_candidates = list(research.get("candidates") or [])
     industries = list(research.get("industries") or [])
@@ -320,16 +377,37 @@ def build_candidate_pool(
         mentioned_picks = extract_mentioned_tickers(industry_texts)
         mentioned_picks = enrich_with_screener_data(mentioned_picks)
 
-    # 합쳐서 dedup
+    # 1d) Universe-wide deterministic scan — embeddings + LLM refine (1순위, 결정적)
+    universe_picks: list[dict] = []
+    if thesis_text:
+        universe_picks = _universe_scan_picks(thesis_text, research, target_size)
+
+    if universe_picks:
+        # universe_scan을 1순위로 — 다른 sources는 universe에 없는 종목만 augment
+        seen = {c.get("ticker6") or c.get("ticker") for c in universe_picks}
+        augment_pool: list[dict] = []
+        for c in research_candidates + mentioned_picks + screener_picks:
+            t = c.get("ticker6") or c.get("ticker")
+            if t and t not in seen:
+                augment_pool.append(c)
+                seen.add(t)
+        # universe 60 + augment 그대로 (dedup 이미 seen으로 처리)
+        pool = universe_picks + augment_pool
+        # universe_scan이 이미 결정적 정렬 → 그 순서 유지하면서 target_size 컷
+        pool = pool[:target_size]
+        log.info(
+            "[sourcing] candidate pool: universe %d + augment(research %d + mentioned %d + screener %d → 추가 %d) → top %d",
+            len(universe_picks), len(research_candidates), len(mentioned_picks),
+            len(screener_picks), len(augment_pool), len(pool),
+        )
+        return pool
+
+    # 폴백: 기존 동작 — research + screener + mentioned 합쳐서 시총순
     pool = _dedup_candidates(research_candidates + screener_picks + mentioned_picks)
-
-    # 시총 desc로 정렬 (정확 시총 우선 — screener·perplexity·인용 다 사용)
     pool.sort(key=lambda c: int(c.get("mcap_estimate_krw_eok") or 0), reverse=True)
-
-    # target_size 상한
     pool = pool[:target_size]
     log.info(
-        "[sourcing] candidate pool: research %d + screener %d + mentioned %d → dedup %d → top %d",
+        "[sourcing] candidate pool: research %d + screener %d + mentioned %d → dedup %d → top %d (universe_scan 미가용)",
         len(research_candidates), len(screener_picks), len(mentioned_picks),
         len(research_candidates) + len(screener_picks) + len(mentioned_picks),
         len(pool),
