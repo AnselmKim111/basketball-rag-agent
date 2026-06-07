@@ -30,8 +30,10 @@ EMBED_DIM = 1536  # text-embedding-3-small 기본 차원
 
 KST = timezone(timedelta(hours=9))
 
-# rate limit + token cap 안전 마진
-DEFAULT_BATCH_SIZE = 100        # OpenAI는 한 호출에 최대 2048 items, 100이면 안전
+# OpenAI embeddings: 1 request당 max 300K tokens cap (max_tokens_per_request).
+# 한국어 ~3 chars/token이라 12000 chars × 50 = 600K chars / 3 = 200K tokens 정도.
+# 안전 마진 유지 (BadRequestError 발생 시 자동 분할 재시도도 추가).
+DEFAULT_BATCH_SIZE = 50
 DEFAULT_MAX_TOKENS_PER_INPUT = 4000  # text-embedding-3-small은 8191 max, 4000으로 cap
 
 
@@ -102,8 +104,10 @@ def embed_texts(
     if not to_embed:
         return out  # type: ignore
 
-    for batch_start in range(0, len(to_embed), batch_size):
-        chunk = to_embed[batch_start: batch_start + batch_size]
+    def _call_with_split(chunk: list[tuple[int, str]]) -> None:
+        """단일 batch 호출 + max_tokens_per_request 초과 시 절반으로 분할 재시도."""
+        if not chunk:
+            return
         inputs = [c[1] for c in chunk]
         try:
             resp = client.embeddings.create(model=model, input=inputs)
@@ -114,6 +118,16 @@ def embed_texts(
                     f"[{provider}] embeddings endpoint 미지원 또는 모델 '{model}' 없음. "
                     "OPENAI_API_KEY 설정 권장."
                 ) from e
+            # 300K tokens cap 초과 — 절반으로 분할 재시도
+            if "max_tokens_per_request" in msg or "max tokens per request" in msg.lower():
+                if len(chunk) <= 1:
+                    log.warning("[embedding] 단일 텍스트가 300K 초과 — skip idx=%d", chunk[0][0])
+                    return
+                mid = len(chunk) // 2
+                log.info("[embedding] batch %d → %d+%d로 분할 (tokens cap)", len(chunk), mid, len(chunk) - mid)
+                _call_with_split(chunk[:mid])
+                _call_with_split(chunk[mid:])
+                return
             raise
         for (orig_idx, _txt), data in zip(chunk, resp.data):
             vec = np.asarray(data.embedding, dtype=np.float32)
@@ -122,6 +136,10 @@ def embed_texts(
                 if n > 0:
                     vec = vec / n
             out[orig_idx] = vec
+
+    for batch_start in range(0, len(to_embed), batch_size):
+        chunk = to_embed[batch_start: batch_start + batch_size]
+        _call_with_split(chunk)
         # 진행 로그 큰 batch만
         if len(to_embed) >= 500:
             log.info(
