@@ -108,8 +108,22 @@ def embed_texts(
     if not to_embed:
         return out  # type: ignore
 
+    def _is_token_cap_error(msg: str) -> bool:
+        """OpenAI tokens cap 관련 BadRequest 모든 변형 잡기 (메시지 표현 다양함)."""
+        m = msg.lower()
+        return any(k in m for k in (
+            "max_tokens_per_request",
+            "max tokens per request",
+            "maximum request size",
+            "maximum input length",
+            "8192 tokens",
+            "300000 tokens",
+            "exceeds the model",
+            "max_tokens",
+        ))
+
     def _call_with_split(chunk: list[tuple[int, str]]) -> None:
-        """단일 batch 호출 + max_tokens_per_request 초과 시 절반으로 분할 재시도."""
+        """단일 batch 호출 + token cap 초과 시 batch+input 동시 분할/truncate 재시도."""
         if not chunk:
             return
         inputs = [c[1] for c in chunk]
@@ -122,25 +136,23 @@ def embed_texts(
                     f"[{provider}] embeddings endpoint 미지원 또는 모델 '{model}' 없음. "
                     "OPENAI_API_KEY 설정 권장."
                 ) from e
-            # 300K tokens/request cap 초과 — batch 절반으로 분할 재시도
-            if "max_tokens_per_request" in msg or "max tokens per request" in msg.lower():
-                if len(chunk) <= 1:
-                    log.warning("[embedding] 단일 텍스트가 300K 초과 — skip idx=%d", chunk[0][0])
+            if _is_token_cap_error(msg):
+                # 단일 input이 너무 길면 → input 자체 truncate
+                if len(chunk) == 1:
+                    orig_len = len(chunk[0][1])
+                    if orig_len < 200:
+                        log.warning("[embedding] 단일 텍스트 200자 미만인데 cap 초과 — skip idx=%d", chunk[0][0])
+                        return
+                    truncated_one = [(chunk[0][0], chunk[0][1][: max(500, orig_len // 2)])]
+                    log.info("[embedding] 단일 input truncate %d→%d 재시도", orig_len, len(truncated_one[0][1]))
+                    _call_with_split(truncated_one)
                     return
+                # batch가 크고 누적 cap이면 절반으로 분할
                 mid = len(chunk) // 2
-                log.info("[embedding] batch %d → %d+%d로 분할 (300K cap)", len(chunk), mid, len(chunk) - mid)
+                log.info("[embedding] batch %d → %d+%d 분할 (token cap: %s)",
+                         len(chunk), mid, len(chunk) - mid, msg[:100])
                 _call_with_split(chunk[:mid])
                 _call_with_split(chunk[mid:])
-                return
-            # 단일 input이 8192 tokens 초과 — 모든 input을 절반으로 truncate 후 재시도
-            if "maximum input length" in msg or "8192 tokens" in msg or "max_tokens" in msg.lower():
-                # 평균보다 긴 input들이 있다는 신호 — 일률적으로 절반 truncate
-                truncated = [(idx, t[: max(1000, len(t) // 2)]) for idx, t in chunk]
-                avg_old = sum(len(t) for _, t in chunk) // max(1, len(chunk))
-                avg_new = sum(len(t) for _, t in truncated) // max(1, len(truncated))
-                log.info("[embedding] input 길이 초과 — avg %d→%d chars truncate 재시도", avg_old, avg_new)
-                # truncate 후에도 token cap이면 또 split될 것
-                _call_with_split(truncated)
                 return
             raise
         for (orig_idx, _txt), data in zip(chunk, resp.data):
@@ -150,6 +162,17 @@ def embed_texts(
                 if n > 0:
                     vec = vec / n
             out[orig_idx] = vec
+
+    # 동적 batch_size — 평균 input 길이 기반 안전 cap (1 char=1 token 보수 가정).
+    # 200K tokens/batch 목표 (300K request cap 안전 마진).
+    total_chars = sum(len(t) for _, t in to_embed)
+    avg_chars = total_chars // max(1, len(to_embed))
+    if avg_chars > 0:
+        dynamic_batch = max(1, 200_000 // avg_chars)
+        if dynamic_batch < batch_size:
+            log.info("[embedding] 동적 batch_size %d→%d (avg input=%d chars)",
+                     batch_size, dynamic_batch, avg_chars)
+            batch_size = dynamic_batch
 
     for batch_start in range(0, len(to_embed), batch_size):
         chunk = to_embed[batch_start: batch_start + batch_size]
