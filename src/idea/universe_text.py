@@ -104,27 +104,59 @@ async def _fetch_single(ticker: str, name: str, skip_if_recent_days: int) -> tup
     # 3) archive 다운로드 + 사업의 내용 추출
     with tempfile.TemporaryDirectory(prefix=f"universe_text_{ticker}_") as tmp:
         tmp_dir = Path(tmp)
-        try:
-            archive_path = await loop.run_in_executor(
-                None, dart_client.download_report_archive, report.rcept_no, tmp_dir, False,
-            )
-        except Exception:
-            log.exception("[universe_text] archive 다운로드 예외 ticker=%s", ticker)
-            return ticker, "failed_download"
+        # archive 다운로드는 retry (DART rate-limit·일시 503 흡수)
+        archive_path = None
+        for attempt in range(3):
+            try:
+                archive_path = await loop.run_in_executor(
+                    None, dart_client.download_report_archive, report.rcept_no, tmp_dir, False,
+                )
+            except Exception:
+                log.exception(
+                    "[universe_text] archive 다운로드 예외 ticker=%s rcept_no=%s attempt=%d",
+                    ticker, report.rcept_no, attempt + 1,
+                )
+                archive_path = None
+            if archive_path:
+                break
+            # 1.5초, 3초 지연 — DART rate-limit 회복 마진
+            await asyncio.sleep(1.5 * (attempt + 1))
         if not archive_path:
             return ticker, "failed_archive"
 
+        # 1차: "사업의 내용" 섹션 타겟 추출
         try:
             raw_text = await loop.run_in_executor(
                 None, dart_client.extract_doc_text, archive_path, 80_000, "사업의 내용",
             )
         except Exception:
             log.exception("[universe_text] 텍스트 추출 예외 ticker=%s", ticker)
-            return ticker, "failed_extract"
+            raw_text = ""
 
-    cleaned = _cleanup_business_text(raw_text or "")
-    if len(cleaned) < 200:
-        # 200자 미만은 사업 description으로 못 씀 (스팩·신규상장·청산예정)
+        cleaned = _cleanup_business_text(raw_text or "")
+        raw1_len = len(raw_text or "")
+
+        # 2차: 1차가 200자 미만이면 prefer_section="" 으로 전체 본문 재추출
+        # (DART XML SECTION 태그 구조가 회사마다 달라 _extract_xml_or_html이
+        #  title_tag 못 찾고 빈 string 내놓는 경우 다수 발견)
+        raw2_len = 0
+        if len(cleaned) < 200:
+            try:
+                raw_text2 = await loop.run_in_executor(
+                    None, dart_client.extract_doc_text, archive_path, 80_000, "",
+                )
+                raw2_len = len(raw_text2 or "")
+                if raw_text2 and len(raw_text2) > len(raw_text or ""):
+                    cleaned = _cleanup_business_text(raw_text2)
+            except Exception:
+                log.exception("[universe_text] 텍스트 재추출 예외 ticker=%s", ticker)
+
+    # 최종 컷오프 — 50자 미만은 의미 매칭 무리 (스팩·청산예정 종목 등)
+    if len(cleaned) < 50:
+        log.info(
+            "[universe_text] failed_short_text 진단 ticker=%s ext=%s raw1=%d raw2=%d cleaned=%d",
+            ticker, archive_path.suffix if archive_path else "?", raw1_len, raw2_len, len(cleaned),
+        )
         return ticker, "failed_short_text"
 
     # 4) DB upsert (text 갱신 시 기존 embedding은 자동 무효화 — upsert_business_text가 NULL 세팅)
@@ -143,7 +175,7 @@ async def _fetch_single(ticker: str, name: str, skip_if_recent_days: int) -> tup
 
 async def bulk_refresh_business_text(
     tickers: Optional[list[str]] = None,
-    max_concurrency: int = 4,
+    max_concurrency: int = 2,
     skip_if_recent_days: int = 90,
     progress_every: int = 50,
 ) -> dict[str, int]:
