@@ -49,7 +49,8 @@ def _get_client() -> tuple[OpenAI, str]:
     """OpenAI direct 우선, OpenRouter 폴백. (client, provider) 반환."""
     openai_key = os.getenv("OPENAI_API_KEY")
     if openai_key:
-        return OpenAI(api_key=openai_key, timeout=60.0, max_retries=2), "openai"
+        # max_retries=5: TPM cap 일시 초과 시 자동 재시도 (각 retry 사이 6초 간격)
+        return OpenAI(api_key=openai_key, timeout=120.0, max_retries=5), "openai"
     or_key = os.getenv("OPENROUTER_API_KEY")
     if or_key:
         log.warning(
@@ -185,8 +186,15 @@ def embed_texts(
                 (len(to_embed) + batch_size - 1) // batch_size,
                 len(chunk), model,
             )
-        # OpenAI는 rate limit 안 걸리지만 안전 마진
-        time.sleep(0.02)
+        # TPM throttle — OpenAI free tier TPM cap 1M/분.
+        # 보수 800K target. chunk의 char 합 ≈ token 상한(영어/숫자 mixed).
+        # sleep = (chunk_tokens / TPM_TARGET) * 60.
+        TPM_TARGET = 800_000
+        chunk_chars = sum(len(t) for _, t in chunk)
+        throttle_s = (chunk_chars / TPM_TARGET) * 60
+        # 너무 짧으면 OpenAI SDK 자체 retry로 충분
+        if throttle_s > 0.1:
+            time.sleep(throttle_s)
     return out  # type: ignore
 
 
