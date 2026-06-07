@@ -834,6 +834,10 @@ REPORT_COMMANDS = [
     ("portfolio_add", "💼 보유 종목 등록"),
     ("portfolio_list", "📋 보유 종목 list"),
     ("portfolio_remove", "🗑 보유 종목 삭제"),
+    ("model_eval", "🤖 모델 가성비 즉시 재평가"),
+    ("model_approve", "✅ 모델 추천 승인 (Railway env 적용)"),
+    ("model_reject", "❎ 모델 추천 거부"),
+    ("model_status", "📡 현재 모델 + 대기 추천 보기"),
     ("stop", "🔕 자동 발송 탈퇴"),
     ("help", "도움말"),
 ]
@@ -852,6 +856,13 @@ def build_report_app(token: str) -> Application:
     app.add_handler(CommandHandler("portfolio_remove", _cmd_portfolio_remove))
     app.add_handler(CommandHandler("portfolio_list", _cmd_portfolio_list))
     app.add_handler(CommandHandler("portfolio_clear", _cmd_portfolio_clear))
+    from src.model_router.handler import (
+        model_eval_cmd, model_approve_cmd, model_reject_cmd, model_status_cmd,
+    )
+    app.add_handler(CommandHandler("model_eval", model_eval_cmd))
+    app.add_handler(CommandHandler("model_approve", model_approve_cmd))
+    app.add_handler(CommandHandler("model_reject", model_reject_cmd))
+    app.add_handler(CommandHandler("model_status", model_status_cmd))
     if os.getenv("REPORT_TEST_MODE", "0") == "1":
         try:
             loop = asyncio.get_running_loop()
