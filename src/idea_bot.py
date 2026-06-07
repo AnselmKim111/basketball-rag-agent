@@ -1674,7 +1674,7 @@ async def _collect_industry_reports(
         all_paths: list[Path] = []
         text_by_name: dict[str, str] = {}
         seen_rpt_ids: set[str] = set()  # 산업이 같은 코드로 매핑돼도 중복 다운로드 방지
-        general_pool_used = False  # 일반 industry top reports는 한 번만
+        # 일반 popular 폴백은 비활성화됨 (반도체 idea에 에너지·통신 리포트 오염 방지)
 
         try:
             wr_id, wr_pw = wisereport_creds()
@@ -1728,20 +1728,16 @@ async def _collect_industry_reports(
                                     limit=INDUSTRY_REPORTS_PER_INDUSTRY,
                                     days_back=REPORT_DAYS_BACK_FALLBACK, industry_gics=code,
                                 )
-                        if not items and not general_pool_used:
-                            log.info("산업 '%s' 매칭 실패 → 일반 industry top reports 1회 사용", name)
-                            items = cli.list_top_reports(
-                                category="industry", sort_by="popular",
-                                limit=INDUSTRY_REPORTS_PER_INDUSTRY * 2,
-                                days_back=REPORT_DAYS_BACK,
+                        # 폴백 금지 — 코드 매칭 실패한 산업은 그냥 스킵. 일반 popular
+                        # 풀로 폴백하면 반도체와 무관한 트렌드 리포트(에너지·통신·양자 등)가
+                        # 들어와 narrow·synthesis thesis를 오염시킴. 산업 컨텍스트는 종목
+                        # 리포트(_collect_company_reports)와 perplexity research로만 채움.
+                        if not items:
+                            log.info(
+                                "산업 '%s' wisereport 코드 매칭/검색 실패 — 일반 popular 폴백 비활성화. 종목 리포트로만 컨텍스트 구성.",
+                                name,
                             )
-                            if not items and REPORT_DAYS_BACK < REPORT_DAYS_BACK_FALLBACK:
-                                items = cli.list_top_reports(
-                                    category="industry", sort_by="popular",
-                                    limit=INDUSTRY_REPORTS_PER_INDUSTRY * 2,
-                                    days_back=REPORT_DAYS_BACK_FALLBACK,
-                                )
-                            general_pool_used = True
+                            continue
                         # 인기순이지만 sch_dt 최신 우선 보조 정렬 (같은 visit_cnt 그룹 안에서 최신 우대)
                         items.sort(key=lambda it: it.sch_dt, reverse=True)
                     except Exception:
