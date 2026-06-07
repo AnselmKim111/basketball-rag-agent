@@ -51,6 +51,8 @@ from telegram.ext import (
 )
 
 from src import idea_prompts
+from src.idea import scoring as _scoring
+from src.idea import sourcing as _sourcing
 from src.llm_json import parse_json_object as _parse_json
 from src.bot_helpers import (
     deny_message,
@@ -1101,6 +1103,25 @@ async def _run_pipeline(
             await send_text_chunked(bot, chat_id, "❌ 리서치 결과에 산업/후보가 비어있음 — 종료")
             return
 
+        # ---- (1b) 다중 소스 candidate pool: research + screener universe + (TODO 산업리포트·DART)
+        # screener.db universe로 시총 정확 보강 + 누락된 specialty 발굴.
+        pool = _sourcing.build_candidate_pool(research, parsed, target_size=60)
+        if pool:
+            added = len(pool) - len(candidates)
+            if added > 0:
+                await send_text_chunked(
+                    bot, chat_id,
+                    f"🧭 1b단계: screener universe 통합 — pool {len(pool)}개 (research {len(candidates)} + 추가 {added})",
+                )
+            else:
+                await send_text_chunked(
+                    bot, chat_id,
+                    f"🧭 1b단계: screener 시총·섹터 보강 적용 — pool {len(pool)}개",
+                )
+            # research candidates를 enriched pool로 교체 (narrow 입력에 사용)
+            candidates = pool
+            research["candidates"] = pool  # cache에도 반영
+
         # ---- (1.5 + 2) 중요도 평가 LLM + 산업 리포트 wisereport — 동시 진행.
         # 둘은 research 결과에만 의존하고 서로 독립. importance는 synthesis(5단계)에서만
         # 쓰이므로 narrow(3단계) 전에만 끝나면 됨. asyncio.gather로 1-2분 절약.
@@ -1132,6 +1153,23 @@ async def _run_pipeline(
         await send_text_chunked(
             bot, chat_id, f"  ✅ 산업 리포트 {len(industry_pdfs)}건 수집",
         )
+
+        # ---- (2.5) 산업리포트 인용 종목 추출 → pool 재빌드 (mentioned_picks 추가)
+        if industry_texts:
+            before = len(candidates)
+            pool2 = _sourcing.build_candidate_pool(
+                research, parsed,
+                industry_texts=industry_texts,
+                target_size=60,
+            )
+            if pool2 and len(pool2) > before:
+                added = len(pool2) - before
+                await send_text_chunked(
+                    bot, chat_id,
+                    f"📑 2.5단계: 산업리포트 인용 종목 +{added}개 → pool {len(pool2)}개",
+                )
+                candidates = pool2
+                research["candidates"] = pool2
 
         # ---- (3) 30 → 10 narrow
         await send_text_chunked(bot, chat_id, "🎯 3단계: 영업레버리지 4축 점수로 30→10 narrowing")
@@ -1175,6 +1213,24 @@ async def _run_pipeline(
             )
             return
 
+        # ---- (3.5) 손익비 점수: ScreenerBot momentum 신호 합산 + 재정렬
+        top10 = _scoring.sort_by_risk_reward(_scoring.score_top10(top10, days_back=14))
+        mom_hits = sum(1 for c in top10 if (c.get("momentum_score") or 0) > 0)
+        if mom_hits:
+            preview_names = [
+                f"{c.get('name','?')}({c.get('momentum_score',0)})"
+                for c in top10 if (c.get("momentum_score") or 0) > 0
+            ][:5]
+            await send_text_chunked(
+                bot, chat_id,
+                f"📊 3.5단계: 손익비 점수 산출 — momentum 신호 hit {mom_hits}/{len(top10)}: {', '.join(preview_names)}",
+            )
+        else:
+            await send_text_chunked(
+                bot, chat_id,
+                f"📊 3.5단계: 손익비 점수 산출 — momentum hit 0 (op_lev × purity 만으로 정렬)",
+            )
+
         # ---- (4) 종목 리포트 수집
         await send_text_chunked(
             bot, chat_id, f"📈 4단계: top {len(top10)} 종목 리포트 다운로드 (각 {COMPANY_REPORTS_PER_TICKER}건)",
@@ -1199,6 +1255,9 @@ async def _run_pipeline(
         if not synthesis or not synthesis.get("top5"):
             await send_text_chunked(bot, chat_id, "❌ 최종 분석 실패 — 종료")
             return
+
+        # ---- (5.5) synthesis.top5에 손익비·momentum 메타 합치기 (출력용)
+        _attach_scoring_to_top5(synthesis.get("top5") or [], top10)
 
         # ---- (6) 발송
         await _send_results(
@@ -1636,11 +1695,15 @@ async def _collect_industry_reports(
                     all_paths.extend(saved)
                     seen_rpt_ids.update(it.rpt_id for it in items)
 
+                    # filename → sch_dt 매핑 — recency 라벨 주입용
+                    sch_by_name = {p.name: getattr(items[i], "sch_dt", "") for i, p in enumerate(saved) if i < len(items)}
+                    from src.idea.recency import label as _recency_label
                     for p in saved:
                         try:
                             t = summarizer._extract_pdf_text(p, max_chars=INDUSTRY_TEXT_MAX)
                             if t.strip():
-                                text_by_name[p.name] = t
+                                tag = _recency_label(sch_by_name.get(p.name, ""))
+                                text_by_name[p.name] = f"{tag}\n{t}"
                         except Exception:
                             log.exception("산업 PDF 텍스트 추출 실패: %s", p)
         except Exception:
@@ -1752,12 +1815,26 @@ async def _send_narrow_summary(bot: Bot, chat_id: str, narrow: dict) -> None:
 async def _send_scatter_chart(
     bot: Bot, chat_id: str, idea_text: str, all30_scored: list[dict],
 ) -> None:
-    """30종목 4축 산점도 PNG 발송. 차트 생성/발송 어느 단계 실패해도 봇은 계속."""
+    """30종목 4축 산점도 PNG 발송. 차트 생성/발송 어느 단계 실패해도 봇은 계속.
+
+    ScreenerBot signal hit 종목은 ★ 빨간 외곽선으로 강조.
+    """
     loop = asyncio.get_running_loop()
+
+    # ScreenerBot 신호 hit 종목 ticker 집합 (14일)
+    momentum_tickers: set[str] = set()
+    try:
+        from src.cross_bot import screener_query
+        if screener_query.is_available():
+            by_ticker = screener_query.get_recent_signals(days_back=14)
+            momentum_tickers = set(by_ticker.keys())
+    except Exception:
+        log.exception("산점도용 momentum_tickers 수집 실패 — 강조 없이 진행")
+
     try:
         from src import idea_chart
         png_bytes = await loop.run_in_executor(
-            None, idea_chart.build, idea_text, all30_scored,
+            None, idea_chart.build, idea_text, all30_scored, momentum_tickers,
         )
     except Exception:
         log.exception("산점도 생성 단계 실패 — 차트 스킵")
@@ -1765,111 +1842,30 @@ async def _send_scatter_chart(
     if not png_bytes:
         log.info("산점도 PNG 비어있음 — 스킵 (all30_scored=%d개)", len(all30_scored))
         return
+    caption = (
+        "📊 30 후보 4축 산점도\n"
+        "X=매출가속, Y=고정비비중, 점크기=마진민감도, 색=가동률여유\n"
+        "오른쪽 위 + 큰 점 + 진한 색 = 영업레버리지 강한 zone"
+    )
+    if momentum_tickers:
+        hit_in_chart = sum(
+            1 for it in all30_scored
+            if (it.get("ticker6") or "").strip() in momentum_tickers
+        )
+        if hit_in_chart > 0:
+            caption += f"\n★ ScreenerBot 신호 hit: {hit_in_chart}종목 빨간 외곽선 강조"
     try:
         await bot.send_photo(
             chat_id=chat_id,
             photo=png_bytes,
-            caption=(
-                "📊 30 후보 4축 산점도\n"
-                "X=매출가속, Y=고정비비중, 점크기=마진민감도, 색=가동률여유\n"
-                "오른쪽 위 + 큰 점 + 진한 색 = 영업레버리지 강한 zone"
-            ),
+            caption=caption,
         )
     except Exception:
         log.exception("산점도 텔레그램 발송 실패 — 무시하고 계속")
 
 
-async def _fix_tickers(top10: list[dict]) -> list[dict]:
-    """후보의 (name, ticker6) 페어를 DART corp_map과 대조해 검증·교정.
-
-    동작:
-      1. ticker6 있음 → DART에서 ticker → 등록 회사명 조회
-         - LLM이 준 name과 정규화 비교해 일치 → OK
-         - 불일치 (예: HD현대오일뱅크는 비상장, LLM이 002380=KCC를 잘못 매핑) →
-           LLM name으로 재lookup해서 새 ticker 교체. 못 찾으면 ticker 비움.
-      2. ticker6 없음 → name으로 lookup (기존 동작).
-      3. 그래도 ticker 못 찾으면 비워둠 → 후속 _collect_company_reports에서 스킵.
-    """
-    loop = asyncio.get_running_loop()
-    try:
-        from src.deepdive import dart_client
-    except Exception:
-        log.exception("dart_client import 실패 — ticker 룩업 스킵")
-        return top10
-
-    # corp_map 빌드 (한 번)
-    try:
-        await loop.run_in_executor(None, dart_client._load_corp_map)
-    except Exception:
-        log.exception("DART corp_map 로딩 실패")
-
-    def _norm(s: str) -> str:
-        # 회사 suffix(공업/산업/홀딩스/지주)도 약식으로 제거 — 명칭 줄임 매칭 위해
-        s = re.sub(r"[\s()㈜（）\-]+", "", s or "").lower()
-        return s
-
-    def _names_match(llm_name: str, dart_name: str) -> bool:
-        """LLM이 준 회사명과 DART 등록명이 사실상 같은 회사를 가리키는지 fuzzy 판단.
-
-        - 정규화 후 정확 일치 → True
-        - 정규화 후 한쪽이 다른 쪽의 substring → True (예: '한국석유' ↔ '한국석유공업')
-        - 빈 문자열 → False
-        """
-        nl = _norm(llm_name)
-        nd = _norm(dart_name)
-        if not nl or not nd:
-            return False
-        if nl == nd:
-            return True
-        if nl in nd or nd in nl:
-            return True
-        return False
-
-    out: list[dict] = []
-    for c in top10:
-        ticker = (c.get("ticker6") or "").strip()
-        name = (c.get("name") or "").strip()
-
-        if re.match(r"^\d{6}$", ticker):
-            # ticker 있음 — 회사명 일치 검증 (substring 허용)
-            dart_name = dart_client._CORP_NAME_CACHE.get(ticker, "")
-            if _names_match(name, dart_name):
-                out.append(c)
-                continue
-            # 불일치 → name으로 재lookup
-            log.warning(
-                "ticker mismatch: name='%s' ticker=%s but DART에는 '%s' — name으로 재lookup",
-                name, ticker, dart_name,
-            )
-            new_ticker = None
-            if name:
-                try:
-                    new_ticker = await loop.run_in_executor(None, dart_client.lookup_ticker_by_name, name)
-                except Exception:
-                    log.exception("재lookup 실패: %s", name)
-            if new_ticker and new_ticker != ticker:
-                log.info("ticker 교체: %s '%s' → %s '%s'", ticker, name, new_ticker, dart_client._CORP_NAME_CACHE.get(new_ticker, ""))
-                c["ticker6"] = new_ticker
-            else:
-                # 비상장이거나 매칭 못 함 — ticker 비우면 후속 단계에서 스킵
-                log.warning("ticker 매칭 실패 (비상장 가능성) — '%s' candidate ticker6 비움", name)
-                c["ticker6"] = ""
-            out.append(c)
-            continue
-
-        # ticker 비어있음 — name으로 lookup
-        if not name:
-            out.append(c)
-            continue
-        try:
-            t = await loop.run_in_executor(None, dart_client.lookup_ticker_by_name, name)
-        except Exception:
-            log.exception("ticker 룩업 실패: %s", name)
-            t = None
-        if t:
-            c["ticker6"] = t
-        out.append(c)
-    return out
+# ticker 검증·교정은 src/idea/tickers.py 로 이전. 호환 alias.
+from src.idea.tickers import validate_and_fix as _fix_tickers  # noqa: E402
 
 
 # ------------------------------------------------------------------
@@ -1939,11 +1935,14 @@ async def _collect_company_reports(
                         continue
                     paths_by_ticker[ticker] = saved
                     texts: dict[str, str] = {}
+                    sch_by_name = {p.name: getattr(items[i], "sch_dt", "") for i, p in enumerate(saved) if i < len(items)}
+                    from src.idea.recency import label as _recency_label
                     for p in saved:
                         try:
                             t = summarizer._extract_pdf_text(p, max_chars=COMPANY_TEXT_MAX)
                             if t.strip():
-                                texts[p.name] = t
+                                tag = _recency_label(sch_by_name.get(p.name, ""))
+                                texts[p.name] = f"{tag}\n{t}"
                         except Exception:
                             log.exception("종목 PDF 텍스트 추출 실패: %s", p)
                     texts_by_ticker[ticker] = texts
@@ -2178,6 +2177,28 @@ async def _send_top1_quarterly_chart(
         log.exception("Top 1 분기 차트 발송 실패")
 
 
+def _attach_scoring_to_top5(top5: list[dict], top10_scored: list[dict]) -> None:
+    """synthesis.top5 각 pick에 risk_reward_score·momentum_meta를 ticker 매칭으로 합치기.
+
+    매칭 키: ticker6 정확. 없으면 정규화 회사명 substring.
+    """
+    by_ticker = {
+        (c.get("ticker6") or "").strip(): c
+        for c in top10_scored if (c.get("ticker6") or "").strip()
+    }
+    for pick in top5:
+        t = (pick.get("ticker6") or "").strip()
+        match = by_ticker.get(t)
+        if not match:
+            continue
+        if "risk_reward_score" in match:
+            pick["risk_reward_score"] = match["risk_reward_score"]
+        if "momentum_score" in match:
+            pick["momentum_score"] = match["momentum_score"]
+        if "momentum_meta" in match:
+            pick["momentum_meta"] = match["momentum_meta"]
+
+
 async def _send_results(
     bot: Bot, chat_id: str,
     synthesis: dict,
@@ -2245,10 +2266,20 @@ async def _send_results(
         )
         if price_brief:
             header += f"   💰 {price_brief}\n"
+        # 손익비 + momentum 신호 노출 (scoring 후 합쳐진 메타)
+        rr = pick.get("risk_reward_score")
+        mom = pick.get("momentum_score") or 0
+        if rr is not None:
+            header += f"   📊 손익비 score: {rr} (momentum +{mom})\n"
+        meta = pick.get("momentum_meta") or {}
+        sigs = meta.get("signals") or []
+        if sigs:
+            latest = meta.get("latest_date") or "?"
+            header += f"   🔥 ScreenerBot 신호: {', '.join(sigs)} (최근 {latest})\n"
         header += "━━━━━━━━━━━━━━━━━━━━"
         await send_text_chunked(bot, chat_id, header)
 
-        # 5단계 추론 요약 헤더 (사업부/폭/기울기) — thesis 위에 짧게 노출
+        # 5단계 추론 요약 헤더 (사업부/폭/기울기/손익비/trigger) — thesis 위에 짧게 노출
         summary_header = ""
         if business_unit:
             summary_header += f"🏢 사업부: {business_unit}\n"
@@ -2256,6 +2287,15 @@ async def _send_results(
             summary_header += f"📐 폭(magnitude): {magnitude}\n"
         if gradient_timing:
             summary_header += f"⏱️ 기울기/시점: {gradient_timing}\n"
+        rr_note = pick.get("risk_reward_note") or ""
+        if rr_note:
+            summary_header += f"⚖️ 손익비: {rr_note}\n"
+        next_trig = pick.get("next_trigger_quarter") or ""
+        if next_trig:
+            summary_header += f"📅 다음 trigger: {next_trig}\n"
+        mom_sig = pick.get("momentum_signals") or ""
+        if mom_sig:
+            summary_header += f"🔥 모멘텀 confirmation: {mom_sig}\n"
         if summary_header:
             summary_header += "\n"
 

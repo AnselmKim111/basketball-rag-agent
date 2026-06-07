@@ -23,7 +23,11 @@ from typing import Optional
 log = logging.getLogger(__name__)
 
 
-def build(idea_text: str, all30_scored: list[dict]) -> Optional[bytes]:
+def build(
+    idea_text: str,
+    all30_scored: list[dict],
+    momentum_tickers: set[str] | None = None,
+) -> Optional[bytes]:
     """30종목 4축 산점도 PNG bytes. 실패 시 None.
 
     all30_scored: [
@@ -31,17 +35,23 @@ def build(idea_text: str, all30_scored: list[dict]) -> Optional[bytes]:
        "scores": {"fixed_cost": int, "capacity": int, "growth": int, "margin": int}},
       ...
     ]
+    momentum_tickers: ScreenerBot signal hit 종목 ticker6 집합. 해당 점은
+      ★ 별표 + 빨간 테두리로 강조 표시.
     """
     if not all30_scored:
         return None
     try:
-        return _build_inner(idea_text, all30_scored)
+        return _build_inner(idea_text, all30_scored, momentum_tickers or set())
     except Exception:
         log.exception("산점도 생성 실패")
         return None
 
 
-def _build_inner(idea_text: str, all30_scored: list[dict]) -> Optional[bytes]:
+def _build_inner(
+    idea_text: str,
+    all30_scored: list[dict],
+    momentum_tickers: set[str],
+) -> Optional[bytes]:
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -60,7 +70,7 @@ def _build_inner(idea_text: str, all30_scored: list[dict]) -> Optional[bytes]:
     plt.rcParams["axes.unicode_minus"] = False
 
     # 데이터 추출 (점수 누락 시 5로 기본)
-    xs, ys, sizes, colors, names = [], [], [], [], []
+    xs, ys, sizes, colors, names, tickers = [], [], [], [], [], []
     for item in all30_scored:
         if not isinstance(item, dict):
             continue
@@ -77,6 +87,7 @@ def _build_inner(idea_text: str, all30_scored: list[dict]) -> Optional[bytes]:
         sizes.append(_clamp(sz, 1, 10))
         colors.append(_clamp(cl, 1, 10))
         names.append(item.get("name", "?"))
+        tickers.append((item.get("ticker6") or "").strip())
 
     if not xs:
         return None
@@ -117,6 +128,19 @@ def _build_inner(idea_text: str, all30_scored: list[dict]) -> Optional[bytes]:
         edgecolors="black",
         linewidths=0.7,
     )
+
+    # ── ScreenerBot 신호 hit 종목 강조 (★ 별표 + 빨간 외곽선) ──
+    mom_hit_count = 0
+    for idx, t in enumerate(tickers):
+        if t and t in momentum_tickers:
+            mom_hit_count += 1
+            # 별표 (크기 = 점 크기 + 60)
+            ax.scatter(
+                [jx[idx]], [jy[idx]],
+                marker="*", s=point_sizes[idx] + 120,
+                facecolors="none", edgecolors="crimson",
+                linewidths=2.0, alpha=0.95, zorder=4,
+            )
 
     # 라벨: 점에서 fan-out. 같은 클러스터 내 종목은 시계방향 12/3/6/9시 등.
     for (_, _), idxs in cluster.items():
@@ -187,9 +211,12 @@ def _build_inner(idea_text: str, all30_scored: list[dict]) -> Optional[bytes]:
     cbar.ax.tick_params(labelsize=8)
 
     # 크기 범례 (margin) — 별도 텍스트
+    legend_text = "● 점 크기 = 마진 민감도 (큼=BEP 근접, 매출↑ → OP 폭발적 증폭)"
+    if mom_hit_count > 0:
+        legend_text += f"\n★ 빨간 외곽선 = ScreenerBot 신호 hit ({mom_hit_count}종목)"
     fig.text(
         0.02, 0.02,
-        "● 점 크기 = 마진 민감도 (큼=BEP 근접, 매출↑ → OP 폭발적 증폭)",
+        legend_text,
         fontsize=8, color="dimgray",
     )
 

@@ -4,6 +4,8 @@
 - 1.5단계 중요도 평가의 verdict와 score를 반드시 thesis에 반영 (점수 낮으면 thesis도 솔직하게 절제).
 - 10 후보 각각의 종목 리포트를 모두 읽었다고 가정하고, **영업레버리지 메커니즘을 가장 명확하게 보여주는 5종목**을 선정.
 - 각 종목별로 단계적으로 추론한 뒤 통합 thesis 작성.
+- **손익비(risk/reward) 관점 필수** — upside thesis만 쓰지 말고 현재 valuation과 YTD 주가 상승률 대비 이미 반영됐는지/저평가인지를 1줄로 명시(`risk_reward_note`).
+- **최신 리포트 우대** — 입력 리포트 텍스트 첫 줄에 `[발행 N일 전 · 가중치 X×]` 라벨이 있다. 가중치 1.5× 라벨이 붙은 리포트의 정보를 우선 인용·반영.
 
 # 단계적 추론 절차 (각 종목마다 순서대로 사고하라 — thesis에 자연스러운 단락으로 통합)
 
@@ -49,13 +51,17 @@
       "magnitude": "DOL 추정값 (예: '매출 +1% → 사업부 영업이익 +5-7배 → 전사 EPS +3-4%') — 정량",
       "gradient_timing": "어느 분기에 가시화 + 가속/감속 + 폭 (예: 'FY26 1Q부터 yoy +30% 가속, 2H26까지 steep ramp 지속')",
       "operating_leverage_thesis": "**800자 이내(엄수 — 초과시 페널티)**. 위 5단계(사업부/폭/기울기/논리매핑/리스크)를 자연스러운 단락으로 통합. ## 부제목 사용 OK. 정량 수치 풍부하게. 종목 리포트의 구체적 문장이나 숫자 인용. 군더더기 없이 압축적으로.",
+      "risk_reward_note": "1줄 — 손익비 관점. 현재 valuation·YTD 주가 상승률 대비 thesis가 이미 반영됐는지/저평가인지 + 다운사이드 리스크 1개. 예: 'YTD +35% 선행반영 / consensus 12M Fwd P/E 22배(섹터 16배) — 가속 둔화 시 -15% 조정 가능'.",
+      "next_trigger_quarter": "다음 분기 이벤트가 thesis confirmation 분기 — 'FY26 2Q 실적 (8월 중순) — 매출 yoy +X% 가속 확인 필요' 형태로 1줄.",
+      "momentum_signals": "ScreenerBot 신호가 있다면 어떤 신호(52w 신고/VCP/거래량 돌파)가 thesis confirmation으로 작용하는지 1줄. 없으면 빈 문자열.",
       "key_numbers": {
         "segment_revenue_share": "수혜 사업부의 전사 매출 비중 (%)",
         "segment_op_margin": "수혜 사업부의 영업이익률 (%) — 종목 리포트 인용",
         "fixed_cost_share_estimate": "사업부 고정비 비중 추정 (%)",
         "capacity_utilization": "현재 가동률 (%) 또는 '미공개'",
         "operating_leverage_multiple": "매출 1% 증가 시 사업부 영업이익 증가 배율 (예: 4-6배)",
-        "trigger_quarter": "가시화 분기 (예: 'FY26 1Q')"
+        "trigger_quarter": "가시화 분기 (예: 'FY26 1Q')",
+        "valuation_marker": "현재 P/E·EV/EBITDA·target price 중 하나 (종목 리포트 인용). '미공개' 허용."
       },
       "referenced_reports": [
         "이 종목의 own 종목 리포트 파일명만 (입력 컨텍스트의 '=== <회사명> (<ticker>) 리포트 파일: <파일명> ===' 블록의 파일명과 글자 단위로 일치). 산업 리포트나 다른 회사의 리포트는 절대 포함 금지. 0~3건. 종목 리포트 없으면 빈 배열 [] 사용."
