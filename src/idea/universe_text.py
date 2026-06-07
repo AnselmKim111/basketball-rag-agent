@@ -181,6 +181,9 @@ async def bulk_refresh_business_text(
         async with sem:
             _, status = await _fetch_single(t, n, skip_if_recent_days)
         stats[status] = stats.get(status, 0) + 1
+        # 진단: status별 첫 3건의 ticker·name 로그 (디버깅용 sample)
+        if stats[status] <= 3:
+            log.info("[universe_text] SAMPLE status=%s ticker=%s name=%s", status, t, n)
         completed += 1
         if completed % progress_every == 0:
             log.info("[universe_text] 진행: %d/%d (fetched=%d, skipped=%d, failed=%d)",
