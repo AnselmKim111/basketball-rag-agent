@@ -13,9 +13,10 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
-# 소스 코드 + 편집 가능 프롬프트
+# 소스 코드 + 편집 가능 프롬프트 + 정적 데이터(산업 카탈로그 등)
 COPY src ./src
 COPY prompts ./prompts
+COPY data ./data
 
 # Playwright 브라우저 (이미지에 이미 있지만 버전 매칭 보장)
 RUN playwright install chromium --with-deps
