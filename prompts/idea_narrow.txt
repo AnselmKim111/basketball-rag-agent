@@ -20,12 +20,16 @@
    - **purity가 낮으면 다른 축이 다 강해도 EPS 영향이 희석됨 → top10에서 강제 후순위.**
 
 # 입력
+- 사용자 메시지 첫 줄에 **`현재 기준일`** 명시. 모든 날짜/분기 판단은 이 기준.
+- `# 최근 30일 핵심 이벤트` 섹션 — research(perplexity)가 web search로 찾은 30일 내
+  실제 발생 사건 리스트. **이 사건에 직결되는 종목은 동일 점수일 때 강하게 우대.**
 - 사용자 아이디어 본문 + 분해된 mechanisms
 - 30 후보 (각 종목의 mechanism, size_tier, purity_score, source 포함 — source가
   'screener'면 ScreenerBot universe 매칭, 'industry_report'면 분석가가 산업 리포트에
   명시 인용한 종목 = 시장 confirmation, 'perplexity'면 LLM 발굴.)
-- 산업 리포트 PDF 텍스트들 (wisereport). 각 본문 첫 줄에 `[발행 N일 전 · 가중치 X×]`
-  라벨이 있다. 1.5× 라벨(7일 이내) 리포트의 정보를 우선 인용.
+- 산업 리포트 PDF 텍스트들 (wisereport). 각 본문 첫 줄에
+  `[발행 N일 전 (= YYYY-MM-DD) · 가중치 X× · 오늘=YYYY-MM-DD]` 라벨이 있다.
+  가중치 1.5×(7일 이내) 라벨이 붙은 리포트의 정보를 우선 인용.
 
 # 출력 형식 (엄수)
 **오로지 JSON만 출력**. 자연어 서론·결론 금지. 코드 펜스 ```json 사용 가능.

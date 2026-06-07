@@ -87,6 +87,10 @@ COMPANY_REPORTS_PER_TICKER = 2
 INDUSTRY_TEXT_MAX = 12_000   # PDF 텍스트 추출 시 자르는 문자 수
 COMPANY_TEXT_MAX = 10_000
 NARROW_TARGET = 10           # 30 → 10
+# 리포트 freshness — fast-cycle 산업(DRAM 등)에 6개월 cap은 너무 넓음. 기본 90일,
+# 부족하면 코드에서 graceful 폴백 (180일 재시도). env로 override 가능.
+REPORT_DAYS_BACK = int(os.getenv("IDEA_REPORT_DAYS_BACK", "90"))
+REPORT_DAYS_BACK_FALLBACK = int(os.getenv("IDEA_REPORT_DAYS_BACK_FALLBACK", "180"))
 TOP_PICK_COUNT = 5
 
 # idea_bot 자체의 작업 상태 (다른 봇과 별도)
@@ -1243,6 +1247,30 @@ async def _run_pipeline(
             bot, chat_id, f"  ✅ 종목 리포트 총 {total_company_pdfs}건 수집",
         )
 
+        # ---- (4.5) 종목별 최근 30일 뉴스 fetch (perplexity sonar 병렬)
+        # wisereport 분석가 리포트가 회장 발언·capex 가이던스 같은 이벤트성 뉴스를
+        # 리포트화하기 전 1~4주 갭을 메우는 단계. synthesis가 인용하는 source.
+        await send_text_chunked(
+            bot, chat_id,
+            "📰 4.5단계: 종목별 최근 30일 뉴스·공시·실적 web search (perplexity)",
+        )
+        try:
+            from src.idea import news as _news_mod
+            news_by_ticker = await _news_mod.fetch_recent_news_batch(top10, days=30)
+        except Exception:
+            log.exception("종목별 최근 뉴스 fetch 단계 실패 — 빈 결과로 진행")
+            news_by_ticker = {}
+        # top10 각 candidate에 recent_news 부착 → synthesis 컨텍스트로 전달됨
+        for c in top10:
+            t = (c.get("ticker6") or "").strip()
+            c["recent_news"] = news_by_ticker.get(t, [])
+        hit_n = sum(1 for c in top10 if c.get("recent_news"))
+        total_news = sum(len(c.get("recent_news") or []) for c in top10)
+        await send_text_chunked(
+            bot, chat_id,
+            f"  ✅ 최근 뉴스 총 {total_news}건 (hit {hit_n}/{len(top10)} 종목)",
+        )
+
         # ---- (5) 최종 synthesis
         await send_text_chunked(
             bot, chat_id,
@@ -1324,6 +1352,26 @@ async def _run_pipeline(
 # ------------------------------------------------------------------
 # (1) 리서치 — perplexity/sonar-pro 웹검색
 # ------------------------------------------------------------------
+def _today_anchor() -> str:
+    """LLM user_msg 최상단에 prepend할 오늘 날짜 anchor.
+
+    모든 분석 단계(research/importance/narrow/synthesis)의 user_msg에 prepend.
+    LLM training cutoff 이후 사건이 있을 수 있으므로 모델 prior보다 입력 자료를
+    우선 신뢰하도록 명시.
+    """
+    from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+    KST = _tz(_td(hours=9))
+    now = _dt.now(KST)
+    weekday = ("월", "화", "수", "목", "금", "토", "일")[now.weekday()]
+    return (
+        f"**현재 기준일: {now.strftime('%Y년 %m월 %d일')} ({weekday}) KST**\n"
+        f"※ 이 날짜는 분석의 절대 anchor. 모든 'X일 전', '최근 N일', '곧', "
+        f"'다음 분기' 같은 표현은 반드시 이 날짜 기준. 모델 training cutoff "
+        f"이후의 사건이 있을 수 있으니, 본인의 prior보다 입력된 자료/웹검색 "
+        f"결과를 우선 신뢰하라.\n\n"
+    )
+
+
 async def _parse_idea(idea_text: str) -> dict | None:
     """0.5단계: 아이디어 텍스트에서 thesis + constraints 분리.
 
@@ -1442,7 +1490,8 @@ async def _research_idea(idea_text: str, parsed: dict | None = None) -> dict | N
             )
 
         user_msg = (
-            f"투자 아이디어 원문:\n{idea_text}\n\n"
+            _today_anchor()
+            + f"투자 아이디어 원문:\n{idea_text}\n\n"
             f"파싱된 thesis: {thesis}{constraints_block}\n\n"
             "위 자료를 시스템 프롬프트의 형식대로 JSON으로 출력해주세요."
         )
@@ -1529,7 +1578,8 @@ async def _evaluate_importance(idea_text: str, research: dict) -> dict | None:
             ],
         }
         user_msg = (
-            f"# 사용자 투자 아이디어\n{idea_text}\n\n"
+            _today_anchor()
+            + f"# 사용자 투자 아이디어\n{idea_text}\n\n"
             f"# 1단계 리서치 (요약)\n"
             f"{json.dumps(compact, ensure_ascii=False, indent=2)}\n\n"
             "위 자료를 비판적으로 검증해 시스템 프롬프트 형식대로 JSON 출력해주세요."
@@ -1665,15 +1715,32 @@ async def _collect_industry_reports(
                             items = cli.list_top_reports(
                                 category="industry", sort_by="popular",
                                 limit=INDUSTRY_REPORTS_PER_INDUSTRY,
-                                days_back=180, industry_gics=code,  # 6개월 cap
+                                days_back=REPORT_DAYS_BACK, industry_gics=code,  # 기본 90일
                             )
+                            # 90일에 0건이면 180일로 1회 폴백 (fast-cycle 외 산업 대비)
+                            if not items and REPORT_DAYS_BACK < REPORT_DAYS_BACK_FALLBACK:
+                                log.info(
+                                    "산업 '%s' %d일 0건 → %d일 폴백",
+                                    name, REPORT_DAYS_BACK, REPORT_DAYS_BACK_FALLBACK,
+                                )
+                                items = cli.list_top_reports(
+                                    category="industry", sort_by="popular",
+                                    limit=INDUSTRY_REPORTS_PER_INDUSTRY,
+                                    days_back=REPORT_DAYS_BACK_FALLBACK, industry_gics=code,
+                                )
                         if not items and not general_pool_used:
                             log.info("산업 '%s' 매칭 실패 → 일반 industry top reports 1회 사용", name)
                             items = cli.list_top_reports(
                                 category="industry", sort_by="popular",
                                 limit=INDUSTRY_REPORTS_PER_INDUSTRY * 2,
-                                days_back=180,
+                                days_back=REPORT_DAYS_BACK,
                             )
+                            if not items and REPORT_DAYS_BACK < REPORT_DAYS_BACK_FALLBACK:
+                                items = cli.list_top_reports(
+                                    category="industry", sort_by="popular",
+                                    limit=INDUSTRY_REPORTS_PER_INDUSTRY * 2,
+                                    days_back=REPORT_DAYS_BACK_FALLBACK,
+                                )
                             general_pool_used = True
                         # 인기순이지만 sch_dt 최신 우선 보조 정렬 (같은 visit_cnt 그룹 안에서 최신 우대)
                         items.sort(key=lambda it: it.sch_dt, reverse=True)
@@ -1698,11 +1765,14 @@ async def _collect_industry_reports(
                     # filename → sch_dt 매핑 — recency 라벨 주입용
                     sch_by_name = {p.name: getattr(items[i], "sch_dt", "") for i, p in enumerate(saved) if i < len(items)}
                     from src.idea.recency import label as _recency_label
+                    from datetime import datetime as _dt2, timezone as _tz2, timedelta as _td2
+                    _KST2 = _tz2(_td2(hours=9))
+                    _today_kst = _dt2.now(_KST2)
                     for p in saved:
                         try:
                             t = summarizer._extract_pdf_text(p, max_chars=INDUSTRY_TEXT_MAX)
                             if t.strip():
-                                tag = _recency_label(sch_by_name.get(p.name, ""))
+                                tag = _recency_label(sch_by_name.get(p.name, ""), today=_today_kst)
                                 text_by_name[p.name] = f"{tag}\n{t}"
                         except Exception:
                             log.exception("산업 PDF 텍스트 추출 실패: %s", p)
@@ -1738,9 +1808,26 @@ async def _narrow_candidates(
             for fn, txt in industry_texts.items()
         ) or "(산업 리포트 텍스트 없음)"
 
+        # 최근 30일 핵심 이벤트 (research.recent_developments) — narrow가 30→10 줄일 때
+        # 사건 직결 종목 우대용. research 단계가 미구현이거나 빈 응답이면 안내만.
+        rd = research.get("recent_developments") or []
+        if rd:
+            rd_block = (
+                "# 최근 30일 핵심 이벤트 (web search 출처 — perplexity 1단계)\n"
+                + json.dumps(rd, ensure_ascii=False, indent=2)[:6000]
+                + "\n위 이벤트가 직결되는 종목은 동일 점수일 때 우대.\n\n"
+            )
+        else:
+            rd_block = (
+                "# 최근 30일 핵심 이벤트\n(research 단계에서 catalyst 부족 — "
+                "thesis가 stale일 가능성 인지하라.)\n\n"
+            )
+
         user_msg = (
-            f"# 사용자 투자 아이디어\n{idea_text}\n\n"
-            f"# 1단계 리서치 (논리의 기울기 + 산업 + 30 후보)\n"
+            _today_anchor()
+            + f"# 사용자 투자 아이디어\n{idea_text}\n\n"
+            + rd_block
+            + f"# 1단계 리서치 (논리의 기울기 + 산업 + 30 후보)\n"
             f"{json.dumps(research, ensure_ascii=False, indent=2)[:15_000]}\n\n"
             f"# 산업 리포트 텍스트\n{ind_block[:60_000]}\n\n"
             "위 자료를 종합해 시스템 프롬프트 형식대로 top10 JSON을 출력해주세요."
@@ -1919,8 +2006,19 @@ async def _collect_company_reports(
                         items = cli.list_reports(
                             ticker=ticker, sort_by="latest",
                             limit=COMPANY_REPORTS_PER_TICKER,
-                            days_back=180,  # 6개월 이내만 — 옛날 리포트 차단
+                            days_back=REPORT_DAYS_BACK,  # 기본 90일 — fast-cycle 대비
                         )
+                        # 90일 0건이면 180일 폴백 (분기 리포트 cycle 종목 대비)
+                        if not items and REPORT_DAYS_BACK < REPORT_DAYS_BACK_FALLBACK:
+                            log.info(
+                                "종목 %s %d일 0건 → %d일 폴백",
+                                ticker, REPORT_DAYS_BACK, REPORT_DAYS_BACK_FALLBACK,
+                            )
+                            items = cli.list_reports(
+                                ticker=ticker, sort_by="latest",
+                                limit=COMPANY_REPORTS_PER_TICKER,
+                                days_back=REPORT_DAYS_BACK_FALLBACK,
+                            )
                     except Exception:
                         log.exception("종목 리포트 목록 실패: %s", ticker)
                         continue
@@ -1937,11 +2035,14 @@ async def _collect_company_reports(
                     texts: dict[str, str] = {}
                     sch_by_name = {p.name: getattr(items[i], "sch_dt", "") for i, p in enumerate(saved) if i < len(items)}
                     from src.idea.recency import label as _recency_label
+                    from datetime import datetime as _dt3, timezone as _tz3, timedelta as _td3
+                    _KST3 = _tz3(_td3(hours=9))
+                    _today_kst3 = _dt3.now(_KST3)
                     for p in saved:
                         try:
                             t = summarizer._extract_pdf_text(p, max_chars=COMPANY_TEXT_MAX)
                             if t.strip():
-                                tag = _recency_label(sch_by_name.get(p.name, ""))
+                                tag = _recency_label(sch_by_name.get(p.name, ""), today=_today_kst3)
                                 texts[p.name] = f"{tag}\n{t}"
                         except Exception:
                             log.exception("종목 PDF 텍스트 추출 실패: %s", p)
@@ -2002,10 +2103,29 @@ async def _synthesize_top5(
         # 1.5단계 중요도 평가도 컨텍스트로 주입 (verdict, score, args)
         importance_ctx = json.dumps(importance or {}, ensure_ascii=False, indent=2)[:3000]
 
+        # 최근 30일 산업 이벤트 + 종목별 최신 뉴스 — Step 4.5에서 top10에 붙음.
+        rd = research.get("recent_developments") or []
+        rd_block = json.dumps(rd, ensure_ascii=False, indent=2)[:6000] if rd \
+            else "(research에서 최근 30일 산업 catalyst 발견 못 함 — thesis stale 위험)"
+
+        per_ticker_news_lines = []
+        for c in top10:
+            news = c.get("recent_news") or []
+            if news:
+                per_ticker_news_lines.append(
+                    f"## {c.get('name','?')} ({c.get('ticker6','??????')})\n"
+                    + json.dumps(news, ensure_ascii=False, indent=2)[:2500]
+                )
+        per_ticker_news_block = "\n\n".join(per_ticker_news_lines) \
+            or "(종목별 최근 30일 뉴스 fetch 없음 또는 모두 빈 응답)"
+
         user_msg = (
-            f"# 사용자 투자 아이디어\n{idea_text}\n\n"
+            _today_anchor()
+            + f"# 사용자 투자 아이디어\n{idea_text}\n\n"
             f"# 1단계 리서치 — 논리의 기울기\n"
             f"{json.dumps(research.get('logic_gradient_text',''), ensure_ascii=False)[:3000]}\n\n"
+            f"# 최근 30일 산업 핵심 이벤트 (research 단계 perplexity 출처)\n{rd_block}\n\n"
+            f"# 종목별 최근 30일 뉴스 (4.5단계 per-ticker perplexity)\n{per_ticker_news_block[:10_000]}\n\n"
             f"# 1.5단계 중요도 평가 (이 평가를 진지하게 받아 thesis에 반영)\n"
             f"{importance_ctx}\n\n"
             f"# top10 후보 (3단계 narrow 결과)\n"
@@ -2015,6 +2135,7 @@ async def _synthesize_top5(
             "시스템 프롬프트 형식대로 Top 5 JSON을 출력해주세요. "
             "각 종목마다 사업부 식별 → 영업레버리지 폭 → 기울기 → thesis 순으로 단계적으로 추론하고 "
             "최종 thesis에 통합해주세요. "
+            "recent_catalysts_30d 필드는 위 '최근 30일 산업 이벤트' 또는 '종목별 최근 30일 뉴스'에서 직접 인용 (자체 추측 금지). "
             "referenced_reports에는 해당 종목의 own 종목 리포트 파일명만 정확히 사용해주세요."
         )
         # max_tokens=12000 — Top 5 × 1500자 thesis + key_numbers + methodology
@@ -2287,6 +2408,9 @@ async def _send_results(
             summary_header += f"📐 폭(magnitude): {magnitude}\n"
         if gradient_timing:
             summary_header += f"⏱️ 기울기/시점: {gradient_timing}\n"
+        recent_cat = pick.get("recent_catalysts_30d") or ""
+        if recent_cat:
+            summary_header += f"📰 최근 30일 catalyst: {recent_cat}\n"
         rr_note = pick.get("risk_reward_note") or ""
         if rr_note:
             summary_header += f"⚖️ 손익비: {rr_note}\n"

@@ -53,15 +53,26 @@ def weight(sch_dt: str, *, today: datetime | None = None) -> float:
 
 
 def label(sch_dt: str, *, today: datetime | None = None) -> str:
-    """LLM 프롬프트 주입용 라벨. 예: `[발행 5일 전 · 가중치 1.5×]`.
+    """LLM 프롬프트 주입용 라벨. 예:
+    `[발행 5일 전 (= 2026-06-02) · 가중치 1.5× · 오늘=2026-06-07]`.
+
+    절대 날짜·상대 일수·오늘 anchor를 모두 표기 — LLM이 "오늘 - X일 = sch_dt"
+    산수를 자체 검증할 수 있게.
 
     parse 실패 시 `[발행일 미상]`.
     """
     age = days_old(sch_dt, today=today)
     if age is None:
         return "[발행일 미상]"
+    today = today or datetime.now(KST)
     w = weight(sch_dt, today=today)
-    return f"[발행 {age}일 전 · 가중치 {w:.1f}×]"
+    # 절대 날짜는 parse 가능한 형식으로 정규화
+    dt = _parse_date(sch_dt)
+    dt_str = dt.strftime("%Y-%m-%d") if dt else sch_dt.strip()
+    return (
+        f"[발행 {age}일 전 (= {dt_str}) · 가중치 {w:.1f}× · "
+        f"오늘={today.strftime('%Y-%m-%d')}]"
+    )
 
 
 def sort_by_weight(items: Iterable[dict], *, date_key: str = "sch_dt") -> list[dict]:

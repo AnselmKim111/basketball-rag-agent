@@ -63,9 +63,19 @@ def test_weight_invalid_date_returns_1():
 def test_label_format():
     from src.idea.recency import label
     today = _fixed_today()
-    assert label("2026-06-01", today=today) == "[발행 2일 전 · 가중치 1.5×]"
-    assert label("2026-05-04", today=today) == "[발행 30일 전 · 가중치 1.2×]"
-    assert label("2025-01-01", today=today).endswith("· 가중치 1.0×]")
+    # 절대 날짜·상대 일수·오늘 anchor 모두 표기
+    out = label("2026-06-01", today=today)
+    assert "발행 2일 전" in out
+    assert "2026-06-01" in out
+    assert "1.5×" in out
+    assert "오늘=2026-06-03" in out
+
+    out30 = label("2026-05-04", today=today)
+    assert "발행 30일 전" in out30
+    assert "1.2×" in out30
+    assert "2026-05-04" in out30
+
+    assert "1.0×" in label("2025-01-01", today=today)
     assert label("garbage", today=today) == "[발행일 미상]"
 
 
