@@ -116,6 +116,12 @@ class BotSpec:
     optional: bool = True                           # False면 토큰 없을 때 systemexit
 
 
+async def _model_router_weekly_job(bot: Bot) -> None:
+    """주간 모델 가성비 재평가 cron — 일요일 21:00 KST."""
+    from src.model_router.handler import model_eval_job
+    await model_eval_job(bot)
+
+
 BOT_SPECS: list[BotSpec] = [
     BotSpec(
         name="company",
@@ -252,6 +258,12 @@ BOT_SPECS: list[BotSpec] = [
                 job_id="report_daily",
                 cron={"hour": 8, "minute": 0},
                 description="버터대디봇 시황 리포트 — 매일 08:00 KST",
+            ),
+            ScheduledJob(
+                func=_model_router_weekly_job,
+                job_id="model_router_weekly",
+                cron={"day_of_week": "sun", "hour": 21, "minute": 0},
+                description="모델 가성비 주간 재평가 — 매주 일요일 21:00 KST",
             ),
         ],
     ),
