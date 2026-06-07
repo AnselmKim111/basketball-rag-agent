@@ -17,6 +17,14 @@ log = logging.getLogger(__name__)
 REVENUE_TOLERANCE = 0.05   # 5%
 CAPEX_TOLERANCE = 0.15     # 15%
 
+# 컨센 가드 — perplexity가 "$0.00B"로 파싱한 비정상 작은 값이 div-by-zero에 가깝게
+# 폭주(예: +100,949,093,946%)하는 것 차단. 가드 미달 시 unavailable로 강등.
+CONSENSUS_GUARD = {
+    "min_revenue_est": 1e6,    # 100만 USD 미만 추정치는 결손 의심
+    "min_eps_est_abs": 0.01,   # |EPS 추정| < $0.01은 결손 의심
+    "max_valid_delta": 5.0,    # |delta| > 500%는 결손 의심
+}
+
 
 @dataclass
 class VerifyResult:
@@ -149,13 +157,10 @@ def compute_consensus_delta(extract: dict, snap) -> list[ConsensusDelta]:
     rev_est = getattr(snap, "revenue_est_current_q", None) if snap else None
     eps_est = getattr(snap, "eps_est_current_q", None) if snap else None
 
-    # revenue
-    # 가드: rev_est가 비정상 작은 값 (perplexity가 $0.00B로 파싱 → 매우 작은 양수)이면
-    # delta가 폭주 (예: +100,000,000,000%). 임계치 미달 시 unavailable로 강등.
-    if rev_actual is not None and rev_est and rev_est > 1e6:
+    # revenue — perplexity가 "$0.00B"로 파싱한 비정상 값을 가드
+    if rev_actual is not None and rev_est and rev_est > CONSENSUS_GUARD["min_revenue_est"]:
         d = (rev_actual - rev_est) / rev_est
-        if abs(d) > 5.0:
-            # 500% 초과 = 컨센 데이터 결손 의심
+        if abs(d) > CONSENSUS_GUARD["max_valid_delta"]:
             deltas.append(ConsensusDelta(
                 ticker, "revenue", rev_actual, rev_est, None, "unavailable",
                 f"📐 {ticker} Revenue 컨센 데이터 결손 의심 — 실제 ${rev_actual/1e9:.2f}B, 컨센 비정상값"
@@ -173,10 +178,10 @@ def compute_consensus_delta(extract: dict, snap) -> list[ConsensusDelta]:
             f"📐 {ticker} Revenue 컨센 대조 불가 (실제={rev_actual}, 컨센={rev_est})"
         ))
 
-    # eps
-    if eps_actual is not None and eps_est and abs(eps_est) > 0.01:
+    # eps — 동일 가드 패턴
+    if eps_actual is not None and eps_est and abs(eps_est) > CONSENSUS_GUARD["min_eps_est_abs"]:
         d = (eps_actual - eps_est) / eps_est
-        if abs(d) > 5.0:
+        if abs(d) > CONSENSUS_GUARD["max_valid_delta"]:
             deltas.append(ConsensusDelta(
                 ticker, "eps", eps_actual, eps_est, None, "unavailable",
                 f"📐 {ticker} EPS 컨센 데이터 결손 의심 — 실제 ${eps_actual:.2f}, 컨센 비정상값"

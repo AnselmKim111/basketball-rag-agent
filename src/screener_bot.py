@@ -50,7 +50,7 @@ def _is_subscribed_or_admin(update: Update) -> bool:
 
 
 WELCOME_TEXT = (
-    "👋 *ScreenerBot에 오신 걸 환영합니다!*\n\n"
+    "👋 <b>ScreenerBot에 오신 걸 환영합니다!</b>\n\n"
     "📈 한국 주식 기술적 신호를 매일 16:00 KST에 자동 발송합니다.\n"
     "(15:30 장마감 + 30분 정산 버퍼)\n\n"
     "신호:\n"
@@ -61,19 +61,19 @@ WELCOME_TEXT = (
     "  /screen — 지금 즉시 신호 분석 (~2-3분)\n"
     "  /help — 도움말\n"
     "  /stop — 자동 발송 해제\n\n"
-    "_시총 3000억+ KOSPI/KOSDAQ 종목, 섹터별 분류, 시총·상승률 복합 정렬, "
-    "Naver 이중확인 통과만 발송_"
+    "<i>시총 3000억+ KOSPI/KOSDAQ 종목, 섹터별 분류, 시총·상승률 복합 정렬, "
+    "Naver 이중확인 통과만 발송</i>"
 )
 
 HELP_TEXT = (
-    "📈 *ScreenerBot* — 한국 주식 기술적 신호\n\n"
+    "📈 <b>ScreenerBot</b> — 한국 주식 기술적 신호\n\n"
     "자동: 매일 16:00 KST (15:30 종가 기준 · 30분 정산 버퍼)\n"
     "데이터: KRX (Naver Finance 1순위 + pykrx/FDR 폴백)\n"
     "유니버스: KOSPI + KOSDAQ 보통주, 시총 ≥ 3000억\n"
     "이중확인: base_date-anchored signals + Naver 재 fetch cross-validation\n\n"
     "신호:\n"
-    "  🚀 역사적 신고가 — 종가 > 보유 데이터(280일) 최고가\n"
-    "  📈 52주 신고가 — 종가 > 과거 252영업일 최고가\n"
+    "  🚀 역사적 신고가 — 종가 &gt; 보유 데이터(280일) 최고가\n"
+    "  📈 52주 신고가 — 종가 &gt; 과거 252영업일 최고가\n"
     "  🔥 거래량 돌파 — 오늘 거래량 ≥ 20일 평균 ×2.0 + 종가 상승\n"
     "  🎯 52주 돌파 직전 — 종가 = 52주고점 95-99% + 5일 거래량 ≥ ×1.3\n"
     "  💎 VCP 돌파 — 50일 박스권 + ATR 30%+ 수축 + 거래량 dry-up + 돌파\n\n"
@@ -108,7 +108,7 @@ async def _cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
 
     try:
-        await update.message.reply_text(WELCOME_TEXT, parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text(WELCOME_TEXT, parse_mode=ParseMode.HTML)
     except Exception:
         log.exception("[start] welcome 발송 실패")
 
@@ -213,7 +213,7 @@ async def _cmd_unblock(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 async def _help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     # /help는 누구나 — 봇 안내용
     try:
-        await update.message.reply_text(HELP_TEXT, parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text(HELP_TEXT, parse_mode=ParseMode.HTML)
     except Exception:
         log.exception("help reply 실패")
 
@@ -295,86 +295,26 @@ async def _cmd_backfill(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 # ------------------------------------------------------------------
 # 일일 스케줄 잡 (orchestrator가 호출)
 # ------------------------------------------------------------------
-def _parse_chat_ids(*env_keys: str) -> list[str]:
-    """env 여러 개를 합쳐서 진짜 chat_id (숫자 token) 만 추출.
-
-    걸러내는 케이스:
-      - '*' (wildcard 인증용 sentinel — 발송 대상 아님)
-      - '1813560888    (← 주석)' → '1813560888' 만 추출
-      - 빈 문자열 / 공백
-      - 음수·0 같은 비정상 값
-    """
-    import re
-    out: list[str] = []
-    seen: set[str] = set()
-    for key in env_keys:
-        raw = os.getenv(key, "") or ""
-        for token in raw.split(","):
-            # 숫자만 (보통 9~12자리 텔레그램 chat_id)
-            m = re.search(r"-?\d{6,}", token)
-            if not m:
-                continue
-            cid = m.group(0)
-            if cid in seen:
-                continue
-            seen.add(cid)
-            out.append(cid)
-    return out
+from src.bot_helpers import parse_admin_chat_ids as _parse_chat_ids  # legacy alias
 
 
-_BADGE = {
-    "high_all": "💥 역사적 신고가 돌파",
-    "high_52w": "📈 52주 신고가",
-    "vcp_breakout": "💎 VCP 돌파",
-    "volume_breakout": "🔥 거래량 돌파",
-    "near_breakout_52w": "🎯 52주 돌파 직전",
-}
-
-
-def _fmt_won(v) -> str:
-    """원 → 조원/억원 표기."""
-    if not isinstance(v, (int, float)) or v <= 0:
-        return "N/A"
-    if v >= 1e12:
-        return f"{v / 1e12:.1f}조원"
-    if v >= 1e8:
-        return f"{v / 1e8:,.0f}억원"
-    return f"{v:,.0f}원"
-
-
-def _fmt_pct(v) -> str:
-    return f"{v:+.1f}%" if isinstance(v, (int, float)) else "N/A"
-
-
-def _permalink(channel: str, message_id: int) -> str | None:
-    """채널 게시물 영구 링크. @username → 공개, -100… → 비공개 /c/ 형식."""
-    if channel.startswith("@"):
-        return f"https://t.me/{channel.lstrip('@')}/{message_id}"
-    cid = channel.lstrip()
-    if cid.startswith("-100"):
-        return f"https://t.me/c/{cid[4:]}/{message_id}"
-    return None
+from src.screener_common import permalink as _permalink, render_caption, fmt_won as _fmt_won, fmt_pct as _fmt_pct
 
 
 def _chart_caption(ticker: str, item: dict, cats: list[str], rows: list[dict], ytd, eps) -> str:
     from src.screener import fundamentals
-    from src.bot_helpers import html_escape
-    name = html_escape(item.get("name") or ticker)
-    chg = item.get("chg_pct") or 0.0
     turnover = fundamentals.turnover_won(rows[-1]) if rows else 0
-    badge = " ".join(_BADGE[c] for c in cats if c in _BADGE)
-    lines = [
-        f"🇰🇷 {name} ({chg:+.1f}%)",
-        badge,
-        "",
-        f"✝ 종목명 : {name} ({html_escape(ticker)})",
-        f"✝ 시가총액 : {_fmt_won(item.get('market_cap'))}",
-        f"✝ 거래대금 : {_fmt_won(turnover)}",
-        f"✝ 연초대비 상승률 : {_fmt_pct(ytd)}",
-        f"✝ 최근 EPS YoY : {_fmt_pct(eps)}",
-        f'✝ <a href="https://finance.naver.com/item/news.naver?code={ticker}">최신 종목 뉴스 조회</a>',
-    ]
-    return "\n".join(lines)
+    return render_caption(
+        market_label="🇰🇷",
+        ticker=ticker, item=item, cats=cats,
+        turnover=turnover, ytd=ytd, eps=eps,
+        market_cap=item.get("market_cap"),
+        fmt_money=_fmt_won,
+        news_url_template="https://finance.naver.com/item/news.naver?code={ticker}",
+        header_use_name=True,
+        show_ticker_in_name=True,
+        eps_label="최근 EPS YoY",
+    )
 
 
 async def _post_charts_and_meta(results: dict, base_date: str,
@@ -445,7 +385,7 @@ async def _post_charts_and_meta(results: dict, base_date: str,
     return links, extra
 
 
-_screener_running = False  # 동시 /screen·cron 중복 실행 방지 (겹치면 서로 느려짐)
+_screener_lock = asyncio.Lock()  # 동시 /screen·cron 중복 실행 방지 (atomic acquire)
 
 
 async def screener_daily_job(bot: Bot, override_chat_id: str | None = None) -> None:
@@ -457,9 +397,8 @@ async def screener_daily_job(bot: Bot, override_chat_id: str | None = None) -> N
     신호 계산은 한 번만 수행 + 결과를 모든 대상자에게 발송 (효율).
     진행 상황(universe 빌드/백필) 메시지는 첫 대상자(주로 admin)에게만 발송.
     """
-    global _screener_running
     log.info("[scheduled] screener_daily_job 시작 override=%s", override_chat_id)
-    if _screener_running:
+    if _screener_lock.locked():
         log.info("[scheduled] 이미 실행 중 — 중복 호출 스킵")
         if override_chat_id:
             try:
@@ -505,7 +444,7 @@ async def screener_daily_job(bot: Bot, override_chat_id: str | None = None) -> N
     # 진행 메시지 helper (admin에게만)
     chat_id = progress_chat  # 기존 코드 변수명 유지 (진행 메시지용)
 
-    _screener_running = True
+    await _screener_lock.acquire()
     try:
         # universe 보장
         await loop.run_in_executor(None, db.ensure_schema)
@@ -725,7 +664,8 @@ async def screener_daily_job(bot: Bot, override_chat_id: str | None = None) -> N
         except Exception:
             pass
     finally:
-        _screener_running = False
+        if _screener_lock.locked():
+            _screener_lock.release()
 
 
 # ------------------------------------------------------------------

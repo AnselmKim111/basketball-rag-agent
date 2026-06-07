@@ -322,6 +322,16 @@ async def _run_forever() -> None:
     except Exception:
         log.exception("state_store 진단 호출 실패 (orchestrator 계속 진행)")
 
+    # idea_cache 무한 증가 방지 — 부팅 시 1회 cleanup (default 200 cap).
+    # 별도 cron 없이 봇 재시작마다 정리되어 디스크 사용 안정.
+    try:
+        from src import idea_cache
+        removed = idea_cache.cleanup_old(keep=200)
+        if removed:
+            log.info("idea_cache cleanup: removed=%d (keep=200)", removed)
+    except Exception:
+        log.exception("idea_cache cleanup 실패 (orchestrator 계속 진행)")
+
     apps: list[tuple[str, Application]] = []
     bot_objects: dict[str, Bot] = {}
     pending_jobs: list[tuple[str, ScheduledJob]] = []

@@ -17,10 +17,15 @@ import asyncio
 import logging
 import os
 import re
+from datetime import timedelta, timezone
 from pathlib import Path
 from typing import Iterable
 
 from telegram import Bot, Update
+
+# 한국 표준시 — 봇별 중복 정의 제거를 위한 공용 상수.
+# 신규 모듈은 `from src.bot_helpers import KST` 사용.
+KST = timezone(timedelta(hours=9))
 
 log = logging.getLogger(__name__)
 
@@ -155,6 +160,7 @@ async def send_text_chunked(
                         parse_mode, chat_id)
             try:
                 await bot.send_message(chat_id=chat_id, text=body)
+                log.info("send_message plain 폴백 성공 (chat_id=%s)", chat_id)
             except Exception:
                 log.exception("send_message 최종 실패 (chat_id=%s)", chat_id)
                 break

@@ -25,20 +25,13 @@ def _prompt() -> str:
 
 
 def _parse_json_array(text: str) -> list[dict]:
-    s = text.strip()
-    if s.startswith("```"):
-        s = re.sub(r"^```[a-zA-Z]*\n", "", s)
-        s = re.sub(r"\n```\s*$", "", s).strip()
-    # 첫 '[' ~ 마지막 ']' 추출
-    i, j = s.find("["), s.rfind("]")
-    if i >= 0 and j > i:
-        s = s[i:j + 1]
-    try:
-        data = json.loads(s)
-        return data if isinstance(data, list) else []
-    except Exception:
+    """fetch_market_news용 array 파싱 — src/llm_json.py 사용 (tolerant)."""
+    from src.llm_json import parse_json_array
+    arr = parse_json_array(text)
+    if arr is None:
         log.info("[report.news] JSON 파싱 실패")
         return []
+    return [x for x in arr if isinstance(x, dict)]
 
 
 def fetch_market_news(max_items: int = 18, attempts: int = 3) -> list[dict]:

@@ -50,8 +50,8 @@ def _is_subscribed_or_admin(update: Update) -> bool:
 
 
 WELCOME_TEXT = (
-    "👋 *US ScreenerBot에 오신 걸 환영합니다!*\n\n"
-    "🇺🇸 미국 주식(S&P500 + Nasdaq100) 기술적 신호를 매일 07:00 KST에 자동 발송합니다.\n"
+    "👋 <b>US ScreenerBot에 오신 걸 환영합니다!</b>\n\n"
+    "🇺🇸 미국 주식(S&amp;P500 + Nasdaq100) 기술적 신호를 매일 07:00 KST에 자동 발송합니다.\n"
     "(미국 4PM ET 장마감 + 데이터 발행 버퍼)\n\n"
     "신호:\n"
     "  🚀 역사적 신고가  📈 52주 신고가\n"
@@ -61,19 +61,19 @@ WELCOME_TEXT = (
     "  /screen — 지금 즉시 신호 분석 (~3-5분)\n"
     "  /help — 도움말\n"
     "  /stop — 자동 발송 해제\n\n"
-    "_시총 $1B+ S&P500/Nasdaq100 종목, 섹터별 분류, 시총·상승률 복합 정렬, "
-    "이중확인 통과만 발송_"
+    "<i>시총 $1B+ S&amp;P500/Nasdaq100 종목, 섹터별 분류, 시총·상승률 복합 정렬, "
+    "이중확인 통과만 발송</i>"
 )
 
 HELP_TEXT = (
-    "🇺🇸 *US ScreenerBot* — 미국 주식 기술적 신호\n\n"
+    "🇺🇸 <b>US ScreenerBot</b> — 미국 주식 기술적 신호\n\n"
     "자동: 매일 07:00 KST (미국 4PM ET 장마감 기준)\n"
     "데이터: FDR(Yahoo) 1순위 + Stooq 폴백\n"
-    "유니버스: S&P500 + Nasdaq100, 시총 ≥ $1B\n"
+    "유니버스: S&amp;P500 + Nasdaq100, 시총 ≥ $1B\n"
     "이중확인: base_date-anchored signals + 재 fetch cross-validation\n\n"
     "신호:\n"
-    "  🚀 역사적 신고가 — 종가 > 보유 데이터(280일) 최고가\n"
-    "  📈 52주 신고가 — 종가 > 과거 252영업일 최고가\n"
+    "  🚀 역사적 신고가 — 종가 &gt; 보유 데이터(280일) 최고가\n"
+    "  📈 52주 신고가 — 종가 &gt; 과거 252영업일 최고가\n"
     "  🔥 거래량 돌파 — 오늘 거래량 ≥ 20일 평균 ×2.0 + 종가 상승\n"
     "  🎯 52주 돌파 직전 — 종가 = 52주고점 95-99% + 5일 거래량 ≥ ×1.3\n"
     "  💎 VCP 돌파 — 50일 박스권 + ATR 30%+ 수축 + 거래량 dry-up + 돌파\n\n"
@@ -108,7 +108,7 @@ async def _cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
 
     try:
-        await update.message.reply_text(WELCOME_TEXT, parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text(WELCOME_TEXT, parse_mode=ParseMode.HTML)
     except Exception:
         log.exception("[start] welcome 발송 실패")
 
@@ -213,7 +213,7 @@ async def _cmd_unblock(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 async def _help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     # /help는 누구나 — 봇 안내용
     try:
-        await update.message.reply_text(HELP_TEXT, parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text(HELP_TEXT, parse_mode=ParseMode.HTML)
     except Exception:
         log.exception("help reply 실패")
 
@@ -295,88 +295,25 @@ async def _cmd_backfill(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 # ------------------------------------------------------------------
 # 일일 스케줄 잡 (orchestrator가 호출)
 # ------------------------------------------------------------------
-def _parse_chat_ids(*env_keys: str) -> list[str]:
-    """env 여러 개를 합쳐서 진짜 chat_id (숫자 token) 만 추출.
-
-    걸러내는 케이스:
-      - '*' (wildcard 인증용 sentinel — 발송 대상 아님)
-      - '1813560888    (← 주석)' → '1813560888' 만 추출
-      - 빈 문자열 / 공백
-      - 음수·0 같은 비정상 값
-    """
-    import re
-    out: list[str] = []
-    seen: set[str] = set()
-    for key in env_keys:
-        raw = os.getenv(key, "") or ""
-        for token in raw.split(","):
-            # 숫자만 (보통 9~12자리 텔레그램 chat_id)
-            m = re.search(r"-?\d{6,}", token)
-            if not m:
-                continue
-            cid = m.group(0)
-            if cid in seen:
-                continue
-            seen.add(cid)
-            out.append(cid)
-    return out
+from src.bot_helpers import parse_admin_chat_ids as _parse_chat_ids  # legacy alias
 
 
-_BADGE = {
-    "high_all": "💥 역사적 신고가 돌파",
-    "high_52w": "📈 52주 신고가",
-    "vcp_breakout": "💎 VCP 돌파",
-    "volume_breakout": "🔥 거래량 돌파",
-    "near_breakout_52w": "🎯 52주 돌파 직전",
-}
-
-
-def _fmt_usd(v) -> str:
-    if not isinstance(v, (int, float)) or v <= 0:
-        return "N/A"
-    if v >= 1e9:
-        return f"${v / 1e9:.1f}B"
-    if v >= 1e6:
-        return f"${v / 1e6:.0f}M"
-    return f"${v:,.0f}"
-
-
-def _fmt_pct(v) -> str:
-    return f"{v:+.1f}%" if isinstance(v, (int, float)) else "N/A"
-
-
-def _permalink(channel: str, message_id: int) -> str | None:
-    """채널 게시물 영구 링크. @username → 공개, -100… → 비공개 /c/ 형식."""
-    if channel.startswith("@"):
-        return f"https://t.me/{channel.lstrip('@')}/{message_id}"
-    cid = channel.lstrip()
-    if cid.startswith("-100"):
-        return f"https://t.me/c/{cid[4:]}/{message_id}"
-    return None
+from src.screener_common import permalink as _permalink, render_caption, fmt_usd as _fmt_usd, fmt_pct as _fmt_pct
 
 
 def _chart_caption(ticker: str, item: dict, cats: list[str], rows: list[dict],
                    ytd, eps, market_cap=None, earnings_date: str | None = None) -> str:
     from src.us_screener import fundamentals
-    from src.bot_helpers import html_escape
-    name = html_escape(item.get("name") or ticker)
-    chg = item.get("chg_pct") or 0.0
     turnover = fundamentals.turnover_usd(rows[-1]) if rows else 0
-    badge = " ".join(_BADGE[c] for c in cats if c in _BADGE)
-    lines = [
-        f"🇺🇸 {html_escape(ticker)} ({chg:+.1f}%)",
-        badge,
-        "",
-        f"✝ 종목명 : {name}",
-        f"✝ 시가총액 : {_fmt_usd(market_cap)}",
-        f"✝ 거래대금 : {_fmt_usd(turnover)}",
-        f"✝ 연초대비 상승률 : {_fmt_pct(ytd)}",
-        f"✝ 최근분기 EPS YoY : {_fmt_pct(eps)}",
-        f'✝ <a href="https://finviz.com/quote.ashx?t={ticker}">최신 종목 뉴스 조회</a>',
-    ]
-    if earnings_date:
-        lines.insert(3, f"⚡ 다음 어닝 : {html_escape(earnings_date)}")
-    return "\n".join(lines)
+    return render_caption(
+        market_label="🇺🇸",
+        ticker=ticker, item=item, cats=cats,
+        turnover=turnover, ytd=ytd, eps=eps,
+        market_cap=market_cap,
+        fmt_money=_fmt_usd,
+        news_url_template="https://finviz.com/quote.ashx?t={ticker}",
+        earnings_date=earnings_date,
+    )
 
 
 async def _post_charts_and_meta(results: dict, max_tickers: int = 120) -> tuple[dict, dict]:
@@ -414,6 +351,7 @@ async def _post_charts_and_meta(results: dict, max_tickers: int = 120) -> tuple[
     links: dict[str, str] = {}
     extra: dict[str, dict] = {}
     loop = asyncio.get_event_loop()
+    # FMP earnings calendar (httpx.get sync blocking — executor로 event loop 보호)
     from src.us_screener import earnings_proximity
     earnings_map = await loop.run_in_executor(
         None, lambda: earnings_proximity.fetch_upcoming_earnings(set(by_ticker.keys()), days_fwd=7)
@@ -456,6 +394,9 @@ async def _post_charts_and_meta(results: dict, max_tickers: int = 120) -> tuple[
     return links, extra
 
 
+_us_screener_lock = asyncio.Lock()  # 동시 /screen·cron 중복 실행 방지 (atomic acquire)
+
+
 async def us_screener_daily_job(bot: Bot, override_chat_id: str | None = None) -> None:
     """매일 16:00 cron 또는 /screen 즉시 실행.
 
@@ -466,6 +407,15 @@ async def us_screener_daily_job(bot: Bot, override_chat_id: str | None = None) -
     진행 상황(universe 빌드/백필) 메시지는 첫 대상자(주로 admin)에게만 발송.
     """
     log.info("[scheduled] us_screener_daily_job 시작 override=%s", override_chat_id)
+    if _us_screener_lock.locked():
+        log.info("[scheduled] 이미 실행 중 — 중복 호출 스킵")
+        if override_chat_id:
+            try:
+                await send_text_chunked(bot, str(override_chat_id),
+                                        "⏳ 이미 스크리닝 실행 중입니다 — 곧 결과가 옵니다. (잠시만요)")
+            except Exception:
+                pass
+        return
 
     # 발송 대상 chat_id 리스트 결정
     if override_chat_id:
@@ -503,6 +453,7 @@ async def us_screener_daily_job(bot: Bot, override_chat_id: str | None = None) -
     # 진행 메시지 helper (admin에게만)
     chat_id = progress_chat  # 기존 코드 변수명 유지 (진행 메시지용)
 
+    await _us_screener_lock.acquire()
     try:
         # universe 보장 — 미국은 S&P500+Nasdaq100 ~550종목으로 fetch 빠름(~2초).
         # 매번 refresh_universe (upsert) 호출해 NASDAQ100 신규 종목·섹터 항상 반영.
@@ -706,6 +657,9 @@ async def us_screener_daily_job(bot: Bot, override_chat_id: str | None = None) -
             await send_text_chunked(bot, chat_id, "⚠️ 스크리너 작업 실패 — 로그 확인")
         except Exception:
             pass
+    finally:
+        if _us_screener_lock.locked():
+            _us_screener_lock.release()
 
 
 # ------------------------------------------------------------------

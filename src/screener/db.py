@@ -75,6 +75,7 @@ def ensure_schema() -> None:
               payload   TEXT NOT NULL,
               PRIMARY KEY (date, ticker, signal)
             );
+            CREATE INDEX IF NOT EXISTS idx_signals_date ON signals(date);
             CREATE TABLE IF NOT EXISTS fundamentals (
               ticker     TEXT PRIMARY KEY,
               eps_yoy    REAL,
@@ -84,16 +85,37 @@ def ensure_schema() -> None:
             """
         )
         # market_cap, sector 컬럼 추가 (기존 DB 호환). SQLite ALTER는 IF NOT EXISTS 미지원.
+        # universe scan(IdeaBot)을 위한 business_text + embedding 컬럼.
         for col_def in (
             "ALTER TABLE tickers ADD COLUMN market_cap INTEGER",
             "ALTER TABLE tickers ADD COLUMN sector TEXT",
+            "ALTER TABLE tickers ADD COLUMN business_text TEXT",        # DART 사업의 내용
+            "ALTER TABLE tickers ADD COLUMN business_text_dt TEXT",     # 추출일(YYYY-MM-DD)
+            "ALTER TABLE tickers ADD COLUMN business_report_no TEXT",   # 원본 rcept_no
+            "ALTER TABLE tickers ADD COLUMN embedding BLOB",            # float32 vector
+            "ALTER TABLE tickers ADD COLUMN embedding_model TEXT",      # 모델 식별
+            "ALTER TABLE tickers ADD COLUMN embedding_dt TEXT",         # 임베딩 생성일
         ):
             try:
                 c.execute(col_def)
             except sqlite3.OperationalError:
                 pass  # 이미 존재
+        # 스키마 버전 시드 — 향후 migration 토대 (현재는 활용 없음, 기록만).
+        c.execute(
+            "INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', '1')"
+        )
     _INITIALIZED = True
     log.info("[screener.db] 스키마 준비 완료 path=%s", DB_PATH)
+
+
+def get_connection():
+    """RLock + WAL이 적용된 DB 커넥션 context manager.
+
+    `_conn()` 의 public alias — 외부 모듈은 이걸 import 해서 직접 SQL이 필요한
+    경우 사용. 내부 헬퍼 함수(load_ohlcv, get_ticker_name 등) 가 있으면 그걸
+    먼저 쓰는 게 우선이고, ad-hoc SQL이 필요할 때만 이걸 쓴다.
+    """
+    return _conn()
 
 
 # ------------------------------------------------------------------
@@ -191,36 +213,16 @@ def has_date(date_str: str) -> bool:
 
 
 def recent_signals(days_back: int = 14, exclude_date: Optional[str] = None) -> list[dict]:
-    """최근 days_back 영업일 내 발생 신호 (오름차순 date). exclude_date 명시 시 그 날짜 제외(오늘).
+    """**Deprecated** — `load_signals_in_range(start, end, exclude_date)` 사용 권장.
 
-    반환: [{date, ticker, signal, payload(dict)}].
+    호환 위해 보존. days_back×1.5 calendar days로 오버페치하던 근사 로직을 제거하고
+    표준 함수에 위임. 결과 정렬은 표준 함수가 (date, signal, ticker) — 기존 호출자는
+    그래도 동작 (정렬 순서 의존 거의 없음).
     """
-    ensure_schema()
-    with _conn() as c:
-        # 영업일 기준 ≈ days_back×1.5 calendar days로 충분히 넓게 → 호출측이 다시 필터
-        from datetime import date, timedelta
-        cutoff = (date.today() - timedelta(days=int(days_back * 1.5))).isoformat()
-        if exclude_date:
-            cur = c.execute(
-                "SELECT date, ticker, signal, payload FROM signals "
-                "WHERE date >= ? AND date != ? ORDER BY date ASC, ticker, signal",
-                (cutoff, exclude_date),
-            )
-        else:
-            cur = c.execute(
-                "SELECT date, ticker, signal, payload FROM signals "
-                "WHERE date >= ? ORDER BY date ASC, ticker, signal",
-                (cutoff,),
-            )
-        rows = cur.fetchall()
-    out = []
-    for r in rows:
-        try:
-            payload = json.loads(r[3]) if r[3] else {}
-        except Exception:
-            payload = {}
-        out.append({"date": r[0], "ticker": r[1], "signal": r[2], "payload": payload})
-    return out
+    from datetime import date as _date, timedelta as _td
+    start = (_date.today() - _td(days=int(days_back * 1.5))).isoformat()
+    end = _date.today().isoformat()
+    return load_signals_in_range(start, end, exclude_date=exclude_date)
 
 
 def close_after_n_business_days(ticker: str, start_date: str, n: int = 5) -> Optional[int]:
@@ -336,6 +338,117 @@ def get_ticker_name(ticker: str) -> Optional[str]:
 
 
 # ------------------------------------------------------------------
+# Universe scan용 — business_text + embedding 저장/조회
+# ------------------------------------------------------------------
+def upsert_business_text(
+    ticker: str,
+    text: str,
+    extracted_dt: str,
+    report_no: Optional[str] = None,
+) -> None:
+    """ticker에 대해 DART 사업의 내용 텍스트 + 추출일 + rcept_no 저장.
+
+    embedding은 별도 (텍스트 갱신되면 stale 임베딩은 비우는 게 정직).
+    """
+    ensure_schema()
+    with _conn() as c:
+        c.execute(
+            "UPDATE tickers SET business_text=?, business_text_dt=?, business_report_no=?, "
+            "embedding=NULL, embedding_model=NULL, embedding_dt=NULL "
+            "WHERE ticker=?",
+            (text, extracted_dt, report_no, ticker),
+        )
+
+
+def upsert_embedding(
+    ticker: str,
+    embedding: bytes,        # np.float32.tobytes()
+    model: str,
+    embedding_dt: str,
+) -> None:
+    ensure_schema()
+    with _conn() as c:
+        c.execute(
+            "UPDATE tickers SET embedding=?, embedding_model=?, embedding_dt=? "
+            "WHERE ticker=?",
+            (embedding, model, embedding_dt, ticker),
+        )
+
+
+def get_business_text_row(ticker: str) -> Optional[dict]:
+    """단일 ticker의 business_text + 임베딩 메타."""
+    ensure_schema()
+    with _conn() as c:
+        cur = c.execute(
+            "SELECT business_text, business_text_dt, business_report_no, "
+            "embedding, embedding_model, embedding_dt "
+            "FROM tickers WHERE ticker=?",
+            (ticker,),
+        )
+        row = cur.fetchone()
+    if not row:
+        return None
+    return {
+        "business_text": row[0],
+        "business_text_dt": row[1],
+        "business_report_no": row[2],
+        "embedding": row[3],
+        "embedding_model": row[4],
+        "embedding_dt": row[5],
+    }
+
+
+def get_universe_for_scan(
+    require_embedding: bool = True,
+    min_market_cap_won: Optional[int] = None,
+) -> list[dict]:
+    """universe scan용 — embedding(또는 business_text) 보유 종목만 반환.
+
+    반환: [{ticker, name, sector, market_cap, business_text, embedding(bytes),
+            embedding_model, embedding_dt}].
+    """
+    ensure_schema()
+    sql = (
+        "SELECT ticker, name, market, market_cap, sector, business_text, "
+        "embedding, embedding_model, embedding_dt FROM tickers WHERE is_active=1"
+    )
+    args: list = []
+    if require_embedding:
+        sql += " AND embedding IS NOT NULL"
+    else:
+        sql += " AND business_text IS NOT NULL"
+    if min_market_cap_won is not None:
+        sql += " AND market_cap IS NOT NULL AND market_cap >= ?"
+        args.append(int(min_market_cap_won))
+    sql += " ORDER BY ticker"
+    with _conn() as c:
+        cur = c.execute(sql, args)
+        return [
+            {
+                "ticker": r[0], "name": r[1], "market": r[2],
+                "market_cap": r[3], "sector": r[4],
+                "business_text": r[5], "embedding": r[6],
+                "embedding_model": r[7], "embedding_dt": r[8],
+            }
+            for r in cur.fetchall()
+        ]
+
+
+def universe_scan_stats() -> dict:
+    """진단용 — business_text/embedding 보유 종목 카운트."""
+    ensure_schema()
+    with _conn() as c:
+        active = c.execute("SELECT COUNT(*) FROM tickers WHERE is_active=1").fetchone()[0]
+        with_text = c.execute(
+            "SELECT COUNT(*) FROM tickers WHERE is_active=1 AND business_text IS NOT NULL"
+        ).fetchone()[0]
+        with_embed = c.execute(
+            "SELECT COUNT(*) FROM tickers WHERE is_active=1 AND embedding IS NOT NULL"
+        ).fetchone()[0]
+    return {"active": active, "with_business_text": with_text, "with_embedding": with_embed}
+
+
+# ------------------------------------------------------------------
 # Fundamentals 캐시 (EPS YoY) — pykrx 펀더멘털 호출 부하 최소화
 # ------------------------------------------------------------------
 def fundamentals_get(ticker: str, max_age_days: int = 7) -> Optional[dict]:
@@ -418,24 +531,35 @@ def save_signals(date_str: str, results: dict[str, list[dict]]) -> int:
     return len(rows)
 
 
-def load_signals_in_range(start_date: str, end_date: str) -> list[dict]:
+def load_signals_in_range(
+    start_date: str, end_date: str,
+    exclude_date: Optional[str] = None,
+) -> list[dict]:
     """signals 테이블에서 date BETWEEN start AND end 행 전부 (RecapBot용).
 
-    날짜 문자열은 'YYYY-MM-DD' 또는 'YYYYMMDD' 둘 다 처리 — 호출자가 date 객체로
-    가지고 있어 toisoformat()으로 넘기는 패턴이 자연스럽지만, signals 테이블
-    저장 형식이 호출자(screener_daily_job)에 따라 다를 수 있어 양쪽 형식 모두 매칭.
+    `idx_signals_date` 인덱스 위에서 즉시 sargable. exclude_date 지정 시 그 날짜
+    제외 (보통 '오늘' — recent_signals 호환).
 
     반환: [{date, ticker, signal, payload(dict)}, ...] — payload는 JSON 디코딩.
-    payload 디코딩 실패 시 raw string 보존.
+    디코딩 실패 시 {"raw": <text>}.
     """
     ensure_schema()
     out: list[dict] = []
     with _conn() as c:
-        cur = c.execute(
-            "SELECT date, ticker, signal, payload FROM signals "
-            "WHERE date >= ? AND date <= ? ORDER BY date ASC, signal ASC, ticker ASC",
-            (start_date, end_date),
-        )
+        if exclude_date:
+            cur = c.execute(
+                "SELECT date, ticker, signal, payload FROM signals "
+                "WHERE date >= ? AND date <= ? AND date != ? "
+                "ORDER BY date ASC, signal ASC, ticker ASC",
+                (start_date, end_date, exclude_date),
+            )
+        else:
+            cur = c.execute(
+                "SELECT date, ticker, signal, payload FROM signals "
+                "WHERE date >= ? AND date <= ? "
+                "ORDER BY date ASC, signal ASC, ticker ASC",
+                (start_date, end_date),
+            )
         for date_v, ticker, signal, payload in cur.fetchall():
             try:
                 payload_obj = json.loads(payload) if payload else {}

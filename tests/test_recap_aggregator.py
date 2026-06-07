@@ -48,7 +48,7 @@ def test_collect_signal_section_empty(monkeypatch):
     """signals 비어있을 때 안내 dict + scorer summary 0."""
     from src.screener import db
 
-    monkeypatch.setattr(db, "load_signals_in_range", lambda s, e: [])
+    monkeypatch.setattr(db, "load_signals_in_range", lambda s, e, exclude_date=None: [])
     out = ag.collect_signal_section(date(2026, 6, 3))
     assert out["stats"] == []
     assert out["summary"]["total_hits"] == 0
@@ -93,25 +93,30 @@ def test_collect_signal_section_with_data(monkeypatch):
         ],
     }
 
-    monkeypatch.setattr(db, "load_signals_in_range", lambda s, e: fake_signals)
+    monkeypatch.setattr(db, "load_signals_in_range",
+                        lambda s, e, exclude_date=None: fake_signals)
     monkeypatch.setattr(db, "load_ohlcv", lambda t, days=260: fake_ohlcv.get(t, []))
-
-    # tickers 매핑은 conn 컨텍스트 — 빈 list로 우회
-    class _NoTickerConn:
-        def __enter__(self): return self
-        def __exit__(self, *a): return False
-        def execute(self, *a, **kw):
-            class _Cur:
-                def fetchall(self_inner): return []
-            return _Cur()
-    monkeypatch.setattr(db, "_conn", lambda: _NoTickerConn())
+    # ticker name — get_ticker_name (전 conn 직접 접근 제거)
+    monkeypatch.setattr(db, "get_ticker_name", lambda t: "")
+    # horizon close — fake_ohlcv 인덱스 +n 위치 close
+    def _fake_close_after(t: str, start: str, n: int = 5):
+        rows = fake_ohlcv.get(t, [])
+        dates = [r["date"] for r in rows]
+        if start not in dates:
+            return None
+        idx = dates.index(start)
+        target = idx + n
+        if target >= len(rows):
+            return None
+        return int(rows[target]["close"])
+    monkeypatch.setattr(db, "close_after_n_business_days", _fake_close_after)
 
     out = ag.collect_signal_section(date(2026, 6, 3), lookback_days=10, horizon_days=5)
     assert len(out["stats"]) == 2  # high_52w, volume_breakout
     by_sig = {s.signal: s for s in out["stats"]}
     h52 = by_sig["high_52w"]
     assert h52.hit_count == 2
-    # AAA +15%, BBB -12% → avg 1.5%
+    # AAA 100→115 = +15%, BBB 50→44 = -12% → avg 1.5%
     assert h52.avg_pnl == pytest.approx(1.5, abs=0.01)
     assert h52.win_rate == 0.5
 

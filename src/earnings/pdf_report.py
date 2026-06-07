@@ -67,6 +67,26 @@ Y_BOTTOM = 0.03
 BODY_SIZE = 9.0
 LINE_H = 0.0175
 
+# Markdown 헤딩 H1/H2/H3 시각 스타일 — _render_markdown_block 분기 단순화용
+HEADING_STYLES = {
+    1: {
+        "size": 13.0, "weight": "bold", "text_color": "white",
+        "y_consume": 0.048, "min_y": 0.10,
+        "box_h": 0.034, "box_offset": 0.036, "text_y_offset": 0.008,
+        "box_color": "navy",
+    },
+    2: {
+        "size": 11.5, "weight": "bold", "text_color": "navy",
+        "y_consume": 0.030, "min_y": 0.07,
+        "bar_w": 0.006, "bar_h": 0.022, "bar_offset": 0.024,
+        "text_x": 0.015, "bar_color": "navy",
+    },
+    3: {
+        "size": 10.0, "weight": "bold", "text_color": "ink",
+        "y_consume": 0.022, "min_y": 0.05,
+    },
+}
+
 
 def _wrap_text(text: str, width: int = 95) -> list[str]:
     """단어 단위 wrap (영문/한글 혼합 OK). 이모지 제거."""
@@ -238,15 +258,16 @@ def _fmt_usd(v: Any) -> str:
 
 
 def _pick_consensus_delta(deltas: list[Any]) -> dict[str, str]:
-    """consensus delta result list → {revenue: "...", eps: "...", surprise: "..."}."""
+    """ConsensusDelta list → {revenue: msg, eps: msg}. dataclass.metric 필드 기반 직접 분류.
+
+    이전엔 메시지 텍스트를 정규식 매칭했으나 verify.py 메시지 포맷 변경 시 깨지기 쉬워서
+    ConsensusDelta.metric 필드("revenue" | "eps")를 직접 사용한다.
+    """
     out = {"revenue": "—", "eps": "—"}
     for r in deltas or []:
-        msg = getattr(r, "message", str(r))
-        low = msg.lower()
-        if "revenue" in low and ("delta" in low or "vs" in low or "consensus" in low):
-            out["revenue"] = msg
-        elif ("eps" in low) and ("delta" in low or "vs" in low):
-            out["eps"] = msg
+        metric = getattr(r, "metric", None)
+        if metric in out:
+            out[metric] = getattr(r, "message", str(r))
     return out
 
 
@@ -546,8 +567,8 @@ def _draw_chart_interpretation_page(
 # ------------------------------------------------------------------
 # 표지 (compact)
 # ------------------------------------------------------------------
-def _draw_cover(pdf, tickers: list[str], period: str, custom_question: str) -> None:
-    """표지 — 1면 (Decision Page가 메인이지만 표지도 유지)."""
+def _draw_cover_v1(pdf, tickers: list[str], period: str, custom_question: str) -> None:
+    """V1 표지 — 1면. EARNINGS_PDF_V2=0 폴백 경로에서만 호출."""
     import matplotlib.pyplot as plt
     fig = plt.figure(figsize=(8.27, 11.69))
     ax = fig.add_axes([0, 0, 1, 1])
@@ -868,6 +889,39 @@ def _render_inline_styled(ax, x: float, y: float, text: str, *, base_size: float
         cur_x += (ascii_n * 0.0058 + han * 0.011) * (size / 10.0)
 
 
+def _draw_heading(ax, plt, y: float, level: int, text: str) -> float:
+    """HEADING_STYLES[level]에 따라 헤딩 시각 요소 그림. 반환: 다음 y 좌표."""
+    s = HEADING_STYLES[level]
+    txt = _strip_emoji(text)
+    if level == 1:
+        ax.add_patch(plt.Rectangle(
+            (0, y - s["box_offset"]), 1, s["box_h"],
+            facecolor=STYLE[s["box_color"]],
+        ))
+        ax.text(
+            0.01, y - s["text_y_offset"], txt,
+            fontsize=s["size"], fontweight=s["weight"],
+            color=s["text_color"], va="center",
+        )
+    elif level == 2:
+        ax.add_patch(plt.Rectangle(
+            (0.0, y - s["bar_offset"]), s["bar_w"], s["bar_h"],
+            facecolor=STYLE[s["bar_color"]],
+        ))
+        ax.text(
+            s["text_x"], y, txt,
+            fontsize=s["size"], fontweight=s["weight"],
+            color=STYLE[s["text_color"]], va="top",
+        )
+    else:  # level 3
+        ax.text(
+            0.0, y, txt,
+            fontsize=s["size"], fontweight=s["weight"],
+            color=STYLE[s["text_color"]], va="top",
+        )
+    return y - s["y_consume"]
+
+
 def _new_md_page(plt, title: str, *, title_box: bool = True):
     """Markdown 본문 페이지 1장 생성. title_box=True면 상단 파란 띠 + 흰 타이틀."""
     fig = plt.figure(figsize=(PAGE_W, PAGE_H))
@@ -919,28 +973,10 @@ def _render_markdown_block(pdf, title: str, md_text: str, *, footer: str = "") -
             new_page()
 
         if t == "heading":
-            level = tok["level"]
-            txt = _strip_emoji(tok["text"])
-            if level == 1:
-                if y < 0.10:
-                    new_page()
-                ax.add_patch(plt.Rectangle((0, y - 0.036), 1, 0.034, facecolor=STYLE["navy"]))
-                ax.text(0.01, y - 0.008, txt, fontsize=13, fontweight="bold",
-                        color="white", va="center")
-                y -= 0.048
-            elif level == 2:
-                if y < 0.07:
-                    new_page()
-                ax.add_patch(plt.Rectangle((0.0, y - 0.024), 0.006, 0.022, facecolor=STYLE["navy"]))
-                ax.text(0.015, y, txt, fontsize=11.5, fontweight="bold",
-                        color=STYLE["navy"], va="top")
-                y -= 0.030
-            else:  # level 3
-                if y < 0.05:
-                    new_page()
-                ax.text(0.0, y, txt, fontsize=10, fontweight="bold",
-                        color=STYLE["ink"], va="top")
-                y -= 0.022
+            level = max(1, min(3, tok["level"]))
+            if y < HEADING_STYLES[level]["min_y"]:
+                new_page()
+            y = _draw_heading(ax, plt, y, level, tok["text"])
 
         elif t == "blank":
             y -= 0.006
@@ -998,10 +1034,20 @@ def _render_markdown_block(pdf, title: str, md_text: str, *, footer: str = "") -
 # Phase 10-B — Editor's Pick 파서 + 표지 V2
 # ==================================================================
 def _parse_editors_pick(text: str) -> dict[str, Any]:
-    """Editor's Pick markdown 본문에서 TL;DR 박스 데이터 추출.
+    """Phase 9 Editor's Pick markdown 본문에서 표지 TL;DR 박스용 4개 필드 추출.
 
-    구조: ## Verdict / ## 시장 기대 vs 진짜 중요했던 것 / ## 주가 ... / ## 검증 트리거
-    실패 시 raw 첫 800자를 'raw' 키에 담아 반환 (graceful fallback).
+    Editor's Pick은 Opus가 정확히 4개 ## 섹션으로 출력 (`prompts/earnings_editors_pick.txt`):
+      ## Verdict — ticker별 한 줄 (`**TICKER**: bull/bear · ★N · 2문장`)
+      ## 시장 기대 vs 진짜 중요했던 것 — TOP 3 항목
+      ## 주가 ±X% 반응의 진짜 동력
+      ## 다음 분기 검증 트리거 — 3개 트리거
+
+    Returns:
+        dict with keys:
+          - verdict_lines: list[str] (Verdict 섹션의 ticker별 한 줄 라인 max 4)
+          - real_signal: str (시장 기대 vs 진짜 섹션 첫 항목 첫 문장 max 200자)
+          - trigger: str (검증 트리거 첫 항목 max 200자)
+          - raw: str (위 파싱 모두 실패 시 첫 800자 — graceful fallback)
     """
     out: dict[str, Any] = {"verdict_lines": [], "real_signal": "", "trigger": "", "raw": ""}
     if not text:
@@ -1047,7 +1093,7 @@ def _parse_editors_pick(text: str) -> dict[str, Any]:
     return out
 
 
-def _draw_cover_v2(
+def _draw_cover(
     pdf,
     *,
     tickers: list[str],
@@ -1060,7 +1106,24 @@ def _draw_cover_v2(
     market_reaction_by_ticker: dict[str, Any],
     custom_question: str = "",
 ) -> None:
-    """Phase 10-B 통합 표지: 헤더 + TL;DR 박스 + KPI grid + bull/bear."""
+    """V2 통합 표지 — 단일 페이지에 PM 30초 시각.
+
+    레이아웃 (위→아래):
+      0.92-1.00  파란 띠 + "US Earnings Brief" + 종목·분기
+      0.66-0.89  TL;DR 박스 (회색 패널 + 좌측 navy 바) — verdict / 진짜 중요한 것 / 트리거
+      0.20-0.62  KPI snapshot (종목별 Rev/EPS/컨센delta/주가 reaction)
+      0.05-0.17  Bull thesis (좌, 녹색) + Bear/Counter (우, 빨강) 박스
+      0.00-0.04  footer (생성 시각 + 출처)
+
+    데이터 소스:
+      - editors_pick_kr: Phase 9 `_step_editors_pick` Opus 본문. `_parse_editors_pick`으로
+        verdict_lines / real_signal / trigger 추출.
+      - synthesis_text: Phase 8 Opus 비교 합성. §4(시장 서프라이즈) → bull, §6(리스크) → bear.
+      - transcripts[t].headline_numbers: KPI 표 데이터.
+      - market_reaction_by_ticker[t]: 주가 reaction one-liner.
+
+    Editor's Pick 파싱 실패 시 graceful fallback (raw 첫 800자 박스 출력).
+    """
     import matplotlib.pyplot as plt
     fig = plt.figure(figsize=(8.27, 11.69))
     ax = fig.add_axes([0, 0, 1, 1])
@@ -1199,6 +1262,15 @@ def _draw_cover_v2(
 # Phase 10-C — Chart Grid 1페이지 (6개 차트 3×2)
 # ==================================================================
 def _draw_chart_grid_page(pdf, financials_by_ticker: dict[str, Any], synthesis_text: str) -> None:
+    """6개 6년 재무 차트를 1 페이지 3×2 grid에 배치 (V1 대비 12p → 1p 압축).
+
+    종목 수 ≤ 5: grid 모드 (각 sub-chart figsize 자동, sub-title은 synthesis §9.x 첫 문장 25자).
+    종목 수 > 5: 차트 가독성 망 → 폴백 (차트당 1p figsize 절반, 캡션 없음).
+
+    Args:
+        financials_by_ticker: {ticker: CompanyFinancials}. capex/ocf/fcf/revenue 6년치.
+        synthesis_text: Opus 비교 합성 본문. §9.1~§9.6의 첫 문장이 sub-title로 추출됨.
+    """
     import matplotlib.pyplot as plt
     from src.earnings import charts as charts_mod
 
@@ -1276,7 +1348,24 @@ def _draw_ticker_kpi_page(
     consensus: Any,
     consensus_delta: list,
 ) -> None:
-    """종목별 1페이지: 헤더 + KPI 표 + 세그먼트 + 톤·자본배분 + 서프라이즈 + Top 3 Q&A."""
+    """종목별 KPI 페이지 1장 (V1 7p → 1p 압축).
+
+    레이아웃:
+      0.95-1.00  파란 배너 + ticker / company / fiscal_period
+      0.78-0.92  Key Numbers (Revenue/EPS/컨센delta/Margin/Net income/FCF/Buyback·Dividend
+                  /Next-Q guide/FY guide/Capex commentary 12행)
+      0.62-0.76  Market Reaction one-liner + target revisions top 3
+      0.46-0.60  Segments top 4 (name · revenue · YoY · note)
+      0.30-0.44  Management Tone overall (3줄 max)
+      0.10-0.28  Surprises & Risks 불릿 (5개 max)
+
+    Args:
+        tr: extract JSON (headline_numbers / guidance / segments / management_tone /
+            surprises_and_risks 등 필드 사용).
+        mr: MarketReaction | None (Yahoo chart fetch 결과).
+        consensus: ConsensusSnapshot | None (현재 미사용 — 미래 확장용).
+        consensus_delta: list[ConsensusDelta] (revenue/eps 분류해 표에 표시).
+    """
     import matplotlib.pyplot as plt
     fig = plt.figure(figsize=(8.27, 11.69))
     ax = fig.add_axes([0, 0, 1, 1])
@@ -1396,7 +1485,16 @@ def _draw_ticker_kpi_page(
 
 
 def _draw_ticker_qna_page(pdf, ticker: str, company: str, period: str, korean_md: str) -> None:
-    """종목별 한글 번역 본문 (Phase 9 `_step_translate_transcript` 결과)을 markdown 렌더."""
+    """종목별 한글 번역 본문 페이지 (1-2p, V1 영문 verbatim 7p 대비 압축).
+
+    Phase 9 `_step_translate_transcript` (Sonnet 1회/종목) 결과를 `_render_markdown_block`에
+    위임 — markdown 헤딩/굵게/blockquote/표가 시각 강조로 렌더됨. 영문 verbatim 인용은
+    한글 본문 내 blockquote 박스에 자동 매핑.
+
+    Args:
+        korean_md: Sonnet 한글 번역 markdown 본문 (3500-5500자 권장). 빈 문자열이면 호출 skip
+            (caller 책임).
+    """
     title = f"{ticker} — {company} · {period} · 한글 번역"
     _render_markdown_block(pdf, title, korean_md, footer=ticker)
 
@@ -1465,7 +1563,7 @@ def build_pdf(
                 # Phase 10 V2 — 네이버 톤 · 11p 압축
                 # ====================================================
                 # p.1 — Cover + TL;DR + KPI + bull/bear (통합)
-                _draw_cover_v2(
+                _draw_cover(
                     pdf,
                     tickers=tickers,
                     fiscal_period=fiscal_period,
@@ -1598,7 +1696,7 @@ def build_pdf(
                     consensus_delta_by_ticker=consensus_delta_by_ticker,
                     synthesis_text=industry_summary_kr or "",
                 )
-                _draw_cover(pdf, tickers, fiscal_period, custom_question)
+                _draw_cover_v1(pdf, tickers, fiscal_period, custom_question)
                 if industry_summary_kr:
                     _draw_long_text_pages(pdf, "Evidence — 산업 분위기 & 인사이트 (Opus)",
                                           industry_summary_kr, footer_prefix="Evidence")
