@@ -1585,33 +1585,31 @@ async def _evaluate_importance(idea_text: str, research: dict) -> dict | None:
             f"{json.dumps(compact, ensure_ascii=False, indent=2)}\n\n"
             "위 자료를 비판적으로 검증해 시스템 프롬프트 형식대로 JSON 출력해주세요."
         )
+        # 모델 chain — importance도 synthesis와 같은 tier (진짜 지능 필요).
+        from src.llm_models import synthesis_chain
         try:
-            resp = client.chat.completions.create(
-                model=_synthesis_model(),  # 지능 필요 — synthesis와 같은 등급
+            content, used_model = summarizer.chat_with_chain(
+                client,
+                models=synthesis_chain(SYNTHESIS_MODEL_ENV),
                 max_tokens=2000,
                 temperature=0.4,
                 messages=[
                     {"role": "system", "content": sys_prompt},
                     {"role": "user", "content": user_msg},
                 ],
+                context="importance",
             )
-        except summarizer.APIStatusError as e:
-            if summarizer._is_credit_error(e):
-                raise summarizer.OpenRouterCreditExhausted(str(e)) from e
-            log.exception("importance LLM API 에러")
-            return None
-        except Exception as e:
-            _maybe_raise_credit(e)
-            log.exception("importance LLM 호출 실패")
-            return None
-        try:
-            content = (resp.choices[0].message.content or "").strip()
+        except summarizer.OpenRouterCreditExhausted:
+            raise
         except Exception:
-            log.exception("importance 응답 파싱 실패")
+            log.exception("importance LLM chain 호출 실패")
+            return None
+        if not content:
+            log.warning("importance LLM chain 모두 빈 응답")
             return None
         log.info(
             "importance LLM 응답: %d chars (model=%s) — preview=%r",
-            len(content), _synthesis_model(), content[:300],
+            len(content), used_model, content[:300],
         )
         parsed = _parse_json(content)
         if parsed is None:
@@ -1829,44 +1827,31 @@ async def _narrow_candidates(
             f"# 산업 리포트 텍스트\n{ind_block[:60_000]}\n\n"
             "위 자료를 종합해 시스템 프롬프트 형식대로 top10 JSON을 출력해주세요."
         )
-        # 빈 응답 재시도 (kimi가 가끔 idle timeout으로 0자 반환).
-        # 두 번째 시도는 temperature 약간 올려 동일 응답 회피.
-        content = ""
-        for attempt in (1, 2):
-            try:
-                resp = client.chat.completions.create(
-                    model=_narrow_model(),
-                    max_tokens=12000,
-                    temperature=0.3 if attempt == 1 else 0.5,
-                    messages=[
-                        {"role": "system", "content": sys_prompt},
-                        {"role": "user", "content": user_msg},
-                    ],
-                )
-            except summarizer.APIStatusError as e:
-                if summarizer._is_credit_error(e):
-                    raise summarizer.OpenRouterCreditExhausted(str(e)) from e
-                log.exception("narrow LLM API 에러 (attempt %d)", attempt)
-                return None
-            except Exception as e:
-                _maybe_raise_credit(e)
-                log.exception("narrow LLM 호출 실패 (attempt %d)", attempt)
-                if attempt == 2:
-                    return None
-                continue
-            try:
-                content = (resp.choices[0].message.content or "").strip()
-            except Exception:
-                log.exception("narrow 응답 추출 실패 (attempt %d)", attempt)
-                if attempt == 2:
-                    return None
-                continue
-            if content:
-                break
-            log.warning("narrow LLM 빈 응답 (attempt %d) — 재시도", attempt)
+        # 모델 chain — 사용자가 IDEA_NARROW_MODEL 변경해도 빈 응답이면 안정 default로 fallback.
+        from src.llm_models import narrow_chain
+        try:
+            content, used_model = summarizer.chat_with_chain(
+                client,
+                models=narrow_chain(NARROW_MODEL_ENV),
+                max_tokens=12000,
+                temperature=0.3,
+                messages=[
+                    {"role": "system", "content": sys_prompt},
+                    {"role": "user", "content": user_msg},
+                ],
+                context="narrow",
+            )
+        except summarizer.OpenRouterCreditExhausted:
+            raise
+        except Exception:
+            log.exception("narrow LLM chain 호출 실패")
+            return None
+        if not content:
+            log.warning("narrow LLM chain 모두 빈 응답")
+            return None
         log.info(
             "narrow LLM 응답: %d chars (model=%s) — preview=%r",
-            len(content), _narrow_model(), content[:300],
+            len(content), used_model, content[:300],
         )
         parsed = _parse_json(content)
         if parsed is None:
@@ -2135,45 +2120,32 @@ async def _synthesize_top5(
             "recent_catalysts_30d 필드는 위 '최근 30일 산업 이벤트' 또는 '종목별 최근 30일 뉴스'에서 직접 인용 (자체 추측 금지). "
             "referenced_reports에는 해당 종목의 own 종목 리포트 파일명만 정확히 사용해주세요."
         )
-        # max_tokens=12000 — Top 5 × 1500자 thesis + key_numbers + methodology
-        #   (이전 8000은 Claude Sonnet에서 마지막 종목의 referenced_reports 직전에 truncate됨).
-        # 빈 응답 재시도 1회.
-        content = ""
-        for attempt in (1, 2):
-            try:
-                resp = client.chat.completions.create(
-                    model=_synthesis_model(),
-                    max_tokens=16000,
-                    temperature=0.4 if attempt == 1 else 0.6,
-                    messages=[
-                        {"role": "system", "content": sys_prompt},
-                        {"role": "user", "content": user_msg},
-                    ],
-                )
-            except summarizer.APIStatusError as e:
-                if summarizer._is_credit_error(e):
-                    raise summarizer.OpenRouterCreditExhausted(str(e)) from e
-                log.exception("synthesis LLM API 에러 (attempt %d)", attempt)
-                return None
-            except Exception as e:
-                _maybe_raise_credit(e)
-                log.exception("synthesis LLM 호출 실패 (attempt %d)", attempt)
-                if attempt == 2:
-                    return None
-                continue
-            try:
-                content = (resp.choices[0].message.content or "").strip()
-            except Exception:
-                log.exception("synthesis 응답 추출 실패 (attempt %d)", attempt)
-                if attempt == 2:
-                    return None
-                continue
-            if content:
-                break
-            log.warning("synthesis LLM 빈 응답 (attempt %d) — 재시도", attempt)
+        # 모델 chain — synthesis는 진짜 지능 필요. 사용자가 IDEA_SYNTHESIS_MODEL 변경해도
+        # 빈 응답이면 안정 default (sonnet) 자동 fallback.
+        from src.llm_models import synthesis_chain
+        try:
+            content, used_model = summarizer.chat_with_chain(
+                client,
+                models=synthesis_chain(SYNTHESIS_MODEL_ENV),
+                max_tokens=16000,
+                temperature=0.4,
+                messages=[
+                    {"role": "system", "content": sys_prompt},
+                    {"role": "user", "content": user_msg},
+                ],
+                context="synthesis",
+            )
+        except summarizer.OpenRouterCreditExhausted:
+            raise
+        except Exception:
+            log.exception("synthesis LLM chain 호출 실패")
+            return None
+        if not content:
+            log.warning("synthesis LLM chain 모두 빈 응답")
+            return None
         log.info(
             "synthesis LLM 응답: %d chars (model=%s) — preview=%r",
-            len(content), _synthesis_model(), content[:300],
+            len(content), used_model, content[:300],
         )
         parsed = _parse_json(content)
         if parsed is None:

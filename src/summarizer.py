@@ -297,6 +297,58 @@ def chat_with_retry(
     return ""
 
 
+def chat_with_chain(
+    client: OpenAI,
+    *,
+    models: list[str],
+    messages: list[dict],
+    max_tokens: int,
+    temperature: float | None = None,
+    context: str = "",
+    max_attempts_per_model: int = 2,
+) -> tuple[str, str]:
+    """모델 chain 따라 순차 호출 — 첫 비어있지 않은 응답 반환.
+
+    사용자가 env로 모델 변경 시 그 모델이 빈 응답을 보내면 자동으로 다음 모델로
+    fallback. OpenRouterCreditExhausted는 즉시 raise (credit 부족은 다음 모델도
+    동일).
+
+    Args:
+        models: 시도할 모델 list. 첫 모델부터 순차. 각 모델당
+            max_attempts_per_model 번 재시도 (chat_with_retry 내부 로직).
+        max_attempts_per_model: 모델당 retry 횟수 (기본 2 — chain에선 빠른 패스).
+
+    Returns:
+        (content, used_model). 모두 빈 응답이면 ("", "").
+    """
+    if not models:
+        log.error("[chain] 빈 모델 list (%s)", context)
+        return "", ""
+    for i, model in enumerate(models):
+        chain_ctx = f"{context} chain {i+1}/{len(models)} {model}"
+        try:
+            content = chat_with_retry(
+                client, model=model,
+                messages=messages, max_tokens=max_tokens, temperature=temperature,
+                max_attempts=max_attempts_per_model,
+                fallback_model=None,  # chain이 fallback 역할
+                context=chain_ctx,
+            )
+        except OpenRouterCreditExhausted:
+            raise
+        except Exception:
+            log.exception("[chain] %s 예외 — 다음 모델 시도", model)
+            continue
+        if content and content.strip():
+            if i > 0:
+                log.info("[chain] fallback 성공: %s (모델 %d/%d 통과, %d chars)",
+                         context, i + 1, len(models), len(content))
+            return content, model
+        log.warning("[chain] %s 빈 응답 — 다음 모델 시도", model)
+    log.error("[chain] 모든 모델 fail (%s): %s", context, ", ".join(models))
+    return "", ""
+
+
 def summarize_pdf(
     client: OpenAI,
     pdf_path: Path,

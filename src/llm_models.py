@@ -54,6 +54,51 @@ def research_model(env: str = "IDEA_RESEARCH_MODEL") -> str:
     return os.getenv(env) or DEFAULT_RESEARCH
 
 
+# ------------------------------------------------------------------
+# Fallback chain — env에 단일 모델만 있어도 안정 default가 뒤에 자동 보강.
+# 사용자가 모델 변경 후 그 모델이 빈 응답을 반환해도 chain이 다음으로 fallback.
+# ------------------------------------------------------------------
+def model_chain_from_env(env: str, defaults: list[str]) -> list[str]:
+    """env value → 모델 chain.
+
+    - env 미설정/빈 값 → defaults 그대로
+    - 콤마 구분 ("a,b,c") → 각 모델로 split (정확히 사용자 의도)
+    - 단일 모델 ("primary") → [primary] + defaults 중 중복 제거한 fallback
+
+    예:
+      env=None, defaults=["haiku-4.5", "kimi-k2.6"]   → ["haiku-4.5", "kimi-k2.6"]
+      env="xiaomi/mimo", defaults=["haiku-4.5"]       → ["xiaomi/mimo", "haiku-4.5"]
+      env="a,b", defaults=["c"]                        → ["a", "b"]
+    """
+    env_val = (os.getenv(env) or "").strip()
+    if not env_val:
+        return list(defaults)
+    if "," in env_val:
+        parts = [m.strip() for m in env_val.split(",") if m.strip()]
+        return parts or list(defaults)
+    primary = env_val
+    chain = [primary]
+    for d in defaults:
+        if d and d != primary:
+            chain.append(d)
+    return chain
+
+
+def narrow_chain(env: str = "IDEA_NARROW_MODEL") -> list[str]:
+    """Narrow tier chain — env value + 안정 default fallback."""
+    return model_chain_from_env(env, [DEFAULT_NARROW, DEFAULT_SUMMARY])
+
+
+def synthesis_chain(env: str = "IDEA_SYNTHESIS_MODEL") -> list[str]:
+    """Synthesis tier chain — env value + 안정 default fallback."""
+    return model_chain_from_env(env, [DEFAULT_SYNTHESIS, "anthropic/claude-opus-4.7"])
+
+
+def summary_chain() -> list[str]:
+    """Summary tier chain — env(OPENROUTER_MODEL) value + 안정 default fallback."""
+    return model_chain_from_env("OPENROUTER_MODEL", [DEFAULT_SUMMARY, DEFAULT_NARROW])
+
+
 def chained_model(envs: Iterable[str], default: str) -> str:
     """env 이름 여러 개 순회 — 첫 set된 값. 모두 없으면 default.
 
