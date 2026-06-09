@@ -30,9 +30,15 @@ EMBED_DIM = 1536  # text-embedding-3-small 기본 차원
 
 KST = timezone(timedelta(hours=9))
 
-# rate limit + token cap 안전 마진
-DEFAULT_BATCH_SIZE = 100        # OpenAI는 한 호출에 최대 2048 items, 100이면 안전
-DEFAULT_MAX_TOKENS_PER_INPUT = 4000  # text-embedding-3-small은 8191 max, 4000으로 cap
+# OpenAI text-embedding-3-small 제약:
+#   1) 단일 input max 8192 tokens
+#   2) 1 request 누적 max 300K tokens
+# 한국어 ~3 chars/token, 영어/숫자 mixed ~1 char/token. 보수적으로 1 char=1 token 가정.
+# → 단일 input 6000 chars cap → 영어 100% 케이스도 6000 tokens < 8192.
+# → batch 50 × 6000 chars = 300K chars / 3 = 100K tokens (한국어 기준), 영어도 300K = cap 경계.
+# 안전 마진 + BadRequestError 발생 시 자동 분할·truncate 재시도도 추가.
+DEFAULT_BATCH_SIZE = 50
+DEFAULT_MAX_TOKENS_PER_INPUT = 2000  # 6000 chars 보수적 cap
 
 
 class EmbeddingError(RuntimeError):
@@ -43,7 +49,8 @@ def _get_client() -> tuple[OpenAI, str]:
     """OpenAI direct 우선, OpenRouter 폴백. (client, provider) 반환."""
     openai_key = os.getenv("OPENAI_API_KEY")
     if openai_key:
-        return OpenAI(api_key=openai_key, timeout=60.0, max_retries=2), "openai"
+        # max_retries=5: TPM cap 일시 초과 시 자동 재시도 (각 retry 사이 6초 간격)
+        return OpenAI(api_key=openai_key, timeout=120.0, max_retries=5), "openai"
     or_key = os.getenv("OPENROUTER_API_KEY")
     if or_key:
         log.warning(
@@ -102,8 +109,24 @@ def embed_texts(
     if not to_embed:
         return out  # type: ignore
 
-    for batch_start in range(0, len(to_embed), batch_size):
-        chunk = to_embed[batch_start: batch_start + batch_size]
+    def _is_token_cap_error(msg: str) -> bool:
+        """OpenAI tokens cap 관련 BadRequest 모든 변형 잡기 (메시지 표현 다양함)."""
+        m = msg.lower()
+        return any(k in m for k in (
+            "max_tokens_per_request",
+            "max tokens per request",
+            "maximum request size",
+            "maximum input length",
+            "8192 tokens",
+            "300000 tokens",
+            "exceeds the model",
+            "max_tokens",
+        ))
+
+    def _call_with_split(chunk: list[tuple[int, str]]) -> None:
+        """단일 batch 호출 + token cap 초과 시 batch+input 동시 분할/truncate 재시도."""
+        if not chunk:
+            return
         inputs = [c[1] for c in chunk]
         try:
             resp = client.embeddings.create(model=model, input=inputs)
@@ -114,6 +137,24 @@ def embed_texts(
                     f"[{provider}] embeddings endpoint 미지원 또는 모델 '{model}' 없음. "
                     "OPENAI_API_KEY 설정 권장."
                 ) from e
+            if _is_token_cap_error(msg):
+                # 단일 input이 너무 길면 → input 자체 truncate
+                if len(chunk) == 1:
+                    orig_len = len(chunk[0][1])
+                    if orig_len < 200:
+                        log.warning("[embedding] 단일 텍스트 200자 미만인데 cap 초과 — skip idx=%d", chunk[0][0])
+                        return
+                    truncated_one = [(chunk[0][0], chunk[0][1][: max(500, orig_len // 2)])]
+                    log.info("[embedding] 단일 input truncate %d→%d 재시도", orig_len, len(truncated_one[0][1]))
+                    _call_with_split(truncated_one)
+                    return
+                # batch가 크고 누적 cap이면 절반으로 분할
+                mid = len(chunk) // 2
+                log.info("[embedding] batch %d → %d+%d 분할 (token cap: %s)",
+                         len(chunk), mid, len(chunk) - mid, msg[:100])
+                _call_with_split(chunk[:mid])
+                _call_with_split(chunk[mid:])
+                return
             raise
         for (orig_idx, _txt), data in zip(chunk, resp.data):
             vec = np.asarray(data.embedding, dtype=np.float32)
@@ -122,6 +163,21 @@ def embed_texts(
                 if n > 0:
                     vec = vec / n
             out[orig_idx] = vec
+
+    # 동적 batch_size — 평균 input 길이 기반 안전 cap (1 char=1 token 보수 가정).
+    # 200K tokens/batch 목표 (300K request cap 안전 마진).
+    total_chars = sum(len(t) for _, t in to_embed)
+    avg_chars = total_chars // max(1, len(to_embed))
+    if avg_chars > 0:
+        dynamic_batch = max(1, 200_000 // avg_chars)
+        if dynamic_batch < batch_size:
+            log.info("[embedding] 동적 batch_size %d→%d (avg input=%d chars)",
+                     batch_size, dynamic_batch, avg_chars)
+            batch_size = dynamic_batch
+
+    for batch_start in range(0, len(to_embed), batch_size):
+        chunk = to_embed[batch_start: batch_start + batch_size]
+        _call_with_split(chunk)
         # 진행 로그 큰 batch만
         if len(to_embed) >= 500:
             log.info(
@@ -130,8 +186,15 @@ def embed_texts(
                 (len(to_embed) + batch_size - 1) // batch_size,
                 len(chunk), model,
             )
-        # OpenAI는 rate limit 안 걸리지만 안전 마진
-        time.sleep(0.02)
+        # TPM throttle — OpenAI free tier TPM cap 1M/분.
+        # 보수 800K target. chunk의 char 합 ≈ token 상한(영어/숫자 mixed).
+        # sleep = (chunk_tokens / TPM_TARGET) * 60.
+        TPM_TARGET = 800_000
+        chunk_chars = sum(len(t) for _, t in chunk)
+        throttle_s = (chunk_chars / TPM_TARGET) * 60
+        # 너무 짧으면 OpenAI SDK 자체 retry로 충분
+        if throttle_s > 0.1:
+            time.sleep(throttle_s)
     return out  # type: ignore
 
 

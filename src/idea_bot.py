@@ -1585,33 +1585,31 @@ async def _evaluate_importance(idea_text: str, research: dict) -> dict | None:
             f"{json.dumps(compact, ensure_ascii=False, indent=2)}\n\n"
             "위 자료를 비판적으로 검증해 시스템 프롬프트 형식대로 JSON 출력해주세요."
         )
+        # 모델 chain — importance도 synthesis와 같은 tier (진짜 지능 필요).
+        from src.llm_models import synthesis_chain
         try:
-            resp = client.chat.completions.create(
-                model=_synthesis_model(),  # 지능 필요 — synthesis와 같은 등급
+            content, used_model = summarizer.chat_with_chain(
+                client,
+                models=synthesis_chain(SYNTHESIS_MODEL_ENV),
                 max_tokens=2000,
                 temperature=0.4,
                 messages=[
                     {"role": "system", "content": sys_prompt},
                     {"role": "user", "content": user_msg},
                 ],
+                context="importance",
             )
-        except summarizer.APIStatusError as e:
-            if summarizer._is_credit_error(e):
-                raise summarizer.OpenRouterCreditExhausted(str(e)) from e
-            log.exception("importance LLM API 에러")
-            return None
-        except Exception as e:
-            _maybe_raise_credit(e)
-            log.exception("importance LLM 호출 실패")
-            return None
-        try:
-            content = (resp.choices[0].message.content or "").strip()
+        except summarizer.OpenRouterCreditExhausted:
+            raise
         except Exception:
-            log.exception("importance 응답 파싱 실패")
+            log.exception("importance LLM chain 호출 실패")
+            return None
+        if not content:
+            log.warning("importance LLM chain 모두 빈 응답")
             return None
         log.info(
             "importance LLM 응답: %d chars (model=%s) — preview=%r",
-            len(content), _synthesis_model(), content[:300],
+            len(content), used_model, content[:300],
         )
         parsed = _parse_json(content)
         if parsed is None:
@@ -1829,44 +1827,31 @@ async def _narrow_candidates(
             f"# 산업 리포트 텍스트\n{ind_block[:60_000]}\n\n"
             "위 자료를 종합해 시스템 프롬프트 형식대로 top10 JSON을 출력해주세요."
         )
-        # 빈 응답 재시도 (kimi가 가끔 idle timeout으로 0자 반환).
-        # 두 번째 시도는 temperature 약간 올려 동일 응답 회피.
-        content = ""
-        for attempt in (1, 2):
-            try:
-                resp = client.chat.completions.create(
-                    model=_narrow_model(),
-                    max_tokens=12000,
-                    temperature=0.3 if attempt == 1 else 0.5,
-                    messages=[
-                        {"role": "system", "content": sys_prompt},
-                        {"role": "user", "content": user_msg},
-                    ],
-                )
-            except summarizer.APIStatusError as e:
-                if summarizer._is_credit_error(e):
-                    raise summarizer.OpenRouterCreditExhausted(str(e)) from e
-                log.exception("narrow LLM API 에러 (attempt %d)", attempt)
-                return None
-            except Exception as e:
-                _maybe_raise_credit(e)
-                log.exception("narrow LLM 호출 실패 (attempt %d)", attempt)
-                if attempt == 2:
-                    return None
-                continue
-            try:
-                content = (resp.choices[0].message.content or "").strip()
-            except Exception:
-                log.exception("narrow 응답 추출 실패 (attempt %d)", attempt)
-                if attempt == 2:
-                    return None
-                continue
-            if content:
-                break
-            log.warning("narrow LLM 빈 응답 (attempt %d) — 재시도", attempt)
+        # 모델 chain — 사용자가 IDEA_NARROW_MODEL 변경해도 빈 응답이면 안정 default로 fallback.
+        from src.llm_models import narrow_chain
+        try:
+            content, used_model = summarizer.chat_with_chain(
+                client,
+                models=narrow_chain(NARROW_MODEL_ENV),
+                max_tokens=12000,
+                temperature=0.3,
+                messages=[
+                    {"role": "system", "content": sys_prompt},
+                    {"role": "user", "content": user_msg},
+                ],
+                context="narrow",
+            )
+        except summarizer.OpenRouterCreditExhausted:
+            raise
+        except Exception:
+            log.exception("narrow LLM chain 호출 실패")
+            return None
+        if not content:
+            log.warning("narrow LLM chain 모두 빈 응답")
+            return None
         log.info(
             "narrow LLM 응답: %d chars (model=%s) — preview=%r",
-            len(content), _narrow_model(), content[:300],
+            len(content), used_model, content[:300],
         )
         parsed = _parse_json(content)
         if parsed is None:
@@ -2135,45 +2120,32 @@ async def _synthesize_top5(
             "recent_catalysts_30d 필드는 위 '최근 30일 산업 이벤트' 또는 '종목별 최근 30일 뉴스'에서 직접 인용 (자체 추측 금지). "
             "referenced_reports에는 해당 종목의 own 종목 리포트 파일명만 정확히 사용해주세요."
         )
-        # max_tokens=12000 — Top 5 × 1500자 thesis + key_numbers + methodology
-        #   (이전 8000은 Claude Sonnet에서 마지막 종목의 referenced_reports 직전에 truncate됨).
-        # 빈 응답 재시도 1회.
-        content = ""
-        for attempt in (1, 2):
-            try:
-                resp = client.chat.completions.create(
-                    model=_synthesis_model(),
-                    max_tokens=16000,
-                    temperature=0.4 if attempt == 1 else 0.6,
-                    messages=[
-                        {"role": "system", "content": sys_prompt},
-                        {"role": "user", "content": user_msg},
-                    ],
-                )
-            except summarizer.APIStatusError as e:
-                if summarizer._is_credit_error(e):
-                    raise summarizer.OpenRouterCreditExhausted(str(e)) from e
-                log.exception("synthesis LLM API 에러 (attempt %d)", attempt)
-                return None
-            except Exception as e:
-                _maybe_raise_credit(e)
-                log.exception("synthesis LLM 호출 실패 (attempt %d)", attempt)
-                if attempt == 2:
-                    return None
-                continue
-            try:
-                content = (resp.choices[0].message.content or "").strip()
-            except Exception:
-                log.exception("synthesis 응답 추출 실패 (attempt %d)", attempt)
-                if attempt == 2:
-                    return None
-                continue
-            if content:
-                break
-            log.warning("synthesis LLM 빈 응답 (attempt %d) — 재시도", attempt)
+        # 모델 chain — synthesis는 진짜 지능 필요. 사용자가 IDEA_SYNTHESIS_MODEL 변경해도
+        # 빈 응답이면 안정 default (sonnet) 자동 fallback.
+        from src.llm_models import synthesis_chain
+        try:
+            content, used_model = summarizer.chat_with_chain(
+                client,
+                models=synthesis_chain(SYNTHESIS_MODEL_ENV),
+                max_tokens=16000,
+                temperature=0.4,
+                messages=[
+                    {"role": "system", "content": sys_prompt},
+                    {"role": "user", "content": user_msg},
+                ],
+                context="synthesis",
+            )
+        except summarizer.OpenRouterCreditExhausted:
+            raise
+        except Exception:
+            log.exception("synthesis LLM chain 호출 실패")
+            return None
+        if not content:
+            log.warning("synthesis LLM chain 모두 빈 응답")
+            return None
         log.info(
             "synthesis LLM 응답: %d chars (model=%s) — preview=%r",
-            len(content), _synthesis_model(), content[:300],
+            len(content), used_model, content[:300],
         )
         parsed = _parse_json(content)
         if parsed is None:
@@ -2614,7 +2586,81 @@ def build_idea_app(token: str) -> Application:
     try:
         loop = asyncio.get_running_loop()
         loop.create_task(_self_test(app))
+        # universe-scan bootstrap — IDEA_UNIVERSE_BOOTSTRAP=1 + 임베딩 종목 50 미만일 때
+        # 백그라운드로 1회 자동 실행. 동작 중에도 IdeaBot은 정상 운용.
+        loop.create_task(_auto_universe_bootstrap())
     except RuntimeError:
         # async context 밖 (예: CLI 단독 실행) — self-test 비활성
         pass
     return app
+
+
+async def _auto_universe_bootstrap() -> None:
+    """Universe scan용 임베딩 bootstrap을 부팅 시 백그라운드에서 1회 자동 실행.
+
+    조건:
+      - env IDEA_UNIVERSE_BOOTSTRAP=1
+      - env OPENAI_API_KEY 또는 OPENROUTER_API_KEY (embedding) 존재
+      - env DART_API_KEY 존재
+      - 현재 임베딩 보유 종목 < 50
+    예상 시간 ~120분. 끝나면 universe_scan이 자동 활성 (is_universe_scan_ready True).
+    """
+    if os.getenv("IDEA_UNIVERSE_BOOTSTRAP", "0") != "1":
+        return
+    if not os.getenv("DART_API_KEY"):
+        log.warning("[universe-bootstrap] DART_API_KEY 없음 — 스킵")
+        return
+    if not (os.getenv("OPENAI_API_KEY") or os.getenv("OPENROUTER_API_KEY")):
+        log.warning("[universe-bootstrap] embedding key 없음 (OPENAI_API_KEY 권장) — 스킵")
+        return
+
+    # 부팅 직후 self-test와 충돌 안 나게 30초 지연
+    await asyncio.sleep(30)
+    try:
+        from src.screener import db as screener_db
+        from src.idea import universe_text, embedding as emb_mod
+        stats = screener_db.universe_scan_stats()
+        if stats.get("with_embedding", 0) >= 50:
+            log.info("[universe-bootstrap] 이미 %d종목 임베딩 보유 — 스킵",
+                     stats["with_embedding"])
+            return
+        log.info("[universe-bootstrap] 시작 (백그라운드, 약 120분 예상)")
+
+        # universe refresh는 별도 screener_bot cron이 처리. 누락된 종목만 fetch.
+        text_stats = await universe_text.bulk_refresh_business_text(
+            tickers=None,
+            max_concurrency=int(os.getenv("UNIVERSE_BOOTSTRAP_CONCURRENCY", "4")),
+            skip_if_recent_days=90,
+        )
+        log.info("[universe-bootstrap] DART fetch 완료: %s", text_stats)
+
+        # embedding batch
+        rows = screener_db.get_universe_for_scan(require_embedding=False)
+        pending = [r for r in rows if not r.get("embedding")]
+        if not pending:
+            log.info("[universe-bootstrap] embedding 신규 대상 0 — 완료")
+            return
+        log.info("[universe-bootstrap] embedding %d종목 시작", len(pending))
+        texts = [r["business_text"] or "" for r in pending]
+        try:
+            vecs = emb_mod.embed_texts(texts, batch_size=100)
+        except emb_mod.EmbeddingError as e:
+            log.error("[universe-bootstrap] embedding 호출 실패: %s — 사용자 OPENAI_API_KEY 필요", e)
+            return
+        today = emb_mod.now_kst_date()
+        embedded = 0
+        for r, v in zip(pending, vecs):
+            if v is None or v.size == 0:
+                continue
+            screener_db.upsert_embedding(
+                ticker=r["ticker"],
+                embedding=emb_mod.vec_to_bytes(v),
+                model=emb_mod.DEFAULT_EMBED_MODEL,
+                embedding_dt=today,
+            )
+            embedded += 1
+        final = screener_db.universe_scan_stats()
+        log.info("[universe-bootstrap] 완료 — embedded=%d, 최종 stats=%s",
+                 embedded, final)
+    except Exception:
+        log.exception("[universe-bootstrap] 예외 — graceful 종료, IdeaBot 운용 영향 없음")
