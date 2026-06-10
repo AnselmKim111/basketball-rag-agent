@@ -1207,6 +1207,16 @@ async def _run_pipeline(
         # 30종목 4축 산점도 발송 (LLM narrow 성공한 경우만 — all30_scored가 있어야 함)
         all30_scored = (narrow or {}).get("all30_scored") or []
         if all30_scored:
+            # universe_match를 candidate pool에서 merge — 산점도 테두리 두께로 표시
+            um_by_ticker = {
+                (c.get("ticker6") or c.get("ticker") or "").strip(): c.get("universe_match")
+                for c in candidates
+                if c.get("universe_match") is not None
+            }
+            for item in all30_scored:
+                t = (item.get("ticker6") or "").strip()
+                if t and t in um_by_ticker:
+                    item["universe_match"] = um_by_ticker[t]
             await _send_scatter_chart(bot, chat_id, idea_text, all30_scored)
 
         # ticker6 누락 보강 (DART 종목명 룩업)
