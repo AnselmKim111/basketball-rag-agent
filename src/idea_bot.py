@@ -1461,6 +1461,10 @@ async def _parse_idea(idea_text: str) -> dict | None:
         sys_prompt = idea_prompts.load("idea_parse")
         user_msg = f"사용자 투자 아이디어:\n{idea_text}\n\n시스템 프롬프트 형식대로 JSON 출력."
         try:
+            try:
+                from src.llm_schemas import IdeaParseSchema
+            except Exception:
+                IdeaParseSchema = None
             content = summarizer.chat_with_retry(
                 client,
                 model=_summary_model(),       # 1차/2차: kimi
@@ -1472,6 +1476,7 @@ async def _parse_idea(idea_text: str) -> dict | None:
                     {"role": "user", "content": user_msg},
                 ],
                 context="idea_parse",
+                validate_schema=IdeaParseSchema,  # Layer B — 스키마 검증 + JSON 강제
             )
         except summarizer.OpenRouterCreditExhausted:
             raise

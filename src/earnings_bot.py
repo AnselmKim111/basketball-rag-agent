@@ -310,6 +310,7 @@ async def _step_extract_predictions(
             temperature=0.2,
             max_tokens=3000,
             context=f"earnings-predictions-extract:{ticker}",
+            validate_schema=_predictions_schema(),  # Layer B — DB INSERT 전 스키마 검증
         )
     try:
         content = await loop.run_in_executor(None, _call)
@@ -2768,6 +2769,15 @@ def _build_synthesis_payload(
 # ------------------------------------------------------------------
 # 모델 티어는 src/llm_models.py 공유. EarningsBot은 chained env 사용.
 from src.llm_models import summary_model as _summary_model, chained_model
+
+
+def _predictions_schema():
+    """Layer B schema — pydantic 미설치 환경 graceful (None이면 검증 skip)."""
+    try:
+        from src.llm_schemas import PredictionsExtractSchema
+        return PredictionsExtractSchema
+    except Exception:
+        return None
 
 
 def _extract_model() -> str:
