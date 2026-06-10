@@ -24,11 +24,13 @@ from typing import Any
 log = logging.getLogger(__name__)
 KST = timezone(timedelta(hours=9))
 
-# 이모지 — Noto Sans CJK에 글리프 없어 tofu 박스 — 렌더 전 제거
+# 이모지 — Noto Sans CJK에 글리프 없어 tofu 박스 — 렌더 전 제거.
+# 단 ★(U+2605)·☆(U+2606)는 CJK 폰트에 글리프 있고 conviction 표시(★4)에 필수라 보존.
 _EMOJI_RE = re.compile(
     "["
     "\U0001F300-\U0001FAFF"
-    "\U00002600-\U000027BF"
+    "\U00002600-\U00002604"
+    "\U00002607-\U000027BF"
     "\U0001F1E6-\U0001F1FF"
     "\U0000FE00-\U0000FE0F"
     "\U00002190-\U000021FF"
@@ -1153,7 +1155,7 @@ def _draw_cover(
         for line in pick["verdict_lines"][:3]:
             wrapped = _wrap_text_kr(line, width=78)
             for j, w in enumerate(wrapped[:2]):
-                ax.text(0.060, y, ("▸ " if j == 0 else "   ") + w,
+                ax.text(0.060, y, ("• " if j == 0 else "   ") + w,
                         fontsize=9.5, fontweight="bold" if j == 0 else "normal",
                         color=STYLE["ink"], va="top")
                 y -= 0.020
