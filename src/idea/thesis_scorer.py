@@ -41,8 +41,7 @@ PROMPT_REFINE_PATH = ROOT / "prompts" / "idea_universe_refine.txt"
 DEFAULT_TOP_N_COSINE = 300
 DEFAULT_TOP_N_FINAL = 60
 DEFAULT_MIN_MARKET_CAP_WON = 30_000_000_000  # 300억 (env로 조정 가능)
-DEFAULT_REFINE_BATCH = 50  # kimi 컨텍스트 안전 단위
-DEFAULT_REFINE_MODEL = os.getenv("OPENROUTER_MODEL") or "moonshotai/kimi-k2-thinking"
+DEFAULT_REFINE_BATCH = 30  # 출력 truncate 방지 (30 × ~80 tokens/line ≈ 2400 tokens)
 
 
 def _build_query_text(thesis_text: str, research: Optional[dict]) -> str:
@@ -181,22 +180,26 @@ def _parse_refine_jsonl(content: str) -> list[dict]:
 def llm_refine_batch(
     thesis_text: str,
     candidates: list[dict],
-    model: str = DEFAULT_REFINE_MODEL,
+    model: str | None = None,
     batch_size: int = DEFAULT_REFINE_BATCH,
 ) -> list[dict]:
     """top N(보통 300) 종목에 LLM 약식 매칭 점수 부여 → match_score 필드 추가.
 
+    모델 chain (summary tier) — 사용자가 OPENROUTER_MODEL을 바꿔 그 모델이
+    빈 응답을 반환해도 안정 default(kimi-k2.6 → haiku-4.5)로 자동 fallback.
     실패 시 graceful — candidates 그대로 반환 (cosine_score만 정렬 기준).
     """
     if not candidates:
         return candidates
     try:
         from src import summarizer
+        from src.llm_models import summary_chain
         client = summarizer.get_client()
     except Exception:
         log.exception("[thesis_scorer] LLM refine — summarizer client 실패, cosine만 사용")
         return candidates
 
+    models = [model] if model else summary_chain()
     sys_prompt = _refine_prompt()
     refined_by_t: dict[str, dict] = {}
 
@@ -221,10 +224,10 @@ def llm_refine_batch(
             f"각 종목에 대해 JSON 한 줄씩 출력."
         )
         try:
-            content = summarizer.chat_with_retry(
+            content, _used = summarizer.chat_with_chain(
                 client,
-                model=model,
-                max_tokens=4000,
+                models=models,
+                max_tokens=8000,
                 temperature=0.0,
                 messages=[
                     {"role": "system", "content": sys_prompt},
@@ -239,6 +242,12 @@ def llm_refine_batch(
             )
             continue
         parsed = _parse_refine_jsonl(content or "")
+        if len(parsed) < len(batch) * 0.5:
+            log.warning(
+                "[thesis_scorer] refine batch %d 추출 부족 (%d/%d) — content preview=%r",
+                batch_start // batch_size + 1, len(parsed), len(batch),
+                (content or "")[:200],
+            )
         for obj in parsed:
             t = str(obj.get("ticker6") or "").strip()
             if t:

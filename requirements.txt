@@ -18,3 +18,5 @@ numpy>=1.26
 finance-datareader>=0.9.0
 # 버터대디봇 리포트 (트리맵 히트맵)
 squarify>=0.4
+# earnings PDF lint (markdown raw 잔존 자동 검사 — _lint_pdf)
+pdfminer.six>=20231228

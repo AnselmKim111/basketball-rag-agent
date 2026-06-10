@@ -122,6 +122,12 @@ async def _model_router_weekly_job(bot: Bot) -> None:
     await model_eval_job(bot)
 
 
+async def _model_health_cron_job(bot: Bot) -> None:
+    """Layer D 자동 rollback 검사 — 시간당."""
+    from src.model_router.handler import model_health_job
+    await model_health_job(bot)
+
+
 BOT_SPECS: list[BotSpec] = [
     BotSpec(
         name="company",
@@ -264,6 +270,12 @@ BOT_SPECS: list[BotSpec] = [
                 job_id="model_router_weekly",
                 cron={"day_of_week": "sun", "hour": 21, "minute": 0},
                 description="모델 가성비 주간 재평가 — 매주 일요일 21:00 KST",
+            ),
+            ScheduledJob(
+                func=_model_health_cron_job,
+                job_id="model_health_hourly",
+                cron={"minute": 17},
+                description="Layer D — 모델 health 검사 + 자동 rollback (시간당 17분)",
             ),
         ],
     ),

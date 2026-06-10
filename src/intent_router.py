@@ -83,6 +83,15 @@ ROUTER_PROMPT = """당신은 한국 주식 봇의 의도 분류기다. 사용자
 """
 
 
+def _intent_schema():
+    """Layer B schema — pydantic 미설치 환경 graceful (None이면 검증 skip)."""
+    try:
+        from src.llm_schemas import IntentSchema
+        return IntentSchema
+    except Exception:
+        return None
+
+
 def _extract_json(text: str) -> Optional[dict]:
     """LLM 응답에서 JSON 1개 추출. fence + bare 모두."""
     if not text:
@@ -136,6 +145,7 @@ async def classify(text: str) -> Intent:
                 model=model,
                 temperature=0.0,
                 context=f"intent_router ({text[:30]})",
+                validate_schema=_intent_schema(),  # Layer B+C — schema 검증 + JSON 강제
             ),
         )
     except OpenRouterCreditExhausted:

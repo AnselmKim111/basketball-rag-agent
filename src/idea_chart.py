@@ -70,7 +70,7 @@ def _build_inner(
     plt.rcParams["axes.unicode_minus"] = False
 
     # 데이터 추출 (점수 누락 시 5로 기본)
-    xs, ys, sizes, colors, names, tickers = [], [], [], [], [], []
+    xs, ys, sizes, colors, names, tickers, umatches = [], [], [], [], [], [], []
     for item in all30_scored:
         if not isinstance(item, dict):
             continue
@@ -88,6 +88,13 @@ def _build_inner(
         colors.append(_clamp(cl, 1, 10))
         names.append(item.get("name", "?"))
         tickers.append((item.get("ticker6") or "").strip())
+        # universe_match (0-10) — 사업 description-thesis 객관 매칭 점수.
+        # 없으면 None (universe scan 미가용 또는 augment 종목).
+        try:
+            um = item.get("universe_match")
+            umatches.append(float(um) if um is not None else None)
+        except (TypeError, ValueError):
+            umatches.append(None)
 
     if not xs:
         return None
@@ -118,6 +125,12 @@ def _build_inner(
     # 점 크기는 80~700 범위로 매핑 (margin 1~10) — 라벨 공간 확보 위해 살짝 작게
     point_sizes = [80 + (s - 1) * (620 / 9) for s in sizes]
 
+    # 테두리 두께 = universe_match (사업 description-thesis 객관 매칭).
+    # 7+면 굵은 테두리 — "객관 매칭 강한데 LLM이 낮게 봤거나, 그 반대" outlier 식별용.
+    edge_widths = [
+        0.7 if um is None else 0.5 + (max(0.0, min(10.0, um)) / 10.0) * 2.3
+        for um in umatches
+    ]
     sc = ax.scatter(
         jx, jy,
         s=point_sizes,
@@ -126,7 +139,7 @@ def _build_inner(
         vmin=1, vmax=10,
         alpha=0.6,
         edgecolors="black",
-        linewidths=0.7,
+        linewidths=edge_widths,
     )
 
     # ── ScreenerBot 신호 hit 종목 강조 (★ 별표 + 빨간 외곽선) ──
@@ -212,6 +225,9 @@ def _build_inner(
 
     # 크기 범례 (margin) — 별도 텍스트
     legend_text = "● 점 크기 = 마진 민감도 (큼=BEP 근접, 매출↑ → OP 폭발적 증폭)"
+    n_um = sum(1 for um in umatches if um is not None)
+    if n_um > 0:
+        legend_text += f"\n◯ 테두리 두께 = universe 사업매칭 점수 (굵음=DART 사업내용 ↔ thesis 직결, {n_um}종목 측정)"
     if mom_hit_count > 0:
         legend_text += f"\n★ 빨간 외곽선 = ScreenerBot 신호 hit ({mom_hit_count}종목)"
     fig.text(
