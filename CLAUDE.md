@@ -27,14 +27,28 @@
 
 ## 2. 모델 티어 (절대 무너뜨리지 말 것)
 
-| 티어 | env var | 모델 | 용도 |
+| 티어 | env var | 모델 (2026-06-09 현행) | 용도 |
 |---|---|---|---|
 | Summary | `OPENROUTER_MODEL` | kimi-k2.6 (갓성비) | PDF 요약·DART·Forward·deepdive·idea parse |
 | Research | `IDEA_RESEARCH_MODEL` | perplexity/sonar-pro | 1단계 웹검색 |
 | Narrow | `IDEA_NARROW_MODEL` | claude-haiku-4.5 | 3단계 30→10 (큰 출력) + parse 폴백 |
-| Synthesis | `IDEA_SYNTHESIS_MODEL` | claude-sonnet-4.5 | 1.5 importance + 5 synthesis (진짜 지능) |
+| Synthesis | `IDEA_SYNTHESIS_MODEL` / `REPORT_SYNTHESIS_MODEL` | claude-sonnet-4.6 | importance + synthesis + 시황 narrative (진짜 지능) |
+| Deep | `EARNINGS_SYNTHESIS_MODEL` | claude-opus-4.8 | 어닝 비교합성 (최고 지능) |
+| Fallback | `OPENROUTER_FALLBACK_MODEL` | kimi-k2.6 | chat_with_retry 3차 시도 안전망 |
 
 요약·추출 작업은 kimi에서 절대 sonnet으로 올리지 말 것 (비용 6-8배). 진짜 지능 필요한 단계만 sonnet.
+
+### Model Router (src/model_router/ — 주간 자동 재평가)
+- 매주 일요일 21:00 KST cron: OpenRouter /models 가격 + /activity 사용량으로 가성비 재평가
+  → 텔레그램 추천 (`/model_approve <id|all>` 승인 시 Railway env 자동 upsert).
+- **티어별 가중** (scorer.TIER_WEIGHTS): 가성비 티어(Summary/Narrow/Fallback) cost 0.4 /
+  품질 티어(Synthesis/Deep) evidence 0.45-0.50 — 미검증 신모델로 품질 티어 강등 추천 금지.
+- **4 Layer 안전망**:
+  A=canary smoke test (적용 전 한국어·JSON sentinel, 실패 시 변경 거부) ·
+  B=pydantic schema (`src/llm_schemas.py` — **프롬프트 실제 출력과 1:1 대조 필수, 추정 금지**) ·
+  C=force_json (response_format, 미지원 모델 400 자동 off) ·
+  D=auto rollback (시간당 cron, 1h fail_rate >20% 또는 p95 >30s 시 이전 모델 복원).
+- 명령 (버터대디봇 admin): `/model_eval` `/model_approve` `/model_reject` `/model_status`.
 
 ## 3. 배포 흐름
 

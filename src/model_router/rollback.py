@@ -19,8 +19,7 @@ def _previous_model_for_env(env_name: str, current: str) -> str | None:
     env_name 일치 + new_model != current 인 것의 old_model.
     없으면 None.
     """
-    p = Path(approval_store._history_path() if hasattr(approval_store, '_history_path')
-             else "/data/model_router/history.json")
+    p = approval_store._history_path()
     if not p.exists():
         return None
     try:

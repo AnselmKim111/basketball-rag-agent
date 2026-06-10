@@ -1,6 +1,8 @@
-"""모델 가성비 점수 계산.
+"""모델 가성비 점수 계산 — 티어별 가중.
 
-score = cost_score*0.4 + usage_evidence*0.25 + freshness*0.15 + ctx_score*0.1 + tier_bonus*0.1
+가성비 티어 (A_summary/C_narrow/X_fallback): cost 0.4 — 저렴함이 곧 가치.
+품질 티어 (D_synthesis/E_deep): evidence 0.45·cost 0.15 — 검증된 지능 우선.
+  (한국어 narrative·deep reasoning은 미검증 모델 silent 품질 저하 위험이 절감액보다 큼)
 """
 from __future__ import annotations
 
@@ -8,6 +10,18 @@ import math
 import time
 
 from .candidates import VERIFIED_MODELS
+
+# 티어별 가중 (cost, evidence, freshness, ctx, bonus) — 합 1.0
+_DEFAULT_WEIGHTS = (0.40, 0.25, 0.15, 0.10, 0.10)
+TIER_WEIGHTS: dict[str, tuple[float, float, float, float, float]] = {
+    "A_summary":   _DEFAULT_WEIGHTS,
+    "B_research":  _DEFAULT_WEIGHTS,
+    "C_narrow":    _DEFAULT_WEIGHTS,
+    "X_fallback":  _DEFAULT_WEIGHTS,
+    # 품질 티어 — 검증 우선, 비용 가중 낮춤
+    "D_synthesis": (0.15, 0.45, 0.15, 0.10, 0.15),
+    "E_deep":      (0.10, 0.50, 0.15, 0.10, 0.15),
+}
 
 
 def cost_score(in_price: float, out_price: float) -> float:
@@ -56,14 +70,18 @@ def ctx_score(ctx_length: int) -> float:
 
 
 def score_model(model: dict, activity: dict[str, dict] | None = None,
-                tier_bonus: float = 0.0) -> dict:
-    """모델 1개 → 점수 dict (cost/evidence/freshness/ctx/total + 세부)."""
+                tier_bonus: float = 0.0, tier: str | None = None) -> dict:
+    """모델 1개 → 점수 dict (cost/evidence/freshness/ctx/total + 세부).
+
+    tier 지정 시 TIER_WEIGHTS 적용 — 품질 티어(D/E)는 evidence 우선.
+    """
     mid = model["id"]
     cs = cost_score(model["in_price"], model["out_price"])
     ue = usage_evidence(mid, activity)
     fr = freshness(model.get("created_at", 0))
     cx = ctx_score(model.get("ctx_length", 0))
-    total = cs * 0.4 + ue * 0.25 + fr * 0.15 + cx * 0.1 + tier_bonus * 0.1
+    w_cost, w_ev, w_fr, w_cx, w_bonus = TIER_WEIGHTS.get(tier or "", _DEFAULT_WEIGHTS)
+    total = cs * w_cost + ue * w_ev + fr * w_fr + cx * w_cx + tier_bonus * w_bonus
     return {
         "model_id": mid,
         "total": round(total, 4),
