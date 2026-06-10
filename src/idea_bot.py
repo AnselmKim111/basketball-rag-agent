@@ -107,6 +107,8 @@ HELP_TEXT = (
     "  - `중소형 K-방산`\n"
     "  - `코스닥만, 5천억 이하 반도체 장비`\n\n"
     "*Tinkering 명령:*\n"
+    "  `/scan <thesis>` — universe 사업매칭 top 30 즉시 조회 (~5초, 결정적)\n"
+    "    예: `/scan 삼성 HBM4향 후공정 테스트 specialty`\n"
     "  `/history` — 최근 20개 idea 분석 목록\n"
     "  `/show <id>` — 과거 결과 다시 보기 (id 끝 6자리만 OK)\n"
     "  `/dive <rank> [<id>]` — Top N 종목 deepdive 자동 실행\n"
@@ -166,6 +168,64 @@ async def _on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
     asyncio.create_task(_run_pipeline(update, context, text))
+
+
+# ------------------------------------------------------------------
+# /scan — universe scan layer만 즉시 조회 (전체 파이프라인 없이 ~5초)
+# ------------------------------------------------------------------
+async def _cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/scan <thesis>` — 결정적 universe cosine top 30 즉시 반환.
+
+    LLM 호출은 임베딩 1회뿐 (<$0.001, ~5초). 같은 thesis면 항상 같은 결과 —
+    전체 파이프라인 돌리기 전 'universe가 뭘 보고 있는지' sanity check 용.
+    """
+    if not is_authorized(update, ALLOWED_ENV):
+        await deny_message(update, "아이디어봇")
+        return
+    thesis = " ".join(context.args or []).strip()
+    if not thesis:
+        await update.message.reply_text(
+            "사용법: <code>/scan &lt;thesis 텍스트&gt;</code>\n"
+            "예: <code>/scan 삼성전자 HBM4향 후공정 테스트 장비 specialty</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    bot = context.bot
+    chat_id = str(update.effective_chat.id)
+    try:
+        from src.idea import thesis_scorer
+        if not thesis_scorer.is_universe_scan_ready():
+            await send_text_chunked(
+                bot, chat_id,
+                "⚠️ universe scan 미준비 — 임베딩 bootstrap이 아직 안 돌았습니다.",
+            )
+            return
+        loop = asyncio.get_running_loop()
+        results = await loop.run_in_executor(
+            None,
+            lambda: thesis_scorer.score_universe(
+                thesis_text=thesis, research=None,
+                top_n_cosine=30, top_n_final=30, use_llm_refine=False,
+            ),
+        )
+    except Exception:
+        log.exception("/scan 실패")
+        await send_text_chunked(bot, chat_id, "❌ scan 실패 — 로그 확인 필요")
+        return
+    if not results:
+        await send_text_chunked(bot, chat_id, "결과 0건 — thesis 표현을 바꿔보세요.")
+        return
+    lines = [f"🔭 Universe scan top {len(results)} (cosine, 결정적)\n"]
+    for i, c in enumerate(results, 1):
+        mcap_eok = c.get("mcap_estimate_krw_eok")
+        mcap_s = f"{mcap_eok:,}억" if mcap_eok else "?"
+        snippet = (c.get("business_text_snippet") or "").replace("\n", " ")[:60]
+        lines.append(
+            f"{i}. {c.get('name')}({c.get('ticker6')}) "
+            f"— {c.get('cosine_score'):.3f} · {mcap_s} · {c.get('sector') or '?'}\n"
+            f"   {snippet}"
+        )
+    await send_text_chunked(bot, chat_id, "\n".join(lines))
 
 
 # ------------------------------------------------------------------
@@ -2578,6 +2638,7 @@ def build_idea_app(token: str) -> Application:
     app.add_handler(CommandHandler(["start", "help"], _help))
     app.add_handler(CommandHandler("idea", _cmd_idea))
     app.add_handler(CommandHandler("curate", _cmd_curate))
+    app.add_handler(CommandHandler("scan", _cmd_scan))
     app.add_handler(CommandHandler("history", _cmd_history))
     app.add_handler(CommandHandler("show", _cmd_show))
     app.add_handler(CommandHandler("dive", _cmd_dive))
