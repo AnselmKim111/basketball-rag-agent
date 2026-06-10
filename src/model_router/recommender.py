@@ -38,7 +38,7 @@ def _rank_tier(tier: str, all_models: dict, activity: dict) -> list[dict]:
         m = all_models[mid]
         if not _passes_constraints(m, tier):
             continue
-        s = score_model(m, activity)
+        s = score_model(m, activity, tier=tier)
         scored.append(s)
     scored.sort(key=lambda x: -x["total"])
     return scored
@@ -97,7 +97,7 @@ def build_recommendations() -> list[dict]:
                 # 점수 차 5% 미만이면 skip
                 old_meta = all_models.get(old_val)
                 if old_meta:
-                    old_score = score_model(old_meta, activity)
+                    old_score = score_model(old_meta, activity, tier=tier)
                     if best["total"] - old_score["total"] < SKIP_MARGIN:
                         continue
                     old_total = old_score["total"]
