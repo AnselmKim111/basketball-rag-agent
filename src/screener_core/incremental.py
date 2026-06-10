@@ -8,7 +8,7 @@
 KRX 데이터는 보통 16:30~17:00 사이 발행되므로 16:00에는 미발행. 호출자가
 재시도(최대 ~30분)할 수 있도록 fetch_today_or_recent를 별도 제공.
 
-또한 280일 이전 데이터는 정리 (DB 비대화 방지).
+또한 RETENTION_DAYS(1400일) 이전 데이터는 정리 (DB 비대화 방지).
 """
 from __future__ import annotations
 
@@ -32,20 +32,28 @@ def _int_env(key: str, default: int) -> int:
         return default
 
 
-def _last_business_day(d=None):
-    """KST 기준 가장 최근 영업일 (오늘이 영업일이면 오늘) — date 객체."""
+def _last_business_day(d=None, tz=KST):
+    """tz 기준 가장 최근 영업일 (오늘이 영업일이면 오늘) — date 객체."""
     if d is None:
-        d = datetime.now(KST).date()
+        d = datetime.now(tz).date()
     while d.weekday() >= 5:
         d -= timedelta(days=1)
     return d
 
 
-def make_api(db, data_source, universe) -> SimpleNamespace:
-    """시장 모듈 주입 → public 함수들을 closure로 묶어 namespace 반환."""
+def make_api(db, data_source, universe, tz=KST, fdr_fallback: bool = True) -> SimpleNamespace:
+    """시장 모듈 주입 → public 함수들을 closure로 묶어 namespace 반환.
+
+    tz: "오늘"을 결정하는 시장 timezone. KR=KST, US=America/New_York.
+        US를 KST로 두면 07:00 KST cron 시점에 미국장 기준 아직 존재하지 않는
+        날짜를 target으로 잡아 전 종목 fetch를 헛돌림.
+    fdr_fallback: update_specific_date의 2차 FDR 폴백 사용 여부.
+        US는 1차 진입(fetch_ohlcv_by_ticker_via_naver)이 이미 FDR→Stooq라서
+        동일 소스 재스캔은 순수 낭비 → False.
+    """
 
     def update_today() -> dict:
-        """오늘(KST) 데이터 fetch + 280일 이전 정리.
+        """오늘(시장 tz) 데이터 fetch + retention 이전 정리.
 
         반환: {"date": iso_str, "rows": int, "is_business_day": bool, "empty": bool}.
 
@@ -58,7 +66,7 @@ def make_api(db, data_source, universe) -> SimpleNamespace:
             universe.refresh_universe()
         active_set = {t["ticker"] for t in db.get_active_tickers()}
 
-        today = datetime.now(KST).date()
+        today = datetime.now(tz).date()
         iso = today.strftime("%Y-%m-%d")
         ymd = today.strftime("%Y%m%d")
 
@@ -192,8 +200,8 @@ def make_api(db, data_source, universe) -> SimpleNamespace:
             if rows and active_set:
                 rows = [r for r in rows if r[0] in active_set]
 
-        # 2차 폴백: FDR ticker-batch
-        if not rows and active_set:
+        # 2차 폴백: FDR ticker-batch (1차 진입이 이미 FDR인 시장은 skip)
+        if not rows and active_set and fdr_fallback:
             cap = _int_env("SCREENER_INCREMENTAL_FDR_CAP", 1000)
             timeout_s = _int_env("SCREENER_INCREMENTAL_FDR_TIMEOUT_S", 480)
             log.warning(
@@ -245,6 +253,14 @@ def make_api(db, data_source, universe) -> SimpleNamespace:
             return {"date": target_iso, "rows": 0, "empty": True}
 
         inserted = db.upsert_ohlcv_bulk(rows)
+
+        # retention 정리 — update_today를 안 거치는 시장(US: date-batch 없음)도
+        # 이 경로로 정리되도록 여기서도 수행
+        cutoff = (datetime.now(tz).date() - timedelta(days=RETENTION_DAYS)).strftime("%Y-%m-%d")
+        deleted = db.delete_older_than(cutoff)
+        if deleted:
+            log.info("[incremental] %d행 정리 (cutoff=%s)", deleted, cutoff)
+
         log.info("[incremental] %s 강제 fetch 추가 rows=%d", target_iso, inserted)
         return {"date": target_iso, "rows": inserted, "empty": False}
 
@@ -260,7 +276,7 @@ def make_api(db, data_source, universe) -> SimpleNamespace:
         반환: {"date": iso, "rows": int, "empty": bool, "source": "today"|"recent"}.
         """
         db.ensure_schema()
-        today = datetime.now(KST).date()
+        today = datetime.now(tz).date()
         target = _last_business_day(today)
         target_iso = target.strftime("%Y-%m-%d")
 

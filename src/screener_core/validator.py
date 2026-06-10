@@ -87,8 +87,10 @@ def make_api(data_source) -> SimpleNamespace:
                 fetch_failed += 1
 
         # 검증: 각 신호 종목의 DB close vs truth close 비교
+        # rejected는 unique 종목 수 기준 — 한 종목이 여러 카테고리에서 거부돼도 1로 집계
+        # (entry 수로 빼면 validated가 음수가 되거나 과소집계됨)
         validated: dict[str, list[dict]] = {k: [] for k in results.keys()}
-        rejected = 0
+        rejected_set: set[str] = set()
         rejected_tickers: list[str] = []
         for cat, items in results.items():
             for it in items:
@@ -97,24 +99,26 @@ def make_api(data_source) -> SimpleNamespace:
                 true_close = truth.get(t)
                 if true_close is None:
                     # fetch 실패 — 보수적으로 제외 (잘못된 데이터 방지)
-                    rejected += 1
-                    rejected_tickers.append(f"{t}({it.get('name','?')})NoFetch")
+                    if t not in rejected_set:
+                        rejected_tickers.append(f"{t}({it.get('name','?')})NoFetch")
+                    rejected_set.add(t)
                     continue
                 if abs(db_close - true_close) <= tolerance:
                     validated[cat].append(it)
                 else:
-                    rejected += 1
-                    rejected_tickers.append(
-                        f"{t}({it.get('name','?')}) DB={db_close} vs Naver={true_close}"
-                    )
+                    if t not in rejected_set:
+                        rejected_tickers.append(
+                            f"{t}({it.get('name','?')}) DB={db_close} vs Naver={true_close}"
+                        )
+                    rejected_set.add(t)
                     log.warning(
                         "[validator] REJECT %s(%s) DB=%d Naver=%d diff=%d",
                         t, it.get("name", "?"), db_close, true_close, db_close - true_close,
                     )
 
         stats = {
-            "validated": len(tickers) - rejected,
-            "rejected": rejected,
+            "validated": len(tickers) - len(rejected_set),
+            "rejected": len(rejected_set),
             "fetch_failed": fetch_failed,
             "skipped_timeout": skipped_timeout,
             "rejected_samples": rejected_tickers[:10],  # 로그용 sample

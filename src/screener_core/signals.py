@@ -4,7 +4,7 @@ KR/US 스크리너 공통. 단일 종목 OHLCV(asc) → 발현 신호 dict.
 
 신호:
   1. 52주 신고가 — 종가가 과거 252영업일(1년) 최고가 초과
-  2. 역사적 신고가 — 종가가 보유 데이터 전체(280일) 최고가 초과
+  2. 역사적 신고가 — 종가가 보유 데이터 전체(최대 1400일) 최고가 초과
   3. 52주 돌파 직전 — 종가가 52주 고점 95-99% AND 5일 거래량 증가 추세
   4. VCP 돌파 — 변동성 수축 base 형성 후 박스권 상단 돌파
 
@@ -104,7 +104,7 @@ def compute_signals_for_ticker(rows: list[dict], base_date: str | None = None) -
                 "chg_pct": chg_pct,
             }
 
-    # 2) 역사적 신고가 (보유 데이터 전체 — 280일 보존)
+    # 2) 역사적 신고가 (보유 데이터 전체 — 최대 1400일 보존)
     past_high_all = df["high"].iloc[:-1].max()
     if today["close"] > past_high_all and past_high_all > 0:
         out["high_all"] = {

@@ -194,11 +194,16 @@ basketball-rag-agent/
 │   │   ├── wisereport_context.py
 │   │   └── forward_consensus.py
 │   │
-│   └── screener/               # ScreenerBot 모듈 (KRX OHLCV·신호)
-│       ├── signals.py          # 4종 신호 (신고가, 거래량 돌파, VCP, 52주 직전)
-│       ├── data_source.py      # Naver·pykrx·FDR 3단 폴백
-│       ├── incremental.py      # 일일 업데이트 + retry
-│       └── validator.py        # 발송 직전 cross-validation
+│   ├── screener_core/          # KR/US 스크리너 공통 핵심 (단일 출처)
+│   │   ├── signals.py          # 4종 신호 (역사적·52주 신고가, VCP, 52주 돌파 직전)
+│   │   ├── formatter.py        # 미미 스타일 헬퍼 (FormatConfig 주입)
+│   │   └── incremental/backfill/validator/subscribers.py  # make_api(deps) closure DI
+│   ├── screener/               # KR wrapper (KRX OHLCV·신호)
+│   │   ├── data_source.py      # Naver·pykrx·FDR 3단 폴백
+│   │   └── ...                 # core 주입 wrapper들
+│   └── us_screener/            # US wrapper (S&P500+Nasdaq100)
+│       ├── data_source.py      # FDR→Stooq (KR과 동일 시그니처)
+│       └── ...                 # core 주입 wrapper들 (tz=ET, fdr_fallback=False)
 │
 ├── prompts/
 │   ├── deep_research.txt       # /research 합성 프롬프트

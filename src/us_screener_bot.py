@@ -72,7 +72,7 @@ HELP_TEXT = (
     "유니버스: S&P500 + Nasdaq100, 시총 ≥ $1B\n"
     "이중확인: base_date-anchored signals + 재 fetch cross-validation\n\n"
     "신호:\n"
-    "  🚀 역사적 신고가 — 종가 > 보유 데이터(280일) 최고가\n"
+    "  🚀 역사적 신고가 — 종가 > 보유 데이터(최대 1400일) 최고가\n"
     "  📈 52주 신고가 — 종가 > 과거 252영업일 최고가\n"
     "  🎯 52주 돌파 직전 — 종가 = 52주고점 95-99% + 5일 거래량 ≥ ×1.3\n"
     "  💎 VCP 돌파 — 50일 박스권 + ATR 30%+ 수축 + 거래량 dry-up + 돌파\n\n"
@@ -441,26 +441,10 @@ async def us_screener_daily_job(bot: Bot, override_chat_id: str | None = None) -
             lengths2 = await loop.run_in_executor(None, db.ticker_data_lengths)
             log.info("[scheduled] 백필 후 ticker_data_lengths: %s", lengths2)
 
-        # 증분 (오늘 1일치) — KRX 16:30 이전 미발행 대비 retry
-        # US_SCREENER_RETRY_INTERVAL_S(기본 300=5분), US_SCREENER_RETRY_MAX(기본 6회 → 최대 30분)
-        retry_interval = int(os.getenv("US_SCREENER_RETRY_INTERVAL_S", "300"))
-        retry_max = int(os.getenv("US_SCREENER_RETRY_MAX", "6"))
-        inc = await loop.run_in_executor(None, incremental.update_today)
-        attempt = 1
-        while inc.get("empty") and inc.get("is_business_day") and attempt < retry_max:
-            log.info(
-                "[scheduled] today fetch 미발행 → %d초 후 재시도 (%d/%d)",
-                retry_interval, attempt, retry_max,
-            )
-            await asyncio.sleep(retry_interval)
-            inc = await loop.run_in_executor(None, incremental.update_today)
-            attempt += 1
-
-        # 영업일인데도 끝까지 today 미수신이면 어제 영업일 데이터라도 보장
-        if inc.get("empty"):
-            log.info("[scheduled] today 데이터 미수신 → ensure_recent_business_day_data")
-            ensured = await loop.run_in_executor(None, incremental.ensure_recent_business_day_data)
-            log.info("[scheduled] ensure_recent_business_day 결과: %s", ensured)
+        # 증분 — 미국은 date-batch 소스가 없어 update_today가 항상 빈 결과.
+        # KRX식 5분×6회 retry는 무의미 → 바로 최근 영업일(ET 기준) 데이터 보장.
+        ensured = await loop.run_in_executor(None, incremental.ensure_recent_business_day_data)
+        log.info("[scheduled] ensure_recent_business_day 결과: %s", ensured)
 
         # 진단: 대표 미국 종목 last 7일치 close 출력 (cent 단위 → /100 = $)
         try:
