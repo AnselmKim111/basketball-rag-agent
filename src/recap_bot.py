@@ -15,7 +15,7 @@ import asyncio
 import json
 import logging
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 
 from telegram import Bot, Update
 from telegram.constants import ParseMode
@@ -28,6 +28,7 @@ from telegram.ext import (
 )
 
 from src.bot_helpers import (
+    KST,
     deny_message,
     is_authorized,
     send_pdf,
@@ -36,11 +37,12 @@ from src.bot_helpers import (
 from src.pipeline_lock import PIPELINE_LOCK
 
 log = logging.getLogger(__name__)
-KST = timezone(timedelta(hours=9))
 
 ALLOWED_ENV = "RECAP_ALLOWED_CHAT_IDS"
 SYNTHESIS_MODEL_ENV = "IDEA_SYNTHESIS_MODEL"
 NARROW_MODEL_ENV = "IDEA_NARROW_MODEL"
+# sonnet 합성 출력 안전 상한 — 프롬프트는 800-1200자 가이드, 4x 마진.
+MAX_SYNTHESIS_CHARS = 4000
 
 
 HELP_TEXT = (
@@ -257,17 +259,29 @@ async def _synthesize_recap(data: dict) -> str:
             log.exception("[recap] sonnet 호출 실패")
             return ""
         log.info("[recap] sonnet synthesis done, len=%d", len(content or ""))
-        return (content or "").strip()
+        content = (content or "").strip()
+        # 프롬프트 가이드 800-1200자, 4x 안전 마진 — 모델이 폭주해도 텔레그램 메시지
+        # 분할(4000 char) 안에서 한 청크로 끝나도록.
+        if len(content) > MAX_SYNTHESIS_CHARS:
+            log.warning(
+                "[recap] sonnet 출력 %d자 → %d자 truncate",
+                len(content), MAX_SYNTHESIS_CHARS,
+            )
+            content = content[:MAX_SYNTHESIS_CHARS] + "\n…(truncated)"
+        return content
 
     return await loop.run_in_executor(None, _blocking)
 
 
+from src.llm_models import synthesis_model as _make_synthesis, narrow_model as _make_narrow
+
+
 def _synthesis_model() -> str:
-    return os.getenv(SYNTHESIS_MODEL_ENV) or os.getenv("OPENROUTER_MODEL") or "anthropic/claude-sonnet-4.5"
+    return _make_synthesis(SYNTHESIS_MODEL_ENV)
 
 
 def _narrow_model() -> str:
-    return os.getenv(NARROW_MODEL_ENV) or os.getenv("OPENROUTER_MODEL") or "anthropic/claude-haiku-4.5"
+    return _make_narrow(NARROW_MODEL_ENV)
 
 
 # ------------------------------------------------------------------
@@ -316,6 +330,8 @@ def build_recap_app(token: str) -> Application:
     app.add_handler(CommandHandler("recap_me", _cmd_recap_me))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _help))
 
+    # RECAP_TEST_PROMPT는 '플래그' 패턴 — 값 내용은 안 보고 설정 여부만 체크
+    # (다른 봇의 SCREENER_TEST_MODE / IDEA_TEST_PROMPT와 동일 컨벤션).
     if os.getenv("RECAP_TEST_PROMPT"):
         try:
             loop = asyncio.get_running_loop()

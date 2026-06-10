@@ -17,10 +17,15 @@ import asyncio
 import logging
 import os
 import re
+from datetime import timedelta, timezone
 from pathlib import Path
 from typing import Iterable
 
 from telegram import Bot, Update
+
+# 한국 표준시 — 봇별 중복 정의 제거를 위한 공용 상수.
+# 신규 모듈은 `from src.bot_helpers import KST` 사용.
+KST = timezone(timedelta(hours=9))
 
 log = logging.getLogger(__name__)
 

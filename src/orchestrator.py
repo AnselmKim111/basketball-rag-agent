@@ -116,6 +116,18 @@ class BotSpec:
     optional: bool = True                           # False면 토큰 없을 때 systemexit
 
 
+async def _model_router_weekly_job(bot: Bot) -> None:
+    """주간 모델 가성비 재평가 cron — 일요일 21:00 KST."""
+    from src.model_router.handler import model_eval_job
+    await model_eval_job(bot)
+
+
+async def _model_health_cron_job(bot: Bot) -> None:
+    """Layer D 자동 rollback 검사 — 시간당."""
+    from src.model_router.handler import model_health_job
+    await model_health_job(bot)
+
+
 BOT_SPECS: list[BotSpec] = [
     BotSpec(
         name="company",
@@ -253,6 +265,18 @@ BOT_SPECS: list[BotSpec] = [
                 cron={"hour": 8, "minute": 0},
                 description="버터대디봇 시황 리포트 — 매일 08:00 KST",
             ),
+            ScheduledJob(
+                func=_model_router_weekly_job,
+                job_id="model_router_weekly",
+                cron={"day_of_week": "sun", "hour": 21, "minute": 0},
+                description="모델 가성비 주간 재평가 — 매주 일요일 21:00 KST",
+            ),
+            ScheduledJob(
+                func=_model_health_cron_job,
+                job_id="model_health_hourly",
+                cron={"minute": 17},
+                description="Layer D — 모델 health 검사 + 자동 rollback (시간당 17분)",
+            ),
         ],
     ),
     BotSpec(
@@ -309,6 +333,16 @@ async def _run_forever() -> None:
         watchlist_store.diag_log()
     except Exception:
         log.exception("state_store 진단 호출 실패 (orchestrator 계속 진행)")
+
+    # idea_cache 무한 증가 방지 — 부팅 시 1회 cleanup (default 200 cap).
+    # 별도 cron 없이 봇 재시작마다 정리되어 디스크 사용 안정.
+    try:
+        from src import idea_cache
+        removed = idea_cache.cleanup_old(keep=200)
+        if removed:
+            log.info("idea_cache cleanup: removed=%d (keep=200)", removed)
+    except Exception:
+        log.exception("idea_cache cleanup 실패 (orchestrator 계속 진행)")
 
     apps: list[tuple[str, Application]] = []
     bot_objects: dict[str, Bot] = {}

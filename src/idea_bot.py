@@ -51,6 +51,9 @@ from telegram.ext import (
 )
 
 from src import idea_prompts
+from src.idea import scoring as _scoring
+from src.idea import sourcing as _sourcing
+from src.llm_json import parse_json_object as _parse_json
 from src.bot_helpers import (
     deny_message,
     download_root_for,
@@ -84,6 +87,10 @@ COMPANY_REPORTS_PER_TICKER = 2
 INDUSTRY_TEXT_MAX = 12_000   # PDF 텍스트 추출 시 자르는 문자 수
 COMPANY_TEXT_MAX = 10_000
 NARROW_TARGET = 10           # 30 → 10
+# 리포트 freshness — fast-cycle 산업(DRAM 등)에 6개월 cap은 너무 넓음. 기본 90일,
+# 부족하면 코드에서 graceful 폴백 (180일 재시도). env로 override 가능.
+REPORT_DAYS_BACK = int(os.getenv("IDEA_REPORT_DAYS_BACK", "90"))
+REPORT_DAYS_BACK_FALLBACK = int(os.getenv("IDEA_REPORT_DAYS_BACK_FALLBACK", "180"))
 TOP_PICK_COUNT = 5
 
 # idea_bot 자체의 작업 상태 (다른 봇과 별도)
@@ -100,6 +107,8 @@ HELP_TEXT = (
     "  - `중소형 K-방산`\n"
     "  - `코스닥만, 5천억 이하 반도체 장비`\n\n"
     "*Tinkering 명령:*\n"
+    "  `/scan <thesis>` — universe 사업매칭 top 30 즉시 조회 (~5초, 결정적)\n"
+    "    예: `/scan 삼성 HBM4향 후공정 테스트 specialty`\n"
     "  `/history` — 최근 20개 idea 분석 목록\n"
     "  `/show <id>` — 과거 결과 다시 보기 (id 끝 6자리만 OK)\n"
     "  `/dive <rank> [<id>]` — Top N 종목 deepdive 자동 실행\n"
@@ -159,6 +168,64 @@ async def _on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
     asyncio.create_task(_run_pipeline(update, context, text))
+
+
+# ------------------------------------------------------------------
+# /scan — universe scan layer만 즉시 조회 (전체 파이프라인 없이 ~5초)
+# ------------------------------------------------------------------
+async def _cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/scan <thesis>` — 결정적 universe cosine top 30 즉시 반환.
+
+    LLM 호출은 임베딩 1회뿐 (<$0.001, ~5초). 같은 thesis면 항상 같은 결과 —
+    전체 파이프라인 돌리기 전 'universe가 뭘 보고 있는지' sanity check 용.
+    """
+    if not is_authorized(update, ALLOWED_ENV):
+        await deny_message(update, "아이디어봇")
+        return
+    thesis = " ".join(context.args or []).strip()
+    if not thesis:
+        await update.message.reply_text(
+            "사용법: <code>/scan &lt;thesis 텍스트&gt;</code>\n"
+            "예: <code>/scan 삼성전자 HBM4향 후공정 테스트 장비 specialty</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    bot = context.bot
+    chat_id = str(update.effective_chat.id)
+    try:
+        from src.idea import thesis_scorer
+        if not thesis_scorer.is_universe_scan_ready():
+            await send_text_chunked(
+                bot, chat_id,
+                "⚠️ universe scan 미준비 — 임베딩 bootstrap이 아직 안 돌았습니다.",
+            )
+            return
+        loop = asyncio.get_running_loop()
+        results = await loop.run_in_executor(
+            None,
+            lambda: thesis_scorer.score_universe(
+                thesis_text=thesis, research=None,
+                top_n_cosine=30, top_n_final=30, use_llm_refine=False,
+            ),
+        )
+    except Exception:
+        log.exception("/scan 실패")
+        await send_text_chunked(bot, chat_id, "❌ scan 실패 — 로그 확인 필요")
+        return
+    if not results:
+        await send_text_chunked(bot, chat_id, "결과 0건 — thesis 표현을 바꿔보세요.")
+        return
+    lines = [f"🔭 Universe scan top {len(results)} (cosine, 결정적)\n"]
+    for i, c in enumerate(results, 1):
+        mcap_eok = c.get("mcap_estimate_krw_eok")
+        mcap_s = f"{mcap_eok:,}억" if mcap_eok else "?"
+        snippet = (c.get("business_text_snippet") or "").replace("\n", " ")[:60]
+        lines.append(
+            f"{i}. {c.get('name')}({c.get('ticker6')}) "
+            f"— {c.get('cosine_score'):.3f} · {mcap_s} · {c.get('sector') or '?'}\n"
+            f"   {snippet}"
+        )
+    await send_text_chunked(bot, chat_id, "\n".join(lines))
 
 
 # ------------------------------------------------------------------
@@ -1100,6 +1167,25 @@ async def _run_pipeline(
             await send_text_chunked(bot, chat_id, "❌ 리서치 결과에 산업/후보가 비어있음 — 종료")
             return
 
+        # ---- (1b) 다중 소스 candidate pool: research + screener universe + (TODO 산업리포트·DART)
+        # screener.db universe로 시총 정확 보강 + 누락된 specialty 발굴.
+        pool = _sourcing.build_candidate_pool(research, parsed, target_size=60, thesis_text=idea_text)
+        if pool:
+            added = len(pool) - len(candidates)
+            if added > 0:
+                await send_text_chunked(
+                    bot, chat_id,
+                    f"🧭 1b단계: screener universe 통합 — pool {len(pool)}개 (research {len(candidates)} + 추가 {added})",
+                )
+            else:
+                await send_text_chunked(
+                    bot, chat_id,
+                    f"🧭 1b단계: screener 시총·섹터 보강 적용 — pool {len(pool)}개",
+                )
+            # research candidates를 enriched pool로 교체 (narrow 입력에 사용)
+            candidates = pool
+            research["candidates"] = pool  # cache에도 반영
+
         # ---- (1.5 + 2) 중요도 평가 LLM + 산업 리포트 wisereport — 동시 진행.
         # 둘은 research 결과에만 의존하고 서로 독립. importance는 synthesis(5단계)에서만
         # 쓰이므로 narrow(3단계) 전에만 끝나면 됨. asyncio.gather로 1-2분 절약.
@@ -1132,6 +1218,24 @@ async def _run_pipeline(
             bot, chat_id, f"  ✅ 산업 리포트 {len(industry_pdfs)}건 수집",
         )
 
+        # ---- (2.5) 산업리포트 인용 종목 추출 → pool 재빌드 (mentioned_picks 추가)
+        if industry_texts:
+            before = len(candidates)
+            pool2 = _sourcing.build_candidate_pool(
+                research, parsed,
+                industry_texts=industry_texts,
+                target_size=60,
+                thesis_text=idea_text,
+            )
+            if pool2 and len(pool2) > before:
+                added = len(pool2) - before
+                await send_text_chunked(
+                    bot, chat_id,
+                    f"📑 2.5단계: 산업리포트 인용 종목 +{added}개 → pool {len(pool2)}개",
+                )
+                candidates = pool2
+                research["candidates"] = pool2
+
         # ---- (3) 30 → 10 narrow
         await send_text_chunked(bot, chat_id, "🎯 3단계: 영업레버리지 4축 점수로 30→10 narrowing")
         narrow = await _narrow_candidates(idea_text, research, industry_texts, candidates)
@@ -1163,6 +1267,16 @@ async def _run_pipeline(
         # 30종목 4축 산점도 발송 (LLM narrow 성공한 경우만 — all30_scored가 있어야 함)
         all30_scored = (narrow or {}).get("all30_scored") or []
         if all30_scored:
+            # universe_match를 candidate pool에서 merge — 산점도 테두리 두께로 표시
+            um_by_ticker = {
+                (c.get("ticker6") or c.get("ticker") or "").strip(): c.get("universe_match")
+                for c in candidates
+                if c.get("universe_match") is not None
+            }
+            for item in all30_scored:
+                t = (item.get("ticker6") or "").strip()
+                if t and t in um_by_ticker:
+                    item["universe_match"] = um_by_ticker[t]
             await _send_scatter_chart(bot, chat_id, idea_text, all30_scored)
 
         # ticker6 누락 보강 (DART 종목명 룩업)
@@ -1174,6 +1288,24 @@ async def _run_pipeline(
             )
             return
 
+        # ---- (3.5) 손익비 점수: ScreenerBot momentum 신호 합산 + 재정렬
+        top10 = _scoring.sort_by_risk_reward(_scoring.score_top10(top10, days_back=14))
+        mom_hits = sum(1 for c in top10 if (c.get("momentum_score") or 0) > 0)
+        if mom_hits:
+            preview_names = [
+                f"{c.get('name','?')}({c.get('momentum_score',0)})"
+                for c in top10 if (c.get("momentum_score") or 0) > 0
+            ][:5]
+            await send_text_chunked(
+                bot, chat_id,
+                f"📊 3.5단계: 손익비 점수 산출 — momentum 신호 hit {mom_hits}/{len(top10)}: {', '.join(preview_names)}",
+            )
+        else:
+            await send_text_chunked(
+                bot, chat_id,
+                f"📊 3.5단계: 손익비 점수 산출 — momentum hit 0 (op_lev × purity 만으로 정렬)",
+            )
+
         # ---- (4) 종목 리포트 수집
         await send_text_chunked(
             bot, chat_id, f"📈 4단계: top {len(top10)} 종목 리포트 다운로드 (각 {COMPANY_REPORTS_PER_TICKER}건)",
@@ -1184,6 +1316,30 @@ async def _run_pipeline(
         total_company_pdfs = sum(len(v) for v in company_pdfs_by_ticker.values())
         await send_text_chunked(
             bot, chat_id, f"  ✅ 종목 리포트 총 {total_company_pdfs}건 수집",
+        )
+
+        # ---- (4.5) 종목별 최근 30일 뉴스 fetch (perplexity sonar 병렬)
+        # wisereport 분석가 리포트가 회장 발언·capex 가이던스 같은 이벤트성 뉴스를
+        # 리포트화하기 전 1~4주 갭을 메우는 단계. synthesis가 인용하는 source.
+        await send_text_chunked(
+            bot, chat_id,
+            "📰 4.5단계: 종목별 최근 30일 뉴스·공시·실적 web search (perplexity)",
+        )
+        try:
+            from src.idea import news as _news_mod
+            news_by_ticker = await _news_mod.fetch_recent_news_batch(top10, days=30)
+        except Exception:
+            log.exception("종목별 최근 뉴스 fetch 단계 실패 — 빈 결과로 진행")
+            news_by_ticker = {}
+        # top10 각 candidate에 recent_news 부착 → synthesis 컨텍스트로 전달됨
+        for c in top10:
+            t = (c.get("ticker6") or "").strip()
+            c["recent_news"] = news_by_ticker.get(t, [])
+        hit_n = sum(1 for c in top10 if c.get("recent_news"))
+        total_news = sum(len(c.get("recent_news") or []) for c in top10)
+        await send_text_chunked(
+            bot, chat_id,
+            f"  ✅ 최근 뉴스 총 {total_news}건 (hit {hit_n}/{len(top10)} 종목)",
         )
 
         # ---- (5) 최종 synthesis
@@ -1198,6 +1354,9 @@ async def _run_pipeline(
         if not synthesis or not synthesis.get("top5"):
             await send_text_chunked(bot, chat_id, "❌ 최종 분석 실패 — 종료")
             return
+
+        # ---- (5.5) synthesis.top5에 손익비·momentum 메타 합치기 (출력용)
+        _attach_scoring_to_top5(synthesis.get("top5") or [], top10)
 
         # ---- (6) 발송
         await _send_results(
@@ -1264,6 +1423,26 @@ async def _run_pipeline(
 # ------------------------------------------------------------------
 # (1) 리서치 — perplexity/sonar-pro 웹검색
 # ------------------------------------------------------------------
+def _today_anchor() -> str:
+    """LLM user_msg 최상단에 prepend할 오늘 날짜 anchor.
+
+    모든 분석 단계(research/importance/narrow/synthesis)의 user_msg에 prepend.
+    LLM training cutoff 이후 사건이 있을 수 있으므로 모델 prior보다 입력 자료를
+    우선 신뢰하도록 명시.
+    """
+    from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+    KST = _tz(_td(hours=9))
+    now = _dt.now(KST)
+    weekday = ("월", "화", "수", "목", "금", "토", "일")[now.weekday()]
+    return (
+        f"**현재 기준일: {now.strftime('%Y년 %m월 %d일')} ({weekday}) KST**\n"
+        f"※ 이 날짜는 분석의 절대 anchor. 모든 'X일 전', '최근 N일', '곧', "
+        f"'다음 분기' 같은 표현은 반드시 이 날짜 기준. 모델 training cutoff "
+        f"이후의 사건이 있을 수 있으니, 본인의 prior보다 입력된 자료/웹검색 "
+        f"결과를 우선 신뢰하라.\n\n"
+    )
+
+
 async def _parse_idea(idea_text: str) -> dict | None:
     """0.5단계: 아이디어 텍스트에서 thesis + constraints 분리.
 
@@ -1282,6 +1461,10 @@ async def _parse_idea(idea_text: str) -> dict | None:
         sys_prompt = idea_prompts.load("idea_parse")
         user_msg = f"사용자 투자 아이디어:\n{idea_text}\n\n시스템 프롬프트 형식대로 JSON 출력."
         try:
+            try:
+                from src.llm_schemas import IdeaParseSchema
+            except Exception:
+                IdeaParseSchema = None
             content = summarizer.chat_with_retry(
                 client,
                 model=_summary_model(),       # 1차/2차: kimi
@@ -1293,6 +1476,7 @@ async def _parse_idea(idea_text: str) -> dict | None:
                     {"role": "user", "content": user_msg},
                 ],
                 context="idea_parse",
+                validate_schema=IdeaParseSchema,  # Layer B — 스키마 검증 + JSON 강제
             )
         except summarizer.OpenRouterCreditExhausted:
             raise
@@ -1382,7 +1566,8 @@ async def _research_idea(idea_text: str, parsed: dict | None = None) -> dict | N
             )
 
         user_msg = (
-            f"투자 아이디어 원문:\n{idea_text}\n\n"
+            _today_anchor()
+            + f"투자 아이디어 원문:\n{idea_text}\n\n"
             f"파싱된 thesis: {thesis}{constraints_block}\n\n"
             "위 자료를 시스템 프롬프트의 형식대로 JSON으로 출력해주세요."
         )
@@ -1469,38 +1654,37 @@ async def _evaluate_importance(idea_text: str, research: dict) -> dict | None:
             ],
         }
         user_msg = (
-            f"# 사용자 투자 아이디어\n{idea_text}\n\n"
+            _today_anchor()
+            + f"# 사용자 투자 아이디어\n{idea_text}\n\n"
             f"# 1단계 리서치 (요약)\n"
             f"{json.dumps(compact, ensure_ascii=False, indent=2)}\n\n"
             "위 자료를 비판적으로 검증해 시스템 프롬프트 형식대로 JSON 출력해주세요."
         )
+        # 모델 chain — importance도 synthesis와 같은 tier (진짜 지능 필요).
+        from src.llm_models import synthesis_chain
         try:
-            resp = client.chat.completions.create(
-                model=_synthesis_model(),  # 지능 필요 — synthesis와 같은 등급
+            content, used_model = summarizer.chat_with_chain(
+                client,
+                models=synthesis_chain(SYNTHESIS_MODEL_ENV),
                 max_tokens=2000,
                 temperature=0.4,
                 messages=[
                     {"role": "system", "content": sys_prompt},
                     {"role": "user", "content": user_msg},
                 ],
+                context="importance",
             )
-        except summarizer.APIStatusError as e:
-            if summarizer._is_credit_error(e):
-                raise summarizer.OpenRouterCreditExhausted(str(e)) from e
-            log.exception("importance LLM API 에러")
-            return None
-        except Exception as e:
-            _maybe_raise_credit(e)
-            log.exception("importance LLM 호출 실패")
-            return None
-        try:
-            content = (resp.choices[0].message.content or "").strip()
+        except summarizer.OpenRouterCreditExhausted:
+            raise
         except Exception:
-            log.exception("importance 응답 파싱 실패")
+            log.exception("importance LLM chain 호출 실패")
+            return None
+        if not content:
+            log.warning("importance LLM chain 모두 빈 응답")
             return None
         log.info(
             "importance LLM 응답: %d chars (model=%s) — preview=%r",
-            len(content), _synthesis_model(), content[:300],
+            len(content), used_model, content[:300],
         )
         parsed = _parse_json(content)
         if parsed is None:
@@ -1559,16 +1743,22 @@ async def _collect_industry_reports(
     def _blocking() -> tuple[list[Path], dict[str, str]]:
         from src.wisereport import WisereportClient
         from src import summarizer
+        from src.bot_helpers import wisereport_creds, MissingWisereportCreds
 
         all_paths: list[Path] = []
         text_by_name: dict[str, str] = {}
         seen_rpt_ids: set[str] = set()  # 산업이 같은 코드로 매핑돼도 중복 다운로드 방지
-        general_pool_used = False  # 일반 industry top reports는 한 번만
+        # 일반 popular 폴백은 비활성화됨 (반도체 idea에 에너지·통신 리포트 오염 방지)
 
         try:
+            wr_id, wr_pw = wisereport_creds()
+        except MissingWisereportCreds:
+            log.exception("wisereport 자격 증명 누락 — 산업 리포트 수집 스킵")
+            return all_paths, text_by_name
+        try:
             with WisereportClient(
-                user_id=os.environ["WISEREPORT_ID"],
-                password=os.environ["WISEREPORT_PW"],
+                user_id=wr_id,
+                password=wr_pw,
                 download_root=target_dir,
                 headless=True,
                 ignore_https_errors=os.environ.get("IGNORE_HTTPS_ERRORS", "false").lower() == "true",
@@ -1599,16 +1789,29 @@ async def _collect_industry_reports(
                             items = cli.list_top_reports(
                                 category="industry", sort_by="popular",
                                 limit=INDUSTRY_REPORTS_PER_INDUSTRY,
-                                days_back=180, industry_gics=code,  # 6개월 cap
+                                days_back=REPORT_DAYS_BACK, industry_gics=code,  # 기본 90일
                             )
-                        if not items and not general_pool_used:
-                            log.info("산업 '%s' 매칭 실패 → 일반 industry top reports 1회 사용", name)
-                            items = cli.list_top_reports(
-                                category="industry", sort_by="popular",
-                                limit=INDUSTRY_REPORTS_PER_INDUSTRY * 2,
-                                days_back=180,
+                            # 90일에 0건이면 180일로 1회 폴백 (fast-cycle 외 산업 대비)
+                            if not items and REPORT_DAYS_BACK < REPORT_DAYS_BACK_FALLBACK:
+                                log.info(
+                                    "산업 '%s' %d일 0건 → %d일 폴백",
+                                    name, REPORT_DAYS_BACK, REPORT_DAYS_BACK_FALLBACK,
+                                )
+                                items = cli.list_top_reports(
+                                    category="industry", sort_by="popular",
+                                    limit=INDUSTRY_REPORTS_PER_INDUSTRY,
+                                    days_back=REPORT_DAYS_BACK_FALLBACK, industry_gics=code,
+                                )
+                        # 폴백 금지 — 코드 매칭 실패한 산업은 그냥 스킵. 일반 popular
+                        # 풀로 폴백하면 반도체와 무관한 트렌드 리포트(에너지·통신·양자 등)가
+                        # 들어와 narrow·synthesis thesis를 오염시킴. 산업 컨텍스트는 종목
+                        # 리포트(_collect_company_reports)와 perplexity research로만 채움.
+                        if not items:
+                            log.info(
+                                "산업 '%s' wisereport 코드 매칭/검색 실패 — 일반 popular 폴백 비활성화. 종목 리포트로만 컨텍스트 구성.",
+                                name,
                             )
-                            general_pool_used = True
+                            continue
                         # 인기순이지만 sch_dt 최신 우선 보조 정렬 (같은 visit_cnt 그룹 안에서 최신 우대)
                         items.sort(key=lambda it: it.sch_dt, reverse=True)
                     except Exception:
@@ -1629,11 +1832,18 @@ async def _collect_industry_reports(
                     all_paths.extend(saved)
                     seen_rpt_ids.update(it.rpt_id for it in items)
 
+                    # filename → sch_dt 매핑 — recency 라벨 주입용
+                    sch_by_name = {p.name: getattr(items[i], "sch_dt", "") for i, p in enumerate(saved) if i < len(items)}
+                    from src.idea.recency import label as _recency_label
+                    from datetime import datetime as _dt2, timezone as _tz2, timedelta as _td2
+                    _KST2 = _tz2(_td2(hours=9))
+                    _today_kst = _dt2.now(_KST2)
                     for p in saved:
                         try:
                             t = summarizer._extract_pdf_text(p, max_chars=INDUSTRY_TEXT_MAX)
                             if t.strip():
-                                text_by_name[p.name] = t
+                                tag = _recency_label(sch_by_name.get(p.name, ""), today=_today_kst)
+                                text_by_name[p.name] = f"{tag}\n{t}"
                         except Exception:
                             log.exception("산업 PDF 텍스트 추출 실패: %s", p)
         except Exception:
@@ -1668,51 +1878,55 @@ async def _narrow_candidates(
             for fn, txt in industry_texts.items()
         ) or "(산업 리포트 텍스트 없음)"
 
+        # 최근 30일 핵심 이벤트 (research.recent_developments) — narrow가 30→10 줄일 때
+        # 사건 직결 종목 우대용. research 단계가 미구현이거나 빈 응답이면 안내만.
+        rd = research.get("recent_developments") or []
+        if rd:
+            rd_block = (
+                "# 최근 30일 핵심 이벤트 (web search 출처 — perplexity 1단계)\n"
+                + json.dumps(rd, ensure_ascii=False, indent=2)[:6000]
+                + "\n위 이벤트가 직결되는 종목은 동일 점수일 때 우대.\n\n"
+            )
+        else:
+            rd_block = (
+                "# 최근 30일 핵심 이벤트\n(research 단계에서 catalyst 부족 — "
+                "thesis가 stale일 가능성 인지하라.)\n\n"
+            )
+
         user_msg = (
-            f"# 사용자 투자 아이디어\n{idea_text}\n\n"
-            f"# 1단계 리서치 (논리의 기울기 + 산업 + 30 후보)\n"
+            _today_anchor()
+            + f"# 사용자 투자 아이디어\n{idea_text}\n\n"
+            + rd_block
+            + f"# 1단계 리서치 (논리의 기울기 + 산업 + 30 후보)\n"
             f"{json.dumps(research, ensure_ascii=False, indent=2)[:15_000]}\n\n"
             f"# 산업 리포트 텍스트\n{ind_block[:60_000]}\n\n"
             "위 자료를 종합해 시스템 프롬프트 형식대로 top10 JSON을 출력해주세요."
         )
-        # 빈 응답 재시도 (kimi가 가끔 idle timeout으로 0자 반환).
-        # 두 번째 시도는 temperature 약간 올려 동일 응답 회피.
-        content = ""
-        for attempt in (1, 2):
-            try:
-                resp = client.chat.completions.create(
-                    model=_narrow_model(),
-                    max_tokens=12000,
-                    temperature=0.3 if attempt == 1 else 0.5,
-                    messages=[
-                        {"role": "system", "content": sys_prompt},
-                        {"role": "user", "content": user_msg},
-                    ],
-                )
-            except summarizer.APIStatusError as e:
-                if summarizer._is_credit_error(e):
-                    raise summarizer.OpenRouterCreditExhausted(str(e)) from e
-                log.exception("narrow LLM API 에러 (attempt %d)", attempt)
-                return None
-            except Exception as e:
-                _maybe_raise_credit(e)
-                log.exception("narrow LLM 호출 실패 (attempt %d)", attempt)
-                if attempt == 2:
-                    return None
-                continue
-            try:
-                content = (resp.choices[0].message.content or "").strip()
-            except Exception:
-                log.exception("narrow 응답 추출 실패 (attempt %d)", attempt)
-                if attempt == 2:
-                    return None
-                continue
-            if content:
-                break
-            log.warning("narrow LLM 빈 응답 (attempt %d) — 재시도", attempt)
+        # 모델 chain — 사용자가 IDEA_NARROW_MODEL 변경해도 빈 응답이면 안정 default로 fallback.
+        from src.llm_models import narrow_chain
+        try:
+            content, used_model = summarizer.chat_with_chain(
+                client,
+                models=narrow_chain(NARROW_MODEL_ENV),
+                max_tokens=12000,
+                temperature=0.3,
+                messages=[
+                    {"role": "system", "content": sys_prompt},
+                    {"role": "user", "content": user_msg},
+                ],
+                context="narrow",
+            )
+        except summarizer.OpenRouterCreditExhausted:
+            raise
+        except Exception:
+            log.exception("narrow LLM chain 호출 실패")
+            return None
+        if not content:
+            log.warning("narrow LLM chain 모두 빈 응답")
+            return None
         log.info(
             "narrow LLM 응답: %d chars (model=%s) — preview=%r",
-            len(content), _narrow_model(), content[:300],
+            len(content), used_model, content[:300],
         )
         parsed = _parse_json(content)
         if parsed is None:
@@ -1745,12 +1959,26 @@ async def _send_narrow_summary(bot: Bot, chat_id: str, narrow: dict) -> None:
 async def _send_scatter_chart(
     bot: Bot, chat_id: str, idea_text: str, all30_scored: list[dict],
 ) -> None:
-    """30종목 4축 산점도 PNG 발송. 차트 생성/발송 어느 단계 실패해도 봇은 계속."""
+    """30종목 4축 산점도 PNG 발송. 차트 생성/발송 어느 단계 실패해도 봇은 계속.
+
+    ScreenerBot signal hit 종목은 ★ 빨간 외곽선으로 강조.
+    """
     loop = asyncio.get_running_loop()
+
+    # ScreenerBot 신호 hit 종목 ticker 집합 (14일)
+    momentum_tickers: set[str] = set()
+    try:
+        from src.cross_bot import screener_query
+        if screener_query.is_available():
+            by_ticker = screener_query.get_recent_signals(days_back=14)
+            momentum_tickers = set(by_ticker.keys())
+    except Exception:
+        log.exception("산점도용 momentum_tickers 수집 실패 — 강조 없이 진행")
+
     try:
         from src import idea_chart
         png_bytes = await loop.run_in_executor(
-            None, idea_chart.build, idea_text, all30_scored,
+            None, idea_chart.build, idea_text, all30_scored, momentum_tickers,
         )
     except Exception:
         log.exception("산점도 생성 단계 실패 — 차트 스킵")
@@ -1758,111 +1986,30 @@ async def _send_scatter_chart(
     if not png_bytes:
         log.info("산점도 PNG 비어있음 — 스킵 (all30_scored=%d개)", len(all30_scored))
         return
+    caption = (
+        "📊 30 후보 4축 산점도\n"
+        "X=매출가속, Y=고정비비중, 점크기=마진민감도, 색=가동률여유\n"
+        "오른쪽 위 + 큰 점 + 진한 색 = 영업레버리지 강한 zone"
+    )
+    if momentum_tickers:
+        hit_in_chart = sum(
+            1 for it in all30_scored
+            if (it.get("ticker6") or "").strip() in momentum_tickers
+        )
+        if hit_in_chart > 0:
+            caption += f"\n★ ScreenerBot 신호 hit: {hit_in_chart}종목 빨간 외곽선 강조"
     try:
         await bot.send_photo(
             chat_id=chat_id,
             photo=png_bytes,
-            caption=(
-                "📊 30 후보 4축 산점도\n"
-                "X=매출가속, Y=고정비비중, 점크기=마진민감도, 색=가동률여유\n"
-                "오른쪽 위 + 큰 점 + 진한 색 = 영업레버리지 강한 zone"
-            ),
+            caption=caption,
         )
     except Exception:
         log.exception("산점도 텔레그램 발송 실패 — 무시하고 계속")
 
 
-async def _fix_tickers(top10: list[dict]) -> list[dict]:
-    """후보의 (name, ticker6) 페어를 DART corp_map과 대조해 검증·교정.
-
-    동작:
-      1. ticker6 있음 → DART에서 ticker → 등록 회사명 조회
-         - LLM이 준 name과 정규화 비교해 일치 → OK
-         - 불일치 (예: HD현대오일뱅크는 비상장, LLM이 002380=KCC를 잘못 매핑) →
-           LLM name으로 재lookup해서 새 ticker 교체. 못 찾으면 ticker 비움.
-      2. ticker6 없음 → name으로 lookup (기존 동작).
-      3. 그래도 ticker 못 찾으면 비워둠 → 후속 _collect_company_reports에서 스킵.
-    """
-    loop = asyncio.get_running_loop()
-    try:
-        from src.deepdive import dart_client
-    except Exception:
-        log.exception("dart_client import 실패 — ticker 룩업 스킵")
-        return top10
-
-    # corp_map 빌드 (한 번)
-    try:
-        await loop.run_in_executor(None, dart_client._load_corp_map)
-    except Exception:
-        log.exception("DART corp_map 로딩 실패")
-
-    def _norm(s: str) -> str:
-        # 회사 suffix(공업/산업/홀딩스/지주)도 약식으로 제거 — 명칭 줄임 매칭 위해
-        s = re.sub(r"[\s()㈜（）\-]+", "", s or "").lower()
-        return s
-
-    def _names_match(llm_name: str, dart_name: str) -> bool:
-        """LLM이 준 회사명과 DART 등록명이 사실상 같은 회사를 가리키는지 fuzzy 판단.
-
-        - 정규화 후 정확 일치 → True
-        - 정규화 후 한쪽이 다른 쪽의 substring → True (예: '한국석유' ↔ '한국석유공업')
-        - 빈 문자열 → False
-        """
-        nl = _norm(llm_name)
-        nd = _norm(dart_name)
-        if not nl or not nd:
-            return False
-        if nl == nd:
-            return True
-        if nl in nd or nd in nl:
-            return True
-        return False
-
-    out: list[dict] = []
-    for c in top10:
-        ticker = (c.get("ticker6") or "").strip()
-        name = (c.get("name") or "").strip()
-
-        if re.match(r"^\d{6}$", ticker):
-            # ticker 있음 — 회사명 일치 검증 (substring 허용)
-            dart_name = dart_client._CORP_NAME_CACHE.get(ticker, "")
-            if _names_match(name, dart_name):
-                out.append(c)
-                continue
-            # 불일치 → name으로 재lookup
-            log.warning(
-                "ticker mismatch: name='%s' ticker=%s but DART에는 '%s' — name으로 재lookup",
-                name, ticker, dart_name,
-            )
-            new_ticker = None
-            if name:
-                try:
-                    new_ticker = await loop.run_in_executor(None, dart_client.lookup_ticker_by_name, name)
-                except Exception:
-                    log.exception("재lookup 실패: %s", name)
-            if new_ticker and new_ticker != ticker:
-                log.info("ticker 교체: %s '%s' → %s '%s'", ticker, name, new_ticker, dart_client._CORP_NAME_CACHE.get(new_ticker, ""))
-                c["ticker6"] = new_ticker
-            else:
-                # 비상장이거나 매칭 못 함 — ticker 비우면 후속 단계에서 스킵
-                log.warning("ticker 매칭 실패 (비상장 가능성) — '%s' candidate ticker6 비움", name)
-                c["ticker6"] = ""
-            out.append(c)
-            continue
-
-        # ticker 비어있음 — name으로 lookup
-        if not name:
-            out.append(c)
-            continue
-        try:
-            t = await loop.run_in_executor(None, dart_client.lookup_ticker_by_name, name)
-        except Exception:
-            log.exception("ticker 룩업 실패: %s", name)
-            t = None
-        if t:
-            c["ticker6"] = t
-        out.append(c)
-    return out
+# ticker 검증·교정은 src/idea/tickers.py 로 이전. 호환 alias.
+from src.idea.tickers import validate_and_fix as _fix_tickers  # noqa: E402
 
 
 # ------------------------------------------------------------------
@@ -1883,14 +2030,20 @@ async def _collect_company_reports(
     def _blocking() -> tuple[dict[str, list[Path]], dict[str, dict[str, str]]]:
         from src.wisereport import WisereportClient
         from src import summarizer
+        from src.bot_helpers import wisereport_creds, MissingWisereportCreds
 
         paths_by_ticker: dict[str, list[Path]] = {}
         texts_by_ticker: dict[str, dict[str, str]] = {}
 
         try:
+            wr_id, wr_pw = wisereport_creds()
+        except MissingWisereportCreds:
+            log.exception("wisereport 자격 증명 누락 — 종목 리포트 수집 스킵")
+            return paths_by_ticker, texts_by_ticker
+        try:
             with WisereportClient(
-                user_id=os.environ["WISEREPORT_ID"],
-                password=os.environ["WISEREPORT_PW"],
+                user_id=wr_id,
+                password=wr_pw,
                 download_root=target_dir,
                 headless=True,
                 ignore_https_errors=os.environ.get("IGNORE_HTTPS_ERRORS", "false").lower() == "true",
@@ -1910,8 +2063,19 @@ async def _collect_company_reports(
                         items = cli.list_reports(
                             ticker=ticker, sort_by="latest",
                             limit=COMPANY_REPORTS_PER_TICKER,
-                            days_back=180,  # 6개월 이내만 — 옛날 리포트 차단
+                            days_back=REPORT_DAYS_BACK,  # 기본 90일 — fast-cycle 대비
                         )
+                        # 90일 0건이면 180일 폴백 (분기 리포트 cycle 종목 대비)
+                        if not items and REPORT_DAYS_BACK < REPORT_DAYS_BACK_FALLBACK:
+                            log.info(
+                                "종목 %s %d일 0건 → %d일 폴백",
+                                ticker, REPORT_DAYS_BACK, REPORT_DAYS_BACK_FALLBACK,
+                            )
+                            items = cli.list_reports(
+                                ticker=ticker, sort_by="latest",
+                                limit=COMPANY_REPORTS_PER_TICKER,
+                                days_back=REPORT_DAYS_BACK_FALLBACK,
+                            )
                     except Exception:
                         log.exception("종목 리포트 목록 실패: %s", ticker)
                         continue
@@ -1926,11 +2090,17 @@ async def _collect_company_reports(
                         continue
                     paths_by_ticker[ticker] = saved
                     texts: dict[str, str] = {}
+                    sch_by_name = {p.name: getattr(items[i], "sch_dt", "") for i, p in enumerate(saved) if i < len(items)}
+                    from src.idea.recency import label as _recency_label
+                    from datetime import datetime as _dt3, timezone as _tz3, timedelta as _td3
+                    _KST3 = _tz3(_td3(hours=9))
+                    _today_kst3 = _dt3.now(_KST3)
                     for p in saved:
                         try:
                             t = summarizer._extract_pdf_text(p, max_chars=COMPANY_TEXT_MAX)
                             if t.strip():
-                                texts[p.name] = t
+                                tag = _recency_label(sch_by_name.get(p.name, ""), today=_today_kst3)
+                                texts[p.name] = f"{tag}\n{t}"
                         except Exception:
                             log.exception("종목 PDF 텍스트 추출 실패: %s", p)
                     texts_by_ticker[ticker] = texts
@@ -1990,10 +2160,29 @@ async def _synthesize_top5(
         # 1.5단계 중요도 평가도 컨텍스트로 주입 (verdict, score, args)
         importance_ctx = json.dumps(importance or {}, ensure_ascii=False, indent=2)[:3000]
 
+        # 최근 30일 산업 이벤트 + 종목별 최신 뉴스 — Step 4.5에서 top10에 붙음.
+        rd = research.get("recent_developments") or []
+        rd_block = json.dumps(rd, ensure_ascii=False, indent=2)[:6000] if rd \
+            else "(research에서 최근 30일 산업 catalyst 발견 못 함 — thesis stale 위험)"
+
+        per_ticker_news_lines = []
+        for c in top10:
+            news = c.get("recent_news") or []
+            if news:
+                per_ticker_news_lines.append(
+                    f"## {c.get('name','?')} ({c.get('ticker6','??????')})\n"
+                    + json.dumps(news, ensure_ascii=False, indent=2)[:2500]
+                )
+        per_ticker_news_block = "\n\n".join(per_ticker_news_lines) \
+            or "(종목별 최근 30일 뉴스 fetch 없음 또는 모두 빈 응답)"
+
         user_msg = (
-            f"# 사용자 투자 아이디어\n{idea_text}\n\n"
+            _today_anchor()
+            + f"# 사용자 투자 아이디어\n{idea_text}\n\n"
             f"# 1단계 리서치 — 논리의 기울기\n"
             f"{json.dumps(research.get('logic_gradient_text',''), ensure_ascii=False)[:3000]}\n\n"
+            f"# 최근 30일 산업 핵심 이벤트 (research 단계 perplexity 출처)\n{rd_block}\n\n"
+            f"# 종목별 최근 30일 뉴스 (4.5단계 per-ticker perplexity)\n{per_ticker_news_block[:10_000]}\n\n"
             f"# 1.5단계 중요도 평가 (이 평가를 진지하게 받아 thesis에 반영)\n"
             f"{importance_ctx}\n\n"
             f"# top10 후보 (3단계 narrow 결과)\n"
@@ -2003,47 +2192,35 @@ async def _synthesize_top5(
             "시스템 프롬프트 형식대로 Top 5 JSON을 출력해주세요. "
             "각 종목마다 사업부 식별 → 영업레버리지 폭 → 기울기 → thesis 순으로 단계적으로 추론하고 "
             "최종 thesis에 통합해주세요. "
+            "recent_catalysts_30d 필드는 위 '최근 30일 산업 이벤트' 또는 '종목별 최근 30일 뉴스'에서 직접 인용 (자체 추측 금지). "
             "referenced_reports에는 해당 종목의 own 종목 리포트 파일명만 정확히 사용해주세요."
         )
-        # max_tokens=12000 — Top 5 × 1500자 thesis + key_numbers + methodology
-        #   (이전 8000은 Claude Sonnet에서 마지막 종목의 referenced_reports 직전에 truncate됨).
-        # 빈 응답 재시도 1회.
-        content = ""
-        for attempt in (1, 2):
-            try:
-                resp = client.chat.completions.create(
-                    model=_synthesis_model(),
-                    max_tokens=16000,
-                    temperature=0.4 if attempt == 1 else 0.6,
-                    messages=[
-                        {"role": "system", "content": sys_prompt},
-                        {"role": "user", "content": user_msg},
-                    ],
-                )
-            except summarizer.APIStatusError as e:
-                if summarizer._is_credit_error(e):
-                    raise summarizer.OpenRouterCreditExhausted(str(e)) from e
-                log.exception("synthesis LLM API 에러 (attempt %d)", attempt)
-                return None
-            except Exception as e:
-                _maybe_raise_credit(e)
-                log.exception("synthesis LLM 호출 실패 (attempt %d)", attempt)
-                if attempt == 2:
-                    return None
-                continue
-            try:
-                content = (resp.choices[0].message.content or "").strip()
-            except Exception:
-                log.exception("synthesis 응답 추출 실패 (attempt %d)", attempt)
-                if attempt == 2:
-                    return None
-                continue
-            if content:
-                break
-            log.warning("synthesis LLM 빈 응답 (attempt %d) — 재시도", attempt)
+        # 모델 chain — synthesis는 진짜 지능 필요. 사용자가 IDEA_SYNTHESIS_MODEL 변경해도
+        # 빈 응답이면 안정 default (sonnet) 자동 fallback.
+        from src.llm_models import synthesis_chain
+        try:
+            content, used_model = summarizer.chat_with_chain(
+                client,
+                models=synthesis_chain(SYNTHESIS_MODEL_ENV),
+                max_tokens=16000,
+                temperature=0.4,
+                messages=[
+                    {"role": "system", "content": sys_prompt},
+                    {"role": "user", "content": user_msg},
+                ],
+                context="synthesis",
+            )
+        except summarizer.OpenRouterCreditExhausted:
+            raise
+        except Exception:
+            log.exception("synthesis LLM chain 호출 실패")
+            return None
+        if not content:
+            log.warning("synthesis LLM chain 모두 빈 응답")
+            return None
         log.info(
             "synthesis LLM 응답: %d chars (model=%s) — preview=%r",
-            len(content), _synthesis_model(), content[:300],
+            len(content), used_model, content[:300],
         )
         parsed = _parse_json(content)
         if parsed is None:
@@ -2165,6 +2342,28 @@ async def _send_top1_quarterly_chart(
         log.exception("Top 1 분기 차트 발송 실패")
 
 
+def _attach_scoring_to_top5(top5: list[dict], top10_scored: list[dict]) -> None:
+    """synthesis.top5 각 pick에 risk_reward_score·momentum_meta를 ticker 매칭으로 합치기.
+
+    매칭 키: ticker6 정확. 없으면 정규화 회사명 substring.
+    """
+    by_ticker = {
+        (c.get("ticker6") or "").strip(): c
+        for c in top10_scored if (c.get("ticker6") or "").strip()
+    }
+    for pick in top5:
+        t = (pick.get("ticker6") or "").strip()
+        match = by_ticker.get(t)
+        if not match:
+            continue
+        if "risk_reward_score" in match:
+            pick["risk_reward_score"] = match["risk_reward_score"]
+        if "momentum_score" in match:
+            pick["momentum_score"] = match["momentum_score"]
+        if "momentum_meta" in match:
+            pick["momentum_meta"] = match["momentum_meta"]
+
+
 async def _send_results(
     bot: Bot, chat_id: str,
     synthesis: dict,
@@ -2232,10 +2431,20 @@ async def _send_results(
         )
         if price_brief:
             header += f"   💰 {price_brief}\n"
+        # 손익비 + momentum 신호 노출 (scoring 후 합쳐진 메타)
+        rr = pick.get("risk_reward_score")
+        mom = pick.get("momentum_score") or 0
+        if rr is not None:
+            header += f"   📊 손익비 score: {rr} (momentum +{mom})\n"
+        meta = pick.get("momentum_meta") or {}
+        sigs = meta.get("signals") or []
+        if sigs:
+            latest = meta.get("latest_date") or "?"
+            header += f"   🔥 ScreenerBot 신호: {', '.join(sigs)} (최근 {latest})\n"
         header += "━━━━━━━━━━━━━━━━━━━━"
         await send_text_chunked(bot, chat_id, header)
 
-        # 5단계 추론 요약 헤더 (사업부/폭/기울기) — thesis 위에 짧게 노출
+        # 5단계 추론 요약 헤더 (사업부/폭/기울기/손익비/trigger) — thesis 위에 짧게 노출
         summary_header = ""
         if business_unit:
             summary_header += f"🏢 사업부: {business_unit}\n"
@@ -2243,6 +2452,18 @@ async def _send_results(
             summary_header += f"📐 폭(magnitude): {magnitude}\n"
         if gradient_timing:
             summary_header += f"⏱️ 기울기/시점: {gradient_timing}\n"
+        recent_cat = pick.get("recent_catalysts_30d") or ""
+        if recent_cat:
+            summary_header += f"📰 최근 30일 catalyst: {recent_cat}\n"
+        rr_note = pick.get("risk_reward_note") or ""
+        if rr_note:
+            summary_header += f"⚖️ 손익비: {rr_note}\n"
+        next_trig = pick.get("next_trigger_quarter") or ""
+        if next_trig:
+            summary_header += f"📅 다음 trigger: {next_trig}\n"
+        mom_sig = pick.get("momentum_signals") or ""
+        if mom_sig:
+            summary_header += f"🔥 모멘텀 confirmation: {mom_sig}\n"
         if summary_header:
             summary_header += "\n"
 
@@ -2312,238 +2533,27 @@ async def _send_results(
 #   _narrow_model()    → IDEA_NARROW_MODEL (haiku 등) — 30→10 점수화 (큰 출력)
 #   _synthesis_model() → IDEA_SYNTHESIS_MODEL (sonnet 등) — 1.5+5 단계 진짜 지능
 # ------------------------------------------------------------------
-def _summary_model() -> str:
-    """0.5단계 parse 등 단순 추출용 — 가장 저렴한 OPENROUTER_MODEL 사용.
-
-    PDF 요약·DART 파싱·deepdive 요약과 같은 티어. kimi-k2.6 등 갓성비 모델 권장.
-    """
-    return os.getenv("OPENROUTER_MODEL") or "moonshotai/kimi-k2.6"
+# 모델 티어 헬퍼는 src/llm_models.py 로 이전. 아래는 호환 alias.
+from src.llm_models import (
+    summary_model as _summary_model,
+    maybe_raise_credit as _maybe_raise_credit,
+)
 
 
 def _synthesis_model() -> str:
-    """1.5단계 중요도 평가 + 5단계 최종 Top 5 합성 — 가장 지능 필요. 기본 claude-sonnet."""
-    explicit = os.getenv(SYNTHESIS_MODEL_ENV)
-    if explicit:
-        return explicit
-    return os.getenv("OPENROUTER_MODEL") or "anthropic/claude-sonnet-4.5"
+    """1.5 importance + 5 synthesis — sonnet 기본."""
+    from src.llm_models import synthesis_model
+    return synthesis_model(SYNTHESIS_MODEL_ENV)
 
 
 def _narrow_model() -> str:
-    """3단계 30→10 narrowing — 정형화된 스코어링이라 평소 모델로 충분.
-
-    명시값(IDEA_NARROW_MODEL) 없으면 OPENROUTER_MODEL(평소 모델) 사용.
-    """
-    explicit = os.getenv(NARROW_MODEL_ENV)
-    if explicit:
-        return explicit
-    return os.getenv("OPENROUTER_MODEL") or "anthropic/claude-sonnet-4.5"
+    """3 narrow + parse 폴백 — haiku 기본."""
+    from src.llm_models import narrow_model
+    return narrow_model(NARROW_MODEL_ENV)
 
 
-def _maybe_raise_credit(e: Exception) -> None:
-    """OpenRouter 키 한도/결제 오류면 OpenRouterCreditExhausted 재라이즈.
-
-    그렇지 않으면 no-op. 모든 LLM 호출의 except 블록에서 가장 먼저 호출하면
-    credit error를 silent 실패 대신 사용자에게 명확히 전달.
-    """
-    from src import summarizer
-    if isinstance(e, summarizer.APIStatusError) and summarizer._is_credit_error(e):
-        raise summarizer.OpenRouterCreditExhausted(str(e)) from e
-
-
-def _parse_json(content: str) -> dict | None:
-    """LLM 응답에서 JSON 객체 추출 (tolerant).
-
-    처리 단계:
-      1. 코드 펜스 ```json ... ``` 제거
-      2. 첫 { 부터 마지막 } 까지 잘라냄
-      3. trailing comma 정리 (`,]` → `]`, `,}` → `}`)
-      4. JS 라인 코멘트 / 블록 코멘트 제거
-      5. 그래도 실패 시 progressive truncate — 끝에서부터 한 글자씩 빼며 재시도
-         (Claude가 마지막 객체에서 truncate된 경우 직전 } 까지 살리기)
-
-    파싱 실패 시 None.
-    """
-    if not content:
-        log.warning("_parse_json: 빈 content")
-        return None
-    # 코드 펜스 제거
-    fence = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", content, re.DOTALL)
-    if fence:
-        content_inner = fence.group(1)
-    else:
-        content_inner = content
-    # 첫 { 부터 마지막 } 까지
-    start = content_inner.find("{")
-    end = content_inner.rfind("}")
-    if start < 0 or end <= start:
-        log.warning("JSON 블록 못 찾음 (head=%r tail=%r)", content_inner[:200], content_inner[-200:])
-        return None
-    blob = content_inner[start:end + 1]
-
-    # 1차: 그대로 시도
-    obj = _try_loads(blob)
-    if obj is not None:
-        return obj if isinstance(obj, dict) else None
-
-    # 2차: 정리(trailing comma + 코멘트) 후 시도
-    cleaned = _clean_json_loose(blob)
-    obj = _try_loads(cleaned)
-    if obj is not None:
-        log.info("JSON 파싱 — cleanup 후 성공")
-        return obj if isinstance(obj, dict) else None
-
-    # 3차: depth/string-tracking 으로 완전히 닫힌 마지막 top-level 위치까지 잘라냄
-    #      (Claude가 mid-string 으로 truncate된 경우에 대응. 단순 } 카운팅으론
-    #       문자열 안의 }와 진짜 }를 구별 못함.)
-    safe_blob = _truncate_to_balanced_json(content_inner, start)
-    if safe_blob is not None:
-        cleaned = _clean_json_loose(safe_blob)
-        obj = _try_loads(cleaned)
-        if obj is not None:
-            log.info("JSON 파싱 — balanced truncate 성공 (len=%d)", len(safe_blob))
-            return obj if isinstance(obj, dict) else None
-
-    # 4차: depth-aware partial recovery — 마지막 '완성된 top5 항목까지'라도 살리기.
-    #      중첩 array/object 가 닫히지 않은 채로 끝났으면, 강제로 ] 와 } 닫아서
-    #      직전까지의 항목만이라도 재구성.
-    forced = _force_close_open_brackets(content_inner, start, end)
-    if forced is not None:
-        cleaned = _clean_json_loose(forced)
-        obj = _try_loads(cleaned)
-        if obj is not None:
-            log.info("JSON 파싱 — force-close 성공 (len=%d)", len(forced))
-            return obj if isinstance(obj, dict) else None
-
-    log.warning("JSON 파싱 최종 실패 — head=%r tail=%r", blob[:200], blob[-200:])
-    return None
-
-
-def _truncate_to_balanced_json(s: str, start: int) -> str | None:
-    """문자열·이스케이프를 추적하며 depth가 0으로 돌아온 마지막 위치까지 잘라냄.
-
-    LLM이 출력 중간(예: 문자열 안)에서 끊긴 경우, 가장 가까운 안전한 cutoff를 찾는다.
-    반환: s[start:cutoff+1] 형태의 부분 문자열 (성공 시) 또는 None.
-    """
-    if start < 0 or start >= len(s):
-        return None
-    if s[start] != "{":
-        return None
-    depth = 0
-    in_string = False
-    escape = False
-    last_complete = -1  # depth가 0으로 돌아온 가장 최근 위치
-    for i in range(start, len(s)):
-        c = s[i]
-        if escape:
-            escape = False
-            continue
-        if c == "\\" and in_string:
-            escape = True
-            continue
-        if c == '"':
-            in_string = not in_string
-            continue
-        if in_string:
-            continue
-        if c == "{" or c == "[":
-            depth += 1
-        elif c == "}" or c == "]":
-            depth -= 1
-            if depth == 0:
-                last_complete = i
-    if last_complete < 0:
-        return None
-    return s[start:last_complete + 1]
-
-
-def _force_close_open_brackets(s: str, start: int, end: int) -> str | None:
-    """LLM이 array 중간에서 끊긴 경우 마지막 완전한 *항목* 까지 보존하고 강제 닫음.
-
-    동작:
-      1. start 부터 한 글자씩 진행. 문자열·이스케이프 추적.
-      2. push/pop마다 stack 변화 기록.
-      3. **모든 depth에서** "직전이 닫힌 위치" safe_positions[depth] 를 추적.
-      4. **문자열 안에서 EOF 만나면** 그 문자열 시작 직전의 마지막 안전 위치까지 백트랙
-         (perplexity 등이 specialty_note 같은 string field 안에서 truncate되는 케이스 대응).
-      5. 끝까지 가서 닫히지 않은 ']' 와 '}' 가 있으면, **현재 남은 stack depth와 일치하는**
-         safe_positions[len(stack)] 위치까지 잘라내고 stack 역순으로 닫기.
-
-    예: top5 배열에 5개 항목 중 5번째가 닫혔지만 array ']'와 root '}'가 missing인 경우
-        → stack=['{', '['] 길이 2. safe_positions[2] = 5번째 항목 '}' 위치.
-        → 그 위치까지 잘라낸 후 ']}' append → 5개 항목 보존된 valid JSON.
-    """
-    if start < 0 or start >= len(s) or s[start] != "{":
-        return None
-    in_string = False
-    escape = False
-    stack: list[str] = []
-    safe_positions: dict[int, int] = {}  # depth-after-pop → 그 depth에서 마지막 close 위치
-    for i in range(start, len(s)):
-        c = s[i]
-        if escape:
-            escape = False
-            continue
-        if c == "\\" and in_string:
-            escape = True
-            continue
-        if c == '"':
-            in_string = not in_string
-            continue
-        if in_string:
-            continue
-        if c in "{[":
-            stack.append(c)
-        elif c in "}]":
-            if not stack:
-                return None  # 비정상 — 매칭 brackets 깨짐
-            stack.pop()
-            safe_positions[len(stack)] = i
-    if not stack:
-        return s[start:end + 1] if end >= start else None
-    # safe_positions[len(stack)]이 None인 경우 = 현재 top stack 안에서 한 번도 자식이 닫히지 않음.
-    # (예: candidate object 안의 string field에서 truncate되어 자식이 0개 닫힘)
-    # stack을 가상으로 pop하면서 가능한 safe position 탐색 — 가장 데이터 많이 보존되는 거 우선.
-    truncated_blob = None
-    closing = ""
-    for pop_count in range(0, len(stack) + 1):
-        target_depth = len(stack) - pop_count
-        safe = safe_positions.get(target_depth)
-        if safe is None or safe <= start:
-            continue
-        truncated_blob = s[start:safe + 1]
-        items_to_close = stack[:target_depth]
-        closing = "".join("]" if ch == "[" else "}" for ch in reversed(items_to_close))
-        break
-    if truncated_blob is None:
-        return None
-    # trailing comma 가능성 → cleanup이 처리
-    return truncated_blob + closing
-
-
-def _try_loads(s: str):
-    """json.loads 성공 시 객체, 실패 시 None."""
-    try:
-        return json.loads(s)
-    except json.JSONDecodeError:
-        return None
-    except Exception:
-        return None
-
-
-def _clean_json_loose(s: str) -> str:
-    """LLM JSON에서 흔한 비표준 표기 제거.
-
-    - trailing comma: `,\s*]` → `]`, `,\s*}` → `}`
-    - JS 라인 코멘트: `// ...` 줄
-    - JS 블록 코멘트: `/* ... */`
-    """
-    # 라인 코멘트 (행 끝까지)
-    s = re.sub(r"//[^\n\r]*", "", s)
-    # 블록 코멘트
-    s = re.sub(r"/\*.*?\*/", "", s, flags=re.DOTALL)
-    # trailing comma
-    s = re.sub(r",(\s*[}\]])", r"\1", s)
-    return s
+# JSON 파서는 src/llm_json.py 로 이전 — `_parse_json`은 그 모듈의 `parse_json_object` 별칭.
+# (위에서 `from src.llm_json import parse_json_object as _parse_json` 으로 가져옴.)
 
 
 # ------------------------------------------------------------------
@@ -2633,6 +2643,7 @@ def build_idea_app(token: str) -> Application:
     app.add_handler(CommandHandler(["start", "help"], _help))
     app.add_handler(CommandHandler("idea", _cmd_idea))
     app.add_handler(CommandHandler("curate", _cmd_curate))
+    app.add_handler(CommandHandler("scan", _cmd_scan))
     app.add_handler(CommandHandler("history", _cmd_history))
     app.add_handler(CommandHandler("show", _cmd_show))
     app.add_handler(CommandHandler("dive", _cmd_dive))
@@ -2651,7 +2662,81 @@ def build_idea_app(token: str) -> Application:
     try:
         loop = asyncio.get_running_loop()
         loop.create_task(_self_test(app))
+        # universe-scan bootstrap — IDEA_UNIVERSE_BOOTSTRAP=1 + 임베딩 종목 50 미만일 때
+        # 백그라운드로 1회 자동 실행. 동작 중에도 IdeaBot은 정상 운용.
+        loop.create_task(_auto_universe_bootstrap())
     except RuntimeError:
         # async context 밖 (예: CLI 단독 실행) — self-test 비활성
         pass
     return app
+
+
+async def _auto_universe_bootstrap() -> None:
+    """Universe scan용 임베딩 bootstrap을 부팅 시 백그라운드에서 1회 자동 실행.
+
+    조건:
+      - env IDEA_UNIVERSE_BOOTSTRAP=1
+      - env OPENAI_API_KEY 또는 OPENROUTER_API_KEY (embedding) 존재
+      - env DART_API_KEY 존재
+      - 현재 임베딩 보유 종목 < 50
+    예상 시간 ~120분. 끝나면 universe_scan이 자동 활성 (is_universe_scan_ready True).
+    """
+    if os.getenv("IDEA_UNIVERSE_BOOTSTRAP", "0") != "1":
+        return
+    if not os.getenv("DART_API_KEY"):
+        log.warning("[universe-bootstrap] DART_API_KEY 없음 — 스킵")
+        return
+    if not (os.getenv("OPENAI_API_KEY") or os.getenv("OPENROUTER_API_KEY")):
+        log.warning("[universe-bootstrap] embedding key 없음 (OPENAI_API_KEY 권장) — 스킵")
+        return
+
+    # 부팅 직후 self-test와 충돌 안 나게 30초 지연
+    await asyncio.sleep(30)
+    try:
+        from src.screener import db as screener_db
+        from src.idea import universe_text, embedding as emb_mod
+        stats = screener_db.universe_scan_stats()
+        if stats.get("with_embedding", 0) >= 50:
+            log.info("[universe-bootstrap] 이미 %d종목 임베딩 보유 — 스킵",
+                     stats["with_embedding"])
+            return
+        log.info("[universe-bootstrap] 시작 (백그라운드, 약 120분 예상)")
+
+        # universe refresh는 별도 screener_bot cron이 처리. 누락된 종목만 fetch.
+        text_stats = await universe_text.bulk_refresh_business_text(
+            tickers=None,
+            max_concurrency=int(os.getenv("UNIVERSE_BOOTSTRAP_CONCURRENCY", "4")),
+            skip_if_recent_days=90,
+        )
+        log.info("[universe-bootstrap] DART fetch 완료: %s", text_stats)
+
+        # embedding batch
+        rows = screener_db.get_universe_for_scan(require_embedding=False)
+        pending = [r for r in rows if not r.get("embedding")]
+        if not pending:
+            log.info("[universe-bootstrap] embedding 신규 대상 0 — 완료")
+            return
+        log.info("[universe-bootstrap] embedding %d종목 시작", len(pending))
+        texts = [r["business_text"] or "" for r in pending]
+        try:
+            vecs = emb_mod.embed_texts(texts, batch_size=100)
+        except emb_mod.EmbeddingError as e:
+            log.error("[universe-bootstrap] embedding 호출 실패: %s — 사용자 OPENAI_API_KEY 필요", e)
+            return
+        today = emb_mod.now_kst_date()
+        embedded = 0
+        for r, v in zip(pending, vecs):
+            if v is None or v.size == 0:
+                continue
+            screener_db.upsert_embedding(
+                ticker=r["ticker"],
+                embedding=emb_mod.vec_to_bytes(v),
+                model=emb_mod.DEFAULT_EMBED_MODEL,
+                embedding_dt=today,
+            )
+            embedded += 1
+        final = screener_db.universe_scan_stats()
+        log.info("[universe-bootstrap] 완료 — embedded=%d, 최종 stats=%s",
+                 embedded, final)
+    except Exception:
+        log.exception("[universe-bootstrap] 예외 — graceful 종료, IdeaBot 운용 영향 없음")

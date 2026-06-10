@@ -155,26 +155,9 @@ def _smart_text_snippet(text: str, max_chars: int) -> str:
 
 
 def _parse_json_object(content: str) -> Optional[dict]:
-    """LLM 출력에서 첫 번째 valid JSON 객체 추출. 실패 시 None."""
-    if not content:
-        return None
-    # 코드펜스 벗기기
-    fence = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", content, re.DOTALL)
-    if fence:
-        content = fence.group(1)
-    # 첫 { ~ 마지막 } (greedy) — 단일 객체 가정
-    m = re.search(r"\{.*\}", content, re.DOTALL)
-    if not m:
-        return None
-    raw = m.group(0)
-    try:
-        obj = json.loads(raw)
-    except Exception:
-        log.warning("forward JSON 파싱 실패: %s", raw[:300])
-        return None
-    if not isinstance(obj, dict):
-        return None
-    return obj
+    """LLM 출력에서 첫 번째 valid JSON 객체 추출. src/llm_json.py 사용 (tolerant)."""
+    from src.llm_json import parse_json_object
+    return parse_json_object(content)
 
 
 # ------------------------------------------------------------------

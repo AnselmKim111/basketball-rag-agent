@@ -488,7 +488,26 @@ async def _run_pipeline(
                 stderr=asyncio.subprocess.STDOUT,
                 env=os.environ.copy(),
             )
-            stdout_bytes, _ = await proc.communicate()
+            timeout_s = int(os.environ.get("REPORT_SUBPROCESS_TIMEOUT_S", "1200"))  # 20분
+            try:
+                stdout_bytes, _ = await asyncio.wait_for(
+                    proc.communicate(), timeout=timeout_s,
+                )
+            except asyncio.TimeoutError:
+                logging.warning(
+                    "report subprocess %ds 초과 — 강제 종료 (name=%s ticker=%s)",
+                    timeout_s, name, ticker,
+                )
+                try:
+                    proc.kill()
+                    await proc.wait()
+                except Exception:
+                    logging.exception("subprocess kill 실패")
+                await ack.reply_text(
+                    f"⏱️ *{name}* ({ticker}) — subprocess {timeout_s}s 초과 → 강제 종료. 봇 로그 확인.",
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+                return
             output = stdout_bytes.decode("utf-8", errors="replace")
 
             if proc.returncode == 0:

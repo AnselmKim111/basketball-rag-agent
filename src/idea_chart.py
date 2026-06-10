@@ -23,7 +23,11 @@ from typing import Optional
 log = logging.getLogger(__name__)
 
 
-def build(idea_text: str, all30_scored: list[dict]) -> Optional[bytes]:
+def build(
+    idea_text: str,
+    all30_scored: list[dict],
+    momentum_tickers: set[str] | None = None,
+) -> Optional[bytes]:
     """30종목 4축 산점도 PNG bytes. 실패 시 None.
 
     all30_scored: [
@@ -31,17 +35,23 @@ def build(idea_text: str, all30_scored: list[dict]) -> Optional[bytes]:
        "scores": {"fixed_cost": int, "capacity": int, "growth": int, "margin": int}},
       ...
     ]
+    momentum_tickers: ScreenerBot signal hit 종목 ticker6 집합. 해당 점은
+      ★ 별표 + 빨간 테두리로 강조 표시.
     """
     if not all30_scored:
         return None
     try:
-        return _build_inner(idea_text, all30_scored)
+        return _build_inner(idea_text, all30_scored, momentum_tickers or set())
     except Exception:
         log.exception("산점도 생성 실패")
         return None
 
 
-def _build_inner(idea_text: str, all30_scored: list[dict]) -> Optional[bytes]:
+def _build_inner(
+    idea_text: str,
+    all30_scored: list[dict],
+    momentum_tickers: set[str],
+) -> Optional[bytes]:
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -60,7 +70,7 @@ def _build_inner(idea_text: str, all30_scored: list[dict]) -> Optional[bytes]:
     plt.rcParams["axes.unicode_minus"] = False
 
     # 데이터 추출 (점수 누락 시 5로 기본)
-    xs, ys, sizes, colors, names = [], [], [], [], []
+    xs, ys, sizes, colors, names, tickers, umatches = [], [], [], [], [], [], []
     for item in all30_scored:
         if not isinstance(item, dict):
             continue
@@ -77,6 +87,14 @@ def _build_inner(idea_text: str, all30_scored: list[dict]) -> Optional[bytes]:
         sizes.append(_clamp(sz, 1, 10))
         colors.append(_clamp(cl, 1, 10))
         names.append(item.get("name", "?"))
+        tickers.append((item.get("ticker6") or "").strip())
+        # universe_match (0-10) — 사업 description-thesis 객관 매칭 점수.
+        # 없으면 None (universe scan 미가용 또는 augment 종목).
+        try:
+            um = item.get("universe_match")
+            umatches.append(float(um) if um is not None else None)
+        except (TypeError, ValueError):
+            umatches.append(None)
 
     if not xs:
         return None
@@ -107,6 +125,12 @@ def _build_inner(idea_text: str, all30_scored: list[dict]) -> Optional[bytes]:
     # 점 크기는 80~700 범위로 매핑 (margin 1~10) — 라벨 공간 확보 위해 살짝 작게
     point_sizes = [80 + (s - 1) * (620 / 9) for s in sizes]
 
+    # 테두리 두께 = universe_match (사업 description-thesis 객관 매칭).
+    # 7+면 굵은 테두리 — "객관 매칭 강한데 LLM이 낮게 봤거나, 그 반대" outlier 식별용.
+    edge_widths = [
+        0.7 if um is None else 0.5 + (max(0.0, min(10.0, um)) / 10.0) * 2.3
+        for um in umatches
+    ]
     sc = ax.scatter(
         jx, jy,
         s=point_sizes,
@@ -115,8 +139,21 @@ def _build_inner(idea_text: str, all30_scored: list[dict]) -> Optional[bytes]:
         vmin=1, vmax=10,
         alpha=0.6,
         edgecolors="black",
-        linewidths=0.7,
+        linewidths=edge_widths,
     )
+
+    # ── ScreenerBot 신호 hit 종목 강조 (★ 별표 + 빨간 외곽선) ──
+    mom_hit_count = 0
+    for idx, t in enumerate(tickers):
+        if t and t in momentum_tickers:
+            mom_hit_count += 1
+            # 별표 (크기 = 점 크기 + 60)
+            ax.scatter(
+                [jx[idx]], [jy[idx]],
+                marker="*", s=point_sizes[idx] + 120,
+                facecolors="none", edgecolors="crimson",
+                linewidths=2.0, alpha=0.95, zorder=4,
+            )
 
     # 라벨: 점에서 fan-out. 같은 클러스터 내 종목은 시계방향 12/3/6/9시 등.
     for (_, _), idxs in cluster.items():
@@ -187,9 +224,15 @@ def _build_inner(idea_text: str, all30_scored: list[dict]) -> Optional[bytes]:
     cbar.ax.tick_params(labelsize=8)
 
     # 크기 범례 (margin) — 별도 텍스트
+    legend_text = "● 점 크기 = 마진 민감도 (큼=BEP 근접, 매출↑ → OP 폭발적 증폭)"
+    n_um = sum(1 for um in umatches if um is not None)
+    if n_um > 0:
+        legend_text += f"\n◯ 테두리 두께 = universe 사업매칭 점수 (굵음=DART 사업내용 ↔ thesis 직결, {n_um}종목 측정)"
+    if mom_hit_count > 0:
+        legend_text += f"\n★ 빨간 외곽선 = ScreenerBot 신호 hit ({mom_hit_count}종목)"
     fig.text(
         0.02, 0.02,
-        "● 점 크기 = 마진 민감도 (큼=BEP 근접, 매출↑ → OP 폭발적 증폭)",
+        legend_text,
         fontsize=8, color="dimgray",
     )
 
