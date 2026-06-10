@@ -218,6 +218,8 @@ def chat_with_retry(
     max_attempts: int = 3,
     fallback_model: str | None = None,
     context: str = "",
+    force_json: bool = False,
+    validate_schema=None,
 ) -> str:
     """LLM chat 호출 + 빈 content 자동 재시도 + 폴백 모델.
 
@@ -233,34 +235,57 @@ def chat_with_retry(
     인자:
       - fallback_model 미지정 시 env `OPENROUTER_FALLBACK_MODEL` 사용.
       - context: 로그 식별용 문자열 (예: "deepdive 업의 본질").
+      - force_json: True면 response_format={"type":"json_object"} 추가 (Layer C).
+        미지원 모델 시 400 에러 → 자동으로 flag off 재시도.
+      - validate_schema: pydantic BaseModel 클래스 (Layer B). 응답을 schema 검증해
+        실패 시 다음 시도 prompt에 schema 재주입. validate_schema 있으면 force_json
+        자동 default True.
     """
     primary = model or DEFAULT_MODEL
     fallback = fallback_model or os.getenv("OPENROUTER_FALLBACK_MODEL") or None
     last_reason = "unknown"
+    # Layer B+C: schema 있으면 force_json 자동 True
+    if validate_schema is not None and not force_json:
+        force_json = True
+    use_force_json = force_json
+    cur_messages = list(messages)  # schema 재주입 시 copy 수정
 
     for attempt in range(1, max_attempts + 1):
         # 마지막 시도 + fallback 있으면 모델 교체
         cur_model = fallback if (attempt == max_attempts and fallback) else primary
-        kwargs: dict = {"model": cur_model, "max_tokens": max_tokens, "messages": messages}
+        kwargs: dict = {"model": cur_model, "max_tokens": max_tokens, "messages": cur_messages}
         if temperature is not None:
             kwargs["temperature"] = temperature
+        if use_force_json:
+            kwargs["response_format"] = {"type": "json_object"}
+
+        # Layer D: health 측정 시작
+        _t0 = time.time()
 
         try:
             resp = client.chat.completions.create(**kwargs)
         except APIStatusError as e:
             if _is_credit_error(e):
                 raise OpenRouterCreditExhausted(str(e)) from e
-            last_reason = f"APIStatus {e.status_code if hasattr(e, 'status_code') else '?'}"
+            status_code = getattr(e, "status_code", None) or 0
+            # Layer C: 400 + force_json → 미지원 모델 가능성, flag off 재시도
+            if use_force_json and status_code == 400:
+                log.info("[chat_with_retry] %s response_format 미지원 — force_json off 재시도", cur_model)
+                use_force_json = False
+                continue
+            last_reason = f"APIStatus {status_code}"
             log.warning(
                 "LLM call failed [%s] attempt %d/%d (model=%s): %s",
                 context, attempt, max_attempts, cur_model, last_reason,
             )
+            _record_health(cur_model, False, time.time() - _t0)
         except Exception as e:
             last_reason = f"{type(e).__name__}: {str(e)[:160]}"
             log.warning(
                 "LLM call failed [%s] attempt %d/%d (model=%s): %s",
                 context, attempt, max_attempts, cur_model, last_reason,
             )
+            _record_health(cur_model, False, time.time() - _t0)
         else:
             try:
                 content = (resp.choices[0].message.content or "").strip()
@@ -268,6 +293,23 @@ def chat_with_retry(
                 content = ""
                 last_reason = "malformed response"
             if content:
+                # Layer B: schema validation (있을 때만)
+                if validate_schema is not None:
+                    schema_ok, schema_err = _validate_schema_content(content, validate_schema)
+                    if not schema_ok:
+                        last_reason = f"schema: {schema_err[:120]}"
+                        log.warning(
+                            "LLM schema fail [%s] attempt %d/%d (model=%s): %s",
+                            context, attempt, max_attempts, cur_model, last_reason,
+                        )
+                        _record_health(cur_model, False, time.time() - _t0)
+                        # 다음 시도에 schema 재주입
+                        if attempt < max_attempts:
+                            _inject_schema(cur_messages, validate_schema, schema_err)
+                            sleep_s = RETRY_BACKOFF_SECONDS[min(attempt - 1, len(RETRY_BACKOFF_SECONDS) - 1)]
+                            time.sleep(sleep_s)
+                            continue
+                        return ""  # 최종 실패
                 if attempt > 1:
                     log.info(
                         "LLM call recovered [%s] attempt %d (model=%s, chars=%d)",
@@ -278,12 +320,14 @@ def chat_with_retry(
                         "LLM call ok [%s] (model=%s, chars=%d)",
                         context, cur_model, len(content),
                     )
+                _record_health(cur_model, True, time.time() - _t0)
                 return content
             last_reason = "empty content (stream idle timeout 가능성)"
             log.warning(
                 "LLM empty content [%s] attempt %d/%d (model=%s)",
                 context, attempt, max_attempts, cur_model,
             )
+            _record_health(cur_model, False, time.time() - _t0)
 
         # backoff (마지막 attempt 후엔 안 함)
         if attempt < max_attempts:
@@ -295,6 +339,43 @@ def chat_with_retry(
         context, max_attempts, last_reason,
     )
     return ""
+
+
+def _record_health(model: str, ok: bool, elapsed_s: float) -> None:
+    """Layer D — health.record_call 호출 wrapper. 모듈 미설치 시 silent skip."""
+    try:
+        from src.model_router import health
+        health.record_call(model, ok, int(elapsed_s * 1000))
+    except Exception:
+        pass  # health 모듈 미사용 환경 (테스트 등)
+
+
+def _validate_schema_content(content: str, schema_cls) -> tuple[bool, str]:
+    """Layer B — content를 schema로 validate. (ok, err_message) 반환."""
+    try:
+        from src.llm_json import parse_json_object
+        obj = parse_json_object(content)
+        if not isinstance(obj, dict):
+            return False, "parsed is not dict"
+        schema_cls.model_validate(obj)
+        return True, ""
+    except Exception as e:
+        return False, str(e)
+
+
+def _inject_schema(messages: list[dict], schema_cls, prev_err: str) -> None:
+    """Layer B — 다음 시도 user message에 schema 재주입."""
+    try:
+        schema_json = schema_cls.model_json_schema()
+        hint = (f"\n\n[이전 응답이 스키마 실패: {prev_err[:80]}]\n"
+                f"반드시 다음 JSON 스키마 따를 것:\n{schema_json}")
+        # 마지막 user message에 append
+        for msg in reversed(messages):
+            if msg.get("role") == "user":
+                msg["content"] = (msg.get("content", "") or "") + hint
+                return
+    except Exception:
+        pass
 
 
 def chat_with_chain(

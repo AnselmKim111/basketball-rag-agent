@@ -136,6 +136,7 @@ async def classify(text: str) -> Intent:
                 model=model,
                 temperature=0.0,
                 context=f"intent_router ({text[:30]})",
+                force_json=True,  # Layer C — structured output 강제
             ),
         )
     except OpenRouterCreditExhausted:

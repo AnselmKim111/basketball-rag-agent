@@ -66,8 +66,32 @@ def _format_eval_message(recs: list[dict], pending: list[dict],
 
 
 async def _apply_change(env_name: str, new_model: str) -> tuple[bool, str]:
-    """Railway env upsert wrapper."""
+    """Railway env upsert wrapper. Layer A canary 게이트로 보호."""
+    from . import canary
+    result = canary.run_canary(env_name, new_model)
+    if not result.get("skipped") and not result["passed"]:
+        fail_summary = "; ".join(result["failures"][:3])
+        log.warning("[apply_change] %s canary 실패 — 변경 거부: %s", env_name, fail_summary)
+        return False, f"❌ Canary 실패 ({result['sentinels']}건, {len(result['failures'])} fail): {fail_summary}"
     return railway_env.upsert_variable(env_name, new_model)
+
+
+async def model_health_job(bot: Bot, override_chat_id: str | None = None) -> None:
+    """Layer D — 시간당 health 검사 + rollback. cron 등록 (시간당)."""
+    from . import rollback
+    log.info("[model_health] 시작")
+    actions = rollback.check_and_rollback()
+    if not actions:
+        return  # 정상 — silent
+    chat_id = override_chat_id or os.getenv("REPORT_CHAT_ID")
+    if not chat_id:
+        return
+    msg = rollback.format_rollback_message(actions)
+    try:
+        await bot.send_message(chat_id, msg, parse_mode=ParseMode.MARKDOWN)
+        log.info("[model_health] rollback %d건 알림", len(actions))
+    except Exception:
+        log.exception("[model_health] 알림 실패")
 
 
 async def model_eval_job(bot: Bot, override_chat_id: str | None = None) -> None:
