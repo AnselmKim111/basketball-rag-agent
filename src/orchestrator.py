@@ -336,7 +336,19 @@ async def _run_forever() -> None:
     bot_objects: dict[str, Bot] = {}
     pending_jobs: list[tuple[str, ScheduledJob]] = []
 
+    # 분리 배포 가드 — ACTIVE_BOTS="screener,us_screener" 식으로 설정하면 그 봇만 기동.
+    # 미설정이면 기존처럼 토큰 있는 봇 전부. 두 Railway 서비스가 같은 토큰을 공유할 때
+    # 동일 봇이 양쪽에서 getUpdates 폴링 → 텔레그램 409 Conflict 나는 사고 방지.
+    active_filter = {
+        x.strip() for x in os.getenv("ACTIVE_BOTS", "").split(",") if x.strip()
+    }
+    if active_filter:
+        log.info("ACTIVE_BOTS 필터 적용: %s", sorted(active_filter))
+
     for spec in BOT_SPECS:
+        if active_filter and spec.name not in active_filter:
+            log.info("%sBot — ACTIVE_BOTS 필터로 스킵", spec.name)
+            continue
         token = os.getenv(spec.token_env)
         if not token:
             level = log.warning if spec.optional else log.error

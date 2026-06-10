@@ -104,6 +104,7 @@ def format_retrospective_line(retro: dict, days_ahead: int = 5) -> str:
         line = f"  · {label} {d['n']}종목 평균 {sign}{avg}% ({d['beats']}승/{d['n']-d['beats']}패)"
         if d.get("top"):
             t = d["top"][0]
-            line += f" — 최고 {t[1]} {t[2]:+}%"
+            from src.bot_helpers import html_escape
+            line += f" — 최고 {html_escape(str(t[1]))} {t[2]:+}%"
         parts.append(line)
     return "\n".join(parts) + "\n"

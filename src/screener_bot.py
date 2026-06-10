@@ -407,7 +407,17 @@ async def screener_daily_job(bot: Bot, override_chat_id: str | None = None) -> N
             except Exception:
                 pass
         return
+    # locked() 체크 직후 즉시 acquire — 사이에 await 없어 cooperative 스케줄링에서 atomic
+    # (체크~acquire 사이 await가 있으면 두 호출이 직렬 중복 실행되는 TOCTOU 발생)
+    await _screener_lock.acquire()
+    try:
+        await _screener_daily_job_locked(bot, override_chat_id)
+    finally:
+        _screener_lock.release()
 
+
+async def _screener_daily_job_locked(bot: Bot, override_chat_id: str | None) -> None:
+    """screener_daily_job 본체 — 호출자가 _screener_lock을 잡은 상태."""
     # 발송 대상 chat_id 리스트 결정
     if override_chat_id:
         target_chat_ids = [str(override_chat_id)]
@@ -444,15 +454,34 @@ async def screener_daily_job(bot: Bot, override_chat_id: str | None = None) -> N
     # 진행 메시지 helper (admin에게만)
     chat_id = progress_chat  # 기존 코드 변수명 유지 (진행 메시지용)
 
-    await _screener_lock.acquire()
     try:
         # universe 보장
         await loop.run_in_executor(None, db.ensure_schema)
         if not await loop.run_in_executor(None, lambda: bool(db.get_active_tickers())):
             await send_text_chunked(bot, chat_id, "🌐 종목 유니버스 빌드 중...")
             count = await loop.run_in_executor(None, universe.refresh_universe)
+            await loop.run_in_executor(
+                None, lambda: db.meta_set("universe_refreshed_at", datetime.now(KST).date().isoformat()))
             await send_text_chunked(bot, chat_id, f"🌐 활성 종목 {count}개")
         else:
+            # 주 1회 universe 풀 갱신 — 신규 상장·섹터 변경 반영.
+            # cron에서만 (override는 /screen fast path — 기존 DB 사용 설계).
+            if override_chat_id is None:
+                try:
+                    last = await loop.run_in_executor(
+                        None, lambda: db.meta_get("universe_refreshed_at"))
+                    stale = True
+                    if last:
+                        stale = (datetime.now(KST).date()
+                                 - datetime.fromisoformat(last).date()).days >= 7
+                    if stale:
+                        count = await loop.run_in_executor(None, universe.refresh_universe)
+                        await loop.run_in_executor(
+                            None, lambda: db.meta_set(
+                                "universe_refreshed_at", datetime.now(KST).date().isoformat()))
+                        log.info("[scheduled] 주간 universe 갱신: 활성 %d종목", count)
+                except Exception:
+                    log.exception("[scheduled] 주간 universe 갱신 실패 — 기존 universe로 진행")
             # 시총 갱신 (시장 변동 반영 + 기존 DB의 NULL 시총 채우기)
             try:
                 updated = await loop.run_in_executor(None, universe.refresh_market_caps)
@@ -613,7 +642,7 @@ async def screener_daily_job(bot: Bot, override_chat_id: str | None = None) -> N
         if override_chat_id:
             try:
                 uniq = {it.get("ticker") for items in results.values() for it in items
-                        if it.get("ticker") and it.get("ticker") not in (None, "")}
+                        if it.get("ticker")}
                 if uniq:
                     eta = max(30, len(uniq) * 3)
                     await send_text_chunked(
@@ -663,9 +692,6 @@ async def screener_daily_job(bot: Bot, override_chat_id: str | None = None) -> N
             await send_text_chunked(bot, chat_id, "⚠️ 스크리너 작업 실패 — 로그 확인")
         except Exception:
             pass
-    finally:
-        if _screener_lock.locked():
-            _screener_lock.release()
 
 
 # ------------------------------------------------------------------

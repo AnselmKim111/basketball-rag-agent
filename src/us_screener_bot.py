@@ -416,7 +416,17 @@ async def us_screener_daily_job(bot: Bot, override_chat_id: str | None = None) -
             except Exception:
                 pass
         return
+    # locked() 체크 직후 즉시 acquire — 사이에 await 없어 cooperative 스케줄링에서 atomic
+    # (체크~acquire 사이 await가 있으면 두 호출이 직렬 중복 실행되는 TOCTOU 발생)
+    await _us_screener_lock.acquire()
+    try:
+        await _us_screener_daily_job_locked(bot, override_chat_id)
+    finally:
+        _us_screener_lock.release()
 
+
+async def _us_screener_daily_job_locked(bot: Bot, override_chat_id: str | None) -> None:
+    """us_screener_daily_job 본체 — 호출자가 _us_screener_lock을 잡은 상태."""
     # 발송 대상 chat_id 리스트 결정
     if override_chat_id:
         target_chat_ids = [str(override_chat_id)]
@@ -453,7 +463,6 @@ async def us_screener_daily_job(bot: Bot, override_chat_id: str | None = None) -
     # 진행 메시지 helper (admin에게만)
     chat_id = progress_chat  # 기존 코드 변수명 유지 (진행 메시지용)
 
-    await _us_screener_lock.acquire()
     try:
         # universe 보장 — 미국은 S&P500+Nasdaq100 ~550종목으로 fetch 빠름(~2초).
         # 매번 refresh_universe (upsert) 호출해 NASDAQ100 신규 종목·섹터 항상 반영.
@@ -657,9 +666,6 @@ async def us_screener_daily_job(bot: Bot, override_chat_id: str | None = None) -
             await send_text_chunked(bot, chat_id, "⚠️ 스크리너 작업 실패 — 로그 확인")
         except Exception:
             pass
-    finally:
-        if _us_screener_lock.locked():
-            _us_screener_lock.release()
 
 
 # ------------------------------------------------------------------
