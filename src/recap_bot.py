@@ -55,7 +55,7 @@ HELP_TEXT = (
     "*섹션:*\n"
     "  🎯 신호 사후 추적 (screener.db, D+5 PnL)\n"
     "  💡 IdeaBot picks 후속\n"
-    "  📋 공시 트리거 (현재 미수집 — 별도 PR)\n"
+    "  📋 공시 트리거 (DisclosureBot 알림 이력 + 공시 후 수익률)\n"
     "  📊 테마 사이클 (wisereport 시황 리포트 키워드)\n"
     "  🧠 학습 포인트 (sonnet 통합)\n"
     "\n_⚠️ wisereport 접근 = PIPELINE_LOCK 잠시 점유 (1-2분)_"
@@ -119,12 +119,41 @@ async def _run_recap(bot: Bot, chat_id: str, scope: str = "full") -> None:
         parse_mode=ParseMode.MARKDOWN,
     )
 
+    # ─── scope 결정: "me"면 본인 watchlist 종목으로 §1·§3 한정 ───
+    ticker_filter: set[str] | None = None
+    disc_chat_filter: str | None = None
+    if scope == "me":
+        try:
+            from src import watchlist_store
+            items = watchlist_store.list_for_chat(chat_id)
+            ticker_filter = {it["ticker"] for it in items if it.get("ticker")}
+        except Exception:
+            log.exception("[recap] watchlist 로드 실패 — 전체 scope로 진행")
+            ticker_filter = None
+        if not ticker_filter:
+            await send_text_chunked(
+                bot, chat_id,
+                "📭 watchlist 비어있음 — 공시봇에서 `/watch <종목>` 등록 후 사용. "
+                "이번에는 전체(global) 회고로 진행합니다.",
+            )
+            ticker_filter = None
+        else:
+            disc_chat_filter = chat_id
+            await send_text_chunked(
+                bot, chat_id,
+                f"👤 watchlist {len(ticker_filter)}종목 한정 회고",
+            )
+
     # ─── §1 §2 §3는 LLM 없이 즉시 수집 ───
     try:
         # build_recap_input 안에서 themes(§4)는 wisereport 호출 — 그것만 lock 안.
-        sig_section = aggregator.collect_signal_section(today, lookback_days=7)
+        sig_section = aggregator.collect_signal_section(
+            today, lookback_days=7, ticker_filter=ticker_filter,
+        )
         ideas_section = aggregator.collect_ideas_section(days_back=7)
-        disc_section = aggregator.collect_disclosure_section()
+        disc_section = aggregator.collect_disclosure_section(
+            today=today, days_back=7, chat_id=disc_chat_filter,
+        )
     except Exception:
         log.exception("[recap] §1-§3 수집 실패")
         await send_text_chunked(bot, chat_id, "❌ 수집 단계 실패 — 로그 확인")

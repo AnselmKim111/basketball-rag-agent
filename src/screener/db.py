@@ -82,6 +82,18 @@ def ensure_schema() -> None:
               eps_asof   TEXT,
               updated_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS disclosure_log (
+              rcept_no       TEXT NOT NULL,
+              chat_id        TEXT NOT NULL,
+              ticker         TEXT NOT NULL,
+              name           TEXT,
+              report_nm      TEXT,
+              category       TEXT,
+              alert_date     TEXT NOT NULL,
+              baseline_close INTEGER,
+              PRIMARY KEY (rcept_no, chat_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_disclosure_alert_date ON disclosure_log(alert_date);
             """
         )
         # market_cap, sector 컬럼 추가 (기존 DB 호환). SQLite ALTER는 IF NOT EXISTS 미지원.
@@ -570,6 +582,72 @@ def load_signals_in_range(
                 "ticker": ticker,
                 "signal": signal,
                 "payload": payload_obj,
+            })
+    return out
+
+
+# ------------------------------------------------------------------
+# 공시 알림 로그 (DisclosureBot → RecapBot §3 학습 루프)
+# ------------------------------------------------------------------
+def disclosure_log_insert(
+    rcept_no: str, chat_id: str, ticker: str,
+    name: str = "", report_nm: str = "", category: str = "",
+    alert_date: str = "", baseline_close: Optional[int] = None,
+) -> bool:
+    """공시 알림 1건 영속화. (rcept_no, chat_id) PK라 재호출 안전 (OR IGNORE).
+
+    baseline_close: 알림 시점의 최근 종가 — 회고에서 '공시 후 N일 수익률' 기준점.
+    ohlcv 미보유 종목은 None 허용 (회고에서 PnL 계산 스킵).
+    """
+    ensure_schema()
+    try:
+        with _conn() as c:
+            c.execute(
+                "INSERT OR IGNORE INTO disclosure_log "
+                "(rcept_no, chat_id, ticker, name, report_nm, category, alert_date, baseline_close) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (rcept_no, chat_id, ticker, name, report_nm, category,
+                 alert_date, baseline_close),
+            )
+        return True
+    except Exception:
+        log.exception("disclosure_log insert 실패: %s/%s", rcept_no, ticker)
+        return False
+
+
+def load_disclosures_in_range(
+    start_date: str, end_date: str, chat_id: Optional[str] = None,
+) -> list[dict]:
+    """alert_date BETWEEN start AND end 공시 로그. chat_id 지정 시 그 사용자 것만.
+
+    rcept_no 단위 dedup — 같은 공시를 여러 chat이 받았으면 1행만 (chat_id 미지정 시).
+    """
+    ensure_schema()
+    out: list[dict] = []
+    with _conn() as c:
+        if chat_id:
+            cur = c.execute(
+                "SELECT rcept_no, chat_id, ticker, name, report_nm, category, "
+                "alert_date, baseline_close FROM disclosure_log "
+                "WHERE alert_date >= ? AND alert_date <= ? AND chat_id = ? "
+                "ORDER BY alert_date ASC",
+                (start_date, end_date, chat_id),
+            )
+        else:
+            # chat 무관 — rcept_no당 1행 (GROUP BY로 fan-out 중복 제거)
+            cur = c.execute(
+                "SELECT rcept_no, MIN(chat_id), ticker, name, report_nm, category, "
+                "MIN(alert_date), baseline_close FROM disclosure_log "
+                "WHERE alert_date >= ? AND alert_date <= ? "
+                "GROUP BY rcept_no ORDER BY MIN(alert_date) ASC",
+                (start_date, end_date),
+            )
+        for r in cur.fetchall():
+            out.append({
+                "rcept_no": r[0], "chat_id": r[1], "ticker": r[2],
+                "name": r[3] or "", "report_nm": r[4] or "",
+                "category": r[5] or "", "alert_date": r[6],
+                "baseline_close": r[7],
             })
     return out
 

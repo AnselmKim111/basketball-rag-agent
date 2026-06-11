@@ -50,11 +50,14 @@ def _horizon_close(ohlcv: list[dict], hit_date: str, horizon_days: int = 5) -> t
 
 def collect_signal_section(
     today: date, lookback_days: int = 7, horizon_days: int = 5,
+    ticker_filter: set[str] | None = None,
 ) -> dict[str, Any]:
     """signals 테이블 lookback 기간 hit → TickerHit → SignalStats.
 
     오늘 기준 lookback_days 전까지의 signals 행을 모두 가져와 ticker별 ohlcv에서
     hit_date close + (hit_date + horizon_days영업일) close 룩업해 PnL 계산.
+
+    ticker_filter 지정 시 그 종목들만 (/recap_me — 사용자 watchlist 한정).
     """
     from src.recap.scorer import TickerHit, compute_signal_stats, overall_summary
     from src.screener import db
@@ -66,14 +69,22 @@ def collect_signal_section(
         log.exception("[recap] signals load 실패")
         rows = []
 
+    if ticker_filter is not None:
+        rows = [r for r in rows if r["ticker"] in ticker_filter]
+
     if not rows:
+        reason = (
+            "watchlist 종목 중 최근 7일 signal hit 0건"
+            if ticker_filter is not None
+            else "최근 7일 signal hit 0건 — screener_daily 실행 여부 확인"
+        )
         return {
             "stats": [],
             "summary": overall_summary([]),
             "lookback_start": start,
             "lookback_end": end,
             "horizon_days": horizon_days,
-            "empty_reason": "최근 7일 signal hit 0건 — screener_daily 실행 여부 확인",
+            "empty_reason": reason,
         }
 
     # ticker → name 매핑: 헤비 ticker는 get_ticker_name (caching) 활용. 매번 SELECT
@@ -175,19 +186,64 @@ def collect_ideas_section(days_back: int = 7) -> dict[str, Any]:
 
 
 # ------------------------------------------------------------------
-# §3. 공시 트리거 (현재는 placeholder — DisclosureBot 영속 follow-up)
+# §3. 공시 트리거 — disclosure_log (DisclosureBot이 알림마다 영속)
 # ------------------------------------------------------------------
-def collect_disclosure_section() -> dict[str, Any]:
-    """DisclosureBot이 알림한 공시 → 가격 변동. 데이터 없으면 안내 dict.
+def collect_disclosure_section(
+    today: date | None = None, days_back: int = 7,
+    chat_id: str | None = None,
+) -> dict[str, Any]:
+    """지난 N일 공시 알림 로그 + 공시 이후 가격 변동.
 
-    DisclosureBot이 disclosure_log 테이블에 영속하는 follow-up PR 전까지는 빈 결과.
+    chat_id 지정 시 그 사용자가 받은 알림만 (/recap_me). 미지정 시 전체 공시
+    rcept_no 단위 dedup.
+
+    각 로그에 pnl_since_alert(%) 부가 — baseline_close(알림 시점) vs 최신 close.
+    baseline 없거나 ohlcv 미보유면 None (메시지에서 'n/a' 표시).
     """
+    from src.screener import db
+    if today is None:
+        from src.bot_helpers import KST
+        from datetime import datetime
+        today = datetime.now(KST).date()
+    start = (today - timedelta(days=days_back)).isoformat()
+    end = today.isoformat()
+    try:
+        logs = db.load_disclosures_in_range(start, end, chat_id=chat_id)
+    except Exception:
+        log.exception("[recap] disclosure_log 로드 실패")
+        return {"logs": [], "empty_reason": "disclosure_log 조회 실패 — 로그 확인"}
+
+    if not logs:
+        return {
+            "logs": [],
+            "empty_reason": (
+                "지난 7일 공시 알림 0건 — DisclosureBot /watch 등록 종목이 없거나 "
+                "공시가 없었음. 데이터는 알림마다 자동 누적 중."
+            ),
+        }
+
+    # 공시 이후 가격 변동 — baseline_close vs 최신 close (best effort)
+    enriched: list[dict] = []
+    latest_close_cache: dict[str, float | None] = {}
+    for row in logs:
+        ticker = row["ticker"]
+        if ticker not in latest_close_cache:
+            try:
+                ohlcv = db.load_ohlcv(ticker, days=1)
+                latest_close_cache[ticker] = float(ohlcv[-1]["close"]) if ohlcv else None
+            except Exception:
+                latest_close_cache[ticker] = None
+        latest = latest_close_cache[ticker]
+        baseline = row.get("baseline_close")
+        pnl = None
+        if baseline and latest and baseline > 0:
+            pnl = (latest - baseline) / baseline * 100.0
+        enriched.append({**row, "pnl_since_alert": pnl})
+
     return {
-        "logs": [],
-        "empty_reason": (
-            "DisclosureBot 공시 이력 영속 미구현 — 별도 PR 후 첫 회고부터 누적. "
-            "이번 회고에서는 §1, §2, §4로 학습 포인트 도출."
-        ),
+        "logs": enriched,
+        "log_count": len(enriched),
+        "days_back": days_back,
     }
 
 

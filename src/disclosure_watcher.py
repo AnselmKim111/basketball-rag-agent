@@ -61,6 +61,31 @@ def _ticker_to_corp_code(ticker: str) -> tuple[str | None, str]:
     return None, ticker
 
 
+def _log_disclosure_for_recap(
+    rcept_no: str, chat_id: str, ticker: str,
+    name: str, report_nm: str, category: str,
+) -> None:
+    """알림 발송 직후 screener.db disclosure_log에 영속화 (blocking — executor에서).
+
+    baseline_close: screener.db ohlcv의 최근 종가 (그날 회고에서 '공시 후 수익률'
+    기준점). watchlist 종목이 screener universe 밖이면 None — 회고에서 PnL 스킵.
+    """
+    from src.screener import db as screener_db
+    baseline_close = None
+    try:
+        rows = screener_db.load_ohlcv(ticker, days=1)
+        if rows:
+            baseline_close = int(rows[-1]["close"])
+    except Exception:
+        log.debug("baseline_close 조회 실패 (무시): %s", ticker)
+    screener_db.disclosure_log_insert(
+        rcept_no=rcept_no, chat_id=chat_id, ticker=ticker,
+        name=name, report_nm=report_nm, category=category,
+        alert_date=datetime.now(KST).date().isoformat(),
+        baseline_close=baseline_close,
+    )
+
+
 def _format_alert(ticker: str, name: str, report: dart_client.DartReport, category: str) -> str:
     """텔레그램 알림 메시지 텍스트 (마크다운 안 씀 — 안전).
 
@@ -128,6 +153,15 @@ async def poll_and_dispatch(bot: Bot) -> None:
                     except Exception:
                         log.exception("공시 알림 발송 실패: chat=%s ticker=%s", chat_id, ticker)
                         error_count += 1
+                        continue
+                    # 회고 학습 루프용 영속화 (RecapBot §3). 실패해도 알림 흐름엔 무영향.
+                    try:
+                        await loop.run_in_executor(
+                            None, _log_disclosure_for_recap,
+                            r.rcept_no, chat_id, ticker, name, r.report_nm, category,
+                        )
+                    except Exception:
+                        log.exception("disclosure_log 영속화 실패: %s", r.rcept_no)
 
                 # dedup state 갱신 (한 chat 단위)
                 try:

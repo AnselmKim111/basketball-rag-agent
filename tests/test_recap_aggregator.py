@@ -152,11 +152,63 @@ def test_collect_ideas_section_empty(monkeypatch):
     assert out["entry_count"] == 0
 
 
-def test_disclosure_section_placeholder():
-    """현재는 빈 dict + 안내."""
-    out = ag.collect_disclosure_section()
+def test_disclosure_section_empty(monkeypatch):
+    """disclosure_log 비어있으면 빈 logs + 안내 (첫 주 케이스)."""
+    from src.screener import db
+    monkeypatch.setattr(db, "load_disclosures_in_range",
+                        lambda s, e, chat_id=None: [])
+    out = ag.collect_disclosure_section(today=date(2026, 6, 7))
     assert out["logs"] == []
     assert "empty_reason" in out
+
+
+def test_disclosure_section_with_pnl(monkeypatch):
+    """공시 로그 + baseline → pnl_since_alert 계산."""
+    from src.screener import db
+    fake_logs = [
+        {"rcept_no": "20260601000123", "chat_id": "1", "ticker": "005930",
+         "name": "삼성전자", "report_nm": "잠정실적공시", "category": "critical",
+         "alert_date": "2026-06-01", "baseline_close": 100_000},
+        {"rcept_no": "20260602000456", "chat_id": "1", "ticker": "999999",
+         "name": "비유니버스", "report_nm": "일반공시", "category": "normal",
+         "alert_date": "2026-06-02", "baseline_close": None},  # baseline 없음
+    ]
+    fake_latest = {"005930": [{"date": "2026-06-07", "close": 110_000}]}
+    monkeypatch.setattr(db, "load_disclosures_in_range",
+                        lambda s, e, chat_id=None: fake_logs)
+    monkeypatch.setattr(db, "load_ohlcv",
+                        lambda t, days=1: fake_latest.get(t, []))
+    out = ag.collect_disclosure_section(today=date(2026, 6, 7))
+    assert out["log_count"] == 2
+    samsung = next(l for l in out["logs"] if l["ticker"] == "005930")
+    assert samsung["pnl_since_alert"] == pytest.approx(10.0)
+    no_base = next(l for l in out["logs"] if l["ticker"] == "999999")
+    assert no_base["pnl_since_alert"] is None
+
+
+def test_signal_section_ticker_filter(monkeypatch):
+    """/recap_me — ticker_filter 밖 hit는 제외."""
+    from src.screener import db
+    fake_signals = [
+        {"date": "2026-06-02", "ticker": "AAA", "signal": "high_52w",
+         "payload": {"close": 100.0}},
+        {"date": "2026-06-02", "ticker": "BBB", "signal": "high_52w",
+         "payload": {"close": 50.0}},
+    ]
+    monkeypatch.setattr(db, "load_signals_in_range",
+                        lambda s, e, exclude_date=None: fake_signals)
+    monkeypatch.setattr(db, "get_ticker_name", lambda t: "")
+    monkeypatch.setattr(db, "close_after_n_business_days",
+                        lambda t, start, n=5: 110 if t == "AAA" else None)
+    out = ag.collect_signal_section(
+        date(2026, 6, 7), ticker_filter={"AAA"},
+    )
+    assert len(out["stats"]) == 1
+    assert out["stats"][0].hit_count == 1
+    # 전부 필터 밖 → watchlist 안내
+    out2 = ag.collect_signal_section(date(2026, 6, 7), ticker_filter={"ZZZ"})
+    assert out2["stats"] == []
+    assert "watchlist" in out2["empty_reason"]
 
 
 def test_extract_industry_hits_basic():
