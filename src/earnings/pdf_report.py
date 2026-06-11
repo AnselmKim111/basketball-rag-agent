@@ -39,8 +39,16 @@ _EMOJI_RE = re.compile(
 )
 
 
+# Noto Sans CJK에 글리프 없는 문자 → 대체 (LLM 생성 본문에 섞여 들어올 수 있음)
+_GLYPH_FALLBACK = str.maketrans({
+    "▸": "•",  # ▸ → •
+    "▹": "•",  # ▹ → •
+    "‣": "•",  # ‣ → •
+})
+
+
 def _strip_emoji(s: str) -> str:
-    return _EMOJI_RE.sub("", s or "").strip()
+    return _EMOJI_RE.sub("", (s or "").translate(_GLYPH_FALLBACK)).strip()
 
 
 # ------------------------------------------------------------------
@@ -1505,14 +1513,20 @@ def _draw_ticker_qna_page(pdf, ticker: str, company: str, period: str, korean_md
 # Phase 10-G — PDF lint (마크다운 잔존 검사)
 # ==================================================================
 def _lint_pdf(path: Path) -> dict:
-    """raw markdown 잔존 검사. pdfminer 없으면 skip."""
+    """raw markdown 잔존 검사 + 정확한 페이지 수. pdfminer 없으면 skip.
+
+    BaseException까지 잡는 이유: pdfminer → cryptography → pyo3 체인이 깨진 환경에선
+    PanicException(BaseException 계열)이 발생 — lint는 부가 기능이라 PDF 발송을 막으면 안 됨.
+    """
     try:
         from pdfminer.high_level import extract_text  # type: ignore
+        from pdfminer.pdfpage import PDFPage  # type: ignore
         text = extract_text(str(path))
-    except Exception:
+        with open(path, "rb") as f:
+            pages = sum(1 for _ in PDFPage.get_pages(f))
+    except BaseException:  # noqa: BLE001 — pyo3 PanicException 가드 (docstring 참조)
         return {"ok": True, "reason": "pdfminer unavailable"}
     md_hits = len(re.findall(r"^##\s|\*\*\w|\[[A-Z]+\]\[[a-z_]+\]", text, re.MULTILINE))
-    pages = text.count("\f") + 1 if text else 0
     return {"ok": md_hits < 5, "md_hits": md_hits, "pages": pages}
 
 
