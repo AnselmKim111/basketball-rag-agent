@@ -254,6 +254,22 @@ def close_after_n_business_days(ticker: str, start_date: str, n: int = 5) -> Opt
     return int(rows[n][1])
 
 
+def closes_from_date(ticker: str, start_date: str, n: int = 5) -> list[int]:
+    """start_date부터 n+1 영업일치 close 리스트(거래일 오름차순). 부족하면 빈 리스트.
+    회고 수익률의 스케일 브레이크 검사용 (인접일 종가비 확인)."""
+    ensure_schema()
+    with _conn() as c:
+        cur = c.execute(
+            "SELECT close FROM ohlcv WHERE ticker=? AND date >= ? "
+            "ORDER BY date ASC LIMIT ?",
+            (ticker, start_date, n + 1),
+        )
+        rows = cur.fetchall()
+    if len(rows) < n + 1:
+        return []
+    return [int(r[0]) for r in rows]
+
+
 def delete_older_than(cutoff_date: str) -> int:
     ensure_schema()
     with _conn() as c:

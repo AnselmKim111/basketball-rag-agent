@@ -136,13 +136,26 @@ def market_cap_usd(ticker: str, close_dollars: float, use_cache: bool = True) ->
 
 
 def ytd_pct(rows: list[dict]) -> float | None:
-    """연초대비 % (rows: load_ohlcv, close=cents 정수, asc)."""
+    """연초대비 % (rows: load_ohlcv, close=cents 정수, asc).
+
+    미국은 일일 제한이 없어 +50%도 정상이므로, 분할급 스케일 브레이크(>5배/<1/5)만
+    걸러 잘못된 값 노출을 막는다.
+    """
     if not rows:
         return None
     latest = rows[-1]
     year = latest["date"][:4]
-    base = next((r for r in rows if r["date"][:4] == year and r.get("close")), None)
-    if not base or not base.get("close"):
+    base_idx = next((i for i, r in enumerate(rows)
+                     if r["date"][:4] == year and r.get("close")), None)
+    if base_idx is None:
+        return None
+    base = rows[base_idx]
+    if not base.get("close"):
+        return None
+    from src.screener_common.sanity import US_DAILY_HI, US_DAILY_LO, series_is_continuous
+    closes = [r["close"] for r in rows[base_idx:] if r.get("close")]
+    if not series_is_continuous(closes, US_DAILY_LO, US_DAILY_HI):
+        log.warning("[ytd_pct] %s 스케일 브레이크 — 분할/조정 불일치 의심, N/A 처리", latest["date"])
         return None
     return round((latest["close"] - base["close"]) / base["close"] * 100, 1)
 
