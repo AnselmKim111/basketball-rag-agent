@@ -827,10 +827,18 @@ async def _self_test(bot: Bot) -> None:
 # Entry point (orchestrator가 호출)
 # ------------------------------------------------------------------
 SCREENER_COMMANDS = [
+    # 가입자 공개
     ("start", "🚀 가입 (자동 발송 활성화)"),
     ("screen", "📈 즉시 스크리닝 실행"),
     ("stop", "탈퇴 (자동 발송 해제)"),
     ("help", "도움말"),
+    # admin 전용 — 비인가자는 누르면 deny 메시지
+    ("status", "🔧 DB·신호 상태 (admin)"),
+    ("diag", "🔧 종목 누락 원인 추적 — /diag <코드|이름> (admin)"),
+    ("backfill", "🔧 1년치 OHLCV 백필 (admin)"),
+    ("list", "🔧 가입자/차단 목록 (admin)"),
+    ("block", "🔧 chat_id 차단 (admin)"),
+    ("unblock", "🔧 차단 해제 (admin)"),
 ]
 
 
