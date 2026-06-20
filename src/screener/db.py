@@ -365,6 +365,33 @@ def get_ticker_name(ticker: str) -> Optional[str]:
     return row[0] if row else None
 
 
+def get_ticker_row(ticker: str) -> Optional[dict]:
+    """활성 여부 무관 단일 종목 조회 (/diag 진단용)."""
+    ensure_schema()
+    with _conn() as c:
+        cur = c.execute(
+            "SELECT ticker, name, market, is_active, market_cap, sector "
+            "FROM tickers WHERE ticker=?",
+            (ticker,),
+        )
+        r = cur.fetchone()
+    if not r:
+        return None
+    return {"ticker": r[0], "name": r[1], "market": r[2],
+            "is_active": r[3], "market_cap": r[4], "sector": r[5]}
+
+
+def search_tickers_by_name(substr: str, limit: int = 5) -> list[tuple]:
+    """종목명 부분일치 검색 → [(ticker, name), ...] (/diag 종목명 입력 지원)."""
+    ensure_schema()
+    with _conn() as c:
+        cur = c.execute(
+            "SELECT ticker, name FROM tickers WHERE name LIKE ? ORDER BY ticker LIMIT ?",
+            (f"%{substr}%", limit),
+        )
+        return [(r[0], r[1]) for r in cur.fetchall()]
+
+
 # ------------------------------------------------------------------
 # Universe scan용 — business_text + embedding 저장/조회
 # ------------------------------------------------------------------

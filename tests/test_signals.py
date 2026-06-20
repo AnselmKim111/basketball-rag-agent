@@ -50,6 +50,29 @@ def test_high_all_triggers_on_new_high():
     assert out["high_all"]["chg_pct"] == pytest.approx(10.0)
 
 
+def test_close_basis_high_all_fires_despite_past_intraday_wick():
+    """디앤디파마텍 시나리오: 오늘 종가가 과거 모든 종가보다 높지만 과거 장중 윗꼬리
+    하나보다는 낮음 → 종가기준 정의로는 high_all 발화해야 함 (구 장중고가 정의면 누락)."""
+    rows = _make_rows(100, close=10_000)
+    # 과거 어느 날 장중 15,000까지 치솟았다 종가 10,000으로 마감 (윗꼬리)
+    rows[40] = {**rows[40], "high": 15_000}
+    # 오늘 종가 11,000 — 과거 모든 종가(10,000) 위, 그러나 과거 장중고가(15,000) 아래
+    rows[-1] = {**rows[-1], "close": 11_000, "high": 11_000}
+    out = signals.compute_signals_for_ticker(rows, base_date=rows[-1]["date"])
+    assert "high_all" in out, "종가기준 신고가인데 누락됨 (장중고가 정의 잔존?)"
+    assert out["high_all"]["prev_high"] == 10_000  # 과거 최고 '종가' 기준
+    assert out["high_all"]["close"] == 11_000
+
+
+def test_close_basis_high_52w_fires_despite_wick():
+    rows = _make_rows(300, close=10_000)
+    rows[100] = {**rows[100], "high": 20_000}  # 과거 장중 스파이크
+    rows[-1] = {**rows[-1], "close": 12_000, "high": 12_000}
+    out = signals.compute_signals_for_ticker(rows, base_date=rows[-1]["date"])
+    assert "high_52w" in out
+    assert "high_all" in out
+
+
 def test_no_signal_when_flat():
     rows = _make_rows(100)
     out = signals.compute_signals_for_ticker(rows, base_date=rows[-1]["date"])

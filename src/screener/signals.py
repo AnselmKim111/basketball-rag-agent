@@ -91,24 +91,24 @@ def compute_signals_for_ticker(rows: list[dict], base_date: str | None = None) -
 
     out: dict = {}
 
-    # 1) 52주 신고가 (252영업일)
+    # 1) 52주 신고가 (252영업일) — 종가기준 (오늘 종가 > 과거 252일 종가 최고)
     if len(df) >= 252:
-        past_high_52w = df["high"].iloc[-252:-1].max()
-        if today["close"] > past_high_52w and past_high_52w > 0:
+        past_close_high_52w = df["close"].iloc[-252:-1].max()
+        if today["close"] > past_close_high_52w and past_close_high_52w > 0:
             out["high_52w"] = {
                 "close": int(today["close"]),
-                "prev_high": int(past_high_52w),
-                "pct": float((today["close"] / past_high_52w - 1) * 100),
+                "prev_high": int(past_close_high_52w),
+                "pct": float((today["close"] / past_close_high_52w - 1) * 100),
                 "chg_pct": chg_pct,
             }
 
-    # 2) 역사적 신고가 (보유 데이터 전체 — 280일 보존)
-    past_high_all = df["high"].iloc[:-1].max()
-    if today["close"] > past_high_all and past_high_all > 0:
+    # 2) 역사적 신고가 (보유 데이터 전체) — 종가기준 (오늘 종가 > 과거 모든 종가)
+    past_close_high_all = df["close"].iloc[:-1].max()
+    if today["close"] > past_close_high_all and past_close_high_all > 0:
         out["high_all"] = {
             "close": int(today["close"]),
-            "prev_high": int(past_high_all),
-            "pct": float((today["close"] / past_high_all - 1) * 100),
+            "prev_high": int(past_close_high_all),
+            "pct": float((today["close"] / past_close_high_all - 1) * 100),
             "chg_pct": chg_pct,
             "history_days": int(len(df)),
         }
@@ -360,6 +360,9 @@ def compute_all(base_date: str | None = None) -> tuple[dict[str, list[dict]], di
     processed = 0
     skipped_cap = 0
     skipped_no_base = 0
+    skipped_short = 0
+    no_base_tickers: list[str] = []
+    short_tickers: list[str] = []
     max_cap_seen = 0
     for tinfo in tickers:
         ticker = tinfo["ticker"]
@@ -369,11 +372,16 @@ def compute_all(base_date: str | None = None) -> tuple[dict[str, list[dict]], di
             continue
         rows = db.load_ohlcv(ticker, days=1300)
         if len(rows) < 60:
+            skipped_short += 1
+            if len(short_tickers) < 30:
+                short_tickers.append(f"{ticker}({len(rows)})")
             continue
         # base_date row 보유 여부 검증
         has_base = any(r["date"] == base_date for r in rows)
         if not has_base:
             skipped_no_base += 1
+            if len(no_base_tickers) < 30:
+                no_base_tickers.append(f"{ticker}({tinfo.get('name') or '?'})")
             continue
         try:
             sigs = compute_signals_for_ticker(rows, base_date=base_date)
@@ -405,12 +413,17 @@ def compute_all(base_date: str | None = None) -> tuple[dict[str, list[dict]], di
         "processed": processed,
         "skipped_cap": skipped_cap,
         "skipped_no_base": skipped_no_base,
+        "skipped_short": skipped_short,
         "total_active": len(tickers),
     }
     log.info(
         "[signals] base_date=%s processed=%d skipped_cap=%d skipped_no_base=%d "
-        "(min=%.1f억) categories=%s",
-        base_date, processed, skipped_cap, skipped_no_base, min_cap / 1e8,
+        "skipped_short=%d (min=%.1f억) categories=%s",
+        base_date, processed, skipped_cap, skipped_no_base, skipped_short, min_cap / 1e8,
         {k: len(v) for k, v in by_cat.items()},
     )
+    if no_base_tickers:
+        log.warning("[signals] base_date 누락 종목: %s", ", ".join(no_base_tickers))
+    if short_tickers:
+        log.warning("[signals] <60행 skip 종목: %s", ", ".join(short_tickers))
     return by_cat, stats

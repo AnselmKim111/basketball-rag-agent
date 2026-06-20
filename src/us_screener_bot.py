@@ -251,6 +251,96 @@ async def _cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             pass
 
 
+def _diag_report(query: str) -> str:
+    """한 종목을 파이프라인 게이트별로 추적 (blocking — executor에서 호출)."""
+    from src.us_screener import db, signals
+
+    q = query.strip().upper()
+    row = db.get_ticker_row(q)
+    if row:
+        ticker = q
+    else:
+        cands = db.search_tickers_by_name(query.strip())
+        if not cands:
+            return f"❓ '{query}' 매칭 종목 없음 (유니버스 미포함 가능성 — universe refresh 필요)"
+        if len(cands) > 1:
+            lines = [f"🔎 '{query}' 후보 여러 개 — 심볼로 다시:"]
+            lines += [f"  {t} {n}" for t, n in cands]
+            return "\n".join(lines)
+        ticker = cands[0][0]
+        row = db.get_ticker_row(ticker)
+
+    base_date = db.latest_date()
+    min_cap = signals._get_float_env("SCREENER_MIN_MARKET_CAP", signals.DEFAULT_MIN_MARKET_CAP)
+    out = [f"🩺 진단: {ticker} ({(row or {}).get('name') or '?'})", f"기준일(base_date): {base_date}"]
+
+    if not row:
+        out.append("① 유니버스: ❌ 없음 — tickers 테이블 미존재. universe refresh 또는 신규 상장.")
+        return "\n".join(out)
+    out.append(f"① 유니버스: ✅ 존재 / is_active={row['is_active']}"
+               + ("" if row["is_active"] else "  ⚠️ 비활성 → 신호 계산 제외"))
+
+    cap = row.get("market_cap")
+    if cap is None:
+        out.append("② 시총: NULL — 필터 우회(통과). fetch 실패 의심.")
+    else:
+        ok = cap >= min_cap
+        out.append(f"② 시총: ${cap/1e9:,.1f}B / 필터 ${min_cap/1e9:,.1f}B → "
+                   + ("✅ 통과" if ok else "❌ 탈락(skipped_cap)"))
+
+    rows = db.load_ohlcv(ticker, days=1300)
+    n = len(rows)
+    latest = rows[-1]["date"] if rows else "없음"
+    has_base = any(r["date"] == base_date for r in rows)
+    out.append(f"③ 데이터: {n}행 / 최신일 {latest} / base_date row "
+               + ("✅ 보유" if has_base else "❌ 누락(skipped_no_base)"))
+    if n < 60:
+        out.append("   ⚠️ <60행 → silent skip (skipped_short)")
+
+    if has_base and n >= 60:
+        try:
+            sigs = signals.compute_signals_for_ticker(rows, base_date=base_date)
+            fired = ", ".join(sigs.keys()) if sigs else "없음"
+            out.append(f"④ 발화 신호: {fired}")
+        except Exception as e:
+            out.append(f"④ 신호 계산 실패: {e!r}")
+        import pandas as pd
+        df = pd.DataFrame(rows)
+        bi = df.index[df["date"] == base_date].tolist()
+        if bi:
+            df = df.iloc[: bi[0] + 1]
+            tc = int(df.iloc[-1]["close"])
+            pch = int(df["close"].iloc[:-1].max()) if len(df) > 1 else 0
+            phh = int(df["high"].iloc[:-1].max()) if len(df) > 1 else 0
+            out.append(f"⑤ 종가신고가 진단(cents): 오늘={tc:,} / 과거최고종가={pch:,} / 과거최고장중={phh:,}")
+            if tc > pch and tc <= phh:
+                out.append("   → 종가 신고가지만 과거 장중고가에 막힘 (종가기준 수정으로 해결됨)")
+            elif tc > pch:
+                out.append("   → 종가 신고가 + 장중고가도 돌파")
+            else:
+                out.append("   → 종가 신고가 아님")
+    return "\n".join(out)
+
+
+async def _cmd_diag(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/diag <심볼|종목명> — 종목 누락 원인 파이프라인 추적 (admin)."""
+    if not is_authorized(update, ALLOWED_ENV):
+        await deny_message(update, "US 스크리너봇")
+        return
+    chat_id = str(update.effective_chat.id)
+    q = " ".join(context.args or []).strip()
+    if not q:
+        await send_text_chunked(context.bot, chat_id, "사용법: /diag NVDA  또는  /diag Nvidia")
+        return
+    loop = asyncio.get_running_loop()
+    try:
+        report = await loop.run_in_executor(None, lambda: _diag_report(q))
+    except Exception:
+        log.exception("[diag] 실패")
+        report = "⚠️ 진단 실패 — 로그 확인"
+    await send_text_chunked(context.bot, chat_id, report)
+
+
 async def _cmd_backfill(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_authorized(update, ALLOWED_ENV):
         await deny_message(update, "US 스크리너봇")
@@ -722,6 +812,7 @@ def build_us_screener_app(token: str) -> Application:
     app.add_handler(CommandHandler("screen", _cmd_screen))
     # admin 전용
     app.add_handler(CommandHandler("status", _cmd_status))
+    app.add_handler(CommandHandler("diag", _cmd_diag))
     app.add_handler(CommandHandler("backfill", _cmd_backfill))
     app.add_handler(CommandHandler("list", _cmd_list))
     app.add_handler(CommandHandler("block", _cmd_block))
