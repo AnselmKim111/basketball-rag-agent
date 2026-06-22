@@ -385,7 +385,16 @@ async def _run_forever() -> None:
         log.info("%sBot 등록", spec.name.capitalize())
 
     if not apps:
-        raise SystemExit("활성화된 봇이 하나도 없음. 최소 한 봇의 토큰 환경변수가 필요합니다.")
+        # ACTIVE_BOTS로 전부 비활성화 시 crash 대신 idle (잠정폐기 안전망).
+        # Railway는 exit 시 즉시 재시작 → crash loop. asyncio.sleep으로 컨테이너 살림.
+        log.warning("활성화된 봇이 하나도 없음 — idle 모드로 대기 "
+                    "(ACTIVE_BOTS 환경변수로 봇이 전부 필터되었거나 토큰 미설정).")
+        log.warning("복원: ACTIVE_BOTS env 삭제 또는 정상값 설정 후 재배포.")
+        try:
+            while True:
+                await asyncio.sleep(3600)
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            return
 
     # spec → commands 매핑 (initialize 후 set_my_commands 직접 호출용)
     spec_by_name = {s.name: s for s in BOT_SPECS}
