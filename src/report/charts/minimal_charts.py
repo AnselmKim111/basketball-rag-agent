@@ -13,12 +13,96 @@ from . import chart_theme as theme
 log = logging.getLogger(__name__)
 
 
+# 신고가 폴백용 universe — FDR로 직접 fetch (screener.db 미접근 환경)
+_US_UNIVERSE_TOP = [
+    # S&P500 + Nasdaq100 시총 상위 ~80종 (LLM에 의존 안 하는 정적 list)
+    "NVDA","MSFT","AAPL","AMZN","META","GOOGL","GOOG","AVGO","TSLA","BRK-B",
+    "JPM","WMT","LLY","V","XOM","ORCL","MA","UNH","COST","HD",
+    "JNJ","ABBV","PG","BAC","NFLX","CVX","KO","CRM","TMUS","AMD",
+    "PEP","WFC","CSCO","ADBE","MCD","TMO","ABT","LIN","ACN","PM",
+    "DIS","IBM","CAT","GE","TXN","MRK","NOW","INTU","GS","ISRG",
+    "AXP","RTX","MS","UBER","BKNG","BLK","T","C","VRTX","PFE",
+    "NEE","HON","SCHW","SPGI","ELV","PGR","DE","LOW","COP","BSX",
+    "AMGN","ETN","TJX","PLD","ADI","SYK","MDT","PANW","MMC","BMY",
+    "QCOM","MU","DELL","HPE","SMCI","ARM","COIN","PLTR","SNOW","ASML",
+]
+_KR_UNIVERSE_TOP = [
+    # KOSPI200 + KOSDAQ150 시총 상위 ~50종
+    "005930","000660","373220","005380","105560","207940","005935","068270",
+    "035420","006400","051910","028260","000270","055550","005490","003550",
+    "035720","012330","015760","034730","138040","096770","011200","086790",
+    "017670","033780","066570","003670","024110","402340","034220","361610",
+    "316140","000810","259960","051900","326030","010130","267260","006800",
+    "139480","030200","011170","011070","006980","272210","010950","009150",
+    "047810","000100",
+]
+
+
+def _new_highs_from_fdr(us_limit: int = 12, kr_limit: int = 8) -> list:
+    """FDR로 직접 시총 top universe fetch → 252영업일 신고가 자체 계산.
+
+    screener.db 미접근 환경 폴백. (mkt, name, payload, df) list 반환.
+    """
+    from src.report.data import fetch_prices as fp
+
+    found: list[tuple[str, str, dict, object]] = []
+
+    # US — 시총 top 80 fetch (병렬 8 workers)
+    us_dfs = fp.fetch_many({t: t for t in _US_UNIVERSE_TOP[:80]}, days=365, workers=8)
+    log.info("[minimal.new_highs.fdr] US fetch=%d/%d", len(us_dfs), len(_US_UNIVERSE_TOP))
+    us_hits = []
+    for tk, df in us_dfs.items():
+        if df is None or len(df) < 250:
+            continue
+        try:
+            close = df["Close"]
+            last = float(close.iloc[-1])
+            prev_hi = float(close.iloc[-252:-1].max())
+            if last > prev_hi > 0:
+                pct = (last / prev_hi - 1) * 100
+                us_hits.append((tk, last, prev_hi, pct, df))
+        except Exception:
+            continue
+    # 신고가 강도 (pct) 내림차순
+    us_hits.sort(key=lambda x: -x[3])
+    for tk, last, prev_hi, pct, df in us_hits[:us_limit]:
+        found.append(("US", tk, {"ticker": tk, "prev_high": prev_hi, "pct": pct}, df))
+
+    # KR — 시총 top 50 fetch
+    kr_dfs = fp.fetch_many({t: t for t in _KR_UNIVERSE_TOP[:50]}, days=365, workers=8)
+    log.info("[minimal.new_highs.fdr] KR fetch=%d/%d", len(kr_dfs), len(_KR_UNIVERSE_TOP))
+    kr_hits = []
+    for tk, df in kr_dfs.items():
+        if df is None or len(df) < 250:
+            continue
+        try:
+            close = df["Close"]
+            last = float(close.iloc[-1])
+            prev_hi = float(close.iloc[-252:-1].max())
+            if last > prev_hi > 0:
+                pct = (last / prev_hi - 1) * 100
+                kr_hits.append((tk, last, prev_hi, pct, df))
+        except Exception:
+            continue
+    kr_hits.sort(key=lambda x: -x[3])
+    for tk, last, prev_hi, pct, df in kr_hits[:kr_limit]:
+        # KR 종목명 (간이 매핑 — 종목코드 그대로)
+        found.append(("KR", tk, {"ticker": tk, "prev_high": prev_hi, "pct": pct}, df))
+
+    log.info("[minimal.new_highs.fdr] US 신고가 %d / KR 신고가 %d", len(us_hits), len(kr_hits))
+    return found[:16]
+
+
 def new_highs_grid(out_dir: Path, date_iso: str,
                    us_limit: int = 12, kr_limit: int = 8) -> str | None:
-    """US/KR screener.db에서 today 신고가(high_52w) 종목 가격 차트 grid.
+    """US/KR 신고가 종목 가격 차트 grid.
 
-    각 종목은 최근 ~180일 가격 라인 + 52w 신고가 마커. 모바일 가독성 위해
-    종목당 큰 mini chart (4열 × N행).
+    1순위: screener.db high_52w 신호 (us_screener / screener).
+    폴백: screener.db 미접근 시 FDR S&P500 + KOSPI200 시총 top 100 직접 fetch
+          → 252영업일 신고가 자체 계산. report-bot service가 별도 volume이라
+          screener.db 못 보는 경우에 자동 활성화.
+
+    각 종목 최근 ~180일 close 라인 + 직전 52w 신고가 마커.
     """
     from src.report.data import screener_adapter
 
@@ -26,26 +110,21 @@ def new_highs_grid(out_dir: Path, date_iso: str,
     import matplotlib.pyplot as plt
     from matplotlib.gridspec import GridSpec
 
-    # 1. 신고가 종목 수집 (US 먼저, 부족하면 KR로 채움)
+    # 1순위: screener.db 신호
     items: list[tuple[str, str, dict]] = []  # (market, name, payload)
     try:
         us_sig = screener_adapter.load_signals("US")
         for entry in (us_sig.get("high_52w", []) or [])[:us_limit]:
             items.append(("US", entry["name"], entry))
     except Exception:
-        log.exception("[minimal.new_highs_grid] US load 실패")
+        log.exception("[minimal.new_highs_grid] US screener load 실패")
     try:
         kr_sig = screener_adapter.load_signals("KR")
         for entry in (kr_sig.get("high_52w", []) or [])[:kr_limit]:
             items.append(("KR", entry["name"], entry))
     except Exception:
-        log.exception("[minimal.new_highs_grid] KR load 실패")
+        log.exception("[minimal.new_highs_grid] KR screener load 실패")
 
-    if not items:
-        log.warning("[minimal.new_highs_grid] 신고가 종목 0 — skip")
-        return None
-
-    # 2. 각 종목 OHLCV 로드
     enriched: list[tuple[str, str, dict, object]] = []
     for mkt, name, payload in items:
         try:
@@ -55,11 +134,16 @@ def new_highs_grid(out_dir: Path, date_iso: str,
         if df is None or len(df) < 30:
             continue
         enriched.append((mkt, name, payload, df))
-        if len(enriched) >= 16:  # 모바일 보기에 16종 cap
+        if len(enriched) >= 16:
             break
 
+    # 폴백: screener.db 미가용 → FDR 직접 fetch
     if not enriched:
-        log.warning("[minimal.new_highs_grid] OHLCV 로드 0건 — skip")
+        log.info("[minimal.new_highs_grid] screener.db 신호 0 — FDR universe 폴백")
+        enriched = _new_highs_from_fdr(us_limit=us_limit, kr_limit=kr_limit)
+
+    if not enriched:
+        log.warning("[minimal.new_highs_grid] 신고가 종목 0 — skip")
         return None
 
     # 3. grid 그리기 (4열, 행은 종목 수 / 4)
@@ -74,10 +158,16 @@ def new_highs_grid(out_dir: Path, date_iso: str,
     for i, (mkt, name, payload, df) in enumerate(enriched):
         r, c = divmod(i, cols)
         ax = fig.add_subplot(gs[r, c])
-        # 가격 라인 (close)
-        try:
-            closes = df["close"].astype(float).values
-        except Exception:
+        # close 컬럼 — screener.db는 소문자 'close', FDR는 'Close'. 둘 다 시도.
+        closes = None
+        for col in ("close", "Close"):
+            if col in df.columns:
+                try:
+                    closes = df[col].astype(float).values
+                    break
+                except Exception:
+                    continue
+        if closes is None:
             closes = df.iloc[:, -1].astype(float).values
         ax.plot(range(len(closes)), closes, color="#2563eb", linewidth=1.8)
         # 신고가 마커

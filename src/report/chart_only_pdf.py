@@ -79,12 +79,14 @@ def _render_cover(pdf, headline: str, freshness_notes: list[str]) -> None:
 
     # 데이터 신선도 (있을 때만)
     if freshness_notes:
-        ax.text(0.5, 0.52, "📡 데이터 신선도",
+        ax.text(0.5, 0.52, "데이터 신선도",
                 ha="center", va="center", fontsize=14, fontweight="bold",
                 color="#1e293b", transform=ax.transAxes)
         y = 0.48
         for note in freshness_notes[:8]:
-            ax.text(0.5, y, note, ha="center", va="center",
+            # emoji 제거 (Noto CJK 폰트가 ✅⚠️ 미지원 → tofu)
+            clean = note.replace("✅", "[OK]").replace("⚠️", "[stale]").replace("📡", "")
+            ax.text(0.5, y, clean.strip(), ha="center", va="center",
                     fontsize=11, color="#334155", transform=ax.transAxes)
             y -= 0.035
 

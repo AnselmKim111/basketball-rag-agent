@@ -375,14 +375,14 @@ def _build_minimal_report():
              len(sector_etfs or {}), len(theme_etfs or {}), len(theme_rows),
              [s.get("key") if isinstance(s, dict) else s for s in stale])
 
-    # 신선도 라벨
+    # 신선도 라벨 (emoji는 chart_only_pdf 표지에서 ASCII로 치환)
     stale_keys = {(s["key"] if isinstance(s, dict) else s[0]) for s in stale}
     fresh_keys = {"idx", "macro", "kr_size", "kr_flow", "sector", "theme"} - stale_keys
     if fresh_keys:
-        freshness.append(f"✅ 최신 fetch: {', '.join(sorted(fresh_keys))}")
+        freshness.append(f"[OK] 최신 fetch: {', '.join(sorted(fresh_keys))}")
     for s in stale:
         if isinstance(s, dict):
-            freshness.append(f"⚠️ {s.get('key')} — 캐시 폴백 ({s.get('asof','?')})")
+            freshness.append(f"[stale] {s.get('key')} — 캐시 폴백 ({s.get('asof','?')})")
 
     # 1. 주가지수 grid
     if us_idx:
@@ -474,7 +474,7 @@ def _build_minimal_report():
             log.exception("[report.minimal] korea heatmap 실패")
 
     # ---------- PDF 빌드 ----------
-    headline = f"📊 시황 차트 — {date_iso}"
+    headline = f"시황 차트 — {date_iso}"
     out_pdf = base / "report.pdf"
     ok = chart_only_pdf.build_pdf(chart_list, img_dir, out_pdf, headline, freshness)
     pdf_path = str(out_pdf) if ok else None
