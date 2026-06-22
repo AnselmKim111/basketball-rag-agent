@@ -262,6 +262,22 @@ def close_after_n_business_days(ticker: str, start_date: str, n: int = 5) -> Opt
     return int(rows[n][1])
 
 
+def closes_from_date(ticker: str, start_date: str, n: int = 5) -> list[int]:
+    """start_date부터 n+1 영업일치 close(cents) 리스트(거래일 오름차순). 부족하면 빈 리스트.
+    회고 수익률의 스케일 브레이크 검사용."""
+    ensure_schema()
+    with _conn() as c:
+        cur = c.execute(
+            "SELECT close FROM ohlcv WHERE ticker=? AND date >= ? "
+            "ORDER BY date ASC LIMIT ?",
+            (ticker, start_date, n + 1),
+        )
+        rows = cur.fetchall()
+    if len(rows) < n + 1:
+        return []
+    return [int(r[0]) for r in rows]
+
+
 def delete_older_than(cutoff_date: str) -> int:
     ensure_schema()
     with _conn() as c:
@@ -355,6 +371,34 @@ def get_ticker_name(ticker: str) -> Optional[str]:
         cur = c.execute("SELECT name FROM tickers WHERE ticker=?", (ticker,))
         row = cur.fetchone()
     return row[0] if row else None
+
+
+def get_ticker_row(ticker: str) -> Optional[dict]:
+    """활성 여부 무관 단일 종목 조회 (/diag 진단용)."""
+    ensure_schema()
+    with _conn() as c:
+        cur = c.execute(
+            "SELECT ticker, name, market, is_active, market_cap, sector "
+            "FROM tickers WHERE ticker=?",
+            (ticker,),
+        )
+        r = cur.fetchone()
+    if not r:
+        return None
+    return {"ticker": r[0], "name": r[1], "market": r[2],
+            "is_active": r[3], "market_cap": r[4], "sector": r[5]}
+
+
+def search_tickers_by_name(substr: str, limit: int = 5) -> list[tuple]:
+    """종목명/티커 부분일치 검색 → [(ticker, name), ...] (/diag 입력 지원)."""
+    ensure_schema()
+    with _conn() as c:
+        cur = c.execute(
+            "SELECT ticker, name FROM tickers WHERE name LIKE ? OR ticker LIKE ? "
+            "ORDER BY ticker LIMIT ?",
+            (f"%{substr}%", f"%{substr.upper()}%", limit),
+        )
+        return [(r[0], r[1]) for r in cur.fetchall()]
 
 
 # ------------------------------------------------------------------

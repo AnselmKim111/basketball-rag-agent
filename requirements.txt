@@ -1,20 +1,25 @@
-playwright>=1.49.0
-openai>=1.50.0
-httpx>=0.27.0
-pypdf>=5.1.0
-markdown>=3.5
-python-dotenv>=1.0.1
-python-telegram-bot>=21.6
-APScheduler>=3.10.4
+# 버전 정책: 하한(>=)은 기능 요구, 상한(<)은 "어제 되던 빌드가 오늘 깨지는"
+# 메이저 점프 차단용. 정확 핀(==)은 안 함 — Railway 빌드 시점 해석본을 유지하면서
+# API 재작성급 메이저(APScheduler 4, httpx 1, PTB 23 등)만 막는다.
+playwright>=1.49.0,<2
+openai>=1.50.0,<3
+httpx>=0.27.0,<1
+pypdf>=5.1.0,<7
+markdown>=3.5,<4
+python-dotenv>=1.0.1,<2
+python-telegram-bot>=21.6,<23
+APScheduler>=3.10.4,<4
 tzdata>=2024.1
 # deepdive 기능
-matplotlib>=3.8
-beautifulsoup4>=4.12
-lxml>=5.0
+matplotlib>=3.8,<4
+beautifulsoup4>=4.12,<5
+lxml>=5.0,<7
 # screener bot (한국 주식 기술적 스크리너)
-pykrx>=1.0.45
-pandas>=2.2
-numpy>=1.26
-finance-datareader>=0.9.0
+pykrx>=1.0.45,<2
+pandas>=2.2,<4
+numpy>=1.26,<3
+finance-datareader>=0.9.0,<1
 # 버터대디봇 리포트 (트리맵 히트맵)
-squarify>=0.4
+squarify>=0.4,<1
+# earnings PDF lint (markdown raw 잔존 자동 검사 — _lint_pdf)
+pdfminer.six>=20231228

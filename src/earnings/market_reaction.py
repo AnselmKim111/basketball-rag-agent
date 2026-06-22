@@ -3,14 +3,18 @@
 콜 발표 이후의 시장 반응 데이터 — 주가 reaction (T-1, T+1, T+5, T+30),
 ^GSPC 대비 alpha, 옵션 implied move (best-effort), sell-side target revision.
 
-소스:
-1. Yahoo Finance chart API (`/v8/finance/chart/{ticker}`) — `consensus._ensure_yahoo_auth` 재사용.
-2. ^GSPC 동시 fetch로 relative return 계산.
-3. options chain → ATM straddle implied move (실패 시 None).
-4. target revisions — `ConsensusSnapshot.recent_upgrades_downgrades`에서 call_date 이후 필터링.
-5. perplexity 폴백 (1회) — sell-side 노트 코멘트 정성 보강.
+소스 (가격 일봉 — 3단 폴백 체인):
+1. Yahoo Finance chart API (`/v8/finance/chart/{ticker}`) — 무인증, 단 환경에 따라 429.
+2. FDR (FinanceDataReader) — us_screener가 Railway에서 일일 검증하는 경로. ^GSPC 직접 지원.
+3. Stooq CSV (`stooq.com/q/d/l/`) — 무인증 최후 폴백 (^GSPC → ^spx 매핑).
+   (FMP historical은 실측 403 — 무료 티어는 가격 이력 미제공이라 체인에서 제외.)
 
-실패는 graceful — None 반환. 호출자는 payload에서 "시장 반응 데이터 미확보"로 처리.
+부가:
+- ^GSPC 동시 fetch로 relative return 계산 (동일 폴백 체인).
+- options chain → ATM straddle implied move (Yahoo 전용, 실패 시 None).
+- target revisions — `ConsensusSnapshot.recent_upgrades_downgrades`에서 call_date 이후 필터링.
+
+실패는 graceful — 빈 snap 반환. 호출자는 payload에서 "시장 반응 데이터 미확보"로 처리.
 """
 from __future__ import annotations
 
@@ -29,6 +33,7 @@ import httpx
 log = logging.getLogger(__name__)
 
 YAHOO_BASE = "https://query2.finance.yahoo.com"
+STOOQ_URL = "https://stooq.com/q/d/l/"
 YAHOO_TIMEOUT = httpx.Timeout(20.0, connect=8.0)
 
 
@@ -121,6 +126,91 @@ def _parse_closes(chart_result: dict[str, Any]) -> list[tuple[datetime, float]]:
         out.append((datetime.fromtimestamp(int(t), tz=timezone.utc), float(c)))
     out.sort(key=lambda x: x[0])
     return out
+
+
+def _fdr_closes(ticker: str, period1: int, period2: int) -> list[tuple[datetime, float]]:
+    """FDR (FinanceDataReader) 일봉 — us_screener가 Railway에서 검증한 경로 재사용.
+
+    Yahoo 직접 호출이 429일 때 폴백. ^GSPC 인덱스도 직접 지원 (실측 확인).
+    FDR은 sync + pandas — 호출자가 이미 executor 안이라 OK.
+    """
+    frm = datetime.fromtimestamp(period1, tz=timezone.utc).strftime("%Y-%m-%d")
+    to = datetime.fromtimestamp(period2, tz=timezone.utc).strftime("%Y-%m-%d")
+    try:
+        import FinanceDataReader as fdr  # type: ignore
+        df = fdr.DataReader(ticker.replace(".", "-") if not ticker.startswith("^") else ticker, frm, to)
+    except Exception as e:
+        log.warning("FDR chart %s 실패: %s", ticker, e)
+        return []
+    if df is None or getattr(df, "empty", True):
+        return []
+    close_col = next((c for c in ("Close", "close") if c in df.columns), None)
+    if close_col is None:
+        return []
+    out: list[tuple[datetime, float]] = []
+    for idx, row in df.iterrows():
+        try:
+            c = float(row[close_col])
+            if c <= 0 or math.isnan(c):
+                continue
+            dt = idx.to_pydatetime() if hasattr(idx, "to_pydatetime") else idx
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            out.append((dt, c))
+        except Exception:
+            continue
+    out.sort(key=lambda x: x[0])
+    return out
+
+
+def _stooq_chart(client: httpx.Client, ticker: str, period1: int, period2: int) -> list[tuple[datetime, float]]:
+    """Stooq CSV 일봉 — 무인증 최후 폴백. US 종목은 `{sym}.us`, ^GSPC는 `^spx`."""
+    sym = "^spx" if ticker.upper() == "^GSPC" else f"{ticker.lower()}.us"
+    d1 = datetime.fromtimestamp(period1, tz=timezone.utc).strftime("%Y%m%d")
+    d2 = datetime.fromtimestamp(period2, tz=timezone.utc).strftime("%Y%m%d")
+    try:
+        r = client.get(STOOQ_URL, params={"s": sym, "d1": d1, "d2": d2, "i": "d"})
+        if r.status_code != 200 or not r.text or r.text.startswith("No data"):
+            return []
+        out: list[tuple[datetime, float]] = []
+        lines = r.text.strip().splitlines()
+        # 헤더: Date,Open,High,Low,Close,Volume
+        for ln in lines[1:]:
+            parts = ln.split(",")
+            if len(parts) < 5:
+                continue
+            try:
+                out.append((
+                    datetime.strptime(parts[0], "%Y-%m-%d").replace(tzinfo=timezone.utc),
+                    float(parts[4]),
+                ))
+            except (ValueError, TypeError):
+                continue
+        out.sort(key=lambda x: x[0])
+        return out
+    except Exception as e:
+        log.warning("Stooq chart %s 예외: %s", ticker, e)
+        return []
+
+
+def _fetch_closes(
+    client: httpx.Client, ticker: str, period1: int, period2: int,
+) -> tuple[list[tuple[datetime, float]], str]:
+    """가격 일봉 3단 폴백: Yahoo → FDR → Stooq. 반환 (closes, source)."""
+    data = _yahoo_chart(client, ticker, period1, period2)
+    if data:
+        closes = _parse_closes(data)
+        if closes:
+            return closes, "yahoo"
+    closes = _fdr_closes(ticker, period1, period2)
+    if closes:
+        log.info("[market_reaction] %s — Yahoo 실패 → FDR 폴백 (%d closes)", ticker, len(closes))
+        return closes, "fdr"
+    closes = _stooq_chart(client, ticker, period1, period2)
+    if closes:
+        log.info("[market_reaction] %s — Yahoo·FDR 실패 → Stooq 폴백 (%d closes)", ticker, len(closes))
+        return closes, "stooq"
+    return [], "none"
 
 
 def _pick(closes: list[tuple[datetime, float]], target_dt: datetime, side: str = "after") -> tuple[datetime, float] | None:
@@ -253,22 +343,18 @@ def fetch_market_reaction(
 
     try:
         with httpx.Client(timeout=YAHOO_TIMEOUT, follow_redirects=True) as client:
-            tk_data = _yahoo_chart(client, ticker, period1, period2)
-            spx_data = _yahoo_chart(client, "^GSPC", period1, period2)
+            tk_closes, tk_source = _fetch_closes(client, ticker, period1, period2)
+            spx_closes, _ = _fetch_closes(client, "^GSPC", period1, period2)
             implied = _yahoo_options_implied_move(client, ticker)
     except Exception as e:
         log.warning("market reaction client 실패 %s: %s", ticker, e)
         return snap
 
-    if not tk_data:
-        snap.notes = "Yahoo chart fetch 실패"
-        return snap
-
-    tk_closes = _parse_closes(tk_data)
-    spx_closes = _parse_closes(spx_data) if spx_data else []
     if not tk_closes:
-        snap.notes = "ticker close 데이터 없음"
+        snap.notes = "가격 데이터 미확보 (Yahoo·FMP·Stooq 모두 실패)"
+        snap.source = "none"
         return snap
+    snap.source = tk_source
 
     # anchor를 영업일에 맞추기 — anchor on_or_after 첫 close가 T
     t0 = _pick(tk_closes, anchor, side="on_or_after")

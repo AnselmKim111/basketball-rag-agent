@@ -24,11 +24,13 @@ from typing import Any
 log = logging.getLogger(__name__)
 KST = timezone(timedelta(hours=9))
 
-# 이모지 — Noto Sans CJK에 글리프 없어 tofu 박스 — 렌더 전 제거
+# 이모지 — Noto Sans CJK에 글리프 없어 tofu 박스 — 렌더 전 제거.
+# 단 ★(U+2605)·☆(U+2606)는 CJK 폰트에 글리프 있고 conviction 표시(★4)에 필수라 보존.
 _EMOJI_RE = re.compile(
     "["
     "\U0001F300-\U0001FAFF"
-    "\U00002600-\U000027BF"
+    "\U00002600-\U00002604"
+    "\U00002607-\U000027BF"
     "\U0001F1E6-\U0001F1FF"
     "\U0000FE00-\U0000FE0F"
     "\U00002190-\U000021FF"
@@ -37,8 +39,16 @@ _EMOJI_RE = re.compile(
 )
 
 
+# Noto Sans CJK에 글리프 없는 문자 → 대체 (LLM 생성 본문에 섞여 들어올 수 있음)
+_GLYPH_FALLBACK = str.maketrans({
+    "▸": "•",  # ▸ → •
+    "▹": "•",  # ▹ → •
+    "‣": "•",  # ‣ → •
+})
+
+
 def _strip_emoji(s: str) -> str:
-    return _EMOJI_RE.sub("", s or "").strip()
+    return _EMOJI_RE.sub("", (s or "").translate(_GLYPH_FALLBACK)).strip()
 
 
 # ------------------------------------------------------------------
@@ -1153,7 +1163,7 @@ def _draw_cover(
         for line in pick["verdict_lines"][:3]:
             wrapped = _wrap_text_kr(line, width=78)
             for j, w in enumerate(wrapped[:2]):
-                ax.text(0.060, y, ("▸ " if j == 0 else "   ") + w,
+                ax.text(0.060, y, ("• " if j == 0 else "   ") + w,
                         fontsize=9.5, fontweight="bold" if j == 0 else "normal",
                         color=STYLE["ink"], va="top")
                 y -= 0.020
@@ -1503,14 +1513,20 @@ def _draw_ticker_qna_page(pdf, ticker: str, company: str, period: str, korean_md
 # Phase 10-G — PDF lint (마크다운 잔존 검사)
 # ==================================================================
 def _lint_pdf(path: Path) -> dict:
-    """raw markdown 잔존 검사. pdfminer 없으면 skip."""
+    """raw markdown 잔존 검사 + 정확한 페이지 수. pdfminer 없으면 skip.
+
+    BaseException까지 잡는 이유: pdfminer → cryptography → pyo3 체인이 깨진 환경에선
+    PanicException(BaseException 계열)이 발생 — lint는 부가 기능이라 PDF 발송을 막으면 안 됨.
+    """
     try:
         from pdfminer.high_level import extract_text  # type: ignore
+        from pdfminer.pdfpage import PDFPage  # type: ignore
         text = extract_text(str(path))
-    except Exception:
+        with open(path, "rb") as f:
+            pages = sum(1 for _ in PDFPage.get_pages(f))
+    except BaseException:  # noqa: BLE001 — pyo3 PanicException 가드 (docstring 참조)
         return {"ok": True, "reason": "pdfminer unavailable"}
     md_hits = len(re.findall(r"^##\s|\*\*\w|\[[A-Z]+\]\[[a-z_]+\]", text, re.MULTILINE))
-    pages = text.count("\f") + 1 if text else 0
     return {"ok": md_hits < 5, "md_hits": md_hits, "pages": pages}
 
 

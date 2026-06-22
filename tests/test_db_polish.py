@@ -103,3 +103,37 @@ def test_load_signals_in_range_exclude_date(tmp_screener_db):
     assert len(all_rows) == 2
     assert len(excl_rows) == 1
     assert excl_rows[0]["ticker"] == "T2"
+
+
+def test_disclosure_log_insert_and_range(tmp_screener_db):
+    """공시 로그 insert + 기간 조회 + (rcept_no, chat_id) 중복 무시."""
+    db = tmp_screener_db
+    db.ensure_schema()
+    today = date.today().isoformat()
+    ok = db.disclosure_log_insert(
+        rcept_no="20260607000001", chat_id="111", ticker="005930",
+        name="삼성전자", report_nm="잠정실적공시", category="critical",
+        alert_date=today, baseline_close=100_000,
+    )
+    assert ok
+    # 같은 (rcept_no, chat_id) 재호출 — OR IGNORE로 안전
+    assert db.disclosure_log_insert(
+        rcept_no="20260607000001", chat_id="111", ticker="005930",
+        alert_date=today,
+    )
+    # 같은 공시 다른 chat — fan-out 별도 행
+    assert db.disclosure_log_insert(
+        rcept_no="20260607000001", chat_id="222", ticker="005930",
+        alert_date=today,
+    )
+    start = (date.today() - timedelta(days=7)).isoformat()
+    # chat 무관 — rcept_no dedup → 1행
+    rows_all = db.load_disclosures_in_range(start, today)
+    assert len(rows_all) == 1
+    assert rows_all[0]["ticker"] == "005930"
+    # chat_id 지정 — 그 사용자 행만
+    rows_111 = db.load_disclosures_in_range(start, today, chat_id="111")
+    assert len(rows_111) == 1
+    assert rows_111[0]["baseline_close"] == 100_000
+    rows_999 = db.load_disclosures_in_range(start, today, chat_id="999")
+    assert rows_999 == []

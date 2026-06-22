@@ -71,9 +71,28 @@ def format_recap_text(data: dict[str, Any], synthesis_md: str = "") -> str:
         for p in (ent.get("picks") or [])[:3]:
             parts.append(f"     - {p['name']} ({p['ticker']})")
 
-    # §3 공시 (placeholder)
+    # §3 공시 트리거 — 알림받은 공시 + 공시 이후 수익률
     disc = data.get("disclosures") or {}
-    if disc.get("empty_reason"):
+    disc_logs = disc.get("logs") or []
+    if disc_logs:
+        parts.append(f"\n📋 *공시 트리거* ({len(disc_logs)}건)")
+        # critical 우선, 그 안에서 |pnl| 큰 순 — 시장이 반응한 공시가 위로
+        def _disc_key(d: dict) -> tuple:
+            crit = 0 if d.get("category") == "critical" else 1
+            pnl = d.get("pnl_since_alert")
+            return (crit, -(abs(pnl) if pnl is not None else -1))
+        for d in sorted(disc_logs, key=_disc_key)[:10]:
+            pnl = d.get("pnl_since_alert")
+            pnl_str = f"{pnl:+.1f}%" if pnl is not None else "n/a"
+            emoji = "🚨" if d.get("category") == "critical" else "📄"
+            parts.append(
+                f"  {emoji} {d.get('name') or d.get('ticker')} — "
+                f"{(d.get('report_nm') or '')[:40]} "
+                f"({d.get('alert_date', '')[5:]}, 이후 {pnl_str})"
+            )
+        if len(disc_logs) > 10:
+            parts.append(f"  … 외 {len(disc_logs) - 10}건")
+    elif disc.get("empty_reason"):
         parts.append(f"\n📋 *공시 트리거*: {disc['empty_reason']}")
 
     # §4 테마

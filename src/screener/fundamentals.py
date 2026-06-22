@@ -78,13 +78,26 @@ def eps_yoy_map(tickers: list[str], base_date: str) -> dict[str, float | None]:
 
 
 def ytd_pct(rows: list[dict]) -> float | None:
-    """연초대비 % (rows: load_ohlcv, asc). 스케일 무관(비율)."""
+    """연초대비 % (rows: load_ohlcv, asc). 스케일 무관(비율).
+
+    base(연초 첫 거래일)~latest 사이에 ±30% 일일제한을 넘는 스케일 브레이크가 있으면
+    분할/조정 불일치·데이터 손상이므로 None(N/A) 반환 — 잘못된 +244% 노출 방지.
+    """
     if not rows:
         return None
     latest = rows[-1]
     year = latest["date"][:4]
-    base = next((r for r in rows if r["date"][:4] == year and r.get("close")), None)
-    if not base or not base.get("close"):
+    base_idx = next((i for i, r in enumerate(rows)
+                     if r["date"][:4] == year and r.get("close")), None)
+    if base_idx is None:
+        return None
+    base = rows[base_idx]
+    if not base.get("close"):
+        return None
+    from src.screener_common.sanity import KR_DAILY_HI, KR_DAILY_LO, series_is_continuous
+    closes = [r["close"] for r in rows[base_idx:] if r.get("close")]
+    if not series_is_continuous(closes, KR_DAILY_LO, KR_DAILY_HI):
+        log.warning("[ytd_pct] %s 스케일 브레이크 — 분할/조정 불일치 의심, N/A 처리", latest["date"])
         return None
     return round((latest["close"] - base["close"]) / base["close"] * 100, 1)
 

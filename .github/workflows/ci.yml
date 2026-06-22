@@ -1,0 +1,33 @@
+# CI — 여러 Claude 세션이 같은 브랜치에 동시 푸시하는 구조라,
+# 푸시마다 테스트+컴파일을 자동으로 돌려 머지 drift 사고를 푸시 시점에 잡는다.
+#
+# 의도적으로 가볍게 유지: conftest.py가 telegram/playwright/httpx 등 외부 의존을
+# 전부 stub하므로 pytest + pandas/numpy만 설치하면 전체 스위트가 돈다 (~1분).
+name: CI
+
+on:
+  push:
+    branches:
+      - "claude/**"
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install test deps (외부 의존은 conftest stub)
+        run: pip install pytest pandas numpy
+
+      - name: Compile all sources
+        run: python -m compileall -q src/
+
+      - name: Run test suite
+        run: python -m pytest tests/ -q

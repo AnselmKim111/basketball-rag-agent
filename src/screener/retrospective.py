@@ -12,6 +12,7 @@ from collections import defaultdict
 from typing import Optional
 
 from src.screener import db
+from src.screener_common.sanity import KR_DAILY_HI, KR_DAILY_LO, series_is_continuous
 
 log = logging.getLogger(__name__)
 
@@ -52,11 +53,17 @@ def signal_returns(
         if not date_iso or not ticker:
             continue
         try:
-            c0 = db.close_after_n_business_days(ticker, date_iso, 0)
-            cN = db.close_after_n_business_days(ticker, date_iso, days_ahead)
+            closes = db.closes_from_date(ticker, date_iso, days_ahead)
         except Exception:
             continue
+        if len(closes) < days_ahead + 1:
+            continue
+        c0, cN = closes[0], closes[days_ahead]
         if not c0 or not cN or c0 <= 0:
+            continue
+        # 스케일 브레이크(분할/조정 불일치) 표본 제외 — 5영업일 +98.7% 같은 글리치 차단
+        if not series_is_continuous(closes, KR_DAILY_LO, KR_DAILY_HI):
+            log.warning("[retrospective] %s %s 스케일 브레이크 — 표본 제외", ticker, date_iso)
             continue
         ret = (cN - c0) / c0 * 100.0
         name = (s.get("payload") or {}).get("name") or ticker
@@ -104,6 +111,7 @@ def format_retrospective_line(retro: dict, days_ahead: int = 5) -> str:
         line = f"  · {label} {d['n']}종목 평균 {sign}{avg}% ({d['beats']}승/{d['n']-d['beats']}패)"
         if d.get("top"):
             t = d["top"][0]
-            line += f" — 최고 {t[1]} {t[2]:+}%"
+            from src.bot_helpers import html_escape
+            line += f" — 최고 {html_escape(str(t[1]))} {t[2]:+}%"
         parts.append(line)
     return "\n".join(parts) + "\n"

@@ -63,6 +63,9 @@
   git push origin claude/idea-bot-stock-analysis-i6HuR
   ```
 - **다른 세션 충돌 시**: `git fetch origin <branch> + git merge --no-edit FETCH_HEAD` 후 재푸시.
+- **분리 배포 가드**: `ACTIVE_BOTS=screener,us_screener` env 설정 시 그 봇만 기동 (미설정이면
+  토큰 있는 봇 전부). 두 Railway 서비스가 같은 봇 토큰을 공유하면 텔레그램 getUpdates
+  409 Conflict — 서비스별로 ACTIVE_BOTS 명시해 차단 (`src/orchestrator.py`).
 
 ## 4. 자동 검증 도구
 

@@ -251,6 +251,101 @@ async def _cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             pass
 
 
+def _diag_report(query: str) -> str:
+    """한 종목을 파이프라인 게이트별로 추적 (blocking — executor에서 호출)."""
+    import re
+    from src.screener import db, signals
+
+    q = query.strip()
+    if re.match(r"^\d{6}$", q):
+        ticker = q
+    else:
+        cands = db.search_tickers_by_name(q)
+        if not cands:
+            return f"❓ '{q}' 매칭 종목 없음 (유니버스 미포함 가능성 — universe refresh 필요)"
+        if len(cands) > 1:
+            lines = [f"🔎 '{q}' 후보 여러 개 — 6자리 코드로 다시:"]
+            lines += [f"  {t} {n}" for t, n in cands]
+            return "\n".join(lines)
+        ticker = cands[0][0]
+
+    row = db.get_ticker_row(ticker)
+    base_date = db.latest_date()
+    min_cap = signals._get_float_env("SCREENER_MIN_MARKET_CAP", signals.DEFAULT_MIN_MARKET_CAP)
+    out = [f"🩺 진단: {ticker} ({(row or {}).get('name') or '?'})", f"기준일(base_date): {base_date}"]
+
+    # 1) 유니버스
+    if not row:
+        out.append("① 유니버스: ❌ 없음 — tickers 테이블 미존재. universe refresh 또는 비상장/신규.")
+        return "\n".join(out)
+    out.append(f"① 유니버스: ✅ 존재 / is_active={row['is_active']}"
+               + ("" if row["is_active"] else "  ⚠️ 비활성 → 신호 계산 제외"))
+
+    # 2) 시총
+    cap = row.get("market_cap")
+    if cap is None:
+        out.append(f"② 시총: NULL — 필터 우회(통과). fetch 실패 의심.")
+    else:
+        ok = cap >= min_cap
+        out.append(f"② 시총: {cap/1e8:,.0f}억 / 필터 {min_cap/1e8:,.0f}억 → "
+                   + ("✅ 통과" if ok else "❌ 탈락(skipped_cap)"))
+
+    # 3) 데이터
+    rows = db.load_ohlcv(ticker, days=1300)
+    n = len(rows)
+    latest = rows[-1]["date"] if rows else "없음"
+    has_base = any(r["date"] == base_date for r in rows)
+    out.append(f"③ 데이터: {n}행 / 최신일 {latest} / base_date row "
+               + ("✅ 보유" if has_base else "❌ 누락(skipped_no_base)"))
+    if n < 60:
+        out.append("   ⚠️ <60행 → silent skip (skipped_short)")
+
+    # 4) 신호 + 종가신고가 진단
+    if has_base and n >= 60:
+        try:
+            sigs = signals.compute_signals_for_ticker(rows, base_date=base_date)
+            fired = ", ".join(sigs.keys()) if sigs else "없음"
+            out.append(f"④ 발화 신호: {fired}")
+        except Exception as e:
+            out.append(f"④ 신호 계산 실패: {e!r}")
+        # 종가신고가 vs 장중고가 진단
+        import pandas as pd
+        df = pd.DataFrame(rows)
+        bi = df.index[df["date"] == base_date].tolist()
+        if bi:
+            df = df.iloc[: bi[0] + 1]
+            tc = int(df.iloc[-1]["close"])
+            pch = int(df["close"].iloc[:-1].max()) if len(df) > 1 else 0
+            phh = int(df["high"].iloc[:-1].max()) if len(df) > 1 else 0
+            out.append(f"⑤ 종가신고가 진단: 오늘종가={tc:,} / 과거최고종가={pch:,} / 과거최고장중={phh:,}")
+            if tc > pch and tc <= phh:
+                out.append("   → 종가 신고가지만 과거 장중고가에 막힘 (종가기준 수정으로 해결됨)")
+            elif tc > pch:
+                out.append("   → 종가 신고가 + 장중고가도 돌파 (양 정의 모두 발화)")
+            else:
+                out.append("   → 종가 신고가 아님")
+    return "\n".join(out)
+
+
+async def _cmd_diag(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/diag <6자리코드|종목명> — 종목 누락 원인 파이프라인 추적 (admin)."""
+    if not is_authorized(update, ALLOWED_ENV):
+        await deny_message(update, "스크리너봇")
+        return
+    chat_id = str(update.effective_chat.id)
+    q = " ".join(context.args or []).strip()
+    if not q:
+        await send_text_chunked(context.bot, chat_id, "사용법: /diag 005930  또는  /diag 디앤디파마텍")
+        return
+    loop = asyncio.get_running_loop()
+    try:
+        report = await loop.run_in_executor(None, lambda: _diag_report(q))
+    except Exception:
+        log.exception("[diag] 실패")
+        report = "⚠️ 진단 실패 — 로그 확인"
+    await send_text_chunked(context.bot, chat_id, report)
+
+
 async def _cmd_backfill(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_authorized(update, ALLOWED_ENV):
         await deny_message(update, "스크리너봇")
@@ -407,7 +502,17 @@ async def screener_daily_job(bot: Bot, override_chat_id: str | None = None) -> N
             except Exception:
                 pass
         return
+    # locked() 체크 직후 즉시 acquire — 사이에 await 없어 cooperative 스케줄링에서 atomic
+    # (체크~acquire 사이 await가 있으면 두 호출이 직렬 중복 실행되는 TOCTOU 발생)
+    await _screener_lock.acquire()
+    try:
+        await _screener_daily_job_locked(bot, override_chat_id)
+    finally:
+        _screener_lock.release()
 
+
+async def _screener_daily_job_locked(bot: Bot, override_chat_id: str | None) -> None:
+    """screener_daily_job 본체 — 호출자가 _screener_lock을 잡은 상태."""
     # 발송 대상 chat_id 리스트 결정
     if override_chat_id:
         target_chat_ids = [str(override_chat_id)]
@@ -444,15 +549,34 @@ async def screener_daily_job(bot: Bot, override_chat_id: str | None = None) -> N
     # 진행 메시지 helper (admin에게만)
     chat_id = progress_chat  # 기존 코드 변수명 유지 (진행 메시지용)
 
-    await _screener_lock.acquire()
     try:
         # universe 보장
         await loop.run_in_executor(None, db.ensure_schema)
         if not await loop.run_in_executor(None, lambda: bool(db.get_active_tickers())):
             await send_text_chunked(bot, chat_id, "🌐 종목 유니버스 빌드 중...")
             count = await loop.run_in_executor(None, universe.refresh_universe)
+            await loop.run_in_executor(
+                None, lambda: db.meta_set("universe_refreshed_at", datetime.now(KST).date().isoformat()))
             await send_text_chunked(bot, chat_id, f"🌐 활성 종목 {count}개")
         else:
+            # 주 1회 universe 풀 갱신 — 신규 상장·섹터 변경 반영.
+            # cron에서만 (override는 /screen fast path — 기존 DB 사용 설계).
+            if override_chat_id is None:
+                try:
+                    last = await loop.run_in_executor(
+                        None, lambda: db.meta_get("universe_refreshed_at"))
+                    stale = True
+                    if last:
+                        stale = (datetime.now(KST).date()
+                                 - datetime.fromisoformat(last).date()).days >= 7
+                    if stale:
+                        count = await loop.run_in_executor(None, universe.refresh_universe)
+                        await loop.run_in_executor(
+                            None, lambda: db.meta_set(
+                                "universe_refreshed_at", datetime.now(KST).date().isoformat()))
+                        log.info("[scheduled] 주간 universe 갱신: 활성 %d종목", count)
+                except Exception:
+                    log.exception("[scheduled] 주간 universe 갱신 실패 — 기존 universe로 진행")
             # 시총 갱신 (시장 변동 반영 + 기존 DB의 NULL 시총 채우기)
             try:
                 updated = await loop.run_in_executor(None, universe.refresh_market_caps)
@@ -613,7 +737,7 @@ async def screener_daily_job(bot: Bot, override_chat_id: str | None = None) -> N
         if override_chat_id:
             try:
                 uniq = {it.get("ticker") for items in results.values() for it in items
-                        if it.get("ticker") and it.get("ticker") not in (None, "")}
+                        if it.get("ticker")}
                 if uniq:
                     eta = max(30, len(uniq) * 3)
                     await send_text_chunked(
@@ -663,9 +787,6 @@ async def screener_daily_job(bot: Bot, override_chat_id: str | None = None) -> N
             await send_text_chunked(bot, chat_id, "⚠️ 스크리너 작업 실패 — 로그 확인")
         except Exception:
             pass
-    finally:
-        if _screener_lock.locked():
-            _screener_lock.release()
 
 
 # ------------------------------------------------------------------
@@ -706,10 +827,18 @@ async def _self_test(bot: Bot) -> None:
 # Entry point (orchestrator가 호출)
 # ------------------------------------------------------------------
 SCREENER_COMMANDS = [
+    # 가입자 공개
     ("start", "🚀 가입 (자동 발송 활성화)"),
     ("screen", "📈 즉시 스크리닝 실행"),
     ("stop", "탈퇴 (자동 발송 해제)"),
     ("help", "도움말"),
+    # admin 전용 — 비인가자는 누르면 deny 메시지
+    ("status", "🔧 DB·신호 상태 (admin)"),
+    ("diag", "🔧 종목 누락 원인 추적 — /diag <코드|이름> (admin)"),
+    ("backfill", "🔧 1년치 OHLCV 백필 (admin)"),
+    ("list", "🔧 가입자/차단 목록 (admin)"),
+    ("block", "🔧 chat_id 차단 (admin)"),
+    ("unblock", "🔧 차단 해제 (admin)"),
 ]
 
 
@@ -722,6 +851,7 @@ def build_screener_app(token: str) -> Application:
     app.add_handler(CommandHandler("screen", _cmd_screen))
     # admin 전용
     app.add_handler(CommandHandler("status", _cmd_status))
+    app.add_handler(CommandHandler("diag", _cmd_diag))
     app.add_handler(CommandHandler("backfill", _cmd_backfill))
     app.add_handler(CommandHandler("list", _cmd_list))
     app.add_handler(CommandHandler("block", _cmd_block))
