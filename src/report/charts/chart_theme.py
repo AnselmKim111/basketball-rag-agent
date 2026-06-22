@@ -2,6 +2,8 @@
 
 모든 report 차트는 setup() 1회 호출 후 그림. matplotlib Agg(headless).
 캡션은 차트 하단 또는 리포트 본문에서 관찰/해석/체크 3줄로 별도 작성.
+
+모바일 우선 가독성 — figsize 기본값 1.4배 적용 (DEFAULT_FIGSIZE).
 """
 from __future__ import annotations
 
@@ -11,6 +13,11 @@ from pathlib import Path
 log = logging.getLogger(__name__)
 
 _SETUP_DONE = False
+
+# 모바일 가독성 우선 — 모든 차트의 base figsize. 호출자가 명시하면 override.
+DEFAULT_FIGSIZE = (16.0, 9.0)  # 기존 ~12x7 → 1.4배 확대
+PORTRAIT_FIGSIZE = (12.0, 14.0)  # 세로형 (히트맵·종목 grid 등)
+SQUARE_FIGSIZE = (13.0, 13.0)
 
 
 def setup() -> None:
@@ -40,8 +47,13 @@ def setup() -> None:
         "axes.grid": True,
         "grid.alpha": 0.25,
         "axes.unicode_minus": False,
-        "font.size": 11,
-        "figure.dpi": 110,
+        "font.size": 13,           # 모바일 가독성 (11 → 13)
+        "axes.titlesize": 16,
+        "axes.labelsize": 13,
+        "xtick.labelsize": 11,
+        "ytick.labelsize": 11,
+        "legend.fontsize": 11,
+        "figure.dpi": 130,         # 110 → 130 (선명도)
         "text.parse_math": False,  # '$' LaTeX 파싱 방지 (가격 표기)
     })
     _SETUP_DONE = True

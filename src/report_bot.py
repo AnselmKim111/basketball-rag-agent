@@ -240,15 +240,34 @@ async def report_daily_job(bot: Bot, override_chat_id: str | None = None) -> Non
         return
 
     loop = asyncio.get_running_loop()
+    minimal = os.getenv("REPORT_MINIMAL_MODE", "1") == "1"  # default ON (사용자 요청)
     try:
-        # portfolio는 첫 target chat_id 사용 (단일 chat 환경 가정).
-        portfolio_chat_id = targets[0] if targets else None
-        md_path, pdf_path, key_charts, headline = await loop.run_in_executor(
-            None, _build_report, portfolio_chat_id)
+        if minimal:
+            md_path, pdf_path, key_charts, headline = await loop.run_in_executor(
+                None, _build_minimal_report)
+        else:
+            # legacy 전체 리포트 (narrative 포함)
+            portfolio_chat_id = targets[0] if targets else None
+            md_path, pdf_path, key_charts, headline = await loop.run_in_executor(
+                None, _build_report, portfolio_chat_id)
     except Exception:
         log.exception("[report] 빌드 실패")
         for cid in targets:
             await send_text_chunked(bot, cid, "⚠️ 리포트 생성 실패 — 로그 확인")
+        return
+
+    # minimal 모드는 md 없음 — PDF만 검증
+    if minimal:
+        if not pdf_path:
+            for cid in targets:
+                await send_text_chunked(bot, cid, "⚠️ 차트 데이터 미확보 — PDF 생성 실패")
+            return
+        for cid in targets:
+            try:
+                await send_pdf(bot, cid, Path(pdf_path), caption=f"📊 {headline}"[:1000])
+            except Exception:
+                log.exception("[report] PDF 발송 실패 chat=%s", cid)
+        log.info("[report.minimal] 발송 완료 (%d명)", len(targets))
         return
 
     if not md_path:
@@ -302,6 +321,166 @@ def _build_portfolio_section(portfolio_chat_id, theme_summary, img_dir, date_iso
     except Exception:
         log.exception("[report.portfolio] enrichment 실패 — §B 생략")
         return {}
+
+
+def _build_minimal_report():
+    """Chart-only minimal mode — narrative 없이 7개 핵심 차트만 PDF로.
+
+    1. 주가지수 grid (S&P/Nasdaq/Dow/Russell)
+    2. 섹터 상대강도 막대 + RS 표
+    3. 신고가 종목 grid (US+KR screener.db)
+    4. 10년물 + 금리 곡선
+    5. VIX
+    6. S&P500 시총 가중 히트맵
+    7. KOSPI·KOSDAQ 외인·기관·개인 수급 + 한국 히트맵
+
+    반환: (None, pdf_path, [filenames], headline).
+    """
+    from src.report.data import (fetch_prices as fp, fetch_macro, fetch_korea_flows,
+                                  cache)
+    from src.report.charts import (index_charts, volatility_chart, korea_flow_chart,
+                                    heatmap_chart, rotation_charts, minimal_charts)
+    from src.report import chart_only_pdf
+    from src.report.analysis import theme_momentum
+
+    date_iso = datetime.now().astimezone(KST).strftime("%Y-%m-%d")
+    base = Path("reports") / date_iso
+    img_dir = base / "images"
+    img_dir.mkdir(parents=True, exist_ok=True)
+    log.info("[report.minimal] 시작 date=%s", date_iso)
+
+    chart_list: list[tuple[str, str]] = []
+    freshness: list[str] = []
+    stale: list = []
+
+    def foc(key, fn):
+        return cache.fetch_or_cache(key, fn, date_iso, stale=stale)
+
+    def add(fname, caption):
+        if fname:
+            chart_list.append((fname, caption))
+
+    # ---------- 데이터 fetch ----------
+    us_idx = foc("idx", lambda: fp.fetch_many(fp.US_INDICES, days=365))
+    macro = foc("macro", lambda: fetch_macro.fetch_macro(days=365))
+    kr_sizes = foc("kr_size", lambda: fetch_korea_flows.fetch_size_index_ohlcv(days=365))
+    kr_flows = foc("kr_flow", lambda: fetch_korea_flows.fetch_investor_flows(days=120))
+    sector_etfs = foc("sector", lambda: fp.fetch_many(fp.US_SECTOR_ETFS, days=365))
+    theme_etfs = foc("theme", lambda: fp.fetch_many(fp.US_THEME_ETFS, days=365))
+    combined_themes = {**(sector_etfs or {}), **(theme_etfs or {})}
+    theme_rows = theme_momentum.compute(combined_themes) if combined_themes else []
+
+    log.info("[report.minimal] fetch: idx=%d macro=%d kr_size=%d kr_flow=%d sector=%d theme=%d theme_rows=%d stale=%s",
+             len(us_idx or {}), len(macro or {}), len(kr_sizes or {}), len(kr_flows or {}),
+             len(sector_etfs or {}), len(theme_etfs or {}), len(theme_rows),
+             [s.get("key") if isinstance(s, dict) else s for s in stale])
+
+    # 신선도 라벨
+    stale_keys = {(s["key"] if isinstance(s, dict) else s[0]) for s in stale}
+    fresh_keys = {"idx", "macro", "kr_size", "kr_flow", "sector", "theme"} - stale_keys
+    if fresh_keys:
+        freshness.append(f"✅ 최신 fetch: {', '.join(sorted(fresh_keys))}")
+    for s in stale:
+        if isinstance(s, dict):
+            freshness.append(f"⚠️ {s.get('key')} — 캐시 폴백 ({s.get('asof','?')})")
+
+    # 1. 주가지수 grid
+    if us_idx:
+        add(index_charts.us_indices_grid(us_idx, img_dir, date_iso=date_iso),
+            "S&P500 · Nasdaq · Dow · Russell")
+
+    # 2. 섹터 상대강도 (막대 + 표)
+    if theme_rows:
+        add(rotation_charts.sector_return_bars(theme_rows, img_dir, date_iso=date_iso),
+            "섹터·테마 1D/5D/1M 막대")
+        add(minimal_charts.sector_relative_strength_table(theme_rows, img_dir, date_iso),
+            "섹터·테마 상대강도 (SPY 대비)")
+
+    # 3. 신고가 종목 grid (US+KR screener.db)
+    add(minimal_charts.new_highs_grid(img_dir, date_iso),
+        "오늘 52주 신고가 — US + KR")
+
+    # 4. 매크로 — 금리 곡선 + 10Y
+    if macro:
+        try:
+            add(volatility_chart.rates_curve(macro, img_dir, date_iso=date_iso),
+                "금리 곡선 — 단기·중기·장기")
+        except Exception:
+            log.exception("[report.minimal] rates_curve 실패")
+        try:
+            add(volatility_chart.single_macro(macro, img_dir, "04_macro_10y.png",
+                                                "10년물", "10Y", "T10Y", date_iso=date_iso),
+                "10년물 국채금리")
+        except Exception:
+            log.exception("[report.minimal] 10Y single_macro 실패")
+        # 5. VIX
+        try:
+            add(volatility_chart.vol_chart(macro, img_dir, date_iso=date_iso),
+                "VIX 변동성 지수")
+        except Exception:
+            log.exception("[report.minimal] VIX 실패")
+
+    # 6. ★ 히트맵 — S&P500 시총 가중
+    try:
+        from src.us_screener.data_source import fetch_market_caps, fetch_sectors
+        caps = fetch_market_caps() or {}
+        sectors = fetch_sectors() if caps else {}
+    except Exception:
+        log.exception("[report.minimal] 시총·섹터 fetch 실패")
+        caps, sectors = {}, {}
+
+    # changes — us_idx에서 일간 등락
+    changes = {}
+    try:
+        for tk, df in (us_idx or {}).items():
+            if df is None or len(df) < 2:
+                continue
+            try:
+                last = float(df["Close"].iloc[-1])
+                prev = float(df["Close"].iloc[-2])
+                if prev:
+                    changes[tk] = (last / prev - 1) * 100
+            except Exception:
+                continue
+    except Exception:
+        log.exception("[report.minimal] changes 계산 실패")
+
+    if not caps:
+        freshness.append("⚠️ S&P500 시총 부재 — 히트맵 등락 기반 폴백")
+    if changes:
+        try:
+            add(heatmap_chart.sp500_heatmap(caps, changes, sectors, img_dir,
+                                              date_iso=date_iso),
+                "S&P500 — 시총 가중 히트맵 (녹=상승)")
+        except Exception:
+            log.exception("[report.minimal] sp500_heatmap 실패")
+
+    # 7. 외인·기관·개인 수급 + 한국 히트맵
+    if kr_sizes and kr_flows:
+        for i, (label, price_df) in enumerate(kr_sizes.items(), 1):
+            flows_df = kr_flows.get("KOSDAQ") if "KOSDAQ" in label else kr_flows.get("KOSPI")
+            try:
+                fn = korea_flow_chart.flow_multipanel(price_df, flows_df, label,
+                                                       img_dir, f"32_kr_{i:02d}.png")
+                add(fn, f"{label} — 가격·외국인·기관·개인 일별 + 누적순매수")
+            except Exception:
+                log.exception("[report.minimal] %s flow_multipanel 실패", label)
+
+    if kr_flows:
+        try:
+            add(heatmap_chart.korea_flow_heatmap(kr_flows, img_dir, date_iso=date_iso),
+                "한국 수급 20일 누적 히트맵 (외국인·기관·개인 × KOSPI·KOSDAQ)")
+        except Exception:
+            log.exception("[report.minimal] korea heatmap 실패")
+
+    # ---------- PDF 빌드 ----------
+    headline = f"📊 시황 차트 — {date_iso}"
+    out_pdf = base / "report.pdf"
+    ok = chart_only_pdf.build_pdf(chart_list, img_dir, out_pdf, headline, freshness)
+    pdf_path = str(out_pdf) if ok else None
+
+    log.info("[report.minimal] 완료 — %d 차트 · PDF=%s", len(chart_list), pdf_path)
+    return None, pdf_path, [c[0] for c in chart_list], headline
 
 
 def _build_report(portfolio_chat_id: str | None = None):
