@@ -553,20 +553,22 @@ async def _us_screener_daily_job_locked(bot: Bot, override_chat_id: str | None) 
     # 진행 메시지 helper (admin에게만)
     chat_id = progress_chat  # 기존 코드 변수명 유지 (진행 메시지용)
 
+    uni_audit: dict = {}
     try:
-        # universe 보장 — 미국은 S&P500+Nasdaq100 ~550종목으로 fetch 빠름(~2초).
-        # 매번 refresh_universe (upsert) 호출해 NASDAQ100 신규 종목·섹터 항상 반영.
+        # universe 보장 — 광역 보통주($2B floor) ~1100종목 동적 재생성.
+        # 매번 refresh_universe로 신규 진입(RVMD급 미드캡)·floor 미달 비활성화 반영.
         await loop.run_in_executor(None, db.ensure_schema)
         try:
-            count = await loop.run_in_executor(None, universe.refresh_universe)
-            log.info("[scheduled] universe 갱신 %d종목", count)
-            # 헬스 워치독: 평소 ~516종목(S&P500+Nasdaq100). 베이스라인 미만이면 admin에 ⚠
+            uni_audit = await loop.run_in_executor(None, universe.refresh_universe)
+            count = (uni_audit or {}).get("count", 0)
+            log.info("[scheduled] universe 갱신 %s", uni_audit)
+            # 헬스 워치독: 평소 ~1100종목($2B floor). 베이스라인 미만이면 admin에 ⚠
             try:
                 from src.admin_alerts import alert_admin, BASELINES
                 if count is not None and count < BASELINES["us_caps"]:
                     await alert_admin(bot, ("US_SCREENER_ALLOWED_CHAT_IDS", "US_SCREENER_CHAT_ID"),
                                       "⚠ US universe fetch 급감",
-                                      f"평소 ~516종목, 오늘 {count}종목 — FDR StockListing 포맷 변경 의심")
+                                      f"평소 ~1100종목, 오늘 {count}종목 — Nasdaq/FDR 소스 또는 포맷 변경 의심")
             except Exception:
                 log.exception("[scheduled] us 헬스 알림 실패")
         except Exception:
@@ -677,6 +679,29 @@ async def _us_screener_daily_job_locked(bot: Bot, override_chat_id: str | None) 
             None, lambda: signals.compute_all(base_date=base_date)
         )
         log.info("[scheduled] signals stats: %s", stats)
+
+        # 재귀 커버리지 audit (admin 전용) — 유니버스 동적 재생성·자가치유 가시화.
+        # 일반 발송 메시지는 미변경. "매 실행이 유니버스를 학습해 갭을 좁힌다"의 추적.
+        try:
+            from src.admin_alerts import alert_admin
+            ua = uni_audit or {}
+            audit_msg = (
+                f"유니버스: {ua.get('count', '?')}종목 "
+                f"(floor=${ua.get('floor', 0)/1e9:.1f}B) | "
+                f"신규진입 {ua.get('new_entries', '?')} · 비활성화 {ua.get('dropped', '?')} · "
+                f"시총결측 {ua.get('no_cap', '?')}\n"
+                f"데이터부족(backfill 대상) {missing} · "
+                f"base_date 누락 skip {stats.get('skipped_no_base', '?')} · "
+                f"시총미달 skip {stats.get('skipped_cap', '?')}\n"
+                f"신호 발생: {sum(len(v) for v in results.values())}종목"
+            )
+            await alert_admin(
+                bot, ("US_SCREENER_ALLOWED_CHAT_IDS", "US_SCREENER_CHAT_ID"),
+                "📊 US 커버리지 audit", audit_msg,
+            )
+        except Exception:
+            log.exception("[scheduled] 커버리지 audit 발신 실패")
+
         if not results:
             await send_text_chunked(bot, chat_id, "⚠️ 신호 계산 결과 비어있음 — DB 확인")
             return

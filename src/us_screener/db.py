@@ -319,6 +319,35 @@ def upsert_tickers(rows: Iterable[tuple]) -> int:
     return len(rows)
 
 
+def get_active_symbols() -> set[str]:
+    """현재 is_active=1 인 ticker 심볼 집합 (universe diff·deactivation용)."""
+    ensure_schema()
+    with _conn() as c:
+        cur = c.execute("SELECT ticker FROM tickers WHERE is_active=1")
+        return {r[0] for r in cur.fetchall()}
+
+
+def deactivate_missing(keep: set[str]) -> int:
+    """keep 집합에 없는 active ticker를 is_active=0으로 비활성화. 반환: 비활성화 수.
+
+    동적 유니버스 — 시총 floor 미달이거나 상장폐지된 종목을 매일 정리.
+    OHLCV row는 보존 (재진입 시 재사용 + 역사 신고가 계산용).
+    """
+    ensure_schema()
+    with _conn() as c:
+        cur = c.execute("SELECT ticker FROM tickers WHERE is_active=1")
+        current = {r[0] for r in cur.fetchall()}
+        to_drop = current - keep
+        if to_drop:
+            c.execute("BEGIN")
+            c.executemany(
+                "UPDATE tickers SET is_active=0 WHERE ticker=?",
+                [(t,) for t in to_drop],
+            )
+            c.execute("COMMIT")
+    return len(to_drop)
+
+
 def update_market_caps(caps: dict[str, int]) -> int:
     """{ticker: market_cap} 일괄 업데이트. 신규 ticker는 무시 (universe 빌드 후 호출)."""
     if not caps:

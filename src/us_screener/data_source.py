@@ -11,6 +11,8 @@ incremental/validator/backfill 모듈이 무수정 재사용 가능하게 함. �
 from __future__ import annotations
 
 import logging
+import os
+import re
 import time
 from datetime import date, datetime, timedelta
 from typing import Optional
@@ -18,6 +20,15 @@ from typing import Optional
 log = logging.getLogger(__name__)
 
 DEFAULT_RETRIES = 3
+
+# 비보통주 제외 — name 키워드 (ETF는 exchange 엔드포인트에서 이미 빠지나 안전망)
+_NON_COMMON_RE = re.compile(
+    r"\b(ETF|ETN|Warrant|Warrants|Unit|Units|Preferred|Right|Rights|Notes?|"
+    r"Trust|Fund|Depositary)\b",
+    re.IGNORECASE,
+)
+# 비보통주 심볼 마커 (우선주 ^, 워런트/유닛 접미 .W/.U, when-issued 등)
+_NON_COMMON_SYM_RE = re.compile(r"[\^/$]|\.(W|U|R|WS|RT|UN)$", re.IGNORECASE)
 
 # 클래스 주식 심볼 매핑 (FDR StockListing 형식 → Yahoo 형식)
 _SYMBOL_FIX = {
@@ -157,87 +168,214 @@ _NASDAQ100 = [
 ]
 
 
-def fetch_us_tickers() -> list[tuple]:
-    """S&P500(FDR) + Nasdaq100(하드코딩) 합집합. 반환: (symbol, name, index_label).
+_EXCHANGES = ("NASDAQ", "NYSE", "AMEX")
 
-    index_label = 'S&P500' | 'NASDAQ100' (둘 다면 S&P500 우선).
+
+def _normalize_symbol(raw: str) -> str:
+    """Nasdaq screener 심볼 → Yahoo/FDR 형식 정규화. 'BRK/B' → 'BRK.B'."""
+    return str(raw).strip().upper().replace("/", ".")
+
+
+def _is_common_stock(sym: str, name: str) -> bool:
+    """보통주만 통과. ETF/우선주/워런트/유닛/권리 제외."""
+    if not sym or sym == "NAN":
+        return False
+    if _NON_COMMON_SYM_RE.search(sym):
+        return False
+    if name and _NON_COMMON_RE.search(name):
+        return False
+    return True
+
+
+def _parse_cap(raw) -> Optional[int]:
+    """'$1,234,567,890' / '1234567890' / '' → int USD 또는 None."""
+    if raw is None:
+        return None
+    s = str(raw).strip().replace("$", "").replace(",", "")
+    if not s or s.upper() in ("NAN", "N/A", "--"):
+        return None
+    try:
+        cap = int(float(s))
+    except (ValueError, TypeError):
+        return None
+    return cap if cap > 0 else None
+
+
+def _fetch_nasdaq_screener() -> list[tuple]:
+    """1순위: Nasdaq screener API — 전 거래소 보통주 + 시총·섹터 직접 제공.
+
+    반환: [(sym, name, cap|None, sector|None, exch), ...]. 실패 시 [].
     """
+    import requests
+
     out: dict[str, tuple] = {}
-    # 1) S&P500 — FDR StockListing
-    df = _fdr_listing("S&P500")
-    if df is not None and not df.empty:
-        cols = list(df.columns)
-        log.info("[us_data] S&P500 StockListing 컬럼: %s", cols)  # 시총 컬럼명 진단
-        sym_c = next((c for c in ("Symbol", "Code", "Ticker") if c in cols), None)
-        name_c = next((c for c in ("Name", "name") if c in cols), None)
-        if sym_c:
-            for _, row in df.iterrows():
-                try:
-                    sym = str(row[sym_c]).strip().upper()
-                    nm = str(row[name_c]).strip() if name_c else sym
-                except Exception:
-                    continue
-                if sym and sym != "NAN" and sym not in out:
-                    out[sym] = (sym, nm, "S&P500")
-    # 2) NASDAQ100 — 하드코딩 (S&P500 미포함 종목만 추가)
-    for sym in _NASDAQ100:
-        if sym not in out:
-            out[sym] = (sym, sym, "NASDAQ100")
-    log.info("[us_data] 유니버스 fetch: %d종목 (S&P500 FDR + NASDAQ100 하드코딩)", len(out))
+    headers = {
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36",
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    for exch in _EXCHANGES:
+        url = (
+            "https://api.nasdaq.com/api/screener/stocks"
+            f"?tableonly=true&limit=10000&exchange={exch}"
+        )
+        try:
+            resp = requests.get(url, headers=headers, timeout=20)
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as e:
+            log.warning("[us_data] Nasdaq screener %s 실패: %s", exch, e)
+            continue
+        # 응답 구조 방어적 파싱: data.table.rows 또는 data.rows
+        d = data.get("data") or {}
+        rows = (d.get("table") or {}).get("rows") or d.get("rows") or []
+        added = 0
+        for r in rows:
+            try:
+                sym = _normalize_symbol(r.get("symbol", ""))
+                name = str(r.get("name", "")).strip()
+            except Exception:
+                continue
+            if not _is_common_stock(sym, name) or sym in out:
+                continue
+            cap = _parse_cap(r.get("marketCap"))
+            sector = (str(r.get("sector", "")).strip() or None)
+            if sector and sector.lower() in ("nan", "n/a", ""):
+                sector = None
+            out[sym] = (sym, name or sym, cap, sector, exch)
+            added += 1
+        log.info("[us_data] Nasdaq screener %s: %d종목 (누적 %d)", exch, added, len(out))
     return list(out.values())
 
 
-def fetch_market_caps() -> dict[str, int]:
-    """{symbol: market_cap(USD)} — FDR StockListing의 시총 컬럼."""
-    out: dict[str, int] = {}
-    for idx_name in ("S&P500",):  # NASDAQ100 StockListing 미지원 → S&P500만
-        df = _fdr_listing(idx_name)
-        if df is None or df.empty:
+def _fetch_fdr_exchange() -> list[tuple]:
+    """2순위: FDR StockListing(거래소별) 합집합. 시총/섹터 컬럼 있으면 함께.
+
+    반환: [(sym, name, cap|None, sector|None, exch), ...]. 실패 시 [].
+    """
+    out: dict[str, tuple] = {}
+    for exch in _EXCHANGES:
+        df = _fdr_listing(exch)
+        if df is None or getattr(df, "empty", True):
             continue
         cols = list(df.columns)
+        log.info("[us_data] FDR StockListing(%s) 컬럼: %s", exch, cols)
         sym_c = next((c for c in ("Symbol", "Code", "Ticker") if c in cols), None)
+        name_c = next((c for c in ("Name", "name") if c in cols), None)
         cap_c = next(
             (c for c in ("MarketCap", "Marcap", "market_cap", "Market Cap", "Cap", "marketcap")
              if c in cols), None
         )
-        if not sym_c or not cap_c:
-            log.warning("[us_data] 시총 컬럼 없음 — cols=%s", cols)
+        sec_c = next((c for c in ("Sector", "Industry", "sector", "industry") if c in cols), None)
+        if not sym_c:
             continue
         for _, row in df.iterrows():
             try:
-                sym = str(row[sym_c]).strip().upper()
-                cap = int(float(row[cap_c]))
+                sym = _normalize_symbol(row[sym_c])
+                name = str(row[name_c]).strip() if name_c else sym
             except Exception:
                 continue
-            if sym and cap > 0 and sym not in out:
-                out[sym] = cap
+            if not _is_common_stock(sym, name) or sym in out:
+                continue
+            cap = _parse_cap(row[cap_c]) if cap_c else None
+            sector = None
+            if sec_c:
+                s = str(row[sec_c]).strip()
+                sector = s if s and s.lower() != "nan" else None
+            out[sym] = (sym, name or sym, cap, sector, exch)
     if out:
-        log.info("[us_data] market_cap fetch: %d종목", len(out))
+        log.info("[us_data] FDR exchange listing 합집합: %d종목", len(out))
+    return list(out.values())
+
+
+def _fetch_sp500_nasdaq100() -> list[tuple]:
+    """3순위 안전망: S&P500(FDR) + NASDAQ100(하드코딩). 시총/섹터는 S&P500만.
+
+    반환: [(sym, name, cap|None, sector|None, exch), ...].
+    """
+    out: dict[str, tuple] = {}
+    df = _fdr_listing("S&P500")
+    if df is not None and not getattr(df, "empty", True):
+        cols = list(df.columns)
+        log.info("[us_data] S&P500 StockListing 컬럼: %s", cols)
+        sym_c = next((c for c in ("Symbol", "Code", "Ticker") if c in cols), None)
+        name_c = next((c for c in ("Name", "name") if c in cols), None)
+        cap_c = next(
+            (c for c in ("MarketCap", "Marcap", "market_cap", "Market Cap", "Cap", "marketcap")
+             if c in cols), None
+        )
+        sec_c = next((c for c in ("Sector", "Industry", "sector", "industry") if c in cols), None)
+        if sym_c:
+            for _, row in df.iterrows():
+                try:
+                    sym = _normalize_symbol(row[sym_c])
+                    nm = str(row[name_c]).strip() if name_c else sym
+                except Exception:
+                    continue
+                if not sym or sym == "NAN" or sym in out:
+                    continue
+                cap = _parse_cap(row[cap_c]) if cap_c else None
+                sector = None
+                if sec_c:
+                    s = str(row[sec_c]).strip()
+                    sector = s if s and s.lower() != "nan" else None
+                out[sym] = (sym, nm, cap, sector, "S&P500")
+    for sym in _NASDAQ100:
+        if sym not in out:
+            out[sym] = (sym, sym, None, None, "NASDAQ100")
+    log.info("[us_data] 안전망 유니버스: %d종목 (S&P500+NASDAQ100)", len(out))
+    return list(out.values())
+
+
+# 모듈 캐시 — 한 실행에서 fetch_us_tickers/caps/sectors가 소스를 1회만 호출
+_listings_cache: list[tuple] | None = None
+
+
+def fetch_us_listings(force: bool = False) -> list[tuple]:
+    """광역 미국 유니버스 — 보통주 + 시총·섹터. 3단 소스 체인.
+
+    반환: [(sym, name, cap|None, sector|None, exch), ...].
+    Nasdaq screener(1) → FDR 거래소 listing(2) → S&P500+NASDAQ100 안전망(3).
+    같은 실행에서는 모듈 캐시 사용 (caps/sectors/tickers wrapper가 재호출해도 1회).
+    """
+    global _listings_cache
+    if _listings_cache is not None and not force:
+        return _listings_cache
+
+    listings = _fetch_nasdaq_screener()
+    if len(listings) >= 1000:
+        log.info("[us_data] 유니버스 소스=Nasdaq screener (%d종목)", len(listings))
+    else:
+        log.warning("[us_data] Nasdaq screener 부족(%d) → FDR 거래소 listing 시도", len(listings))
+        fdr_listings = _fetch_fdr_exchange()
+        if len(fdr_listings) > len(listings):
+            listings = fdr_listings
+        if len(listings) < 600:
+            log.warning("[us_data] 광역 소스 모두 부족(%d) → S&P500+NASDAQ100 안전망", len(listings))
+            listings = _fetch_sp500_nasdaq100()
+
+    _listings_cache = listings
+    return listings
+
+
+def fetch_us_tickers() -> list[tuple]:
+    """유니버스 ticker 목록. 반환: (symbol, name, exchange_label). (시그니처 유지)"""
+    return [(sym, name, exch) for sym, name, _cap, _sec, exch in fetch_us_listings()]
+
+
+def fetch_market_caps() -> dict[str, int]:
+    """{symbol: market_cap(USD)} — fetch_us_listings에서 분해. (시그니처 유지)"""
+    out = {sym: cap for sym, _n, cap, _s, _e in fetch_us_listings() if cap and cap > 0}
+    if out:
+        log.info("[us_data] market_cap: %d종목", len(out))
     return out
 
 
 def fetch_sectors() -> dict[str, str]:
-    """{symbol: sector} — FDR StockListing의 Sector/Industry 컬럼 (미국은 GICS 제공)."""
-    out: dict[str, str] = {}
-    for idx_name in ("S&P500",):  # NASDAQ100 StockListing 미지원 → S&P500만
-        df = _fdr_listing(idx_name)
-        if df is None or df.empty:
-            continue
-        cols = list(df.columns)
-        sym_c = next((c for c in ("Symbol", "Code", "Ticker") if c in cols), None)
-        sec_c = next((c for c in ("Sector", "Industry", "sector", "industry") if c in cols), None)
-        if not sym_c or not sec_c:
-            continue
-        for _, row in df.iterrows():
-            try:
-                sym = str(row[sym_c]).strip().upper()
-                sec = str(row[sec_c]).strip()
-            except Exception:
-                continue
-            if sym and sec and sec.lower() != "nan" and sym not in out:
-                out[sym] = sec
+    """{symbol: sector} — fetch_us_listings에서 분해. (시그니처 유지)"""
+    out = {sym: sec for sym, _n, _c, sec, _e in fetch_us_listings() if sec}
     if out:
-        log.info("[us_data] sector fetch: %d종목", len(out))
+        log.info("[us_data] sector: %d종목", len(out))
     return out
 
 
