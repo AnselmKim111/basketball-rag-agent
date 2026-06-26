@@ -346,6 +346,54 @@ async def _cmd_diag(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await send_text_chunked(context.bot, chat_id, report)
 
 
+async def _cmd_backtest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/backtest [lookback] [horizon] — 신호 forward 수익률 백테스트 (admin)."""
+    if not is_authorized(update, ALLOWED_ENV):
+        await deny_message(update, "스크리너봇")
+        return
+    chat_id = str(update.effective_chat.id)
+    args = context.args or []
+    lookback = 120
+    horizons = (5, 10, 20)
+    try:
+        if len(args) >= 1:
+            lookback = max(30, min(250, int(args[0])))
+        if len(args) >= 2:
+            horizons = (int(args[1]),)
+    except ValueError:
+        await send_text_chunked(context.bot, chat_id, "사용법: /backtest [lookback일수] [horizon일]")
+        return
+    await send_text_chunked(context.bot, chat_id,
+                            f"📊 백테스트 실행 중 (최근 {lookback}거래일, ~1-3분)...")
+    loop = asyncio.get_running_loop()
+    try:
+        from src.screener import backtest
+        result = await loop.run_in_executor(
+            None, lambda: backtest.backtest_signals(lookback=lookback, horizons=horizons))
+        report = backtest.format_backtest(result)
+    except Exception:
+        log.exception("[backtest] 실패")
+        report = "⚠️ 백테스트 실패 — 로그 확인"
+    await send_text_chunked(context.bot, chat_id, report)
+
+
+async def _cmd_breadth(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/breadth — 시장 폭 지표 (admin). 신고가 부재가 시장 탓인지 판별."""
+    if not is_authorized(update, ALLOWED_ENV):
+        await deny_message(update, "스크리너봇")
+        return
+    chat_id = str(update.effective_chat.id)
+    loop = asyncio.get_running_loop()
+    try:
+        from src.screener import breadth
+        b = await loop.run_in_executor(None, breadth.compute_breadth)
+        report = breadth.format_breadth_full(b)
+    except Exception:
+        log.exception("[breadth] 실패")
+        report = "⚠️ breadth 실패 — 로그 확인"
+    await send_text_chunked(context.bot, chat_id, report)
+
+
 async def _cmd_backfill(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_authorized(update, ALLOWED_ENV):
         await deny_message(update, "스크리너봇")
@@ -835,6 +883,8 @@ SCREENER_COMMANDS = [
     # admin 전용 — 비인가자는 누르면 deny 메시지
     ("status", "🔧 DB·신호 상태 (admin)"),
     ("diag", "🔧 종목 누락 원인 추적 — /diag <코드|이름> (admin)"),
+    ("backtest", "🔧 신호 forward 수익률 백테스트 (admin)"),
+    ("breadth", "🔧 시장 폭 지표 (admin)"),
     ("backfill", "🔧 1년치 OHLCV 백필 (admin)"),
     ("list", "🔧 가입자/차단 목록 (admin)"),
     ("block", "🔧 chat_id 차단 (admin)"),
@@ -852,6 +902,8 @@ def build_screener_app(token: str) -> Application:
     # admin 전용
     app.add_handler(CommandHandler("status", _cmd_status))
     app.add_handler(CommandHandler("diag", _cmd_diag))
+    app.add_handler(CommandHandler("backtest", _cmd_backtest))
+    app.add_handler(CommandHandler("breadth", _cmd_breadth))
     app.add_handler(CommandHandler("backfill", _cmd_backfill))
     app.add_handler(CommandHandler("list", _cmd_list))
     app.add_handler(CommandHandler("block", _cmd_block))

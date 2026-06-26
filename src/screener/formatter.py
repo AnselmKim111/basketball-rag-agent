@@ -156,6 +156,13 @@ def format_results(
         if skipped_no_base > 0:
             line += f" · {skipped_no_base}종목 base_date 데이터 누락"
         parts.append(line)
+        # 시장 폭 — 신고가 부재가 시장 탓인지 판별
+        breadth = stats.get("breadth")
+        if breadth:
+            from src.screener.breadth import format_breadth_line
+            bl = format_breadth_line(breadth)
+            if bl:
+                parts.append(bl)
 
     # 회고 (있으면): 지난 신호 종목들의 N영업일 후 평균 수익률
     if retro:

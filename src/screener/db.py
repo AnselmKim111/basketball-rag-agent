@@ -210,6 +210,15 @@ def latest_date() -> Optional[str]:
     return v
 
 
+def recent_trading_dates(n: int = 150) -> list[str]:
+    """DB에 실제 존재하는 최근 n개 거래일 (오름차순). 백테스트 date loop용."""
+    ensure_schema()
+    with _conn() as c:
+        cur = c.execute("SELECT DISTINCT date FROM ohlcv ORDER BY date DESC LIMIT ?", (n,))
+        dates = [r[0] for r in cur.fetchall()]
+    return sorted(dates)
+
+
 def distinct_tickers_in_db() -> set[str]:
     ensure_schema()
     with _conn() as c:

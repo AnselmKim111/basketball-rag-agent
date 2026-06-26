@@ -364,6 +364,8 @@ def compute_all(base_date: str | None = None) -> tuple[dict[str, list[dict]], di
     no_base_tickers: list[str] = []
     short_tickers: list[str] = []
     max_cap_seen = 0
+    from src.screener.breadth import BreadthAccumulator
+    breadth_acc = BreadthAccumulator()
     for tinfo in tickers:
         ticker = tinfo["ticker"]
         cap = tinfo.get("market_cap")
@@ -371,6 +373,8 @@ def compute_all(base_date: str | None = None) -> tuple[dict[str, list[dict]], di
             skipped_cap += 1
             continue
         rows = db.load_ohlcv(ticker, days=1300)
+        # 시장 폭 누산 (이중 I/O 없이 — 이미 로드된 rows). <60행도 자체 길이 가드 있음.
+        breadth_acc.add(rows)
         if len(rows) < 60:
             skipped_short += 1
             if len(short_tickers) < 30:
@@ -415,6 +419,7 @@ def compute_all(base_date: str | None = None) -> tuple[dict[str, list[dict]], di
         "skipped_no_base": skipped_no_base,
         "skipped_short": skipped_short,
         "total_active": len(tickers),
+        "breadth": breadth_acc.result(),
     }
     log.info(
         "[signals] base_date=%s processed=%d skipped_cap=%d skipped_no_base=%d "
