@@ -85,16 +85,22 @@
 스크리닝봇은 IdeaBot/wisereport 와 격리. 자체 SQLite (`/data/screener.db`),
 별도 cron(매일 16:00 KST), 자체 텔레그램 봇 토큰.
 
-### 핵심 파일
-- `src/screener_bot.py` — 봇 entrypoint, `screener_daily_job` (cron), `_self_test`
-- `src/screener/signals.py` — 신호 계산 (base_date-anchored, **반드시** base_date 명시)
-- `src/screener/incremental.py` — `update_today` (cron), `update_specific_date` (강제 fetch),
-  `ensure_recent_business_day_data` (가장 최근 영업일 보장)
-- `src/screener/data_source.py` — Naver/pykrx/FDR 통합. `fetch_ohlcv_by_ticker_via_naver`가 1순위
-- `src/screener/validator.py` — 발송 직전 cross-validation (Naver 재 fetch ↔ DB)
-- `src/screener/formatter.py` — 미미 스타일 섹터별 그룹핑 출력
-- `src/screener/db.py` — SQLite (tickers, ohlcv, signals, meta), 280일 retention
-- `src/screener/universe.py` — KOSPI/KOSDAQ 보통주 + 시총 + 섹터 갱신
+### 구조 — KR/US 공통 core + 시장별 wrapper
+- **`src/screener_core/`** — 시장 비의존 공통 (단일 출처, 여기만 고치면 KR/US 동시 반영):
+  · `signals.py` — `compute_signals_for_ticker` (base_date-anchored 신호 계산) + `composite_score` + `CATEGORIES`
+  · `formatter.py` — 미미 스타일 헬퍼. 시장 차이는 `FormatConfig`(fallback_sector/priority_market/label_fn) 주입
+  · `incremental.py`/`backfill.py`/`validator.py`/`subscribers.py` — `make_api(deps...)` closure DI.
+    incremental은 `tz`(시장 timezone)·`fdr_fallback` 파라미터 받음
+- **`src/screener/`** (KR wrapper) + `src/screener_bot.py` — KOSPI/KOSDAQ, 매일 16:00 KST cron
+  · `data_source.py` — Naver/pykrx/FDR 통합. `fetch_ohlcv_by_ticker_via_naver`가 1순위
+  · `db.py` — SQLite (tickers, ohlcv, signals, meta), 1400일 retention
+  · `universe.py` — KOSPI/KOSDAQ 보통주 + 시총 + 섹터 갱신
+- **`src/us_screener/`** (US wrapper) + `src/us_screener_bot.py` — S&P500+Nasdaq100, 매일 07:00 KST cron
+  · `data_source.py` — FDR 1순위 → Stooq 폴백. KR과 **동일 함수 시그니처** 유지
+    (`fetch_ohlcv_by_ticker_via_naver` 이름으로 FDR→Stooq 수행, date-batch는 빈 리스트)
+  · incremental은 `tz=America/New_York`, `fdr_fallback=False` 주입 (KST로 두면
+    미국장 기준 미존재 날짜를 전 종목 fetch로 헛돌고, FDR 재스캔은 동일 소스 낭비)
+  · 가격은 cent 단위 정수(×100) 저장, 시총 $1B+ 필터, `US_SCREENER_*` env
 
 ### 데이터 소스 우선순위 (절대 순서 지킬 것)
 1. **Naver Finance siseJson API** — 1순위 (시뮬레이션 환경에서도 정확)
@@ -106,11 +112,13 @@
 - 섹터: pykrx 업종지수(1004~1026) → FDR Industry → 종목명 keyword 휴리스틱(28카테고리)
 
 ### 신호 (4종)
-1. `high_all` — 보유 데이터(280일) 역사적 신고가
+1. `high_all` — 보유 데이터(최대 1400일) 역사적 신고가
 2. `high_52w` — 252영업일 신고가
-3. `volume_breakout` — 오늘 거래량 ≥ 20일 평균 × 2.0 + 종가 상승
-4. `near_breakout_52w` — 52주고점 95~99% + 5일 거래량 ≥ ×1.3
-5. `vcp_breakout` — 50일 박스권(≤1.20) + ATR 30%+ 수축 + 거래량 dry-up + 거래량 동반 상방돌파
+3. `near_breakout_52w` — 52주고점 95~99% + 5일 거래량 ≥ ×1.3
+4. `vcp_breakout` — 50일 박스권 + ATR 수축 + 박스권 상단 돌파 (최근 2주 이내)
+
+(제거됨: `volume_breakout` 거래량≥2배 — 노이즈 다수로 사용자 요청 삭제.
+ 신호 추가/제거는 `src/screener_core/signals.py` + `formatter.py` 두 파일만 수정.)
 
 ### 이중확인 구조 (절대 깨지 말 것)
 신호의 정확성을 두 단계로 보장:
@@ -141,7 +149,7 @@
 미수신이면 `ensure_recent_business_day_data`로 직전 영업일 fetch.
 
 ### 메시지 포맷 (미미 스타일)
-- 섹션: 🚀 역사적 신고가 / 📈 52주 신고가 / 💎 VCP 돌파 / 🔥 거래량 돌파 / 🎯 52주 돌파 직전
+- 섹션: 🚀 역사적 신고가 / 📈 52주 신고가 / 💎 VCP 돌파 / 🎯 52주 돌파 직전
 - 섹션 안에서 섹터별 그룹핑: `(반도체) 삼성전자(+5.2%), SK하이닉스(+3.1%)`
 - KOSPI 우선 정렬 (각 섹터 내부)
 - 헤더에 base_date + 검증 종목 수 + 이중확인 통과 수 명시

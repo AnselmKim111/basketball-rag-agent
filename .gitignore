@@ -3,16 +3,11 @@
 .env.local
 *.env
 CLAUDE.local.md
-.claude/settings.local.json
-
-# Claude Code 개인 설정 (팀 공유 X)
-.claude/settings.local.json
 
 # Downloaded reports (do not commit user data)
 downloads/
 output/
 summaries/
-reports/
 .wisereport_state.json
 
 # Python
@@ -44,5 +39,5 @@ playwright-report/
 .DS_Store
 CLAUDE.md
 
-# Claude Code local settings (per-user)
+# Claude Code 개인 설정 (커밋 금지)
 .claude/settings.local.json
