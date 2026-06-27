@@ -871,6 +871,42 @@ async def _self_test(bot: Bot) -> None:
     log.info("[self-test] 종료")
 
 
+async def _verify_once(bot: Bot) -> None:
+    """SCREENER_VERIFY_ONCE=1 시 부팅 후 1회 — breadth + backtest를 기존 DB로 계산해
+    로그·admin에 출력(라이브 검증용). Naver 재fetch 없음(빠름). 실패는 로그만."""
+    await asyncio.sleep(20)  # 폴링 안정화 대기
+    loop = asyncio.get_running_loop()
+    ids = _parse_chat_ids(CHAT_ID_ENV, ALLOWED_ENV)
+    admin = ids[0] if ids else None
+    log.info("=" * 60)
+    log.info("[verify] 라이브 검증 시작 (breadth + backtest)")
+
+    # breadth
+    try:
+        from src.screener import breadth
+        b = await loop.run_in_executor(None, breadth.compute_breadth)
+        report = breadth.format_breadth_full(b)
+        log.info("[verify] BREADTH\n%s", report)
+        if admin:
+            await send_text_chunked(bot, admin, report)
+    except Exception:
+        log.exception("[verify] breadth 실패")
+
+    # backtest
+    try:
+        from src.screener import backtest
+        res = await loop.run_in_executor(
+            None, lambda: backtest.backtest_signals(lookback=90, sample_every=5,
+                                                    horizons=(5, 10, 20)))
+        report = backtest.format_backtest(res)
+        log.info("[verify] BACKTEST\n%s", report)
+        if admin:
+            await send_text_chunked(bot, admin, report)
+    except Exception:
+        log.exception("[verify] backtest 실패")
+    log.info("[verify] 종료")
+
+
 # ------------------------------------------------------------------
 # Entry point (orchestrator가 호출)
 # ------------------------------------------------------------------
@@ -913,6 +949,12 @@ def build_screener_app(token: str) -> Application:
         try:
             loop = asyncio.get_running_loop()
             loop.create_task(_self_test(app.bot))
+        except RuntimeError:
+            pass
+    if os.getenv("SCREENER_VERIFY_ONCE", "0") == "1":
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(_verify_once(app.bot))
         except RuntimeError:
             pass
     return app
