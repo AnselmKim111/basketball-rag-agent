@@ -28,12 +28,14 @@ def render_caption(
     header_use_name: bool = False,
     show_ticker_in_name: bool = False,
     eps_label: str = "최근분기 EPS YoY",
+    data_date: str | None = None,
 ) -> str:
     """차트 캡션 (HTML parse_mode 가정).
 
     header_use_name: 첫줄에 종목명 사용 (KR), False면 ticker (US).
     show_ticker_in_name: 종목명 줄에 (ticker)도 함께 (KR 관례).
     earnings_date 있으면 badge 아래 ⚡ 라인 삽입 (US 어닝 마커).
+    data_date: 차트 데이터 마지막 거래일 — 기준일 표기 (stale이면 caller가 ⚠️ 첨부).
     """
     name = html_escape(item.get("name") or ticker)
     chg = item.get("chg_pct") or 0.0
@@ -45,6 +47,10 @@ def render_caption(
         badge,
         "",
         f"✝ 종목명 : {name_line_value}",
+    ]
+    if data_date:
+        lines.append(f"✝ 기준일 : {html_escape(data_date)}")
+    lines += [
         f"✝ 시가총액 : {fmt_money(market_cap)}",
         f"✝ 거래대금 : {fmt_money(turnover)}",
         f"✝ 연초대비 상승률 : {fmt_pct(ytd)}",

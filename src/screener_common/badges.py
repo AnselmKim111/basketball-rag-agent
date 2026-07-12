@@ -6,4 +6,5 @@ BADGE: dict[str, str] = {
     "vcp_breakout": "💎 VCP 돌파",
     "volume_breakout": "🔥 거래량 돌파",
     "near_breakout_52w": "🎯 52주 돌파 직전",
+    "rs_leaders": "💪 상대강도 리더",
 }

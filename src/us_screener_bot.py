@@ -392,7 +392,8 @@ from src.screener_common import permalink as _permalink, render_caption, fmt_usd
 
 
 def _chart_caption(ticker: str, item: dict, cats: list[str], rows: list[dict],
-                   ytd, eps, market_cap=None, earnings_date: str | None = None) -> str:
+                   ytd, eps, market_cap=None, earnings_date: str | None = None,
+                   data_date: str | None = None) -> str:
     from src.us_screener import fundamentals
     turnover = fundamentals.turnover_usd(rows[-1]) if rows else 0
     return render_caption(
@@ -403,23 +404,29 @@ def _chart_caption(ticker: str, item: dict, cats: list[str], rows: list[dict],
         fmt_money=_fmt_usd,
         news_url_template="https://finviz.com/quote.ashx?t={ticker}",
         earnings_date=earnings_date,
+        data_date=data_date,
     )
 
 
-async def _post_charts_and_meta(results: dict, max_tickers: int = 120) -> tuple[dict, dict]:
+# 차트/메타 대상 = formatter 표시 섹션과 1:1 계약 (KR 미러와 구조 통일 — drift 방지).
+DISPLAY_CATEGORIES = ("near_breakout_52w", "high_all", "high_52w", "vcp_breakout", "rs_leaders")
+
+
+async def _post_charts_and_meta(results: dict, base_date: str | None = None,
+                                max_tickers: int = 120) -> tuple[dict, dict]:
     """신호 티커별 (1) 채널 차트 게시 → permalink, (2) ytd·eps 메타 산출.
 
     채널 토큰/ID 미설정이면 게시는 건너뛰고 메타(ytd·eps)만 계산(4열 포맷 enrich).
+    base_date: freshness 가드용 — 차트 데이터 마지막 거래일과 불일치 시 warning + ⚠️.
     반환: (links: {ticker: url}, extra: {ticker: {ytd, eps_yoy}}).
     """
     from src.us_screener import chart, db, fundamentals
 
-    # 카테고리 dedupe + 티커별 badge
     by_ticker: dict[str, dict] = {}
     badges: dict[str, list] = {}
     for cat, items in results.items():
-        if cat == "volume_breakout":
-            continue  # 거래량 돌파는 메시지·채널서 제외
+        if cat not in DISPLAY_CATEGORIES:
+            continue
         for it in items:
             t = it.get("ticker")
             if not t:
@@ -463,13 +470,18 @@ async def _post_charts_and_meta(results: dict, max_tickers: int = 120) -> tuple[
             if mcap:
                 mcap_n += 1
             if chart_bot and rows:
+                # freshness 가드 — cron 경로에선 절대 stale이 아니어야 정상 (뜨면 조기 경보)
+                data_date = rows[-1]["date"]
+                if base_date and data_date != base_date:
+                    log.warning("[chart] %s 데이터 stale (%s != base %s)", t, data_date, base_date)
+                    data_date += " ⚠️"
                 png = await loop.run_in_executor(
                     None, lambda t=t, rows=rows, it=it: chart.render_candle_volume(
                         t, rows, title=f"{t} — {it.get('name', '')}"))
                 if png:
                     from src.bot_helpers import send_channel_photo
                     cap = _chart_caption(t, it, badges[t], rows, ytd, eps, market_cap=mcap,
-                                         earnings_date=ed)
+                                         earnings_date=ed, data_date=data_date)
                     msg = await send_channel_photo(chart_bot, channel, png, cap, ParseMode.HTML)
                     if msg:
                         url = _permalink(channel, msg.message_id)
@@ -717,7 +729,7 @@ async def _us_screener_daily_job_locked(bot: Bot, override_chat_id: str | None) 
 
         # 티커별 채널 차트 게시 + ytd/eps 메타 (채널 미설정 시 메타만)
         try:
-            links, extra = await _post_charts_and_meta(results)
+            links, extra = await _post_charts_and_meta(results, base_date)
         except Exception:
             log.exception("[scheduled] 차트 게시/메타 실패 — 링크 없이 발송")
             links, extra = {}, {}

@@ -444,7 +444,8 @@ from src.bot_helpers import parse_admin_chat_ids as _parse_chat_ids  # legacy al
 from src.screener_common import permalink as _permalink, render_caption, fmt_won as _fmt_won, fmt_pct as _fmt_pct
 
 
-def _chart_caption(ticker: str, item: dict, cats: list[str], rows: list[dict], ytd, eps) -> str:
+def _chart_caption(ticker: str, item: dict, cats: list[str], rows: list[dict], ytd, eps,
+                   data_date: str | None = None) -> str:
     from src.screener import fundamentals
     turnover = fundamentals.turnover_won(rows[-1]) if rows else 0
     return render_caption(
@@ -457,7 +458,14 @@ def _chart_caption(ticker: str, item: dict, cats: list[str], rows: list[dict], y
         header_use_name=True,
         show_ticker_in_name=True,
         eps_label="최근 EPS YoY",
+        data_date=data_date,
     )
+
+
+# 차트/메타 대상 = formatter.format_results 표시 섹션과 1:1 계약 (링크·YTD는 표시
+# 종목에만 필요). 미표시 신호(추세전환 4종·volume_breakout)까지 게시하면 채널 flood +
+# max_tickers cap 소모 — 실측 하루 ~94건 낭비. 섹션 추가 시 여기도 함께 갱신할 것.
+DISPLAY_CATEGORIES = ("near_breakout_52w", "high_all", "high_52w", "vcp_breakout", "rs_leaders")
 
 
 async def _post_charts_and_meta(results: dict, base_date: str,
@@ -472,8 +480,8 @@ async def _post_charts_and_meta(results: dict, base_date: str,
     by_ticker: dict[str, dict] = {}
     badges: dict[str, list] = {}
     for cat, items in results.items():
-        if cat in ("volume_breakout", "rs_leaders"):
-            continue  # 거래량 돌파는 제외 · RS 리더는 텍스트만 (채널 flood 제어)
+        if cat not in DISPLAY_CATEGORIES:
+            continue
         for it in items:
             t = it.get("ticker")
             if not t:
@@ -509,12 +517,17 @@ async def _post_charts_and_meta(results: dict, base_date: str,
             eps = eps_map.get(t)
             extra[t] = {"ytd": ytd, "eps_yoy": eps}
             if chart_bot and rows:
+                # freshness 가드 — cron 경로에선 절대 stale이 아니어야 정상 (뜨면 조기 경보)
+                data_date = rows[-1]["date"]
+                if data_date != base_date:
+                    log.warning("[chart] %s 데이터 stale (%s != base %s)", t, data_date, base_date)
+                    data_date += " ⚠️"
                 title = f"{it.get('name', t)} ({t})"
                 png = await loop.run_in_executor(
                     None, lambda t=t, rows=rows, title=title: chart.render_candle_volume(t, rows, title=title))
                 if png:
                     from src.bot_helpers import send_channel_photo
-                    cap = _chart_caption(t, it, badges[t], rows, ytd, eps)
+                    cap = _chart_caption(t, it, badges[t], rows, ytd, eps, data_date=data_date)
                     msg = await send_channel_photo(chart_bot, channel, png, cap, ParseMode.HTML)
                     if msg:
                         url = _permalink(channel, msg.message_id)
