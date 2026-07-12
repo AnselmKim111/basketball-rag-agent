@@ -171,15 +171,17 @@ def format_results(
         if retro_str:
             parts.append(retro_str)
 
-    # 앞에 나온 종목은 뒷 섹션서 제외 (역사적 신고가 → 52주 신고가 순으로 dedup)
+    # 섹션 순서 = 백테스트 edge 순 (2026-06 검증: 돌파직전 +2.3%p > 52주 +2.0%p > ATH).
+    # 앞 섹션이 종목을 먼저 claim (공용 seen dedup).
     seen: set = set()
+    parts.append(_format_section(results.get("near_breakout_52w", []), "🎯", "52주 돌파 직전 90-99%", links, extra, seen))
     parts.append(_format_section(results.get("high_all", []), "🚀", "역사적 신고가", links, extra, seen))
     parts.append(_format_section(results.get("high_52w", []), "📈", "52주 신고가", links, extra, seen))
     parts.append(_format_section(results.get("vcp_breakout", []), "💎", "VCP 돌파 (최근 1주 이내)", links, extra, seen))
-    parts.append(_format_section(results.get("near_breakout_52w", []), "🎯", "52주 돌파 직전 95-99%", links, extra, seen))
+    parts.append(_format_section(results.get("rs_leaders", []), "💪", "상대강도 리더 (시장 대비 상위 10%)", links, extra, seen))
 
     total = sum(len(results.get(k, [])) for k in
-                ("high_all", "high_52w", "vcp_breakout", "near_breakout_52w"))
+                ("high_all", "high_52w", "vcp_breakout", "near_breakout_52w", "rs_leaders"))
     if total == 0:
         parts.append("\n오늘은 신호 발생 종목이 없습니다.")
 

@@ -28,8 +28,14 @@ KST = timezone(timedelta(hours=9))
 
 # 임계값 — env 오버라이드 가능
 DEFAULT_VOL_BREAKOUT_RATIO = 2.0
-DEFAULT_NEAR_BREAKOUT_LOWER = 0.95
+# 0.95→0.90 확장 (Phase 2) — 백테스트 edge 최고 신호(+2.3%p@10일)를 넓게 포착.
+# 확장 구간(0.90~0.95)은 compute_all에서 RS rank 게이트로 노이즈 차단.
+DEFAULT_NEAR_BREAKOUT_LOWER = 0.90
 DEFAULT_NEAR_BREAKOUT_UPPER = 0.99
+# 확장 구간 RS 게이트 / RS 리더 선정 임계 (백분위)
+DEFAULT_RS_GATE_PCT = 60.0
+DEFAULT_RS_LEADER_PCT = 90.0
+DEFAULT_RS_LEADER_MAX = 10
 # 시가총액 필터 (원). 기본 3000억 — 사용자 요구사항.
 DEFAULT_MIN_MARKET_CAP = 300_000_000_000
 
@@ -300,6 +306,8 @@ CATEGORIES = [
     "rsi_oversold_recovery",
     "base_hold_after_breakout",
     "downtrend_exit",
+    # 유니버스 상대강도 리더 (compute_all에서 cross-sectional 산출 — per-ticker 아님)
+    "rs_leaders",
 ]
 
 
@@ -309,7 +317,8 @@ def _composite_score(item: dict, max_cap: float) -> float:
     score = 0.5 * normalized_chg_pct + 0.5 * normalized_log_cap
       - normalized_chg_pct: 0 ~ 30% 기준 0~1 (clip)
       - normalized_log_cap: log10(cap) / log10(max_cap)
-    상승률 높고 시총 큰 종목이 우선. desc 정렬용 → 음수 반환.
+      - normalized_rs: rs_3m_rank/100 (유니버스 상대강도, 없으면 0.5 중립)
+    score = 0.4·chg + 0.3·cap + 0.3·rs. desc 정렬용 → 음수 반환.
     """
     chg = max(0.0, float(item.get("chg_pct", 0.0)))
     norm_chg = min(chg / 30.0, 1.0)
@@ -320,7 +329,10 @@ def _composite_score(item: dict, max_cap: float) -> float:
         norm_cap = max(0.0, min(1.0, norm_cap))
     else:
         norm_cap = 0.0
-    score = 0.5 * norm_chg + 0.5 * norm_cap
+    # RS 항 (Phase 2) — 시장을 이기는 종목 우선. rank 없으면 중립 0.5.
+    rs = item.get("rs_3m_rank")
+    norm_rs = (rs / 100.0) if isinstance(rs, (int, float)) else 0.5
+    score = 0.4 * norm_chg + 0.3 * norm_cap + 0.3 * norm_rs
     return -score
 
 
@@ -364,6 +376,7 @@ def compute_all(base_date: str | None = None) -> tuple[dict[str, list[dict]], di
     no_base_tickers: list[str] = []
     short_tickers: list[str] = []
     max_cap_seen = 0
+    rs_meta: dict[str, dict] = {}  # ticker → 상대강도 원료 (base_date 기준)
     from src.screener.breadth import BreadthAccumulator
     breadth_acc = BreadthAccumulator()
     for tinfo in tickers:
@@ -381,8 +394,8 @@ def compute_all(base_date: str | None = None) -> tuple[dict[str, list[dict]], di
                 short_tickers.append(f"{ticker}({len(rows)})")
             continue
         # base_date row 보유 여부 검증
-        has_base = any(r["date"] == base_date for r in rows)
-        if not has_base:
+        base_idx = next((i for i, r in enumerate(rows) if r["date"] == base_date), None)
+        if base_idx is None:
             skipped_no_base += 1
             if len(no_base_tickers) < 30:
                 no_base_tickers.append(f"{ticker}({tinfo.get('name') or '?'})")
@@ -392,6 +405,26 @@ def compute_all(base_date: str | None = None) -> tuple[dict[str, list[dict]], di
         except Exception:
             log.exception("[signals] %s 계산 실패", ticker)
             continue
+        # 유니버스 상대강도(RS) 원료 — base_date 기준 truncate된 종가로 계산
+        closes = [r.get("close") or 0 for r in rows[: base_idx + 1]]
+        if len(closes) >= 64 and closes[-64] > 0 and closes[-1] > 0:
+            cur = closes[-1]
+            meta = {
+                "r3m_pct": (cur / closes[-64] - 1) * 100,
+                "r1m_pct": (cur / closes[-22] - 1) * 100 if closes[-22] > 0 else None,
+                "above_ma50": len(closes) >= 50 and cur > sum(closes[-50:]) / 50,
+                "chg_pct": (cur / closes[-2] - 1) * 100 if closes[-2] > 0 else 0.0,
+                "close": cur,
+            }
+            if len(closes) >= 252:
+                past_close_hi = max(closes[-252:-1])
+                meta["near_high_15"] = past_close_hi > 0 and cur >= past_close_hi * 0.85
+            else:
+                meta["near_high_15"] = False
+            meta.update({"name": tinfo.get("name") or ticker,
+                         "market": tinfo.get("market") or "",
+                         "market_cap": cap, "sector": tinfo.get("sector") or ""})
+            rs_meta[ticker] = meta
         if cap and cap > max_cap_seen:
             max_cap_seen = cap
         for cat_key, payload in sigs.items():
@@ -408,8 +441,57 @@ def compute_all(base_date: str | None = None) -> tuple[dict[str, list[dict]], di
             by_cat[cat_key].append(entry)
         processed += 1
 
-    # 시총+상승률 복합 정렬
+    # ------------------------------------------------------------------
+    # 유니버스 상대강도(RS) — 3M 수익률 백분위 rank (0~100)
+    # ------------------------------------------------------------------
+    rs_rank: dict[str, float] = {}
+    ranked = sorted(rs_meta.items(), key=lambda kv: kv[1]["r3m_pct"])
+    n_rank = len(ranked)
+    if n_rank >= 2:
+        for i, (t, _) in enumerate(ranked):
+            rs_rank[t] = round(i / (n_rank - 1) * 100, 1)
+
+    # 모든 신호 entry에 rs_3m_rank 부여
+    for items in by_cat.values():
+        for it in items:
+            it["rs_3m_rank"] = rs_rank.get(it["ticker"])
+
+    # near_breakout 확장 구간(proximity < 95%) — RS 게이트로 노이즈 차단.
+    # 코어 구간(95~99%)은 백테스트 검증된 그대로 무조건 유지.
+    rs_gate = _get_float_env("SCREENER_RS_GATE_PCT", DEFAULT_RS_GATE_PCT)
+    nb = by_cat.get("near_breakout_52w") or []
+    if nb:
+        kept = [it for it in nb
+                if (it.get("proximity_pct") or 0) >= 95.0
+                or (it.get("rs_3m_rank") or 0) >= rs_gate]
+        gated = len(nb) - len(kept)
+        if gated:
+            log.info("[signals] near_breakout 확장구간 RS 게이트: %d종목 제외", gated)
+        by_cat["near_breakout_52w"] = kept
+
+    # RS 리더 — 시장 대비 상위 + 기술적 양호 (약세장 리더십 watchlist)
+    leader_pct = _get_float_env("SCREENER_RS_LEADER_PCT", DEFAULT_RS_LEADER_PCT)
+    leader_max = int(_get_float_env("SCREENER_RS_LEADER_MAX", DEFAULT_RS_LEADER_MAX))
+    leaders = []
+    for t, m in rs_meta.items():
+        rank = rs_rank.get(t)
+        if rank is None or rank < leader_pct:
+            continue
+        if not m.get("above_ma50") or not m.get("near_high_15"):
+            continue
+        leaders.append({
+            "ticker": t, "name": m["name"], "market": m["market"],
+            "market_cap": m["market_cap"], "sector": m["sector"],
+            "close": int(m["close"]), "chg_pct": round(m["chg_pct"], 2),
+            "rs_3m_rank": rank, "r3m_pct": round(m["r3m_pct"], 1),
+        })
+    leaders.sort(key=lambda x: -x["rs_3m_rank"])
+    by_cat["rs_leaders"] = leaders[:leader_max]
+
+    # 시총+상승률+RS 복합 정렬 (rs_leaders는 이미 RS rank desc — 유지)
     for cat, items in by_cat.items():
+        if cat == "rs_leaders":
+            continue
         items.sort(key=lambda it: _composite_score(it, max_cap_seen))
 
     stats = {

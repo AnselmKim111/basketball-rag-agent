@@ -472,8 +472,8 @@ async def _post_charts_and_meta(results: dict, base_date: str,
     by_ticker: dict[str, dict] = {}
     badges: dict[str, list] = {}
     for cat, items in results.items():
-        if cat == "volume_breakout":
-            continue  # 거래량 돌파는 메시지·채널서 제외
+        if cat in ("volume_breakout", "rs_leaders"):
+            continue  # 거래량 돌파는 제외 · RS 리더는 텍스트만 (채널 flood 제어)
         for it in items:
             t = it.get("ticker")
             if not t:
