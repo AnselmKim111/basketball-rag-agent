@@ -87,9 +87,10 @@ def _install_blanket_dummies(names: list[str]) -> None:
 
 _install_dummy_telegram()
 _install_dummy_openai()
+# bs4는 더미 제외 — channel_relay 파서 테스트가 실제 파싱을 검증 (dev에 설치됨).
 _install_blanket_dummies([
     "pypdf", "playwright", "playwright.sync_api",
-    "httpx", "bs4", "matplotlib", "matplotlib.pyplot",
+    "httpx", "matplotlib", "matplotlib.pyplot",
     "matplotlib.backends", "matplotlib.backends.backend_pdf",
     "PIL", "PIL.Image", "FinanceDataReader", "pykrx", "pykrx.stock",
 ])
