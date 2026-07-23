@@ -23,3 +23,5 @@ finance-datareader>=0.9.0,<1
 squarify>=0.4,<1
 # earnings PDF lint (markdown raw 잔존 자동 검사 — _lint_pdf)
 pdfminer.six>=20231228
+# channel_relay MTProto 백엔드 (웹 프리뷰 꺼진 공개 채널 읽기 — DSInvResearch 등)
+telethon>=1.36,<2

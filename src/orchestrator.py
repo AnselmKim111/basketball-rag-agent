@@ -48,6 +48,7 @@ from src.category_bots import (
     industry_top10_job,
     market_daily_job,
 )
+from src.channel_relay import channel_relay_job
 from src.disclosure_bot import DISCLOSURE_COMMANDS, build_disclosure_app, disclosure_poll_job
 from src.earnings_bot import EARNINGS_COMMANDS, build_earnings_app, earnings_watch_poll_job, earnings_digest_cron_job
 from src.idea_bot import IDEA_COMMANDS, build_idea_app
@@ -161,6 +162,13 @@ BOT_SPECS: list[BotSpec] = [
                 job_id="market_daily",
                 cron={"hour": 9, "minute": 0},
                 description="시황 신규 — 매일 09:00 KST",
+            ),
+            ScheduledJob(
+                func=channel_relay_job,
+                job_id="channel_relay",
+                # 20분 폴링 — "저자 글 3시간 이내 전달" 요구에 충분한 여유.
+                cron={"minute": "*/20"},
+                description="t.me/DSInvResearch 양형모 글 릴레이 — 20분 폴링",
             ),
         ],
     ),
