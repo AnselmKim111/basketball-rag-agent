@@ -465,7 +465,8 @@ def _chart_caption(ticker: str, item: dict, cats: list[str], rows: list[dict], y
 # 차트/메타 대상 = formatter.format_results 표시 섹션과 1:1 계약 (링크·YTD는 표시
 # 종목에만 필요). 미표시 신호(추세전환 4종·volume_breakout)까지 게시하면 채널 flood +
 # max_tickers cap 소모 — 실측 하루 ~94건 낭비. 섹션 추가 시 여기도 함께 갱신할 것.
-DISPLAY_CATEGORIES = ("near_breakout_52w", "high_all", "high_52w", "vcp_breakout", "rs_leaders")
+DISPLAY_CATEGORIES = ("near_breakout_52w", "high_all", "high_52w", "high_26w",
+                      "vcp_breakout", "volume_surge", "rs_leaders")
 
 
 async def _post_charts_and_meta(results: dict, base_date: str,

@@ -132,6 +132,7 @@ def backtest_signals(
 _CAT_LABEL = {
     "high_all": "역사적 신고가",
     "high_52w": "52주 신고가",
+    "high_26w": "6개월 신고가",
     "vcp_breakout": "VCP 돌파",
     "volume_breakout": "거래량 돌파",
     "near_breakout_52w": "52주 돌파 직전",

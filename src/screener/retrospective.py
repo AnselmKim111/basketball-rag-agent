@@ -89,9 +89,11 @@ def signal_returns(
 _CAT_LABEL = {
     "high_all": "역사적 신고가",
     "high_52w": "52주 신고가",
+    "high_26w": "6개월 신고가",
     "vcp_breakout": "VCP 돌파",
     "near_breakout_52w": "52주 돌파 직전",
     "rs_leaders": "상대강도 리더",
+    "volume_surge": "수급 유입",
 }
 
 
@@ -101,7 +103,8 @@ def format_retrospective_line(retro: dict, days_ahead: int = 5) -> str:
         return ""
     parts = [f"🔁 <b>지난 회고</b> (신호일 기준 {days_ahead}영업일 후)"]
     # 카테고리 표시 순서
-    order = ("high_all", "high_52w", "vcp_breakout", "near_breakout_52w", "rs_leaders")
+    order = ("high_all", "high_52w", "high_26w", "vcp_breakout", "near_breakout_52w",
+             "volume_surge", "rs_leaders")
     for cat in order:
         d = retro.get(cat)
         if not d or d["n"] == 0:

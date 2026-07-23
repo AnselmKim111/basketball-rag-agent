@@ -409,7 +409,8 @@ def _chart_caption(ticker: str, item: dict, cats: list[str], rows: list[dict],
 
 
 # 차트/메타 대상 = formatter 표시 섹션과 1:1 계약 (KR 미러와 구조 통일 — drift 방지).
-DISPLAY_CATEGORIES = ("near_breakout_52w", "high_all", "high_52w", "vcp_breakout", "rs_leaders")
+DISPLAY_CATEGORIES = ("near_breakout_52w", "high_all", "high_52w", "high_26w",
+                      "vcp_breakout", "volume_surge", "rs_leaders")
 
 
 async def _post_charts_and_meta(results: dict, base_date: str | None = None,

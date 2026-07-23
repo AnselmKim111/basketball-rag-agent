@@ -36,6 +36,11 @@ DEFAULT_NEAR_BREAKOUT_UPPER = 0.99
 DEFAULT_RS_GATE_PCT = 60.0
 DEFAULT_RS_LEADER_PCT = 90.0
 DEFAULT_RS_LEADER_MAX = 10
+# 수급 유입(volume_surge) 표시 게이트 — 원신호 volume_breakout(2×)은 저장용으로 유지,
+# 표시는 강한 것만 (거래량 3× + 종가 +3% + RS 상위 50%)
+DEFAULT_VOL_SURGE_RATIO = 3.0
+DEFAULT_VOL_SURGE_CHG = 3.0
+DEFAULT_VOL_SURGE_RS = 50.0
 # 시가총액 필터 (원). 기본 3000억 — 사용자 요구사항.
 DEFAULT_MIN_MARKET_CAP = 300_000_000_000
 
@@ -105,6 +110,19 @@ def compute_signals_for_ticker(rows: list[dict], base_date: str | None = None) -
                 "close": int(today["close"]),
                 "prev_high": int(past_close_high_52w),
                 "pct": float((today["close"] / past_close_high_52w - 1) * 100),
+                "chg_pct": chg_pct,
+            }
+
+    # 1.5) 6개월(126거래일) 신고가 — 종가기준. 장기 하락 후 회복 국면 조기 포착
+    # (52주 고점에선 멀지만 6개월 박스권을 뚫는 GS건설류). 52주 신고가와 독립 발화 —
+    # 중복 표시는 formatter dedup이 처리, 백테스트는 원신호 그대로 측정.
+    if len(df) >= 127:
+        past_close_high_26w = df["close"].iloc[-127:-1].max()
+        if today["close"] > past_close_high_26w and past_close_high_26w > 0:
+            out["high_26w"] = {
+                "close": int(today["close"]),
+                "prev_high": int(past_close_high_26w),
+                "pct": float((today["close"] / past_close_high_26w - 1) * 100),
                 "chg_pct": chg_pct,
             }
 
@@ -298,8 +316,10 @@ def compute_signals_for_ticker(rows: list[dict], base_date: str | None = None) -
 CATEGORIES = [
     "high_all",
     "high_52w",
+    "high_26w",
     "vcp_breakout",
     "volume_breakout",
+    "volume_surge",
     "near_breakout_52w",
     # 신규 trend_reversal 4종 — 버터대디봇 watchlist용
     "ma_golden_cross",
@@ -468,6 +488,18 @@ def compute_all(base_date: str | None = None) -> tuple[dict[str, list[dict]], di
         if gated:
             log.info("[signals] near_breakout 확장구간 RS 게이트: %d종목 제외", gated)
         by_cat["near_breakout_52w"] = kept
+
+    # 수급 유입(volume_surge) — volume_breakout 중 강한 것만 표시용 복제
+    # (원신호는 저장·버터대디용 유지). 게이트: 거래량 3× + 종가 +3% + RS 상위 50%.
+    vs_ratio = _get_float_env("SCREENER_VOL_SURGE_RATIO", DEFAULT_VOL_SURGE_RATIO)
+    vs_chg = _get_float_env("SCREENER_VOL_SURGE_CHG", DEFAULT_VOL_SURGE_CHG)
+    vs_rs = _get_float_env("SCREENER_VOL_SURGE_RS", DEFAULT_VOL_SURGE_RS)
+    by_cat["volume_surge"] = [
+        dict(it) for it in (by_cat.get("volume_breakout") or [])
+        if (it.get("vol_ratio") or 0) >= vs_ratio
+        and (it.get("chg_pct") or 0) >= vs_chg
+        and (it.get("rs_3m_rank") or 0) >= vs_rs
+    ]
 
     # RS 리더 — 시장 대비 상위 + 기술적 양호 (약세장 리더십 watchlist)
     leader_pct = _get_float_env("SCREENER_RS_LEADER_PCT", DEFAULT_RS_LEADER_PCT)

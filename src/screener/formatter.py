@@ -177,11 +177,15 @@ def format_results(
     parts.append(_format_section(results.get("near_breakout_52w", []), "🎯", "52주 돌파 직전 90-99%", links, extra, seen))
     parts.append(_format_section(results.get("high_all", []), "🚀", "역사적 신고가", links, extra, seen))
     parts.append(_format_section(results.get("high_52w", []), "📈", "52주 신고가", links, extra, seen))
+    # 6개월 신고가 — 52주 계열에 이미 나온 종목은 dedup으로 빠져 "회복 국면"만 남음
+    parts.append(_format_section(results.get("high_26w", []), "📊", "6개월 신고가 (회복 국면)", links, extra, seen))
     parts.append(_format_section(results.get("vcp_breakout", []), "💎", "VCP 돌파 (최근 1주 이내)", links, extra, seen))
+    parts.append(_format_section(results.get("volume_surge", []), "🔥", "수급 유입 (거래량 3배+ 급등)", links, extra, seen))
     parts.append(_format_section(results.get("rs_leaders", []), "💪", "상대강도 리더 (시장 대비 상위 10%)", links, extra, seen))
 
     total = sum(len(results.get(k, [])) for k in
-                ("high_all", "high_52w", "vcp_breakout", "near_breakout_52w", "rs_leaders"))
+                ("high_all", "high_52w", "high_26w", "vcp_breakout",
+                 "near_breakout_52w", "volume_surge", "rs_leaders"))
     if total == 0:
         parts.append("\n오늘은 신호 발생 종목이 없습니다.")
 
