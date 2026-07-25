@@ -563,6 +563,30 @@ async def us_screener_daily_job(bot: Bot, override_chat_id: str | None = None) -
         base_date = await loop.run_in_executor(None, db.latest_date) or datetime.now(KST).strftime("%Y-%m-%d")
         log.info("[scheduled] base_date for signals: %s", base_date)
 
+        # 휴장일 가드 — 미국 동부(ET) 기준. 07:00 KST = 전날 17~18시 ET이므로
+        # "방금 끝난 ET 세션 날짜"의 데이터가 있어야 발송. 없으면 휴장/지연 → 스킵.
+        # ET 주말은 조용히(일요일 07:00 KST에 금요일 신호 재발송되던 버그도 차단),
+        # 주중 휴장(Thanksgiving/July4 등)만 admin 통지. /screen 수동은 미적용.
+        from src.us_screener.incremental import _US_EASTERN
+        et_today = datetime.now(_US_EASTERN).date()
+        if et_today.weekday() >= 5:
+            log.info("[scheduled] ET 주말 (%s) — 발송 스킵 (금요일 세션은 전일 발송됨)", et_today)
+            return
+        if base_date != et_today.isoformat():
+            log.info("[scheduled] US 휴장일/데이터 미발행 (base_date=%s != ET today=%s) — 발송 스킵",
+                     base_date, et_today)
+            try:
+                from src.admin_alerts import alert_admin
+                await alert_admin(
+                    bot, ("US_SCREENER_ALLOWED_CHAT_IDS", "US_SCREENER_CHAT_ID"),
+                    "😴 US 휴장일 — 신호 발송 스킵",
+                    f"ET 오늘({et_today}) 데이터 없음. 최신 데이터={base_date}.\n"
+                    f"공휴일이 아니라면 데이터 소스 지연 — /screen으로 수동 실행 가능.",
+                )
+            except Exception:
+                log.exception("[scheduled] 휴장 통지 실패")
+            return
+
         # 신호 계산 — 모든 종목이 동일 base_date 강제, 미보유 종목 자동 skip
         results, stats = await loop.run_in_executor(
             None, lambda: signals.compute_all(base_date=base_date)

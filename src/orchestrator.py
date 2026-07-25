@@ -230,8 +230,8 @@ BOT_SPECS: list[BotSpec] = [
             ScheduledJob(
                 func=screener_daily_job,
                 job_id="screener_daily",
-                cron={"hour": 16, "minute": 0},
-                description="한국 주식 기술적 신호 — 매일 16:00 KST (15:30 종가 기준)",
+                cron={"day_of_week": "mon-fri", "hour": 16, "minute": 0},
+                description="한국 주식 기술적 신호 — 평일 16:00 KST (15:30 종가 기준)",
                 # 90분 — 실측 base case ~48분(약 1200종목 Naver 재fetch + today-fetch).
                 # 최악(KRX 미발행 시 30분 retry 누적)까지 여유. 종전 45분은 매일 거짓
                 # 미완주 알림 발생(2026-06-16 16:48 완주인데 16:45 알림) → 알람 피로.
@@ -249,8 +249,8 @@ BOT_SPECS: list[BotSpec] = [
             ScheduledJob(
                 func=us_screener_daily_job,
                 job_id="us_screener_daily",
-                cron={"hour": 7, "minute": 0},
-                description="미국 기술적 신호 — 매일 07:00 KST (미국 4PM ET 종가)",
+                cron={"day_of_week": "tue-sat", "hour": 7, "minute": 0},
+                description="미국 기술적 신호 — 화~토 07:00 KST (ET 월~금 세션 마감 직후)",
                 # 40분 — Naver 없어 KR보다 짧지만, 차트 채널 게시(종목당 3s pacing)+
                 # FMP 어닝 조회가 추가돼 25분은 빠듯. 거짓 미완주 방지 여유.
                 deadline_sec=2400,

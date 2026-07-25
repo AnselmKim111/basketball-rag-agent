@@ -583,6 +583,29 @@ async def screener_daily_job(bot: Bot, override_chat_id: str | None = None) -> N
         base_date = await loop.run_in_executor(None, db.latest_date) or datetime.now(KST).strftime("%Y-%m-%d")
         log.info("[scheduled] base_date for signals: %s", base_date)
 
+        # 휴장일 가드 — 오늘(KST) 데이터가 없으면 장 안 열린 날(공휴일/주말/데이터 지연).
+        # 캘린더 불필요: 장이 열렸는가의 진실은 데이터 자체에 있음. 구독자 발송 스킵,
+        # 주중 휴장만 admin 통지(주말은 매주 반복 노이즈라 조용히). /screen 수동은 미적용.
+        now_kst = datetime.now(KST)
+        today_iso = now_kst.strftime("%Y-%m-%d")
+        if base_date != today_iso:
+            if now_kst.weekday() >= 5:
+                log.info("[scheduled] KST 주말 — 발송 스킵 (base_date=%s)", base_date)
+                return
+            log.info("[scheduled] 휴장일/데이터 미발행 (base_date=%s != today=%s) — 발송 스킵",
+                     base_date, today_iso)
+            try:
+                from src.admin_alerts import alert_admin
+                await alert_admin(
+                    bot, ("SCREENER_ALLOWED_CHAT_IDS", "SCREENER_CHAT_ID"),
+                    "😴 KR 휴장일 — 신호 발송 스킵",
+                    f"오늘({today_iso}) 데이터 없음. 최신 데이터={base_date}.\n"
+                    f"공휴일이 아니라면 KRX 발행 지연 — /screen으로 수동 실행 가능.",
+                )
+            except Exception:
+                log.exception("[scheduled] 휴장 통지 실패")
+            return
+
         # 신호 계산 — 모든 종목이 동일 base_date 강제, 미보유 종목 자동 skip
         results, stats = await loop.run_in_executor(
             None, lambda: signals.compute_all(base_date=base_date)
