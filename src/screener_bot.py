@@ -765,6 +765,26 @@ async def _screener_daily_job_locked(bot: Bot, override_chat_id: str | None) -> 
         base_date = await loop.run_in_executor(None, db.latest_date) or datetime.now(KST).strftime("%Y-%m-%d")
         log.info("[scheduled] base_date for signals: %s", base_date)
 
+        # 데이터 기반 휴장 판정 (cron 경로만) — 새 거래일 데이터가 없어 base_date가
+        # 마지막 발송분과 같으면 휴장(공휴일)으로 보고 가입자 무음 skip.
+        # 요일 필터(mon-fri)가 주말을 막으므로, 여기 걸리면 평일 공휴일 또는 소스 장애
+        # → admin에게만 1줄 (구분용). /screen·self-test(override)는 항상 진행.
+        if override_chat_id is None:
+            last_sent = await loop.run_in_executor(
+                None, lambda: db.meta_get("last_sent_base_date"))
+            if last_sent == base_date:
+                log.info("[scheduled] base_date=%s 이미 발송 — 휴장 판정, skip", base_date)
+                try:
+                    from src.admin_alerts import alert_admin
+                    await alert_admin(
+                        bot, (ALLOWED_ENV, CHAT_ID_ENV),
+                        "📅 휴장 판정 — 발송 skip",
+                        f"base_date {base_date} 기발송 (새 거래일 데이터 없음). "
+                        f"오늘이 영업일이면 데이터 소스 장애 의심.")
+                except Exception:
+                    log.exception("[scheduled] 휴장 알림 실패")
+                return
+
         # 신호 계산 — 모든 종목이 동일 base_date 강제, 미보유 종목 자동 skip
         results, stats = await loop.run_in_executor(
             None, lambda: signals.compute_all(base_date=base_date)
@@ -843,6 +863,13 @@ async def _screener_daily_job_locked(bot: Bot, override_chat_id: str | None) -> 
                 log.exception("[scheduled] 발송 실패 cid=%s", cid)
         log.info("[scheduled] 발송 완료 (base_date=%s, sent=%d/%d)",
                  base_date, sent_count, len(target_chat_ids))
+        # cron 경로에서만 기록 — /screen·self-test가 다음 cron 발송을 막지 않게
+        if override_chat_id is None and sent_count > 0:
+            try:
+                await loop.run_in_executor(
+                    None, lambda: db.meta_set("last_sent_base_date", base_date))
+            except Exception:
+                log.exception("[scheduled] last_sent_base_date 기록 실패")
     except Exception:
         log.exception("[scheduled] screener_daily_job 실패")
         try:
