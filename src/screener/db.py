@@ -226,6 +226,14 @@ def distinct_tickers_in_db() -> set[str]:
         return {r[0] for r in cur.fetchall()}
 
 
+def rows_per_ticker() -> dict[str, int]:
+    """종목별 OHLCV 행 수 — 백필 resume(기보유 종목 skip)용. 단일 GROUP BY 쿼리."""
+    ensure_schema()
+    with _conn() as c:
+        cur = c.execute("SELECT ticker, COUNT(*) FROM ohlcv GROUP BY ticker")
+        return {r[0]: int(r[1]) for r in cur.fetchall()}
+
+
 def has_date(date_str: str) -> bool:
     ensure_schema()
     with _conn() as c:

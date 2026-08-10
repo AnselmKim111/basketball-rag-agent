@@ -56,7 +56,8 @@ def run_full_backfill(
 
     # 0순위: Naver ticker-batch (1년치 단일 요청)
     naver_result = _run_naver_batch_backfill(days=days, progress_cb=progress_cb)
-    if naver_result["rows"] > 0:
+    # resume 재실행에서 전 종목이 이미 완료(skip)여도 성공 — date-batch 폴백으로 새지 않게
+    if naver_result["rows"] > 0 or naver_result.get("skipped_existing", 0) > 0:
         return naver_result
     log.warning("[backfill] Naver 백필 빈 결과 → pykrx date-batch 폴백 시도")
 
@@ -163,12 +164,20 @@ def _run_naver_batch_backfill(
         len(tickers), start_iso, end_iso, cap, timeout_s,
     )
 
-    success = fail = total_rows = 0
+    # resume 지원 — 이미 충분한 히스토리(기본 1000행+)를 가진 종목은 skip.
+    # timeout으로 중단된 백필을 재실행하면 완료분을 건너뛰고 꼬리부터 이어감.
+    skip_rows = _int_env("SCREENER_BACKFILL_SKIP_ROWS", 1000)
+    have = db.rows_per_ticker()
+
+    success = fail = total_rows = skipped_existing = 0
     t0 = time.monotonic()
     for i, ticker in enumerate(tickers, 1):
         if time.monotonic() - t0 > timeout_s:
             log.warning("[backfill] Naver timeout %ds 초과 → %d/%d에서 중단", timeout_s, i - 1, len(tickers))
             break
+        if have.get(ticker, 0) >= skip_rows:
+            skipped_existing += 1
+            continue
         try:
             rows = data_source.fetch_ohlcv_by_ticker_via_naver(ticker, start_iso, end_iso)
             if rows:
@@ -197,7 +206,7 @@ def _run_naver_batch_backfill(
         json.dumps(
             {
                 "success": success, "fail": fail, "rows": total_rows,
-                "skipped_existing": 0, "mode": "naver-ticker-batch",
+                "skipped_existing": skipped_existing, "mode": "naver-ticker-batch",
                 "completed_at": datetime.now(KST).isoformat(),
             },
             ensure_ascii=False,
@@ -206,12 +215,12 @@ def _run_naver_batch_backfill(
     if total_rows > 0:
         db.meta_set("naver_backfill_done", datetime.now(KST).isoformat())
     log.info(
-        "[backfill] 완료 (Naver) success=%d fail=%d rows=%d",
-        success, fail, total_rows,
+        "[backfill] 완료 (Naver) success=%d fail=%d rows=%d skipped_existing=%d",
+        success, fail, total_rows, skipped_existing,
     )
     return {
         "success": success, "fail": fail, "rows": total_rows,
-        "skipped_existing": 0, "mode": "naver-ticker-batch",
+        "skipped_existing": skipped_existing, "mode": "naver-ticker-batch",
     }
 
 
