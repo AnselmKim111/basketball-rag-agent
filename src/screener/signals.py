@@ -41,8 +41,11 @@ DEFAULT_RS_LEADER_MAX = 10
 DEFAULT_VOL_SURGE_RATIO = 3.0
 DEFAULT_VOL_SURGE_CHG = 3.0
 DEFAULT_VOL_SURGE_RS = 50.0
-# 시가총액 필터 (원). 기본 3000억 — 사용자 요구사항.
-DEFAULT_MIN_MARKET_CAP = 300_000_000_000
+# 시가총액 필터 (원). 3000억 → 1000억 확장 (2026-08 미미의 신고가 대비 커버리지 —
+# 코스닥 중소형 포함). 3000억 미만은 formatter가 🧩 중소형 섹션으로 분리 표시.
+DEFAULT_MIN_MARKET_CAP = 100_000_000_000
+# 중소형 표시 분리 경계 — 이 값 미만은 별도 섹션(시총 표기 포함)
+DEFAULT_SMALLCAP_MAX = 300_000_000_000
 
 
 def _get_float_env(key: str, default: float) -> float:

@@ -143,12 +143,12 @@ def _run_naver_batch_backfill(
     """Naver Finance 종목별 1년치 fetch (1순위). 단일 요청에 full history.
 
     시총 desc 정렬 (대형주 우선). cap/timeout으로 보호:
-      - SCREENER_BACKFILL_NAVER_CAP (기본 1300)
-      - SCREENER_BACKFILL_NAVER_TIMEOUT_S (기본 900=15분)
+      - SCREENER_BACKFILL_NAVER_CAP (기본 1600)
+      - SCREENER_BACKFILL_NAVER_TIMEOUT_S (기본 1200=20분)
     """
     db.ensure_schema()
-    cap = _int_env("SCREENER_BACKFILL_NAVER_CAP", 1300)
-    timeout_s = _int_env("SCREENER_BACKFILL_NAVER_TIMEOUT_S", 900)
+    cap = _int_env("SCREENER_BACKFILL_NAVER_CAP", 1600)
+    timeout_s = _int_env("SCREENER_BACKFILL_NAVER_TIMEOUT_S", 1200)
 
     # 시총 desc 정렬 (대형주 우선 — timeout 시 소형주만 누락)
     all_tickers = db.get_active_tickers()

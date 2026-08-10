@@ -51,7 +51,7 @@ def cross_validate(
     반환: (validated_results, validation_stats).
     validated_results는 검증 통과 종목만 유지. 불일치 종목은 모든 카테고리에서 제거.
     """
-    timeout_s = _int_env("SCREENER_VALIDATE_TIMEOUT_S", 60)
+    timeout_s = _int_env("SCREENER_VALIDATE_TIMEOUT_S", 120)
     tolerance = _int_env("SCREENER_VALIDATE_TOLERANCE", 1)  # ±1원까지 OK (반올림 오차)
 
     tickers = _all_signal_tickers(results)
@@ -61,35 +61,51 @@ def cross_validate(
     log.info("[validator] %d종목 cross-validate 시작 (base_date=%s, timeout=%ds)",
              len(tickers), base_date, timeout_s)
 
-    # ticker → 검증된 close (Naver 응답)
+    # ticker → 검증된 close (Naver 응답). fetch만 ThreadPool 병렬 — 순차 시절
+    # ~150종목이 timeout 한계였고 초과분이 NoFetch로 전량 reject되던 병목 해소.
+    # 판정 로직(±tolerance, 불일치/NoFetch reject)은 그대로.
+    from datetime import datetime as _dt, timedelta as _td
+    target_dt = _dt.strptime(base_date, "%Y-%m-%d").date()
+    start = (target_dt - _td(days=3)).strftime("%Y-%m-%d")
+    end = (target_dt + _td(days=1)).strftime("%Y-%m-%d")
+
+    def _fetch_one(ticker: str) -> tuple[str, int | None]:
+        try:
+            rows = data_source.fetch_ohlcv_by_ticker_via_naver(ticker, start, end)
+        except Exception as e:
+            log.debug("[validator] %s fetch 실패: %s", ticker, e)
+            return ticker, None
+        match = [r for r in rows if r[1] == base_date]
+        return ticker, (int(match[0][5]) if match else None)  # close (index 5)
+
     truth: dict[str, int | None] = {}
     fetch_failed = 0
     skipped_timeout = 0
 
+    from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as _FutTimeout
     t0 = time.monotonic()
-    for ticker in sorted(tickers):
-        if time.monotonic() - t0 > timeout_s:
-            log.warning("[validator] timeout %ds 초과 — %d종목 skip", timeout_s, len(tickers) - len(truth))
-            skipped_timeout = len(tickers) - len(truth)
-            break
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = {pool.submit(_fetch_one, t): t for t in sorted(tickers)}
         try:
-            from datetime import datetime as _dt, timedelta as _td
-            target_dt = _dt.strptime(base_date, "%Y-%m-%d").date()
-            start = (target_dt - _td(days=3)).strftime("%Y-%m-%d")
-            end = (target_dt + _td(days=1)).strftime("%Y-%m-%d")
-            rows = data_source.fetch_ohlcv_by_ticker_via_naver(ticker, start, end)
-        except Exception as e:
-            log.debug("[validator] %s fetch 실패: %s", ticker, e)
-            fetch_failed += 1
-            truth[ticker] = None
-            continue
-        # base_date close 추출
-        match = [r for r in rows if r[1] == base_date]
-        if match:
-            truth[ticker] = int(match[0][5])  # close (index 5)
-        else:
-            truth[ticker] = None
-            fetch_failed += 1
+            for fut in as_completed(futures, timeout=timeout_s + 10):
+                if time.monotonic() - t0 > timeout_s:
+                    skipped_timeout = len(tickers) - len(truth)
+                    log.warning("[validator] timeout %ds 초과 — %d종목 skip", timeout_s, skipped_timeout)
+                    for f in futures:
+                        f.cancel()
+                    break
+                try:
+                    ticker, close = fut.result()
+                except Exception:
+                    continue
+                truth[ticker] = close
+                if close is None:
+                    fetch_failed += 1
+        except _FutTimeout:
+            skipped_timeout = len(tickers) - len(truth)
+            log.warning("[validator] futures timeout — %d종목 skip", skipped_timeout)
+            for f in futures:
+                f.cancel()
 
     # 검증: 각 신호 종목의 DB close vs truth close 비교
     validated: dict[str, list[dict]] = {k: [] for k in results.keys()}

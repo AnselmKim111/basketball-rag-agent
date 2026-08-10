@@ -105,6 +105,48 @@ def _format_section(items: list[dict], emoji: str, title: str,
     return "\n".join(lines) + "\n"
 
 
+def _fmt_cap_short(cap) -> str:
+    """시총 짧은 표기: 2,150억 / 1.5조. fmt_won에서 '원'만 제거."""
+    from src.screener_common import fmt_won
+    s = fmt_won(cap)
+    return s[:-1] if s.endswith("원") else s
+
+
+def _format_smallcap_section(small_by_ticker: dict, links: dict | None,
+                             extra: dict | None, seen: set,
+                             cap_n: int = 12) -> str:
+    """🧩 중소형(1000억~3000억) 신호 — 시총 표기 + 발화 신호 이모지.
+
+    small_by_ticker: {ticker: {"item": dict, "emojis": [..]}} (복수 신호는 이모지 병기).
+    라인: 이름(2,150억) / 당일 / 연초대비 / 🚀📈
+    """
+    links = links or {}
+    extra = extra or {}
+    items = [(t, v) for t, v in small_by_ticker.items() if t not in seen]
+    head = f"━━━ 🧩 중소형 신호 (1000억~3000억) ({len(items)}) ━━━"
+    if not items:
+        return head + "\n해당 없음\n"
+    items.sort(key=lambda kv: -(kv[1]["item"].get("chg_pct") or 0.0))
+    for t, _ in items:
+        seen.add(t)
+    capped = items[:cap_n]
+    rest = len(items) - len(capped)
+    from src.bot_helpers import html_escape
+    lines = [head, "(종목(시총) / 당일 / 연초대비 / 신호)"]
+    for t, v in capped:
+        it = v["item"]
+        name = html_escape(it.get("name") or t)
+        cap_s = _fmt_cap_short(it.get("market_cap"))
+        chg = _fmt_pct(it.get("chg_pct", 0.0))
+        ytd = _fmt_pct_or_na((extra.get(t) or {}).get("ytd"))
+        url = links.get(t)
+        name_disp = f'<a href="{url}">{name}</a>' if url else name
+        lines.append(f"{name_disp}({cap_s}) / {chg} / {ytd} / {''.join(v['emojis'])}")
+    if rest > 0:
+        lines.append(f"... 외 {rest}종목")
+    return "\n".join(lines) + "\n"
+
+
 def _sector_summary(items: list[dict], top_n: int = 6) -> str:
     """전체 신호 통합 섹터 집계."""
     if not items:
@@ -152,7 +194,7 @@ def format_results(
     if stats:
         proc = stats.get("processed", 0)
         skipped_no_base = stats.get("skipped_no_base", 0)
-        line = f"✓ {proc}종목 신호 계산 (시총 3000억+)"
+        line = f"✓ {proc}종목 신호 계산 (시총 1000억+)"
         if skipped_no_base > 0:
             line += f" · {skipped_no_base}종목 base_date 데이터 누락"
         parts.append(line)
@@ -171,21 +213,45 @@ def format_results(
         if retro_str:
             parts.append(retro_str)
 
+    # 시총 3000억 경계로 대형/중소형 분리 — 기존 섹션은 3000억+(또는 시총 미상)만,
+    # 중소형(1000억~3000억)은 맨 뒤 🧩 섹션에 시총 표기와 함께 모아서.
+    import os as _os
+    try:
+        smallcap_max = float(_os.getenv("SCREENER_SMALLCAP_MAX", "") or 300_000_000_000)
+    except ValueError:
+        smallcap_max = 300_000_000_000
+    _CAT_EMOJI = [
+        ("near_breakout_52w", "🎯"), ("high_all", "🚀"), ("high_52w", "📈"),
+        ("high_26w", "📊"), ("vcp_breakout", "💎"), ("volume_surge", "🔥"),
+        ("rs_leaders", "💪"),
+    ]
+    big: dict[str, list[dict]] = {}
+    small_by_ticker: dict[str, dict] = {}  # ticker → {"item", "emojis"}
+    for cat, emoji in _CAT_EMOJI:
+        big[cat] = []
+        for it in results.get(cat, []) or []:
+            cap = it.get("market_cap")
+            if cap and cap < smallcap_max:
+                agg = small_by_ticker.setdefault(it.get("ticker"), {"item": it, "emojis": []})
+                if emoji not in agg["emojis"]:
+                    agg["emojis"].append(emoji)
+            else:
+                big[cat].append(it)
+
     # 섹션 순서 = 백테스트 edge 순 (2026-06 검증: 돌파직전 +2.3%p > 52주 +2.0%p > ATH).
     # 앞 섹션이 종목을 먼저 claim (공용 seen dedup).
     seen: set = set()
-    parts.append(_format_section(results.get("near_breakout_52w", []), "🎯", "52주 돌파 직전 90-99%", links, extra, seen))
-    parts.append(_format_section(results.get("high_all", []), "🚀", "역사적 신고가", links, extra, seen))
-    parts.append(_format_section(results.get("high_52w", []), "📈", "52주 신고가", links, extra, seen))
+    parts.append(_format_section(big["near_breakout_52w"], "🎯", "52주 돌파 직전 90-99%", links, extra, seen))
+    parts.append(_format_section(big["high_all"], "🚀", "역사적 신고가", links, extra, seen))
+    parts.append(_format_section(big["high_52w"], "📈", "52주 신고가", links, extra, seen))
     # 6개월 신고가 — 52주 계열에 이미 나온 종목은 dedup으로 빠져 "회복 국면"만 남음
-    parts.append(_format_section(results.get("high_26w", []), "📊", "6개월 신고가 (회복 국면)", links, extra, seen))
-    parts.append(_format_section(results.get("vcp_breakout", []), "💎", "VCP 돌파 (최근 1주 이내)", links, extra, seen))
-    parts.append(_format_section(results.get("volume_surge", []), "🔥", "수급 유입 (거래량 3배+ 급등)", links, extra, seen))
-    parts.append(_format_section(results.get("rs_leaders", []), "💪", "상대강도 리더 (시장 대비 상위 10%)", links, extra, seen))
+    parts.append(_format_section(big["high_26w"], "📊", "6개월 신고가 (회복 국면)", links, extra, seen))
+    parts.append(_format_section(big["vcp_breakout"], "💎", "VCP 돌파 (최근 1주 이내)", links, extra, seen))
+    parts.append(_format_section(big["volume_surge"], "🔥", "수급 유입 (거래량 3배+ 급등)", links, extra, seen))
+    parts.append(_format_section(big["rs_leaders"], "💪", "상대강도 리더 (시장 대비 상위 10%)", links, extra, seen))
+    parts.append(_format_smallcap_section(small_by_ticker, links, extra, seen))
 
-    total = sum(len(results.get(k, [])) for k in
-                ("high_all", "high_52w", "high_26w", "vcp_breakout",
-                 "near_breakout_52w", "volume_surge", "rs_leaders"))
+    total = sum(len(v) for v in big.values()) + len(small_by_ticker)
     if total == 0:
         parts.append("\n오늘은 신호 발생 종목이 없습니다.")
 

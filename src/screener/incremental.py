@@ -134,8 +134,8 @@ def update_specific_date(target_iso: str, force: bool = False) -> dict:
     active_set = set(active_list)
 
     # 0차: Naver Finance ticker-batch (1순위 — FDR 시뮬레이션 미스매치 우회)
-    naver_cap = _int_env("SCREENER_NAVER_CAP", 1200)
-    naver_timeout = _int_env("SCREENER_NAVER_TIMEOUT_S", 600)
+    naver_cap = _int_env("SCREENER_NAVER_CAP", 1600)
+    naver_timeout = _int_env("SCREENER_NAVER_TIMEOUT_S", 900)
     rows: list[tuple] = []
     if active_set:
         log.info(
