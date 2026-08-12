@@ -134,8 +134,11 @@
 - `SCREENER_NAVER_CAP=1200`, `SCREENER_NAVER_TIMEOUT_S=600` — Naver fetch 보호
 - `SCREENER_FORCE_REFETCH=1` — cached 무시하고 매번 Naver 재 fetch (정확성 위해 켬)
 - `SCREENER_FORCE_BACKFILL=<토큰>` — 강제 백필 **one-shot**: 같은 토큰은 1회만 소비
-  (meta `force_backfill_consumed`). 재실행은 값을 바꿔서(예: 날짜). Railway env 스냅샷이
-  컨테이너에 남아도 cron마다 재백필 안 됨. env 삭제 후엔 재배포까지 확인할 것.
+  (meta `force_backfill_consumed`). 재실행은 값을 바꿔서(예: 날짜).
+- **Railway env 스냅샷 주의 (실측 2회)**: `variableDelete`는 실행 중 컨테이너에 반영 안 됨
+  (재배포도 자동 트리거 안 됨) → 검증용 env(TEST_MODE 등) 삭제 후 반드시
+  `serviceInstanceRedeploy(environmentId, serviceId)` mutation 호출 + 새 deployment
+  SUCCESS 확인까지가 정리 절차.
 - `SCREENER_VALIDATE_TIMEOUT_S=60`, `SCREENER_VALIDATE_TOLERANCE=1`(원) — validator 보호
 - `SCREENER_INCREMENTAL_FDR_FALLBACK=0` — FDR 폴백 비활성 (sequential hang 방지)
 
