@@ -611,6 +611,10 @@ async def _screener_daily_job_locked(bot: Bot, override_chat_id: str | None) -> 
     # 진행 메시지 helper (admin에게만)
     chat_id = progress_chat  # 기존 코드 변수명 유지 (진행 메시지용)
 
+    # 운영노트 — 실행 중 특이사항(백필·검증제외 등)을 모아 본 메시지 끝 한 줄로.
+    # 별도 알림 메시지 금지 (사용자 요청: 티 안 나게 footer로).
+    ops_notes: list[str] = []
+
     try:
         # universe 보장
         await loop.run_in_executor(None, db.ensure_schema)
@@ -662,11 +666,15 @@ async def _screener_daily_job_locked(bot: Bot, override_chat_id: str | None) -> 
 
         # 백필 트리거 조건:
         #   - DB 비었음 (첫 실행)
-        #   - 강제 (SCREENER_FORCE_BACKFILL=1)
+        #   - 강제 (SCREENER_FORCE_BACKFILL=<토큰>) — one-shot: 같은 토큰은 1회만 소비.
+        #     Railway env 스냅샷이 컨테이너에 남아도(삭제 미반영) cron마다 재실행 안 됨.
+        #     재실행하려면 값을 바꿔서 설정 (예: 날짜 문자열).
         #   - 252일+ 종목이 ohlcv 보유의 30% 미만 (52주 신고가 산출 불가)
         #   - max_len < 1000 (5년 데이터 미확보 — 역사적 신고가 ATH 계산 불가). flag 무관.
-        #     5년 backfill 1회 성공 후 max_len≈1260 → 다음부터 skip.
-        force = os.getenv("SCREENER_FORCE_BACKFILL", "0") == "1"
+        force_token = (os.getenv("SCREENER_FORCE_BACKFILL", "") or "").strip()
+        consumed = await loop.run_in_executor(
+            None, lambda: db.meta_get("force_backfill_consumed"))
+        force = bool(force_token) and force_token != "0" and force_token != consumed
         rc = await loop.run_in_executor(None, db.row_count)
         ge_252 = lengths.get("ge_252", 0)
         total_t = lengths.get("total_tickers", 0) or 1
@@ -681,31 +689,19 @@ async def _screener_daily_job_locked(bot: Bot, override_chat_id: str | None) -> 
 
         if need_backfill:
             reason = "첫 실행" if rc == 0 else ("강제" if force else f"252일+ 종목 부족 ({ge_252}/{total_t})")
-            await send_text_chunked(
-                bot, chat_id,
-                f"📥 1년치 백필 시작 ({reason}, Naver 기반 ~6-15분)",
-            )
-
-            def _progress(done: int, total: int, success: int) -> None:
-                try:
-                    asyncio.run_coroutine_threadsafe(
-                        send_text_chunked(
-                            bot, chat_id,
-                            f"📥 백필 진행 {done}/{total} (성공 {success})",
-                        ),
-                        loop,
-                    )
-                except Exception:
-                    log.exception("progress push 실패")
-
+            # 진행 상황은 로그만 — 채팅 스팸 금지 (특이사항은 본 메시지 footer 한 줄로)
+            log.info("[scheduled] 백필 시작 (%s, Naver 기반)", reason)
             result = await loop.run_in_executor(
-                None, lambda: backfill.run_full_backfill(progress_cb=_progress)
+                None, lambda: backfill.run_full_backfill()
             )
-            await send_text_chunked(
-                bot, chat_id,
-                f"✅ 백필 완료: mode={result.get('mode')} success={result['success']} "
-                f"fail={result['fail']} rows={result['rows']}",
-            )
+            log.info("[scheduled] 백필 완료: mode=%s success=%s fail=%s rows=%s skipped=%s",
+                     result.get("mode"), result["success"], result["fail"], result["rows"],
+                     result.get("skipped_existing"))
+            if result.get("success"):
+                ops_notes.append(f"백필 {result['success']}종목")
+            if force:
+                await loop.run_in_executor(
+                    None, lambda: db.meta_set("force_backfill_consumed", force_token))
             # 백필 후 데이터 길이 재진단
             lengths2 = await loop.run_in_executor(None, db.ticker_data_lengths)
             log.info("[scheduled] 백필 후 ticker_data_lengths: %s", lengths2)
@@ -766,23 +762,15 @@ async def _screener_daily_job_locked(bot: Bot, override_chat_id: str | None) -> 
         log.info("[scheduled] base_date for signals: %s", base_date)
 
         # 데이터 기반 휴장 판정 (cron 경로만) — 새 거래일 데이터가 없어 base_date가
-        # 마지막 발송분과 같으면 휴장(공휴일)으로 보고 가입자 무음 skip.
-        # 요일 필터(mon-fri)가 주말을 막으므로, 여기 걸리면 평일 공휴일 또는 소스 장애
-        # → admin에게만 1줄 (구분용). /screen·self-test(override)는 항상 진행.
+        # 마지막 발송분과 같으면 휴장(공휴일)으로 보고 완전 무음 skip (로그만 — 별도
+        # 알림 메시지 금지). 평일 skip(소스 장애 의심)은 로그 + cron watchdog이 커버.
+        # /screen·self-test(override)는 항상 진행.
         if override_chat_id is None:
             last_sent = await loop.run_in_executor(
                 None, lambda: db.meta_get("last_sent_base_date"))
             if last_sent == base_date:
-                log.info("[scheduled] base_date=%s 이미 발송 — 휴장 판정, skip", base_date)
-                try:
-                    from src.admin_alerts import alert_admin
-                    await alert_admin(
-                        bot, (ALLOWED_ENV, CHAT_ID_ENV),
-                        "📅 휴장 판정 — 발송 skip",
-                        f"base_date {base_date} 기발송 (새 거래일 데이터 없음). "
-                        f"오늘이 영업일이면 데이터 소스 장애 의심.")
-                except Exception:
-                    log.exception("[scheduled] 휴장 알림 실패")
+                log.warning("[scheduled] base_date=%s 이미 발송 — 휴장 판정, 무음 skip "
+                            "(영업일이면 데이터 소스 장애 의심)", base_date)
                 return
 
         # 신호 계산 — 모든 종목이 동일 base_date 강제, 미보유 종목 자동 skip
@@ -804,10 +792,13 @@ async def _screener_daily_job_locked(bot: Bot, override_chat_id: str | None) -> 
             log.info("[scheduled] validator stats: %s", val_stats)
             stats["validated"] = val_stats.get("validated", 0)
             stats["rejected"] = val_stats.get("rejected", 0)
+            if val_stats.get("rejected"):
+                ops_notes.append(f"검증제외 {val_stats['rejected']}")
         except Exception:
             log.exception("[scheduled] validator 실패 — 검증 없이 발송")
             stats["validated"] = -1
             stats["rejected"] = -1
+            ops_notes.append("검증 생략(오류)")
 
         # 히스토리 저장 (검증 통과만)
         try:
@@ -835,23 +826,13 @@ async def _screener_daily_job_locked(bot: Bot, override_chat_id: str | None) -> 
             log.exception("[scheduled] 차트 게시/메타 실패 — 링크 없이 발송")
             links, extra = {}, {}
 
-        # 회고: 지난 신호 종목들의 5영업일 후 평균 수익률 (DB signals 히스토리)
-        retro = {}
-        try:
-            from src.screener import retrospective as retro_mod
-            retro = await loop.run_in_executor(
-                None, lambda: retro_mod.signal_returns(
-                    days_back=10, days_ahead=5, today_iso=base_date))
-            if retro:
-                log.info("[scheduled] 회고 집계: %s",
-                         {k: f"n={v['n']} avg={v['avg_return_pct']}" for k, v in retro.items()})
-        except Exception:
-            log.exception("[scheduled] 회고 집계 실패 — 회고 없이 발송")
+        # 회고 섹션은 메시지에서 제거 (사용자 요청) — 신호 히스토리는 계속 저장되므로
+        # 성적 조회는 /backtest admin 명령으로.
 
-        # 발송 — formatter에 base_date + stats + links + extra + retro 전달
+        # 발송 — formatter에 base_date + stats + links + extra + 운영노트 전달
         text = formatter.format_results(
             results, datetime.now(KST), base_date=base_date, stats=stats,
-            links=links, extra=extra, retro=retro,
+            links=links, extra=extra, ops_notes=ops_notes,
         )
         # 모든 대상자에게 broadcast (한 번 계산 → N번 발송)
         sent_count = 0

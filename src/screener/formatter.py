@@ -177,6 +177,7 @@ def format_results(
     links: dict | None = None,
     extra: dict | None = None,
     retro: dict | None = None,
+    ops_notes: list[str] | None = None,
 ) -> str:
     """미미 스타일 메시지 포맷.
 
@@ -254,5 +255,10 @@ def format_results(
     total = sum(len(v) for v in big.values()) + len(small_by_ticker)
     if total == 0:
         parts.append("\n오늘은 신호 발생 종목이 없습니다.")
+
+    # 운영노트 — 실행 중 특이사항(백필·검증제외 등)을 티 안 나게 끝에 한 줄
+    if ops_notes:
+        from src.bot_helpers import html_escape
+        parts.append(f"<i>〔운영: {html_escape(' · '.join(ops_notes))}〕</i>")
 
     return "\n".join(parts)

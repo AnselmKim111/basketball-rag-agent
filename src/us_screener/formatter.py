@@ -123,6 +123,7 @@ def format_results(
     links: dict | None = None,
     extra: dict | None = None,
     retro: dict | None = None,
+    ops_notes: list[str] | None = None,
 ) -> str:
     parts: list[str] = []
     parts.append(f"🇺🇸 미국 주식 기술적 신호 — {_fmt_kst_header(as_of)}")
@@ -158,5 +159,10 @@ def format_results(
                 ("high_all", "high_52w", "vcp_breakout", "near_breakout_52w"))
     if total == 0:
         parts.append("\n오늘은 신호 발생 종목이 없습니다.")
+
+    # 운영노트 — 특이사항(백필·검증제외 등)을 티 안 나게 끝에 한 줄
+    if ops_notes:
+        from src.bot_helpers import html_escape
+        parts.append(f"<i>〔운영: {html_escape(' · '.join(ops_notes))}〕</i>")
 
     return "\n".join(parts)

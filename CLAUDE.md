@@ -133,6 +133,9 @@
   KRX 미발행 대비 16:30까지 5분 간격 재시도)
 - `SCREENER_NAVER_CAP=1200`, `SCREENER_NAVER_TIMEOUT_S=600` — Naver fetch 보호
 - `SCREENER_FORCE_REFETCH=1` — cached 무시하고 매번 Naver 재 fetch (정확성 위해 켬)
+- `SCREENER_FORCE_BACKFILL=<토큰>` — 강제 백필 **one-shot**: 같은 토큰은 1회만 소비
+  (meta `force_backfill_consumed`). 재실행은 값을 바꿔서(예: 날짜). Railway env 스냅샷이
+  컨테이너에 남아도 cron마다 재백필 안 됨. env 삭제 후엔 재배포까지 확인할 것.
 - `SCREENER_VALIDATE_TIMEOUT_S=60`, `SCREENER_VALIDATE_TOLERANCE=1`(원) — validator 보호
 - `SCREENER_INCREMENTAL_FDR_FALLBACK=0` — FDR 폴백 비활성 (sequential hang 방지)
 

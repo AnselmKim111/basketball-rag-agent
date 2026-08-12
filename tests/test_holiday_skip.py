@@ -53,7 +53,7 @@ def test_holiday_guard_and_mark_present(bot_file):
     src = (REPO / bot_file).read_text()
     # 가드: cron 경로에서 last_sent 비교 후 return
     assert 'meta_get("last_sent_base_date")' in src, f"{bot_file}: 휴장 가드 누락"
-    assert "휴장 판정, skip" in src
+    assert "휴장 판정, 무음 skip" in src  # 별도 알림 없이 로그만 (사용자 요청)
     # 기록: 발송 성공 후 cron 경로에서만 meta_set
     assert 'meta_set("last_sent_base_date", base_date)' in src, f"{bot_file}: 발송 기록 누락"
     assert "override_chat_id is None and sent_count > 0" in src, \

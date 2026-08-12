@@ -566,6 +566,9 @@ async def _us_screener_daily_job_locked(bot: Bot, override_chat_id: str | None) 
     # 진행 메시지 helper (admin에게만)
     chat_id = progress_chat  # 기존 코드 변수명 유지 (진행 메시지용)
 
+    # 운영노트 — 실행 중 특이사항을 본 메시지 끝 한 줄 footer로 (별도 알림 금지)
+    ops_notes: list[str] = []
+
     try:
         # universe 보장 — 미국은 S&P500+Nasdaq100 ~550종목으로 fetch 빠름(~2초).
         # 매번 refresh_universe (upsert) 호출해 NASDAQ100 신규 종목·섹터 항상 반영.
@@ -596,7 +599,11 @@ async def _us_screener_daily_job_locked(bot: Bot, override_chat_id: str | None) 
         #   - active universe 대비 ohlcv 60일+ 미보유 종목 10개 초과 (신규 종목 — NASDAQ100
         #     추가분 등 — 데이터 backfill 필요). backfill_done flag 무관하게 트리거.
         #   - max_len < 1000 (5년 데이터 미확보 — 역사적 신고가 ATH 계산 불가). flag 무관.
-        force = os.getenv("US_SCREENER_FORCE_BACKFILL", "0") == "1"
+        # one-shot force — 같은 토큰은 1회만 소비 (Railway env 스냅샷 잔존 대비)
+        force_token = (os.getenv("US_SCREENER_FORCE_BACKFILL", "") or "").strip()
+        consumed = await loop.run_in_executor(
+            None, lambda: db.meta_get("force_backfill_consumed"))
+        force = bool(force_token) and force_token != "0" and force_token != consumed
         rc = await loop.run_in_executor(None, db.row_count)
         ge_252 = lengths.get("ge_252", 0)
         ge_60 = lengths.get("ge_60", 0)
@@ -619,31 +626,18 @@ async def _us_screener_daily_job_locked(bot: Bot, override_chat_id: str | None) 
                 else (f"신규 종목 {missing}개 데이터 부족" if missing > 10
                       else f"252일+ 종목 부족 ({ge_252}/{total_t})"))
             )
-            await send_text_chunked(
-                bot, chat_id,
-                f"📥 1년치 백필 시작 ({reason}, Naver 기반 ~6-15분)",
-            )
-
-            def _progress(done: int, total: int, success: int) -> None:
-                try:
-                    asyncio.run_coroutine_threadsafe(
-                        send_text_chunked(
-                            bot, chat_id,
-                            f"📥 백필 진행 {done}/{total} (성공 {success})",
-                        ),
-                        loop,
-                    )
-                except Exception:
-                    log.exception("progress push 실패")
-
+            # 진행 상황은 로그만 — 채팅 스팸 금지 (특이사항은 본 메시지 footer 한 줄로)
+            log.info("[scheduled] 백필 시작 (%s, Naver 기반)", reason)
             result = await loop.run_in_executor(
-                None, lambda: backfill.run_full_backfill(progress_cb=_progress)
+                None, lambda: backfill.run_full_backfill()
             )
-            await send_text_chunked(
-                bot, chat_id,
-                f"✅ 백필 완료: mode={result.get('mode')} success={result['success']} "
-                f"fail={result['fail']} rows={result['rows']}",
-            )
+            log.info("[scheduled] 백필 완료: mode=%s success=%s fail=%s rows=%s",
+                     result.get("mode"), result["success"], result["fail"], result["rows"])
+            if result.get("success"):
+                ops_notes.append(f"백필 {result['success']}종목")
+            if force:
+                await loop.run_in_executor(
+                    None, lambda: db.meta_set("force_backfill_consumed", force_token))
             # 백필 후 데이터 길이 재진단
             lengths2 = await loop.run_in_executor(None, db.ticker_data_lengths)
             log.info("[scheduled] 백필 후 ticker_data_lengths: %s", lengths2)
@@ -692,16 +686,8 @@ async def _us_screener_daily_job_locked(bot: Bot, override_chat_id: str | None) 
             last_sent = await loop.run_in_executor(
                 None, lambda: db.meta_get("last_sent_base_date"))
             if last_sent == base_date:
-                log.info("[scheduled] base_date=%s 이미 발송 — 휴장 판정, skip", base_date)
-                try:
-                    from src.admin_alerts import alert_admin
-                    await alert_admin(
-                        bot, (ALLOWED_ENV, CHAT_ID_ENV),
-                        "📅 US 휴장 판정 — 발송 skip",
-                        f"base_date {base_date} 기발송 (새 거래일 데이터 없음). "
-                        f"오늘이 미국 영업일이면 데이터 소스 장애 의심.")
-                except Exception:
-                    log.exception("[scheduled] 휴장 알림 실패")
+                log.warning("[scheduled] base_date=%s 이미 발송 — 휴장 판정, 무음 skip "
+                            "(미국 영업일이면 데이터 소스 장애 의심)", base_date)
                 return
 
         # 신호 계산 — 모든 종목이 동일 base_date 강제, 미보유 종목 자동 skip
@@ -723,10 +709,13 @@ async def _us_screener_daily_job_locked(bot: Bot, override_chat_id: str | None) 
             log.info("[scheduled] validator stats: %s", val_stats)
             stats["validated"] = val_stats.get("validated", 0)
             stats["rejected"] = val_stats.get("rejected", 0)
+            if val_stats.get("rejected"):
+                ops_notes.append(f"검증제외 {val_stats['rejected']}")
         except Exception:
             log.exception("[scheduled] validator 실패 — 검증 없이 발송")
             stats["validated"] = -1
             stats["rejected"] = -1
+            ops_notes.append("검증 생략(오류)")
 
         # 히스토리 저장 (검증 통과만)
         try:
@@ -754,23 +743,12 @@ async def _us_screener_daily_job_locked(bot: Bot, override_chat_id: str | None) 
             log.exception("[scheduled] 차트 게시/메타 실패 — 링크 없이 발송")
             links, extra = {}, {}
 
-        # 회고: 지난 신호 종목들의 5영업일 후 평균 수익률
-        retro = {}
-        try:
-            from src.us_screener import retrospective as retro_mod
-            retro = await loop.run_in_executor(
-                None, lambda: retro_mod.signal_returns(
-                    days_back=10, days_ahead=5, today_iso=base_date))
-            if retro:
-                log.info("[scheduled] 회고 집계: %s",
-                         {k: f"n={v['n']} avg={v['avg_return_pct']}" for k, v in retro.items()})
-        except Exception:
-            log.exception("[scheduled] 회고 집계 실패 — 회고 없이 발송")
+        # 회고 섹션은 메시지에서 제거 (사용자 요청) — 히스토리는 계속 저장, /backtest로 조회.
 
-        # 발송 — formatter에 retro 포함
+        # 발송 — formatter에 운영노트 포함
         text = formatter.format_results(
             results, datetime.now(KST), base_date=base_date, stats=stats,
-            links=links, extra=extra, retro=retro,
+            links=links, extra=extra, ops_notes=ops_notes,
         )
         # 모든 대상자에게 broadcast (한 번 계산 → N번 발송)
         sent_count = 0
