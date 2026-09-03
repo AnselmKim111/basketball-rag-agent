@@ -46,6 +46,10 @@
   → 텔레그램 추천 (`/model_approve <id|all>` 승인 시 Railway env 자동 upsert).
 - **티어별 가중** (scorer.TIER_WEIGHTS): 가성비 티어(Summary/Narrow/Fallback) cost 0.4 /
   품질 티어(Synthesis/Deep) evidence 0.45-0.50 — 미검증 신모델로 품질 티어 강등 추천 금지.
+- **프로바이더 제외** (recommender): `MODEL_ROUTER_EXCLUDE_PROVIDERS` (기본 `anthropic`
+  — 사용자 지시 2026-09-03). 랭킹 단계 필터라 automatic 경로 포함 어떤 추천에도 안 뜸.
+  해제하려면 env를 빈 문자열로. X_fallback은 Summary 1차와 같은 프로바이더 자동 제외
+  (분리 원칙 강제 — kimi→deepseek 같은 역추천 차단).
 - **4 Layer 안전망**:
   A=canary smoke test (적용 전 한국어·JSON sentinel, 실패 시 변경 거부) ·
   B=pydantic schema (`src/llm_schemas.py` — **프롬프트 실제 출력과 1:1 대조 필수, 추정 금지**) ·

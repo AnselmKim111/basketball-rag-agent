@@ -19,6 +19,20 @@ log = logging.getLogger(__name__)
 SKIP_MARGIN = 0.05
 
 
+def _excluded_providers() -> set[str]:
+    """추천에서 제외할 프로바이더 prefix (콤마 구분 env).
+
+    기본 "anthropic" — 사용자 지시 (2026-09-03): Anthropic 모델 추천 금지.
+    빈 문자열로 설정하면 제외 없음 (지시 해제 시).
+    """
+    raw = os.getenv("MODEL_ROUTER_EXCLUDE_PROVIDERS", "anthropic")
+    return {x.strip().lower() for x in raw.split(",") if x.strip()}
+
+
+def _provider_of(model_id: str) -> str:
+    return model_id.split("/", 1)[0].lower()
+
+
 def _passes_constraints(model: dict, tier: str) -> bool:
     c = TIER_CONSTRAINTS.get(tier, {})
     if c.get("min_ctx") and model.get("ctx_length", 0) < c["min_ctx"]:
@@ -29,10 +43,28 @@ def _passes_constraints(model: dict, tier: str) -> bool:
 
 
 def _rank_tier(tier: str, all_models: dict, activity: dict) -> list[dict]:
-    """티어 후보를 점수순으로 정렬 — top N."""
+    """티어 후보를 점수순으로 정렬 — top N.
+
+    필터 2종:
+      1. 제외 프로바이더 (기본 anthropic — MODEL_ROUTER_EXCLUDE_PROVIDERS)
+      2. X_fallback은 Summary 1차와 같은 프로바이더 제외 — "fallback은 1차와
+         프로바이더 분리" 원칙 (상관 장애 회피)을 랭킹 단계에서 강제.
+    automatic 업그레이드도 best 랭킹을 거치므로 여기서 걸러지면 어느 경로로도
+    추천 불가.
+    """
     candidates = TIER_CANDIDATES.get(tier, [])
+    excluded = _excluded_providers()
+    fallback_conflict: str | None = None
+    if tier == "X_fallback":
+        from src.llm_models import DEFAULT_SUMMARY
+        primary = os.getenv("OPENROUTER_MODEL") or DEFAULT_SUMMARY
+        fallback_conflict = _provider_of(primary)
     scored = []
     for mid in candidates:
+        if _provider_of(mid) in excluded:
+            continue
+        if fallback_conflict and _provider_of(mid) == fallback_conflict:
+            continue
         if mid not in all_models:
             continue
         m = all_models[mid]
