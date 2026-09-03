@@ -155,7 +155,7 @@ def _build_llm_messages(query: str, catalog: list[dict]) -> list[dict]:
     user_msg = (
         f"사용자 입력:\n{query}\n\n"
         f"산업 카탈로그 (정식 산업명만 사용 가능):\n"
-        f"{json.dumps(cat_payload, ensure_ascii=False, indent=2)}\n\n"
+        f"{json.dumps(cat_payload, ensure_ascii=False, separators=(',', ':'))}\n\n"
         "위 카탈로그 내 산업명 중 1개로 best 매핑, 나머지는 후보 2개로 ranked. JSON만 출력."
     )
     return [

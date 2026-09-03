@@ -239,16 +239,14 @@ def write_report(
         "**일반 룰**: news는 내러티브에 자연스럽게 녹이되 **출처 URL 절대 금지**, 매체/주체 이름만. "
         "입력 news에 있는 사실만 쓰고 없는 수치·사실은 만들지 마라. "
         "stale_data 카테고리는 '⚠ 전일자 데이터(asof)'로 명시. 데이터 미확보는 '데이터 미수집'으로.\n\n"
-        + json.dumps(payload, ensure_ascii=False, indent=2)
+        + json.dumps(payload, ensure_ascii=False, separators=(',', ':'))
     )
     try:
-        from openai import OpenAI
         from src import summarizer
-        client = OpenAI(
-            base_url="https://openrouter.ai/api/v1",
-            api_key=os.environ["OPENROUTER_API_KEY"],
-        )
-        model = os.getenv("REPORT_SYNTHESIS_MODEL") or os.getenv("IDEA_SYNTHESIS_MODEL") or "anthropic/claude-sonnet-4.5"
+        from src.llm_models import DEFAULT_SYNTHESIS
+        # 공용 캐시 클라이언트 재사용 (timeout/재시도/헤더 일관 + pool 재사용)
+        client = summarizer.get_client()
+        model = os.getenv("REPORT_SYNTHESIS_MODEL") or os.getenv("IDEA_SYNTHESIS_MODEL") or DEFAULT_SYNTHESIS
         max_tok = int(os.getenv("REPORT_MAX_TOKENS") or "24000")
         md = summarizer.chat_with_retry(
             client,

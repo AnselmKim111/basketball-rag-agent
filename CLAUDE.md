@@ -27,16 +27,19 @@
 
 ## 2. 모델 티어 (절대 무너뜨리지 말 것)
 
-| 티어 | env var | 모델 (2026-06-09 현행) | 용도 |
-|---|---|---|---|
-| Summary | `OPENROUTER_MODEL` | kimi-k2.6 (갓성비) | PDF 요약·DART·Forward·deepdive·idea parse |
-| Research | `IDEA_RESEARCH_MODEL` | perplexity/sonar-pro | 1단계 웹검색 |
-| Narrow | `IDEA_NARROW_MODEL` | claude-haiku-4.5 | 3단계 30→10 (큰 출력) + parse 폴백 |
-| Synthesis | `IDEA_SYNTHESIS_MODEL` / `REPORT_SYNTHESIS_MODEL` | claude-sonnet-4.6 | importance + synthesis + 시황 narrative (진짜 지능) |
-| Deep | `EARNINGS_SYNTHESIS_MODEL` | claude-opus-4.8 | 어닝 비교합성 (최고 지능) |
-| Fallback | `OPENROUTER_FALLBACK_MODEL` | kimi-k2.6 | chat_with_retry 3차 시도 안전망 |
+| 티어 | env var | 모델 (2026-09-03 라이브가격 재평가) | chain 2차 | 용도 |
+|---|---|---|---|---|
+| Summary | `OPENROUTER_MODEL` | **deepseek-v4-flash** ($0.089/$0.177 — kimi 대비 11-23x↓) | kimi-k2.6 | PDF 요약·DART·Forward·deepdive·idea parse |
+| Research | `IDEA_RESEARCH_MODEL` | perplexity/sonar-pro (저볼륨 — 품질 유지) | — | 1단계 웹검색 |
+| Narrow | `IDEA_NARROW_MODEL` | **deepseek-v4-flash** (출력단가 haiku 대비 28x↓, JSON OK) | claude-haiku-4.5 | 3단계 30→10 (큰 출력) + parse 폴백 |
+| Synthesis | `IDEA_SYNTHESIS_MODEL` / `REPORT_SYNTHESIS_MODEL` | claude-sonnet-4.6 (품질 티어 — canary 검증 없인 강등 금지) | **deepseek-v4-pro** (구 opus-4.7 역구조 교정) | importance + synthesis + 시황 narrative |
+| Deep | `EARNINGS_SYNTHESIS_MODEL` | claude-opus-4.8 (저볼륨 유지) | — | 어닝 비교합성 (최고 지능) |
+| Fallback | `OPENROUTER_FALLBACK_MODEL` | kimi-k2.6 (1차와 프로바이더 분리) | — | chat_with_retry 3차 시도 안전망 |
 
-요약·추출 작업은 kimi에서 절대 sonnet으로 올리지 말 것 (비용 6-8배). 진짜 지능 필요한 단계만 sonnet.
+요약·추출 작업을 sonnet으로 올리지 말 것 (비용 30-80배). 진짜 지능 필요한 단계만 sonnet.
+코드 기본값은 `src/llm_models.py` — **Railway env가 우선하므로 활성화하려면 env도 갱신**
+(`/model_eval` → `/model_approve` 경로가 canary 검증 포함이라 안전, 또는 Variables 수동 수정).
+가성비 티어 신모델 전환 후 1주는 model_router Layer D(시간당 rollback 검사)가 실패율 감시.
 
 ### Model Router (src/model_router/ — 주간 자동 재평가)
 - 매주 일요일 21:00 KST cron: OpenRouter /models 가격 + /activity 사용량으로 가성비 재평가

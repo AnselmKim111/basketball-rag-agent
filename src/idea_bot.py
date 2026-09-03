@@ -785,7 +785,7 @@ async def _run_contrarian(
             f"# 1단계 리서치 요약\n"
             f"{json.dumps(cached_research.get('logic_gradient_text',''), ensure_ascii=False)[:3000]}\n\n"
             f"# 1.5 importance 평가\n{json.dumps(importance, ensure_ascii=False)[:1500]}\n\n"
-            f"# top10 후보\n{json.dumps(cached_top10, ensure_ascii=False, indent=2)[:8000]}\n\n"
+            f"# top10 후보\n{json.dumps(cached_top10, ensure_ascii=False, separators=(',', ':'))[:8000]}\n\n"
             f"# 산업 리포트 텍스트\n{ind_block[:50_000]}\n\n"
             f"# 종목 리포트 텍스트\n{company_block[:60_000]}\n\n"
             "thesis가 깨질 시나리오와 그때 가장 취약한 Top 5를 시스템 프롬프트 형식대로 JSON으로 출력해주세요."
@@ -1560,7 +1560,7 @@ async def _research_idea(idea_text: str, parsed: dict | None = None) -> dict | N
         )):
             constraints_block = (
                 "\n\n<constraints>\n"
-                f"{json.dumps(constraints, ensure_ascii=False, indent=2)}\n"
+                f"{json.dumps(constraints, ensure_ascii=False, separators=(',', ':'))}\n"
                 "</constraints>\n"
                 "위 제약을 반드시 엄격하게 적용하세요. 제약 위반 종목은 candidates에 절대 포함하지 마세요."
             )

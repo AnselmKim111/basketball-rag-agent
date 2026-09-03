@@ -22,7 +22,9 @@ from pypdf import PdfReader
 log = logging.getLogger(__name__)
 
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
-DEFAULT_MODEL = os.getenv("OPENROUTER_MODEL", "anthropic/claude-sonnet-4.5")
+# Summary tier 기본 — CLAUDE.md §2: 요약·추출을 sonnet으로 올리지 말 것.
+# (이전 기본 sonnet-4.5는 규칙 위반 — env 미설정 환경에서 6-30x 과금 위험)
+DEFAULT_MODEL = os.getenv("OPENROUTER_MODEL", "deepseek/deepseek-v4-flash")
 
 # pypdf로 추출한 텍스트의 최대 길이 (모델 컨텍스트 보호)
 MAX_PDF_TEXT_CHARS = 80_000
@@ -120,7 +122,15 @@ class IndividualSummary:
     summary_text: str
 
 
+# get_client 모듈 캐시 — OpenAI 클라이언트는 thread-safe이고 내부 httpx pool을
+# 재사용하므로 호출마다 새로 만들면 TLS handshake·pool 비용만 낭비.
+_CLIENT_CACHE: OpenAI | None = None
+
+
 def get_client() -> OpenAI:
+    global _CLIENT_CACHE
+    if _CLIENT_CACHE is not None:
+        return _CLIENT_CACHE
     api_key = os.getenv("OPENROUTER_API_KEY")
     if not api_key:
         raise RuntimeError(
@@ -128,7 +138,7 @@ def get_client() -> OpenAI:
         )
     # OpenRouter 쪽 일부 모델(xiaomi/mimo 등)이 stream idle timeout으로 partial response를
     # 자주 흘림. 명시적 timeout(180s) + 자동 재시도(2회)로 transient 실패 흡수.
-    return OpenAI(
+    _CLIENT_CACHE = OpenAI(
         api_key=api_key,
         base_url=OPENROUTER_BASE_URL,
         timeout=180.0,
@@ -138,6 +148,7 @@ def get_client() -> OpenAI:
             "X-Title": "wisereport-auto-downloader",
         },
     )
+    return _CLIENT_CACHE
 
 
 def _extract_pdf_text(pdf_path: Path, max_chars: int = MAX_PDF_TEXT_CHARS) -> str:

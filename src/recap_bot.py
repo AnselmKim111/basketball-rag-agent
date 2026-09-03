@@ -266,7 +266,7 @@ async def _synthesize_recap(data: dict) -> str:
         }
         user_msg = (
             "다음 4섹션 회고 데이터를 시스템 프롬프트 형식대로 합성:\n\n"
-            + json.dumps(payload, ensure_ascii=False, indent=2, default=str)[:15_000]
+            + json.dumps(payload, ensure_ascii=False, separators=(',', ':'), default=str)[:15_000]
         )
         try:
             content = summarizer.chat_with_retry(

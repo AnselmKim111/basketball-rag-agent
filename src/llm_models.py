@@ -18,11 +18,23 @@ import os
 from typing import Iterable
 
 
-# 기본값 — 각 티어의 안전 fallback
-DEFAULT_SUMMARY = "moonshotai/kimi-k2.6"
-DEFAULT_NARROW = "anthropic/claude-haiku-4.5"
-DEFAULT_SYNTHESIS = "anthropic/claude-sonnet-4.5"
+# 기본값 — 각 티어의 안전 fallback.
+# 2026-09-03 라이브 가격 재평가 (openrouter /models 실측, $/1M in·out):
+#   deepseek-v4-flash 0.089·0.177 (1M ctx, JSON OK) ← kimi-k2.6 0.95·4.00 대비 11-23x 절감
+#   deepseek-v4-pro   1.042·2.085 ← sonnet 3.00·15.00 (synthesis fallback용)
+#   haiku-4.5         1.00·5.00   → narrow 1차에서 v4-flash로 교체 (출력단가 28x)
+# Summary·Narrow(가성비 티어)는 최저가로 공격 전환 + 품질 모델을 chain 2차로 유지.
+# Synthesis·Deep(품질 티어)은 CLAUDE.md §2 가드레일대로 검증 모델 유지 — 승격은
+# model_router 주간 평가 + canary 경로로만.
+DEFAULT_SUMMARY = "deepseek/deepseek-v4-flash"
+DEFAULT_NARROW = "deepseek/deepseek-v4-flash"
+DEFAULT_SYNTHESIS = "anthropic/claude-sonnet-4.6"
 DEFAULT_RESEARCH = "perplexity/sonar-pro"
+
+# chain 2차용 — 1차(초저가)와 프로바이더를 분리해 상관 장애 회피.
+FALLBACK_SUMMARY = "moonshotai/kimi-k2.6"
+FALLBACK_NARROW = "anthropic/claude-haiku-4.5"
+FALLBACK_SYNTHESIS = "deepseek/deepseek-v4-pro"
 
 
 def summary_model() -> str:
@@ -85,18 +97,23 @@ def model_chain_from_env(env: str, defaults: list[str]) -> list[str]:
 
 
 def narrow_chain(env: str = "IDEA_NARROW_MODEL") -> list[str]:
-    """Narrow tier chain — env value + 안정 default fallback."""
-    return model_chain_from_env(env, [DEFAULT_NARROW, DEFAULT_SUMMARY])
+    """Narrow tier chain — 초저가 1차 + 검증된 품질 모델(haiku) 2차."""
+    return model_chain_from_env(env, [DEFAULT_NARROW, FALLBACK_NARROW])
 
 
 def synthesis_chain(env: str = "IDEA_SYNTHESIS_MODEL") -> list[str]:
-    """Synthesis tier chain — env value + 안정 default fallback."""
-    return model_chain_from_env(env, [DEFAULT_SYNTHESIS, "anthropic/claude-opus-4.7"])
+    """Synthesis tier chain — sonnet 1차 + 저가 고성능(v4-pro) 2차.
+
+    이전 2차는 opus-4.7($25/M out)이었는데 fallback이 1차보다 비싼 역구조 —
+    v4-pro($2.09/M out)로 교체. fallback은 1차 빈 응답 시에만 타므로 품질
+    리스크 국소적, 비용 12x 절감.
+    """
+    return model_chain_from_env(env, [DEFAULT_SYNTHESIS, FALLBACK_SYNTHESIS])
 
 
 def summary_chain() -> list[str]:
-    """Summary tier chain — env(OPENROUTER_MODEL) value + 안정 default fallback."""
-    return model_chain_from_env("OPENROUTER_MODEL", [DEFAULT_SUMMARY, DEFAULT_NARROW])
+    """Summary tier chain — 초저가 1차 + 프로바이더 분리된 kimi 2차."""
+    return model_chain_from_env("OPENROUTER_MODEL", [DEFAULT_SUMMARY, FALLBACK_SUMMARY])
 
 
 def chained_model(envs: Iterable[str], default: str) -> str:
