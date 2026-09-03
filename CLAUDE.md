@@ -51,7 +51,10 @@
   B=pydantic schema (`src/llm_schemas.py` — **프롬프트 실제 출력과 1:1 대조 필수, 추정 금지**) ·
   C=force_json (response_format, 미지원 모델 400 자동 off) ·
   D=auto rollback (시간당 cron, 1h fail_rate >20% 또는 p95 >30s 시 이전 모델 복원).
-- 명령 (버터대디봇 admin): `/model_eval` `/model_approve` `/model_reject` `/model_status`.
+- 명령: **종목봇**(TELEGRAM_BOT_TOKEN)에서 `/model_eval` `/model_approve` `/model_reject`
+  `/model_status` — 버터대디봇 사망(2026-06-23~)으로 이관. cron 2개(주간 재평가 +
+  Layer D)도 company spec으로 이동. 알림 대상: REPORT_CHAT_ID → MODEL_ROUTER_CHAT_ID
+  → ALLOWED_CHAT_IDS 첫 id 폴백.
 
 ## 3. 배포 흐름
 

@@ -135,7 +135,22 @@ BOT_SPECS: list[BotSpec] = [
         token_env="TELEGRAM_BOT_TOKEN",
         builder=build_company_app,
         commands=COMPANY_COMMANDS,
-        jobs=[],  # 스케줄 없음 (사용자 명령 기반)
+        jobs=[
+            # model_router cron — 버터대디봇(report) 사망으로 이관 (2026-09).
+            # 살아있는 봇 토큰이면 어떤 봇이든 무방 — 알림은 handler가 env로 라우팅.
+            ScheduledJob(
+                func=_model_router_weekly_job,
+                job_id="model_router_weekly",
+                cron={"day_of_week": "sun", "hour": 21, "minute": 0},
+                description="모델 가성비 주간 재평가 — 매주 일요일 21:00 KST",
+            ),
+            ScheduledJob(
+                func=_model_health_cron_job,
+                job_id="model_health_hourly",
+                cron={"minute": 17},
+                description="Layer D — 모델 health 검사 + 자동 rollback (시간당 17분)",
+            ),
+        ],
     ),
     BotSpec(
         name="industry",
@@ -281,18 +296,6 @@ BOT_SPECS: list[BotSpec] = [
                 job_id="report_daily",
                 cron={"hour": 8, "minute": 0},
                 description="버터대디봇 시황 리포트 — 매일 08:00 KST",
-            ),
-            ScheduledJob(
-                func=_model_router_weekly_job,
-                job_id="model_router_weekly",
-                cron={"day_of_week": "sun", "hour": 21, "minute": 0},
-                description="모델 가성비 주간 재평가 — 매주 일요일 21:00 KST",
-            ),
-            ScheduledJob(
-                func=_model_health_cron_job,
-                job_id="model_health_hourly",
-                cron={"minute": 17},
-                description="Layer D — 모델 health 검사 + 자동 rollback (시간당 17분)",
             ),
         ],
     ),

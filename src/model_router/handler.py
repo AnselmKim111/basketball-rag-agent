@@ -31,11 +31,31 @@ def _ttl_hours() -> int:
 
 
 def _is_admin(chat_id: int, allowed_env: str = "REPORT_ALLOWED_CHAT_IDS") -> bool:
-    allowed = os.getenv(allowed_env, "") or os.getenv("REPORT_CHAT_ID", "")
+    """admin 판정 — report 봇 env 우선, 없으면 종목봇(ALLOWED_CHAT_IDS) 폴백.
+
+    2026-09: 버터대디봇 사망으로 model_* 명령을 종목봇에도 등록 — 종목봇
+    사용자 allowlist가 곧 admin (개인 운영 전제)."""
+    allowed = (os.getenv(allowed_env, "") or os.getenv("REPORT_CHAT_ID", "")
+               or os.getenv("ALLOWED_CHAT_IDS", ""))
     if allowed == "*":
         return True
     ids = {x.strip() for x in allowed.split(",") if x.strip()}
     return str(chat_id) in ids
+
+
+def _cron_notify_chat_id() -> str | None:
+    """cron 알림 대상 — report 봇 사망 대비 다단 폴백.
+
+    REPORT_CHAT_ID → MODEL_ROUTER_CHAT_ID → ALLOWED_CHAT_IDS 첫 숫자 id."""
+    v = os.getenv("REPORT_CHAT_ID") or os.getenv("MODEL_ROUTER_CHAT_ID")
+    if v:
+        return v.strip()
+    raw = os.getenv("ALLOWED_CHAT_IDS", "")
+    for tok in raw.split(","):
+        tok = tok.strip()
+        if tok and tok != "*" and tok.lstrip("-").isdigit():
+            return tok
+    return None
 
 
 def _format_eval_message(recs: list[dict], pending: list[dict],
@@ -89,7 +109,7 @@ async def model_health_job(bot: Bot, override_chat_id: str | None = None) -> Non
     actions = await asyncio.to_thread(rollback.check_and_rollback)
     if not actions:
         return  # 정상 — silent
-    chat_id = override_chat_id or os.getenv("REPORT_CHAT_ID")
+    chat_id = override_chat_id or _cron_notify_chat_id()
     if not chat_id:
         return
     msg = rollback.format_rollback_message(actions)
@@ -103,9 +123,9 @@ async def model_health_job(bot: Bot, override_chat_id: str | None = None) -> Non
 async def model_eval_job(bot: Bot, override_chat_id: str | None = None) -> None:
     """cron entrypoint — 주간 재평가 + admin 알림."""
     log.info("[model_router.cron] 시작")
-    chat_id = override_chat_id or os.getenv("REPORT_CHAT_ID")
+    chat_id = override_chat_id or _cron_notify_chat_id()
     if not chat_id:
-        log.warning("[model_router.cron] REPORT_CHAT_ID 미설정 — 알림 skip")
+        log.warning("[model_router.cron] 알림 대상 chat 미설정 (REPORT_CHAT_ID/MODEL_ROUTER_CHAT_ID/ALLOWED_CHAT_IDS) — skip")
         return
 
     # 1. expire old pending (이전 주 미응답)

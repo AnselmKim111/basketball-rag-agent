@@ -769,6 +769,9 @@ COMPANY_COMMANDS = [
     ("report", "특정 종목 리포트 다운 + 요약 (분리 발송)"),
     ("deepdive", "DART 사업보고서·IR·재무차트 심층분석 (분리 발송)"),
     ("status", "현재 작업 진행 상태"),
+    ("model_eval", "🤖 모델 가성비 즉시 재평가"),
+    ("model_approve", "✅ 모델 추천 승인 (Railway env 적용)"),
+    ("model_status", "모델 티어 현황"),
     ("deephelp", "deepdive 상세 도움말"),
     ("help", "전체 도움말"),
 ]
@@ -786,6 +789,18 @@ def build_company_app(token: str) -> Application:
     app.add_handler(CommandHandler("report", cmd_report))
     app.add_handler(CommandHandler("research", cmd_research))
     app.add_handler(CommandHandler("curate", cmd_curate))
+    # model_router admin 명령 — 버터대디봇(report) 사망으로 이관 (2026-09).
+    # report_bot 등록은 유지 (부활 시 양쪽 동작, 해 없음).
+    try:
+        from src.model_router.handler import (
+            model_eval_cmd, model_approve_cmd, model_reject_cmd, model_status_cmd,
+        )
+        app.add_handler(CommandHandler("model_eval", model_eval_cmd))
+        app.add_handler(CommandHandler("model_approve", model_approve_cmd))
+        app.add_handler(CommandHandler("model_reject", model_reject_cmd))
+        app.add_handler(CommandHandler("model_status", model_status_cmd))
+    except Exception:
+        logging.exception("model_router 핸들러 등록 실패 — 종목봇 기본 기능은 정상")
     app.add_handler(
         CallbackQueryHandler(cmd_curate_pick, pattern=f"^{_CURATE_PICK_PREFIX}\\|")
     )
