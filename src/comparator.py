@@ -32,7 +32,7 @@ log = logging.getLogger(__name__)
 KST = timezone(timedelta(hours=9))
 
 SYNTHESIS_MODEL_ENV = "IDEA_SYNTHESIS_MODEL"  # deep_research와 동일 — claude-sonnet-4.5
-DEFAULT_SYNTHESIS_MODEL = "anthropic/claude-sonnet-4.5"
+from src.llm_models import DEFAULT_SYNTHESIS as DEFAULT_SYNTHESIS_MODEL
 
 COMPARE_PROMPT = """당신은 헤지펀드 PM 입장에서 종목 N개를 특정 측면으로 비교한다.
 경쟁자(다른 최고 투자자)보다 빠르게 우열을 짚어내는 게 목표.

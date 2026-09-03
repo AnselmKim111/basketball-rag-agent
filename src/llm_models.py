@@ -28,15 +28,16 @@ from typing import Iterable
 # model_router 주간 평가 + canary 경로로만.
 DEFAULT_SUMMARY = "deepseek/deepseek-v4-flash"
 DEFAULT_NARROW = "deepseek/deepseek-v4-flash"
-# sonnet-5: 4.6 대비 신세대 + 33% 저렴($2/$10 vs $3/$15) — 같은 프로바이더
-# 세대 업그레이드 (candidates.AUTOMATIC_UPGRADES 경로, canary가 최종 게이트).
-DEFAULT_SYNTHESIS = "anthropic/claude-sonnet-5"
+# 사용자 지시(2026-09-03): Anthropic 제외 — 비-Anthropic 중 최적 조합.
+# v4-pro $1.04/$2.08 (JSON OK, repo 후보 1순위) + gpt-5.1 품질 백업.
+DEFAULT_SYNTHESIS = "deepseek/deepseek-v4-pro"
 DEFAULT_RESEARCH = "perplexity/sonar-pro"
+DEFAULT_DEEP = "openai/gpt-5.2"             # 비-Anthropic 최상급 ($1.75/$14)
 
 # chain 2차용 — 1차(초저가)와 프로바이더를 분리해 상관 장애 회피.
 FALLBACK_SUMMARY = "moonshotai/kimi-k2.6"
-FALLBACK_NARROW = "anthropic/claude-haiku-4.5"
-FALLBACK_SYNTHESIS = "deepseek/deepseek-v4-pro"
+FALLBACK_NARROW = "qwen/qwen3.7-plus"       # $0.32/$1.28, 1M ctx, JSON OK
+FALLBACK_SYNTHESIS = "openai/gpt-5.1"       # 1차(deepseek)와 프로바이더 분리, 프론티어 백업
 
 
 def summary_model() -> str:
@@ -122,7 +123,7 @@ def chained_model(envs: Iterable[str], default: str) -> str:
     """env 이름 여러 개 순회 — 첫 set된 값. 모두 없으면 default.
 
     예: EarningsBot의 EARNINGS_SYNTHESIS_MODEL > IDEA_SYNTHESIS_MODEL > opus 기본:
-        chained_model(["EARNINGS_SYNTHESIS_MODEL", "IDEA_SYNTHESIS_MODEL"], "anthropic/claude-opus-4.7")
+        chained_model(["EARNINGS_SYNTHESIS_MODEL", "IDEA_SYNTHESIS_MODEL"], DEFAULT_DEEP)
     """
     for env in envs:
         v = os.getenv(env)

@@ -27,7 +27,7 @@ log = logging.getLogger(__name__)
 
 # 모델 — 빠른 추론 (haiku) + JSON 출력. idea_bot narrow tier 재사용.
 ROUTER_MODEL_ENV = "INTENT_ROUTER_MODEL"
-DEFAULT_ROUTER_MODEL = "anthropic/claude-haiku-4.5"
+from src.llm_models import DEFAULT_SUMMARY as DEFAULT_ROUTER_MODEL  # 분류 작업 — summary 티어면 충분
 
 
 @dataclass

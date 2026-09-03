@@ -848,7 +848,8 @@ def summarize_event_8k(event: Event8K, ticker: str, summary_model: str | None = 
         "directional impact (positive / negative / neutral) on the company's thesis. No prose, "
         "just one sentence."
     )
-    model = summary_model or os.getenv("EARNINGS_EXTRACT_MODEL") or "anthropic/claude-sonnet-4.5"
+    from src.llm_models import DEFAULT_NARROW
+    model = summary_model or os.getenv("EARNINGS_EXTRACT_MODEL") or DEFAULT_NARROW
     try:
         client = summarizer.get_client()
         content = summarizer.chat_with_retry(

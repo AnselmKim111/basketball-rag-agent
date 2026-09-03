@@ -43,7 +43,7 @@ KST = timezone(timedelta(hours=9))
 
 # 모델 — IdeaBot synthesis tier 재사용 (claude-sonnet-4.5)
 SYNTHESIS_MODEL_ENV = "IDEA_SYNTHESIS_MODEL"
-DEFAULT_SYNTHESIS_MODEL = "anthropic/claude-sonnet-4.5"
+from src.llm_models import DEFAULT_SYNTHESIS as DEFAULT_SYNTHESIS_MODEL
 
 # 웹 리서치 — perplexity sonar-pro (idea_bot과 동일 키)
 RESEARCH_MODEL_ENV = "IDEA_RESEARCH_MODEL"

@@ -31,12 +31,12 @@
 |---|---|---|---|---|
 | Summary | `OPENROUTER_MODEL` | **deepseek-v4-flash** ($0.089/$0.177 — kimi 대비 11-23x↓) | kimi-k2.6 | PDF 요약·DART·Forward·deepdive·idea parse |
 | Research | `IDEA_RESEARCH_MODEL` | perplexity/sonar-pro (저볼륨 — 품질 유지) | — | 1단계 웹검색 |
-| Narrow | `IDEA_NARROW_MODEL` | **deepseek-v4-flash** (출력단가 haiku 대비 28x↓, JSON OK) | claude-haiku-4.5 | 3단계 30→10 (큰 출력) + parse 폴백 |
-| Synthesis | `IDEA_SYNTHESIS_MODEL` / `REPORT_SYNTHESIS_MODEL` | **claude-sonnet-5** ($2/$10 — 4.6 대비 신세대 + 33%↓, AUTOMATIC_UPGRADES 경로) | deepseek-v4-pro | importance + synthesis + 시황 narrative |
-| Deep | `EARNINGS_SYNTHESIS_MODEL` | **claude-opus-5** ($5/$25 — 4.8과 동가 신세대) | — | 어닝 비교합성 (최고 지능) |
+| Narrow | `IDEA_NARROW_MODEL` | **deepseek-v4-flash** (출력단가 haiku 대비 28x↓, JSON OK) | qwen3.7-plus | 3단계 30→10 (큰 출력) + parse 폴백 |
+| Synthesis | `IDEA_SYNTHESIS_MODEL` / `REPORT_SYNTHESIS_MODEL` | **deepseek-v4-pro** ($1.04/$2.08 — 비-Anthropic 지시, sonnet 대비 출력 7x↓) | gpt-5.1 (프론티어 백업) | importance + synthesis + 시황 narrative |
+| Deep | `EARNINGS_SYNTHESIS_MODEL` | **gpt-5.2** ($1.75/$14 — 비-Anthropic 최상급, opus 대비 44%↓) | — | 어닝 비교합성 (최고 지능) |
 | Fallback | `OPENROUTER_FALLBACK_MODEL` | kimi-k2.6 (1차와 프로바이더 분리) | — | chat_with_retry 3차 시도 안전망 |
 
-요약·추출 작업을 sonnet으로 올리지 말 것 (비용 30-80배). 진짜 지능 필요한 단계만 sonnet.
+요약·추출 작업을 상위 티어로 올리지 말 것 (비용 30-80배). **비-Anthropic 지시 (2026-09-03)** — Anthropic 모델은 기본값·chain에서 제외 (router 후보 풀에는 유지, 추천은 사용자 승인 게이트).
 코드 기본값은 `src/llm_models.py` — **Railway env가 우선하므로 활성화하려면 env도 갱신**
 (`/model_eval` → `/model_approve` 경로가 canary 검증 포함이라 안전, 또는 Variables 수동 수정).
 가성비 티어 신모델 전환 후 1주는 model_router Layer D(시간당 rollback 검사)가 실패율 감시.

@@ -277,7 +277,8 @@ async def _answer_question(update: Update, question: str) -> None:
     except Exception:
         await update.message.reply_text("⚠️ LLM 초기화 실패 — 명시 명령(/research 등) 사용해 주세요.")
         return
-    model = os.getenv("IDEA_SYNTHESIS_MODEL") or "anthropic/claude-sonnet-4.5"
+    from src.llm_models import DEFAULT_SYNTHESIS
+    model = os.getenv("IDEA_SYNTHESIS_MODEL") or DEFAULT_SYNTHESIS
     prompt = (
         "당신은 한국 주식·금융 시장 전문가다. 다음 질문에 한국어로 답하라.\n"
         "구체·실용 우선, 추상 표현 금지. 1000자 이내.\n\n"

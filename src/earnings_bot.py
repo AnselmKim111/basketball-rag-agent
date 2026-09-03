@@ -2768,7 +2768,7 @@ def _build_synthesis_payload(
 # 모델 티어 / 프롬프트 / 메시지 헬퍼
 # ------------------------------------------------------------------
 # 모델 티어는 src/llm_models.py 공유. EarningsBot은 chained env 사용.
-from src.llm_models import summary_model as _summary_model, chained_model
+from src.llm_models import DEFAULT_SYNTHESIS, summary_model as _summary_model, chained_model
 
 
 def _predictions_schema():
@@ -2784,7 +2784,7 @@ def _extract_model() -> str:
     """종목별 전문 심층추출 — sonnet (긴 입력 정밀 읽기, 비용 절충)."""
     return chained_model(
         ["EARNINGS_EXTRACT_MODEL", "IDEA_NARROW_MODEL"],
-        "anthropic/claude-sonnet-4.5",
+        DEFAULT_SYNTHESIS,
     )
 
 
@@ -2792,7 +2792,7 @@ def _synthesis_model() -> str:
     """최종 비교 합성 + 커스텀 분석 — Opus (딥리서치급 추론)."""
     return chained_model(
         ["EARNINGS_SYNTHESIS_MODEL", "IDEA_SYNTHESIS_MODEL"],
-        "anthropic/claude-opus-5",  # 4.7/4.8과 동가($5/$25) 신세대
+        "openai/gpt-5.2",  # 비-Anthropic 최상급 ($1.75/$14)
     )
 
 

@@ -50,7 +50,7 @@ KST = timezone(timedelta(hours=9))
 
 # 모델 — IdeaBot의 synthesis tier 그대로 (claude-sonnet-4.5 등 진짜 지능 필요)
 SYNTHESIS_MODEL_ENV = "IDEA_SYNTHESIS_MODEL"
-DEFAULT_SYNTHESIS_MODEL = "anthropic/claude-sonnet-4.5"
+from src.llm_models import DEFAULT_SYNTHESIS as DEFAULT_SYNTHESIS_MODEL
 
 DEFAULT_DAYS_BACK = 5  # 후보 풀: 최근 5일 (사용자 의도 — 즉시 거래 가능한 신선한 리서치)
 SUMMARY_CHARS = 5000  # 5000자 요약 (long)
