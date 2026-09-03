@@ -19,11 +19,17 @@ UPSERT_MUTATION = """mutation upsert($input: VariableUpsertInput!){variableUpser
 
 def _config() -> dict | None:
     tok = os.getenv("RAILWAY_PROJECT_ACCESS_TOKEN")
+    # PROJECT/ENVIRONMENT/SERVICE ID는 Railway가 컨테이너에 자동 주입 —
+    # 사용자가 손수 넣어야 하는 건 사실상 토큰 하나뿐.
     pid = os.getenv("RAILWAY_PROJECT_ID")
     eid = os.getenv("RAILWAY_ENVIRONMENT_ID")
-    sids = os.getenv("RAILWAY_SERVICE_IDS", "")
-    if not (tok and pid and eid and sids):
-        log.warning("[model_router.railway_env] Railway env 누락 (TOKEN/PROJECT/ENV/SERVICE) — upsert 불가")
+    sids = os.getenv("RAILWAY_SERVICE_IDS", "") or os.getenv("RAILWAY_SERVICE_ID", "")
+    missing = [n for n, v in (("RAILWAY_PROJECT_ACCESS_TOKEN", tok),
+                              ("RAILWAY_PROJECT_ID", pid),
+                              ("RAILWAY_ENVIRONMENT_ID", eid),
+                              ("RAILWAY_SERVICE_ID(S)", sids)) if not v]
+    if missing:
+        log.warning("[model_router.railway_env] Railway env 누락: %s — upsert 불가", missing)
         return None
     return {
         "token": tok, "project_id": pid, "env_id": eid,
@@ -35,7 +41,7 @@ def upsert_variable(name: str, value: str) -> tuple[bool, str]:
     """env var을 모든 등록된 서비스에 upsert. (success, message) 반환."""
     cfg = _config()
     if not cfg:
-        return False, "Railway 설정 누락 — CLAUDE.local.md 참조"
+        return False, ("Railway 설정 누락 — RAILWAY_PROJECT_ACCESS_TOKEN을 Variables에 추가 ""(PROJECT/ENV/SERVICE ID는 Railway 자동 주입). 토큰: railway.app → Project → Tokens")
 
     ok_count = 0
     errors = []
