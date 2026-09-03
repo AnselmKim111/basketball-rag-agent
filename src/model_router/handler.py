@@ -18,7 +18,7 @@ from telegram.ext import ContextTypes
 
 from . import approval_store, railway_env
 from .candidates import TIER_ENV
-from .recommender import build_recommendations
+from .recommender import build_recommendations, LAST_EVAL_STATUS
 
 log = logging.getLogger(__name__)
 
@@ -80,7 +80,14 @@ def _format_eval_message(recs: list[dict], pending: list[dict],
         parts.append("승인: `/model_approve <id|all>`")
         parts.append("거부: `/model_reject <id|all>`")
     elif not auto_applied:
-        parts.append("✨ 변경 권고 없음 — 현 모델이 최적")
+        parts.append("✨ 변경 권고 없음 — 아래 현황 참조")
+
+    if LAST_EVAL_STATUS:
+        parts.append("")
+        parts.append("*[티어 현황]*")
+        for s in LAST_EVAL_STATUS:
+            cur = s.get("current") or "(미설정)"
+            parts.append(f"· `{s['env_name']}`: {cur} — {s['state']}")
 
     return "\n".join(parts)
 

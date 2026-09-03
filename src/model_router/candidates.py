@@ -19,8 +19,8 @@ TIER_CONSTRAINTS = {
     "A_summary":   {"min_ctx": 100_000, "max_out_price": 6.0, "need_json": True},
     "B_research":  {"need_web_tool": True},  # perplexity 전용
     "C_narrow":    {"min_ctx": 100_000, "max_out_price": 6.0, "need_json": True},
-    "D_synthesis": {"min_ctx": 200_000, "need_reasoning": True, "max_out_price": 30.0},
-    "E_deep":      {"min_ctx": 200_000, "need_reasoning": True, "max_out_price": 80.0},
+    "D_synthesis": {"min_ctx": 200_000, "need_reasoning": True, "max_out_price": 30.0, "min_out_price": 1.0},
+    "E_deep":      {"min_ctx": 200_000, "need_reasoning": True, "max_out_price": 80.0, "min_out_price": 3.0},
     "X_fallback":  {"min_ctx": 100_000, "max_out_price": 6.0},
 }
 
@@ -55,12 +55,15 @@ TIER_CANDIDATES = {
         "perplexity/sonar-pro",
     ],
     "C_narrow": [
+        "deepseek/deepseek-v4-flash",   # 코드 기본값 — 후보 누락으로 mimo가 추천되던 구멍 (2026-09)
+        "qwen/qwen3.7-plus",
         "anthropic/claude-haiku-4.5",
         "deepseek/deepseek-v3.2",
         "moonshotai/kimi-k2.6",
         "xiaomi/mimo-v2.5",
     ],
     "D_synthesis": [
+        "openai/gpt-5.1",               # synthesis chain 2차 — 후보에도 노출
         "anthropic/claude-sonnet-5",
         "anthropic/claude-sonnet-4.6",
         "anthropic/claude-sonnet-4.5",
@@ -70,6 +73,9 @@ TIER_CANDIDATES = {
         "qwen/qwen3.7-plus",
     ],
     "E_deep": [
+        "openai/gpt-5.2",               # 코드 기본값 (비-Anthropic 최상급)
+        "openai/gpt-5.1",
+        "qwen/qwen3.8-max",
         "anthropic/claude-opus-5",
         "anthropic/claude-opus-4.8",
         "anthropic/claude-opus-4.7",

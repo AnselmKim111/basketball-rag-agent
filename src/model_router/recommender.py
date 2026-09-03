@@ -39,7 +39,41 @@ def _passes_constraints(model: dict, tier: str) -> bool:
         return False
     if c.get("max_out_price") is not None and model["out_price"] > c["max_out_price"]:
         return False
+    # 품질 티어 가격 하한 — 증거 없는 신모델은 스코어가 비용으로 붕괴해
+    # 초소형 flash가 synthesis에 올라오는 것 방지 (가격 = 크기의 대리 지표).
+    if c.get("min_out_price") is not None:
+        if model["out_price"] < c["min_out_price"]:
+            return False
+        # 이름 기반 소형/특화 라인 제외 — flash·lite·mini 등은 가격 하한을
+        # 넘어도 한국어 장문 합성용이 아님. code 특화도 narrative 부적합.
+        mid_low = model.get("id", "").lower()
+        if any(k in mid_low for k in ("flash", "lite", "mini", "nano", "tiny", "-code", "codex")):
+            return False
+    sp = model.get("supported", [])
+    if sp:  # supported 정보가 있을 때만 검사 (구버전 캐시 호환)
+        if c.get("need_json") and not ("response_format" in sp or "structured_outputs" in sp):
+            return False
+        if c.get("need_reasoning") and "reasoning" not in sp:
+            return False
     return True
+
+
+def _discover_candidates(tier: str, all_models: dict) -> list[str]:
+    """라이브 카탈로그 전체에서 티어 제약을 만족하는 모델 자동 발굴.
+
+    수동 큐레이션(TIER_CANDIDATES)만 보면 신모델을 영영 못 찾는 병목 —
+    사용자 지적(2026-09) 반영. :free/:batch 변형은 실시간 운용 불가라 제외.
+    perplexity 전용 티어(B_research)는 발굴 대상 아님 (검색 내장 필요).
+    """
+    if tier == "B_research":
+        return []
+    out = []
+    for mid, m in all_models.items():
+        if ":" in mid:          # :free, :batch, :extended 등 변형 제외
+            continue
+        if _passes_constraints(m, tier):
+            out.append(mid)
+    return out
 
 
 def _rank_tier(tier: str, all_models: dict, activity: dict) -> list[dict]:
@@ -52,7 +86,10 @@ def _rank_tier(tier: str, all_models: dict, activity: dict) -> list[dict]:
     automatic 업그레이드도 best 랭킹을 거치므로 여기서 걸러지면 어느 경로로도
     추천 불가.
     """
-    candidates = TIER_CANDIDATES.get(tier, [])
+    # 큐레이션 목록 + 라이브 자동 발굴 합집합 (순서 유지 dedup)
+    curated = TIER_CANDIDATES.get(tier, [])
+    discovered = _discover_candidates(tier, all_models)
+    candidates = list(dict.fromkeys([*curated, *discovered]))
     excluded = _excluded_providers()
     fallback_conflict: str | None = None
     if tier == "X_fallback":
@@ -85,6 +122,16 @@ def _current_env_model(env_names: list[str]) -> tuple[str, str] | None:
     return None
 
 
+# 마지막 평가의 티어별 현황 — handler가 메시지에 "왜 추천이 안 떴는지" 표시용.
+# in-place mutate (clear/append)만 사용 — from-import 바인딩 stale 방지.
+LAST_EVAL_STATUS: list[dict] = []
+
+
+def _note_status(env_name: str, current: str | None, best: str | None, state: str) -> None:
+    LAST_EVAL_STATUS.append(
+        {"env_name": env_name, "current": current, "best": best, "state": state})
+
+
 def build_recommendations() -> list[dict]:
     """티어별 추천 list 반환.
 
@@ -99,6 +146,7 @@ def build_recommendations() -> list[dict]:
         return []
     activity = fetch_activity(days=30)
 
+    LAST_EVAL_STATUS.clear()
     out = []
     for tier, env_names in TIER_ENV.items():
         ranked = _rank_tier(tier, all_models, activity)
@@ -119,6 +167,7 @@ def build_recommendations() -> list[dict]:
                 })
                 continue
             if old_val == best["model_id"]:
+                _note_status(env_name, old_val, best["model_id"], "최적")
                 continue  # 이미 최적
 
             # automatic upgrade 체크
@@ -131,6 +180,8 @@ def build_recommendations() -> list[dict]:
                 if old_meta:
                     old_score = score_model(old_meta, activity, tier=tier)
                     if best["total"] - old_score["total"] < SKIP_MARGIN:
+                        _note_status(env_name, old_val, best["model_id"],
+                                     f"보류 (점수차 {best['total'] - old_score['total']:+.2f} < {SKIP_MARGIN})")
                         continue
                     old_total = old_score["total"]
                     sav = None
@@ -151,6 +202,7 @@ def build_recommendations() -> list[dict]:
                 "savings_pct": sav if cls != "automatic" else 0.0,
                 "reason": reason,
             })
+            _note_status(env_name, old_val, best["model_id"], "추천")
     log.info("[model_router.recommender] %d recommendations (auto=%d suggest=%d)",
              len(out),
              sum(1 for x in out if x["classification"] == "automatic"),

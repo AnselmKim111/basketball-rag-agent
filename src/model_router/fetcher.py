@@ -57,6 +57,7 @@ def fetch_models() -> dict[str, dict]:
             "out_price": out_price,
             "ctx_length": m.get("context_length", 0),
             "created_at": m.get("created", 0),
+            "supported": m.get("supported_parameters", []),
         }
     log.info("[model_router.fetcher] fetched %d models", len(out))
     return out

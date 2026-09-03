@@ -46,6 +46,11 @@
   → 텔레그램 추천 (`/model_approve <id|all>` 승인 시 Railway env 자동 upsert).
 - **티어별 가중** (scorer.TIER_WEIGHTS): 가성비 티어(Summary/Narrow/Fallback) cost 0.4 /
   품질 티어(Synthesis/Deep) evidence 0.45-0.50 — 미검증 신모델로 품질 티어 강등 추천 금지.
+- **자동 발굴** (recommender._discover_candidates, 2026-09): 수동 후보 리스트 병목 제거 —
+  라이브 카탈로그 전체(424+)에서 티어 제약(ctx·가격·JSON·reasoning) 통과 모델 자동 편입.
+  품질 티어(D/E)는 min_out_price 하한 + flash/lite/mini/nano/code 이름 제외 (증거 없는
+  신모델 스코어가 비용으로 붕괴 → 초소형 모델 유입 방지). 평가 메시지에 [티어 현황]
+  섹션 추가 — 이미 최적/보류 사유 표시.
 - **프로바이더 제외** (recommender): `MODEL_ROUTER_EXCLUDE_PROVIDERS` (기본 `anthropic`
   — 사용자 지시 2026-09-03). 랭킹 단계 필터라 automatic 경로 포함 어떤 추천에도 안 뜸.
   해제하려면 env를 빈 문자열로. X_fallback은 Summary 1차와 같은 프로바이더 자동 제외
