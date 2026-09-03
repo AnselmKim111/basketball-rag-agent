@@ -186,16 +186,20 @@ async def model_approve_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await update.message.reply_text("권한 없음")
         return
     args = context.args or []
-    if not args:
-        await update.message.reply_text("사용: `/model_approve <id|all>`", parse_mode=ParseMode.MARKDOWN)
-        return
-
-    target = args[0].lower()
     items = approval_store.load_pending()
     pendings = [i for i in items if i["status"] == "pending"]
     if not pendings:
-        await update.message.reply_text("대기 중인 추천 없음")
+        await update.message.reply_text("대기 중인 추천 없음 — `/model_eval`로 재평가")
         return
+    if not args:
+        # 인자 없음 → 사용법 대신 대기 목록 자체를 보여줌 (UX)
+        lines = ["*대기 중인 추천* — `/model_approve <id|all>` 로 승인:"]
+        for pd in pendings:
+            lines.append(f"{pd['id']}. `{pd['env_name']}`: {pd.get('old_model') or '(미설정)'} → *{pd['new_model']}*")
+        await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+        return
+
+    target = args[0].lower()
 
     if target == "all":
         targets = pendings
@@ -210,15 +214,27 @@ async def model_approve_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             await update.message.reply_text(f"id={tid} 대기 항목 없음")
             return
 
-    results = []
+    # 즉시 ack — canary가 항목당 30-60초라 침묵하면 고장처럼 보임.
+    await update.message.reply_text(
+        f"⏳ {len(targets)}건 canary 검증 시작 (항목당 30-60초) — 결과 실시간 표시",
+    )
+    ok_n = 0
     for p in targets:
         ok, msg = await _apply_change(p["env_name"], p["new_model"])
         if ok:
+            ok_n += 1
             approval_store.mark_status(p["id"], "approved", note=msg)
-            results.append(f"✅ {p['id']} `{p['env_name']}` → *{p['new_model']}* — {msg}")
+            line = f"✅ {p['id']} `{p['env_name']}` → *{p['new_model']}* — {msg}"
         else:
-            results.append(f"❌ {p['id']} `{p['env_name']}` 실패 — {msg}")
-    await update.message.reply_text("\n".join(results), parse_mode=ParseMode.MARKDOWN)
+            line = f"❌ {p['id']} `{p['env_name']}` 실패 — {msg}"
+        try:
+            await update.message.reply_text(line, parse_mode=ParseMode.MARKDOWN)
+        except Exception:
+            await update.message.reply_text(line)
+    await update.message.reply_text(
+        f"🏁 완료: {ok_n}/{len(targets)} 적용. Railway env 반영됨 — 재배포 후 유효. "
+        f"1주간 Layer D가 실패율 감시.",
+    )
 
 
 async def model_reject_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

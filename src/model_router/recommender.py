@@ -90,6 +90,12 @@ def _rank_tier(tier: str, all_models: dict, activity: dict) -> list[dict]:
     curated = TIER_CANDIDATES.get(tier, [])
     discovered = _discover_candidates(tier, all_models)
     candidates = list(dict.fromkeys([*curated, *discovered]))
+    if tier == "X_fallback":
+        # 안전망 티어 — 1차 실패 시 마지막 보루라 신뢰성 > 비용.
+        # 미검증 초소형 모델(ling-flash 등)이 발굴로 올라오는 것 차단:
+        # 30일+ 운영 검증(VERIFIED_MODELS)된 모델만 후보.
+        from .candidates import VERIFIED_MODELS
+        candidates = [c for c in candidates if c in VERIFIED_MODELS]
     excluded = _excluded_providers()
     fallback_conflict: str | None = None
     if tier == "X_fallback":
