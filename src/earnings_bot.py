@@ -2792,7 +2792,7 @@ def _synthesis_model() -> str:
     """최종 비교 합성 + 커스텀 분석 — Opus (딥리서치급 추론)."""
     return chained_model(
         ["EARNINGS_SYNTHESIS_MODEL", "IDEA_SYNTHESIS_MODEL"],
-        "anthropic/claude-opus-4.7",
+        "anthropic/claude-opus-5",  # 4.7/4.8과 동가($5/$25) 신세대
     )
 
 

@@ -36,7 +36,9 @@ VERIFIED_MODELS = {
 # 비교 페어 — automatic 분류 대상 (동가 업그레이드만, 비용·구조 동일 → 자동 적용)
 AUTOMATIC_UPGRADES = {
     "anthropic/claude-sonnet-4.5": "anthropic/claude-sonnet-4.6",
+    "anthropic/claude-sonnet-4.6": "anthropic/claude-sonnet-5",   # 신세대 + 33% 저렴
     "anthropic/claude-opus-4.7":   "anthropic/claude-opus-4.8",
+    "anthropic/claude-opus-4.8":   "anthropic/claude-opus-5",     # 동가 신세대
     # opus 4.8 → 4.9 같은 미래 안전 업그레이드도 자동 (등록만 하면 됨)
 }
 
@@ -59,6 +61,7 @@ TIER_CANDIDATES = {
         "xiaomi/mimo-v2.5",
     ],
     "D_synthesis": [
+        "anthropic/claude-sonnet-5",
         "anthropic/claude-sonnet-4.6",
         "anthropic/claude-sonnet-4.5",
         "deepseek/deepseek-v4-pro",
@@ -67,6 +70,7 @@ TIER_CANDIDATES = {
         "qwen/qwen3.7-plus",
     ],
     "E_deep": [
+        "anthropic/claude-opus-5",
         "anthropic/claude-opus-4.8",
         "anthropic/claude-opus-4.7",
         "anthropic/claude-sonnet-4.6",

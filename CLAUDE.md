@@ -32,8 +32,8 @@
 | Summary | `OPENROUTER_MODEL` | **deepseek-v4-flash** ($0.089/$0.177 — kimi 대비 11-23x↓) | kimi-k2.6 | PDF 요약·DART·Forward·deepdive·idea parse |
 | Research | `IDEA_RESEARCH_MODEL` | perplexity/sonar-pro (저볼륨 — 품질 유지) | — | 1단계 웹검색 |
 | Narrow | `IDEA_NARROW_MODEL` | **deepseek-v4-flash** (출력단가 haiku 대비 28x↓, JSON OK) | claude-haiku-4.5 | 3단계 30→10 (큰 출력) + parse 폴백 |
-| Synthesis | `IDEA_SYNTHESIS_MODEL` / `REPORT_SYNTHESIS_MODEL` | claude-sonnet-4.6 (품질 티어 — canary 검증 없인 강등 금지) | **deepseek-v4-pro** (구 opus-4.7 역구조 교정) | importance + synthesis + 시황 narrative |
-| Deep | `EARNINGS_SYNTHESIS_MODEL` | claude-opus-4.8 (저볼륨 유지) | — | 어닝 비교합성 (최고 지능) |
+| Synthesis | `IDEA_SYNTHESIS_MODEL` / `REPORT_SYNTHESIS_MODEL` | **claude-sonnet-5** ($2/$10 — 4.6 대비 신세대 + 33%↓, AUTOMATIC_UPGRADES 경로) | deepseek-v4-pro | importance + synthesis + 시황 narrative |
+| Deep | `EARNINGS_SYNTHESIS_MODEL` | **claude-opus-5** ($5/$25 — 4.8과 동가 신세대) | — | 어닝 비교합성 (최고 지능) |
 | Fallback | `OPENROUTER_FALLBACK_MODEL` | kimi-k2.6 (1차와 프로바이더 분리) | — | chat_with_retry 3차 시도 안전망 |
 
 요약·추출 작업을 sonnet으로 올리지 말 것 (비용 30-80배). 진짜 지능 필요한 단계만 sonnet.

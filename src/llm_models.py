@@ -28,7 +28,9 @@ from typing import Iterable
 # model_router 주간 평가 + canary 경로로만.
 DEFAULT_SUMMARY = "deepseek/deepseek-v4-flash"
 DEFAULT_NARROW = "deepseek/deepseek-v4-flash"
-DEFAULT_SYNTHESIS = "anthropic/claude-sonnet-4.6"
+# sonnet-5: 4.6 대비 신세대 + 33% 저렴($2/$10 vs $3/$15) — 같은 프로바이더
+# 세대 업그레이드 (candidates.AUTOMATIC_UPGRADES 경로, canary가 최종 게이트).
+DEFAULT_SYNTHESIS = "anthropic/claude-sonnet-5"
 DEFAULT_RESEARCH = "perplexity/sonar-pro"
 
 # chain 2차용 — 1차(초저가)와 프로바이더를 분리해 상관 장애 회피.
