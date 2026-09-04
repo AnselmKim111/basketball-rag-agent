@@ -231,10 +231,18 @@ async def model_approve_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             await update.message.reply_text(line, parse_mode=ParseMode.MARKDOWN)
         except Exception:
             await update.message.reply_text(line)
-    await update.message.reply_text(
-        f"🏁 완료: {ok_n}/{len(targets)} 적용. Railway env 반영됨 — 재배포 후 유효. "
-        f"1주간 Layer D가 실패율 감시.",
-    )
+    if ok_n == 0:
+        await update.message.reply_text(
+            f"🏁 0/{len(targets)} 적용 — 전부 실패. 위 사유 참조.\n"
+            "· Railway 설정 누락 → RAILWAY_PROJECT_ACCESS_TOKEN 추가 후 재배포 → "
+            "/model_eval → 재승인\n"
+            "· Canary 실패 → 모델 품질 미달로 정상 차단 (조치 불필요)",
+        )
+    else:
+        await update.message.reply_text(
+            f"🏁 완료: {ok_n}/{len(targets)} 적용. Railway env 반영됨 — 재배포 후 유효. "
+            f"1주간 Layer D가 실패율 감시.",
+        )
 
 
 async def model_reject_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
