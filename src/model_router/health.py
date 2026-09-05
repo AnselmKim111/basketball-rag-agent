@@ -16,7 +16,27 @@ log = logging.getLogger(__name__)
 # 임계
 ROLLBACK_MIN_SAMPLES = 10
 ROLLBACK_FAIL_RATE = 0.20
-ROLLBACK_P95_LATENCY_S = 30
+ROLLBACK_P95_LATENCY_S = 60  # env 미매칭 기본
+
+# env(=작업 유형)별 p95 임계 — 작업 크기가 달라 단일 30s는 오탐 (2026-09-05 실측:
+# v4-flash 8만자 PDF 요약 p95 70s → 정상인데 매시간 롤백 경고).
+# 요약은 gather 병렬이라 p95 자체가 체감 지연이 아님. 분류(intent)만 타이트.
+P95_LATENCY_BY_ENV_S = {
+    "OPENROUTER_MODEL": 150,          # PDF 요약 (입력 8만자)
+    "OPENROUTER_FALLBACK_MODEL": 150,
+    "IDEA_NARROW_MODEL": 180,         # 30→10 JSON 12k 토큰 출력
+    "IDEA_SYNTHESIS_MODEL": 240,      # Top5 합성
+    "REPORT_SYNTHESIS_MODEL": 240,    # 시황 narrative
+    "EARNINGS_SYNTHESIS_MODEL": 400,  # 어닝 비교합성 8000자+
+    "IDEA_RESEARCH_MODEL": 120,       # perplexity 웹검색
+    "REPORT_RESEARCH_MODEL": 120,
+    "EARNINGS_RESEARCH_MODEL": 120,
+    "INTENT_ROUTER_MODEL": 30,        # 짧은 분류 — 여기만 타이트
+}
+
+
+def p95_threshold_s(env_name: str | None) -> int:
+    return P95_LATENCY_BY_ENV_S.get(env_name or "", ROLLBACK_P95_LATENCY_S)
 
 
 def _store_dir() -> Path:
@@ -107,15 +127,18 @@ def recent_stats(model: str, hours: int = 1) -> dict:
     return {"samples": samples, "fail_rate": fail_rate, "p95_latency_ms": p95}
 
 
-def should_rollback(model: str) -> tuple[bool, str]:
-    """rollback 필요 여부 + 이유. samples 부족 시 False (insufficient data)."""
+def should_rollback(model: str, env_name: str | None = None) -> tuple[bool, str]:
+    """rollback 필요 여부 + 이유. samples 부족 시 False (insufficient data).
+
+    env_name을 주면 그 작업 유형의 p95 임계 적용 (P95_LATENCY_BY_ENV_S)."""
     st = recent_stats(model, hours=1)
     if st["samples"] < ROLLBACK_MIN_SAMPLES:
         return False, f"insufficient samples ({st['samples']})"
     if st["fail_rate"] > ROLLBACK_FAIL_RATE:
         return True, f"fail_rate {st['fail_rate']:.0%} > {ROLLBACK_FAIL_RATE:.0%}"
-    if st["p95_latency_ms"] / 1000 > ROLLBACK_P95_LATENCY_S:
-        return True, f"p95 latency {st['p95_latency_ms']}ms > {ROLLBACK_P95_LATENCY_S}s"
+    limit = p95_threshold_s(env_name)
+    if st["p95_latency_ms"] / 1000 > limit:
+        return True, f"p95 latency {st['p95_latency_ms']}ms > {limit}s ({env_name or 'default'})"
     return False, "healthy"
 
 

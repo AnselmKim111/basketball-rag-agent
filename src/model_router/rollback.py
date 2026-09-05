@@ -52,12 +52,13 @@ def check_and_rollback() -> list[dict]:
             cur = os.getenv(env_name)
             if not cur:
                 continue
-            need, reason = health.should_rollback(cur)
+            need, reason = health.should_rollback(cur, env_name=env_name)
             if not need:
                 continue
             prev = _previous_model_for_env(env_name, cur)
             if not prev:
                 log.warning("[rollback] %s 롤백 필요 (%s) but history 없음 — skip", env_name, reason)
+                health.reset(cur)  # 같은 샘플로 매시간 재경고 방지 — 다음 1h 데이터로 재판정
                 actions.append({"env_name": env_name, "from": cur, "to": None,
                                 "reason": reason, "applied": False,
                                 "note": "history 없음"})
