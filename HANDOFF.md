@@ -1,4 +1,4 @@
-# HANDOFF — 세션 인계 문서 (2026-09-05 기준)
+# HANDOFF — 세션 인계 문서 (2026-09-06 기준)
 
 새 세션은 이 파일을 먼저 읽고 §4 "즉시 할 일"부터 자율 진행할 것.
 CLAUDE.md(작업 규약)와 함께 적용. **시크릿 값은 이 파일에 절대 쓰지 않는다** — env 이름만.
@@ -47,59 +47,42 @@ git checkout -B claude/wisereport-auto-downloader-C7C8l origin/...` 로 복원.
 
 ## 4. 즉시 할 일 (우선순위 순)
 
-### 4-1. Railway 진단 + 모델 env 반영 (최우선)
-사용자가 Railway Variables에 `RAILWAY_PROJECT_ACCESS_TOKEN`을 넣었는데도 종목봇
-`/model_approve`가 "Railway 설정 누락"으로 실패 중. 이 세션의 토큰으로 직접 진단:
+### 4-1. Railway 진단 + 모델 env 반영 — ✅ 완료 (2026-09-06)
+원인: 종목봇 서비스(`basketball-rag-agent`) Variables에 토큰이 `RAILWAY_ACCESS_TOKEN`
+이름으로 들어가 있었음 (코드는 `RAILWAY_PROJECT_ACCESS_TOKEN` 기대). 토큰 자체는 유효.
+조치:
+- 코드: `railway_env._config`가 `RAILWAY_ACCESS_TOKEN`도 alias로 수용 (+ 테스트 3건).
+  부팅 로그 `[orch] relevant env vars`에 RAILWAY_*ACCESS*/SERVICE_ID(S) 마스킹 출력.
+- env(종목봇 서비스): `RAILWAY_SERVICE_IDS`=두 서비스, `IDEA_NARROW_MODEL`·
+  `INTENT_ROUTER_MODEL`=deepseek-v4-flash, `EARNINGS_SYNTHESIS_MODEL`=gpt-5.2,
+  `EARNINGS_EXTRACT_MODEL` 삭제(Anthropic sonnet → narrow 티어 폴백). report-bot
+  서비스도 동일 값으로 맞춤. 재배포(commit 84f964e) 로그로 컨테이너 반영 확인.
+- 검증 남은 것: 종목봇에서 `/model_status` → env 값 확인, `/model_approve`로 실제 upsert 1회.
+- 참고: variableUpsert는 자동 재배포 트리거됨(실측). variableDelete는 안 됨(기존 메모 유지).
+- Railway 구조: 프로젝트 `dynamic-embrace`, 서비스 2개 — `basketball-rag-agent`(전 봇, watch
+  브랜치 `claude/stock-screening-feature-2Jo4X`)·`report-bot`(`ACTIVE_BOTS=_disabled_` idle,
+  2026-06-22 이후 배포 없음). id는 `projectToken` 쿼리로 획득.
 
-```python
-# Project Token 스코프 확인 → project/environment id 자동 획득
-query { projectToken { projectId environmentId } }
-# 서비스 목록
-query($pid:String!){ project(id:$pid){ services{ edges{ node{ id name } } } } }
-# 서비스 변수 조회
-query($pid:String!,$eid:String!,$sid:String!){ variables(projectId:$pid, environmentId:$eid, serviceId:$sid) }
-# upsert
-mutation($input:VariableUpsertInput!){ variableUpsert(input:$input) }
-# 재배포 (variableDelete는 자동 재배포 안 됨 — CLAUDE.md §6 주의)
-mutation($eid:String!,$sid:String!){ serviceInstanceRedeploy(environmentId:$eid, serviceId:$sid) }
-# 로그
-query($id:String!){ deploymentLogs(deploymentId:$id, limit:500){ message timestamp severity } }
-```
-엔드포인트 `https://backboard.railway.com/graphql/v2`, 헤더 `Project-Access-Token: <token>`.
-코드 참조: `src/model_router/railway_env.py`.
-
-체크리스트:
-1. 봇 서비스 Variables에 `RAILWAY_PROJECT_ACCESS_TOKEN` 실제 존재? 추가 후 재배포 됐나?
-2. 컨테이너에 `RAILWAY_PROJECT_ID`/`RAILWAY_ENVIRONMENT_ID`/`RAILWAY_SERVICE_ID` 자동 주입되나?
-   (railway_env._config 가 이걸 기대 — 없으면 Variables에 명시 추가)
-3. 서비스가 2개(봇/스크리너 분리, `ACTIVE_BOTS`)면 `RAILWAY_SERVICE_IDS`에 콤마로 둘 다.
-4. 모델 env 목표값 (비-Anthropic, 라이브 가격 2026-09-03 기준):
-   ```
-   OPENROUTER_MODEL=deepseek/deepseek-v4-flash
-   IDEA_NARROW_MODEL=deepseek/deepseek-v4-flash
-   INTENT_ROUTER_MODEL=deepseek/deepseek-v4-flash
-   IDEA_SYNTHESIS_MODEL=deepseek/deepseek-v4-pro
-   REPORT_SYNTHESIS_MODEL=deepseek/deepseek-v4-pro
-   EARNINGS_SYNTHESIS_MODEL=openai/gpt-5.2
-   OPENROUTER_FALLBACK_MODEL=moonshotai/kimi-k2.6
-   IDEA_RESEARCH_MODEL=perplexity/sonar-pro
-   ```
-   (코드 기본값 `src/llm_models.py`와 동일 — env가 우선하므로 env도 맞춰야 적용)
-5. 재배포 → deploymentLogs로 부팅·봇 폴링 확인 → 종목봇 `/model_status`로 반영 확인.
-
-### 4-2. 버터대디봇(report, `REPORT_BOT_TOKEN`) 사망 원인
-2026-06-23 이후 무응답·리포트 미발송. 배포 로그에서 `report` 봇 관련 에러
-(getUpdates 409 Conflict = 토큰 중복 사용 / Unauthorized = 토큰 만료 / `ACTIVE_BOTS` 제외) 확인.
-model_router 명령·cron은 이미 종목봇으로 이관 완료라 급하진 않음.
+### 4-2. 버터대디봇(report) 사망 원인 — ✅ 원인 확정 (2026-09-06)
+원인은 코드 에러가 아니라 **배포 구성**: `REPORT_BOT_TOKEN`은 `report-bot` 서비스에만 있고
+그 서비스는 2026-06-22 `ACTIVE_BOTS=_disabled_`로 idle 처리됨(commit f726c2fe, "잠정폐기").
+종목봇 서비스에는 토큰이 없어 매 부팅 `REPORT_BOT_TOKEN 미설정 → reportBot 스킵`.
+살리려면(사용자 결정 필요 — 6월 폐기 결정 번복이라 자동 실행 안 함):
+종목봇 서비스에 `REPORT_BOT_TOKEN` 추가(REPORT_CHAT_ID·ALLOWED는 이미 있음) → 재배포.
+report-bot 서비스는 계속 disabled 유지(같은 토큰 양쪽 폴링 시 409).
+같은 이유로 `RECAP_BOT_TOKEN`도 종목봇 서비스에 없어 RecapBot(주간 회고) 스킵 중 —
+봇 토큰이 발급돼 있으면 추가만 하면 됨.
 
 ### 4-3. DSInvResearch → 시황봇 릴레이 활성화
 - 코드 완료: `src/channel_relay.py` (20분 cron, market spec). 채널이 웹 프리뷰 OFF라 **MTProto 필수**.
 - 필요: `TG_SESSION_STRING` 생성. `TG_API_ID/HASH`는 env에 있음. 사용자 PC 없음 →
   이 컨테이너에서 Telethon 2단계 로그인 (send_code → 사용자가 채팅으로 코드 전달 → sign_in).
-  참고 스크립트 `scripts/make_tg_session.py` (대화형) — 비대화형 2단계 버전으로 재작성해
-  scratchpad에서 실행 (`SETUPTOOLS_USE_DISTUTILS=stdlib pip install pyaes` 후 `pip install telethon`).
-  사용자 전화번호 요청 → 코드 요청 → 세션 문자열을 Railway `TG_SESSION_STRING`에 upsert.
-- `MARKET_CHAT_ID` 존재 확인 (릴레이 발송 대상).
+  `scripts/make_tg_session.py`에 비대화형 2단계(`send-code` / `sign-in`) 구현 완료(2026-09-06).
+  컨테이너 준비: `SETUPTOOLS_USE_DISTUTILS=stdlib pip install pyaes && pip install telethon`.
+  **사용자 입력 필요**: 전화번호(+82…) → `send-code --phone … --state <scratchpad>/tg.json`
+  → 사용자가 앱에서 받은 코드 전달 → `sign-in --code …` → 마지막 줄 `TG_SESSION_STRING=…`을
+  Railway 종목봇 서비스에 upsert (값 채팅 출력 금지). 2단계 비밀번호 계정이면 `--password`.
+- `MARKET_CHAT_ID` 종목봇 서비스에 존재 확인됨(2026-09-06).
 
 ### 4-4. 검증 루프 (CLAUDE.md §1) 재가동
 Railway 토큰 확보로 이제 가능: self-test env(`IDEA_TEST_PROMPT` 등) 주입 → 재배포 → 로그 분석 →
