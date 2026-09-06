@@ -450,6 +450,14 @@ async def _run_forever() -> None:
         )
         log.info("스케줄: %s (deadline %ds)", job.description or job.job_id, job.deadline_sec)
 
+    # Telethon 세션 생성 (env 주도, 1회성) — TG_LOGIN_PHONE/CODE 있을 때만 동작.
+    tg_login_task = None
+    try:
+        from src import tg_login
+        tg_login_task = tg_login.schedule_boot_login(bot_objects.get("company"))
+    except Exception:
+        log.exception("tg_login 스케줄 실패 (orchestrator 계속 진행)")
+
     scheduler.start()
     next_run = {j.id: str(j.next_run_time) for j in scheduler.get_jobs()}
     log.info("스케줄러 시작. 다음 실행 시각: %s", next_run)
@@ -466,6 +474,8 @@ async def _run_forever() -> None:
     await stop_event.wait()
 
     log.info("종료 시그널 수신 → 정리")
+    if tg_login_task and not tg_login_task.done():
+        tg_login_task.cancel()
     scheduler.shutdown(wait=False)
     for name, app in apps:
         try:

@@ -78,3 +78,44 @@ def upsert_variable(name: str, value: str) -> tuple[bool, str]:
     if ok_count > 0:
         return True, f"⚠ {ok_count}/{len(cfg['service_ids'])} 서비스 성공 — 일부 실패: {'; '.join(errors)}"
     return False, f"❌ 전부 실패: {'; '.join(errors)}"
+
+
+DELETE_MUTATION = """mutation del($input: VariableDeleteInput!){variableDelete(input:$input)}"""
+
+
+def delete_variable(name: str) -> tuple[bool, str]:
+    """env var을 모든 등록된 서비스에서 삭제. (success, message) 반환.
+
+    주의(CLAUDE.md §6 실측): variableDelete는 재배포를 트리거하지 않음 — 실행 중
+    컨테이너에는 남아 있으므로, 이후 upsert(재배포 유발)나 명시 재배포가 필요.
+    """
+    cfg = _config()
+    if not cfg:
+        return False, "Railway 설정 누락"
+    ok_count = 0
+    errors = []
+    for sid in cfg["service_ids"]:
+        payload = {
+            "query": DELETE_MUTATION,
+            "variables": {"input": {
+                "projectId": cfg["project_id"],
+                "environmentId": cfg["env_id"],
+                "serviceId": sid,
+                "name": name,
+            }},
+        }
+        try:
+            with httpx.Client(timeout=15) as c:
+                r = c.post(GRAPHQL_URL, json=payload,
+                           headers={"Project-Access-Token": cfg["token"],
+                                    "Content-Type": "application/json"})
+            data = r.json()
+            if r.status_code == 200 and data.get("data", {}).get("variableDelete"):
+                ok_count += 1
+            else:
+                errors.append(f"sid={sid[:8]}: {data.get('errors') or data}")
+        except Exception as e:
+            errors.append(f"sid={sid[:8]}: {e}")
+    if ok_count == len(cfg["service_ids"]):
+        return True, f"✅ {ok_count}개 서비스 삭제"
+    return ok_count > 0, f"{ok_count}/{len(cfg['service_ids'])} 삭제 — {'; '.join(errors)}"
