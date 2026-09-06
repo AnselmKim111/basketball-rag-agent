@@ -70,8 +70,9 @@ git checkout -B claude/wisereport-auto-downloader-C7C8l origin/...` 로 복원.
 살리려면(사용자 결정 필요 — 6월 폐기 결정 번복이라 자동 실행 안 함):
 종목봇 서비스에 `REPORT_BOT_TOKEN` 추가(REPORT_CHAT_ID·ALLOWED는 이미 있음) → 재배포.
 report-bot 서비스는 계속 disabled 유지(같은 토큰 양쪽 폴링 시 409).
-같은 이유로 `RECAP_BOT_TOKEN`도 종목봇 서비스에 없어 RecapBot(주간 회고) 스킵 중 —
-봇 토큰이 발급돼 있으면 추가만 하면 됨.
+`RECAP_BOT_TOKEN`도 어디에도 없어 RecapBot 전용 봇은 스킵 — 대신 **종목봇에 합류**(2026-09-06):
+`/recap` `/recap_global` `/recap_me` 명령 + 일 19:00 cron(`recap_weekly_company`, REPORT_CHAT_ID로
+발송). 나중에 전용 토큰을 넣으면 전용 봇이 담당하고 종목봇 cron은 자동 스킵(중복 가드).
 
 ### 4-3. DSInvResearch → 시황봇 릴레이 활성화 — ✅ 세션 생성 완료 (2026-09-06)
 - `TG_SESSION_STRING`·`TG_API_ID`·`TG_API_HASH` 종목봇 서비스 Railway env에 반영됨.

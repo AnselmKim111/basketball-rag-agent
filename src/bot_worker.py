@@ -772,6 +772,8 @@ COMPANY_COMMANDS = [
     ("model_eval", "🤖 모델 가성비 즉시 재평가"),
     ("model_approve", "✅ 모델 추천 승인 (Railway env 적용)"),
     ("model_status", "모델 티어 현황"),
+    ("recap", "📋 지난 주 회고 (신호 PnL·아이디어 후속·테마·합성)"),
+    ("recap_me", "👤 본인 watchlist 한정 회고"),
     ("deephelp", "deepdive 상세 도움말"),
     ("help", "전체 도움말"),
 ]
@@ -801,6 +803,13 @@ def build_company_app(token: str) -> Application:
         app.add_handler(CommandHandler("model_status", model_status_cmd))
     except Exception:
         logging.exception("model_router 핸들러 등록 실패 — 종목봇 기본 기능은 정상")
+    # 회고 명령 — RECAP_BOT_TOKEN 없는 배포에서도 /recap 사용 가능 (2026-09-06).
+    # 전용 봇이 살아있으면 양쪽 동작 (해 없음). cron은 orchestrator에서 중복 가드.
+    try:
+        from src.recap_bot import register_handlers as register_recap
+        register_recap(app)
+    except Exception:
+        logging.exception("recap 핸들러 등록 실패 — 종목봇 기본 기능은 정상")
     app.add_handler(
         CallbackQueryHandler(cmd_curate_pick, pattern=f"^{_CURATE_PICK_PREFIX}\\|")
     )

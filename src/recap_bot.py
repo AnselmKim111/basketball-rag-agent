@@ -39,6 +39,9 @@ from src.pipeline_lock import PIPELINE_LOCK
 log = logging.getLogger(__name__)
 
 ALLOWED_ENV = "RECAP_ALLOWED_CHAT_IDS"
+# 전용 봇 토큰(RECAP_BOT_TOKEN)이 없을 때 종목봇에 합쳐서 동작 (2026-09-06) —
+# 그 경우 allowlist·발송 대상은 종목봇 env로 폴백.
+_ALLOWED_FALLBACK_ENV = "ALLOWED_CHAT_IDS"
 SYNTHESIS_MODEL_ENV = "IDEA_SYNTHESIS_MODEL"
 NARROW_MODEL_ENV = "IDEA_NARROW_MODEL"
 # sonnet 합성 출력 안전 상한 — 프롬프트는 800-1200자 가이드, 4x 마진.
@@ -65,15 +68,36 @@ HELP_TEXT = (
 # ------------------------------------------------------------------
 # 핸들러
 # ------------------------------------------------------------------
+def _allowed_env() -> str:
+    """RECAP_ALLOWED_CHAT_IDS 우선, 없으면 종목봇 ALLOWED_CHAT_IDS (합류 모드)."""
+    return ALLOWED_ENV if os.getenv(ALLOWED_ENV, "").strip() else _ALLOWED_FALLBACK_ENV
+
+
+def _authorized(update: Update) -> bool:
+    return is_authorized(update, _allowed_env())
+
+
+def cron_chat_id() -> str | None:
+    """cron 발송 대상 — RECAP_CHAT_ID → REPORT_CHAT_ID → ALLOWED_CHAT_IDS 첫 숫자 id."""
+    v = os.environ.get("RECAP_CHAT_ID") or os.environ.get("REPORT_CHAT_ID")
+    if v and v.strip():
+        return v.strip()
+    for tok in os.environ.get(_ALLOWED_FALLBACK_ENV, "").split(","):
+        tok = tok.strip()
+        if tok and tok != "*" and tok.lstrip("-").isdigit():
+            return tok
+    return None
+
+
 async def _help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_authorized(update, ALLOWED_ENV):
+    if not _authorized(update):
         await deny_message(update, "회고봇")
         return
     await update.message.reply_text(HELP_TEXT, parse_mode=ParseMode.MARKDOWN)
 
 
 async def _cmd_recap(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_authorized(update, ALLOWED_ENV):
+    if not _authorized(update):
         await deny_message(update, "회고봇")
         return
     chat_id = str(update.effective_chat.id)
@@ -81,7 +105,7 @@ async def _cmd_recap(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 async def _cmd_recap_global(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_authorized(update, ALLOWED_ENV):
+    if not _authorized(update):
         await deny_message(update, "회고봇")
         return
     chat_id = str(update.effective_chat.id)
@@ -89,7 +113,7 @@ async def _cmd_recap_global(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 
 async def _cmd_recap_me(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_authorized(update, ALLOWED_ENV):
+    if not _authorized(update):
         await deny_message(update, "회고봇")
         return
     chat_id = str(update.effective_chat.id)
@@ -317,10 +341,10 @@ def _narrow_model() -> str:
 # Cron (orchestrator가 등록)
 # ------------------------------------------------------------------
 async def recap_weekly_job(bot: Bot, override_chat_id: str | None = None) -> None:
-    """매주 일요일 19:00 KST cron. RECAP_CHAT_ID 또는 override로 발송."""
-    chat_id = override_chat_id or os.environ.get("RECAP_CHAT_ID")
+    """매주 일요일 19:00 KST cron. override → RECAP_CHAT_ID → REPORT_CHAT_ID → allowlist 첫 id."""
+    chat_id = override_chat_id or cron_chat_id()
     if not chat_id:
-        log.warning("RECAP_CHAT_ID 미설정 — cron 스킵")
+        log.warning("RECAP_CHAT_ID/REPORT_CHAT_ID 미설정 — cron 스킵")
         return
     await _run_recap(bot, chat_id, scope="full")
 
@@ -351,12 +375,17 @@ RECAP_COMMANDS = [
 ]
 
 
-def build_recap_app(token: str) -> Application:
-    app = Application.builder().token(token).build()
-    app.add_handler(CommandHandler(["start", "help"], _help))
+def register_handlers(app: Application) -> None:
+    """다른 봇(종목봇)에 회고 명령만 합류 — help/자유텍스트는 호스트 봇 것 유지."""
     app.add_handler(CommandHandler("recap", _cmd_recap))
     app.add_handler(CommandHandler("recap_global", _cmd_recap_global))
     app.add_handler(CommandHandler("recap_me", _cmd_recap_me))
+
+
+def build_recap_app(token: str) -> Application:
+    app = Application.builder().token(token).build()
+    app.add_handler(CommandHandler(["start", "help"], _help))
+    register_handlers(app)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _help))
 
     # RECAP_TEST_PROMPT는 '플래그' 패턴 — 값 내용은 안 보고 설정 여부만 체크

@@ -129,6 +129,15 @@ async def _model_health_cron_job(bot: Bot) -> None:
     await model_health_job(bot)
 
 
+async def _recap_weekly_via_company(bot: Bot) -> None:
+    """주간 회고 cron을 종목봇으로 대행 — 전용 회고봇 토큰이 없을 때만 (중복 발송 가드)."""
+    if os.getenv("RECAP_BOT_TOKEN"):
+        logging.getLogger("orchestrator").info(
+            "recap_weekly(company): RECAP_BOT_TOKEN 있음 → 전용 봇이 담당, 스킵")
+        return
+    await recap_weekly_job(bot)
+
+
 BOT_SPECS: list[BotSpec] = [
     BotSpec(
         name="company",
@@ -149,6 +158,12 @@ BOT_SPECS: list[BotSpec] = [
                 job_id="model_health_hourly",
                 cron={"minute": 17},
                 description="Layer D — 모델 health 검사 + 자동 rollback (시간당 17분)",
+            ),
+            ScheduledJob(
+                func=_recap_weekly_via_company,
+                job_id="recap_weekly_company",
+                cron={"day_of_week": "sun", "hour": 19, "minute": 0},
+                description="주간 회고(종목봇 대행) — 일 19:00 KST, RECAP_BOT_TOKEN 없을 때만",
             ),
         ],
     ),
