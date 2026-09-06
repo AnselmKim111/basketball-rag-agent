@@ -1,7 +1,8 @@
 """Railway GraphQL variableUpsert — 승인된 모델 변경을 환경변수에 자동 반영.
 
-필요 env: `RAILWAY_PROJECT_ACCESS_TOKEN`, `RAILWAY_PROJECT_ID`, `RAILWAY_ENVIRONMENT_ID`,
-`RAILWAY_SERVICE_IDS` (콤마 구분 — 여러 서비스에 동시 upsert).
+필요 env: `RAILWAY_PROJECT_ACCESS_TOKEN` (alias `RAILWAY_ACCESS_TOKEN`), `RAILWAY_PROJECT_ID`,
+`RAILWAY_ENVIRONMENT_ID` (둘 다 Railway 자동 주입), `RAILWAY_SERVICE_IDS` (콤마 구분 — 여러
+서비스에 동시 upsert; 미설정 시 자동 주입 `RAILWAY_SERVICE_ID` 단일).
 """
 from __future__ import annotations
 
@@ -18,7 +19,9 @@ UPSERT_MUTATION = """mutation upsert($input: VariableUpsertInput!){variableUpser
 
 
 def _config() -> dict | None:
-    tok = os.getenv("RAILWAY_PROJECT_ACCESS_TOKEN")
+    # 사용자가 Variables에 `RAILWAY_ACCESS_TOKEN` 이름으로 넣는 실수가 실측됨(2026-09-06)
+    # — Project Token이면 이름과 무관하게 동작하므로 alias로 수용.
+    tok = os.getenv("RAILWAY_PROJECT_ACCESS_TOKEN") or os.getenv("RAILWAY_ACCESS_TOKEN")
     # PROJECT/ENVIRONMENT/SERVICE ID는 Railway가 컨테이너에 자동 주입 —
     # 사용자가 손수 넣어야 하는 건 사실상 토큰 하나뿐.
     pid = os.getenv("RAILWAY_PROJECT_ID")

@@ -322,7 +322,8 @@ BOT_SPECS: list[BotSpec] = [
 def _diag_env() -> None:
     relevant = diag_env_keys(
         ("TELEGRAM", "WISE", "OPEN", "ALLOWED", "CHAT", "INDUSTRY", "MARKET",
-         "GLOBAL", "DART", "IDEA", "DISCLOSURE", "SCREENER", "EARNINGS", "SEC")
+         "GLOBAL", "DART", "IDEA", "DISCLOSURE", "SCREENER", "EARNINGS", "SEC",
+         "RAILWAY_PROJECT_ACCESS", "RAILWAY_ACCESS", "RAILWAY_SERVICE_ID")
     )
     print(f"[orch] env keys total = {len(os.environ)}", flush=True)
     print(f"[orch] relevant env vars = {relevant}", flush=True)
