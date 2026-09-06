@@ -73,16 +73,16 @@ report-bot 서비스는 계속 disabled 유지(같은 토큰 양쪽 폴링 시 4
 같은 이유로 `RECAP_BOT_TOKEN`도 종목봇 서비스에 없어 RecapBot(주간 회고) 스킵 중 —
 봇 토큰이 발급돼 있으면 추가만 하면 됨.
 
-### 4-3. DSInvResearch → 시황봇 릴레이 활성화
-- 코드 완료: `src/channel_relay.py` (20분 cron, market spec). 채널이 웹 프리뷰 OFF라 **MTProto 필수**.
-- 필요: `TG_SESSION_STRING` 생성. `TG_API_ID/HASH`는 env에 있음. 사용자 PC 없음 →
-  이 컨테이너에서 Telethon 2단계 로그인 (send_code → 사용자가 채팅으로 코드 전달 → sign_in).
-  `scripts/make_tg_session.py`에 비대화형 2단계(`send-code` / `sign-in`) 구현 완료(2026-09-06).
-  컨테이너 준비: `SETUPTOOLS_USE_DISTUTILS=stdlib pip install pyaes && pip install telethon`.
-  **사용자 입력 필요**: 전화번호(+82…) → `send-code --phone … --state <scratchpad>/tg.json`
-  → 사용자가 앱에서 받은 코드 전달 → `sign-in --code …` → 마지막 줄 `TG_SESSION_STRING=…`을
-  Railway 종목봇 서비스에 upsert (값 채팅 출력 금지). 2단계 비밀번호 계정이면 `--password`.
-- `MARKET_CHAT_ID` 종목봇 서비스에 존재 확인됨(2026-09-06).
+### 4-3. DSInvResearch → 시황봇 릴레이 활성화 — ✅ 세션 생성 완료 (2026-09-06)
+- `TG_SESSION_STRING`·`TG_API_ID`·`TG_API_HASH` 종목봇 서비스 Railway env에 반영됨.
+  릴레이(`src/channel_relay.py`, 20분 cron, MARKET_CHAT_ID 발송)는 자동 활성.
+- 방법: Claude Code 컨테이너는 TLS 재종단 프록시라 MTProto 불가 → `src/tg_login.py`가
+  Railway 컨테이너 부팅 시 env 주도로 2단계 로그인 대행 (TG_LOGIN_PHONE → 코드 →
+  TG_LOGIN_CODE(+TG_LOGIN_PASSWORD) → sign_in → TG_SESSION_STRING upsert → TG_LOGIN_* 자동 삭제).
+  세션이 만료/로그아웃되면 같은 절차 반복: `TG_SESSION_STRING` 삭제 후 `TG_LOGIN_PHONE` upsert.
+- 보안 메모: 2단계 비밀번호가 채팅에 노출됨 — 사용자에게 변경 권고함. 세션은 비밀번호 변경과
+  무관하게 유효.
+- 확인 포인트: 배포 로그 `channel_relay` 라인(20분 간격)에 MTProto 읽기 실패가 없어야 정상.
 
 ### 4-4. 검증 루프 (CLAUDE.md §1) 재가동
 Railway 토큰 확보로 이제 가능: self-test env(`IDEA_TEST_PROMPT` 등) 주입 → 재배포 → 로그 분석 →
