@@ -19,7 +19,9 @@ log = logging.getLogger(__name__)
 KST = timezone(timedelta(hours=9))
 
 # 5년(1260거래일) + 여유 = 1400일치 보관 (역사적 신고가 ATH 계산용)
-RETENTION_DAYS = 1400
+# 보존 기간(달력일). backfill 범위(DEFAULT_DAYS 1260거래일 ≈ 1900달력일)보다 길어야 한다 —
+# 2026-09-23 실측: 1400일로 잘라내자 max_len 937 < 1000(백필 트리거) → 매일 백필→정리 루프.
+RETENTION_DAYS = 2000
 
 
 def _int_env(key: str, default: int) -> int:
