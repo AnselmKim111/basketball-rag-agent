@@ -170,11 +170,9 @@ def test_formatter_section_order_and_rs_leaders():
                         "rs_3m_rank": 97.0, "r3m_pct": 22.0}],
     }
     msg = format_results(results, datetime.now(), base_date="2026-06-27")
-    i_nb = msg.index("52주 돌파 직전")
-    i_ha = msg.index("역사적 신고가")
-    i_rs = msg.index("상대강도 리더")
-    assert i_nb < i_ha < i_rs               # 🎯 맨 앞, 💪 맨 뒤
-    assert "리더" in msg
+    # 2026-09-23 미미 스타일: 신고가 블록이 앞, 돌파 직전이 뒤. RS 리더는 미표시.
+    assert msg.index("📈 신고가") < msg.index("🎯 돌파 직전")
+    assert "리더" not in msg
 
 
 def test_formatter_dedup_rs_leaders_after_breakout():
@@ -190,5 +188,5 @@ def test_formatter_dedup_rs_leaders_after_breakout():
         "rs_leaders": [dict(dup, rs_3m_rank=99.0)],
     }
     msg = format_results(results, datetime.now())
-    assert msg.count("중복종목") == 1       # 한 번만 (🚀 섹션에서)
-    assert "상대강도 리더 (시장 대비 상위 10%) (0)" in msg
+    assert msg.count("중복종목") == 1       # 한 번만 (신고가 블록)
+    assert "상대강도" not in msg

@@ -101,6 +101,7 @@ def ensure_schema() -> None:
         for col_def in (
             "ALTER TABLE tickers ADD COLUMN market_cap INTEGER",
             "ALTER TABLE tickers ADD COLUMN sector TEXT",
+            "ALTER TABLE tickers ADD COLUMN sector_naver TEXT",         # Naver 업종(표시 우선)
             "ALTER TABLE tickers ADD COLUMN business_text TEXT",        # DART 사업의 내용
             "ALTER TABLE tickers ADD COLUMN business_text_dt TEXT",     # 추출일(YYYY-MM-DD)
             "ALTER TABLE tickers ADD COLUMN business_report_no TEXT",   # 원본 rcept_no
@@ -359,19 +360,51 @@ def update_sectors(secs: dict[str, str]) -> int:
 
 
 def get_active_tickers() -> list[dict]:
+    """활성 종목. sector는 Naver 업종(sector_naver)이 있으면 그것을 우선 (표시 품질)."""
     ensure_schema()
     with _conn() as c:
         cur = c.execute(
-            "SELECT ticker, name, market, market_cap, sector FROM tickers "
+            "SELECT ticker, name, market, market_cap, sector, sector_naver FROM tickers "
             "WHERE is_active=1 ORDER BY ticker"
         )
         return [
             {
                 "ticker": r[0], "name": r[1], "market": r[2],
-                "market_cap": r[3], "sector": r[4],
+                "market_cap": r[3], "sector": r[5] or r[4],
             }
             for r in cur.fetchall()
         ]
+
+
+def get_sectors_naver(tickers: Iterable[str]) -> dict[str, str]:
+    """{ticker: sector_naver} — 캐시된 Naver 업종만 (없으면 키 없음)."""
+    ensure_schema()
+    ts = [t for t in tickers if t]
+    if not ts:
+        return {}
+    out: dict[str, str] = {}
+    with _conn() as c:
+        for i in range(0, len(ts), 500):
+            chunk = ts[i:i + 500]
+            q = ",".join("?" * len(chunk))
+            cur = c.execute(
+                f"SELECT ticker, sector_naver FROM tickers WHERE ticker IN ({q}) "
+                "AND sector_naver IS NOT NULL AND sector_naver != ''", chunk)
+            out.update({r[0]: r[1] for r in cur.fetchall()})
+    return out
+
+
+def update_sectors_naver(secs: dict[str, str]) -> int:
+    """{ticker: naver 업종명} 일괄 저장 (refresh_market_caps의 sector 갱신과 독립)."""
+    if not secs:
+        return 0
+    ensure_schema()
+    with _conn() as c:
+        c.execute("BEGIN")
+        c.executemany("UPDATE tickers SET sector_naver=? WHERE ticker=?",
+                      [(str(v), k) for k, v in secs.items() if v])
+        c.execute("COMMIT")
+    return len(secs)
 
 
 def get_ticker_name(ticker: str) -> Optional[str]:

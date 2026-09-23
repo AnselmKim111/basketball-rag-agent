@@ -3,6 +3,8 @@
 BADGE: dict[str, str] = {
     "high_all": "💥 역사적 신고가 돌파",
     "high_52w": "📈 52주 신고가",
+    "high_52w_hi": "📈 52주 신고가(장중)",
+    "high_52w_small": "📈 신고가(소형주)",
     "high_26w": "📊 6개월 신고가",
     "vcp_breakout": "💎 VCP 돌파",
     "volume_breakout": "🔥 거래량 돌파",

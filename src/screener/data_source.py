@@ -245,6 +245,133 @@ def fetch_ohlcv_by_ticker_via_naver(
     return apply_regular_session_override(str(ticker), rows)
 
 
+# ------------------------------------------------------------------
+# Naver 업종 — 종목별 industryCode → 업종명 (표시 그룹핑용). pykrx 업종지수 사망 대체.
+# ------------------------------------------------------------------
+_NAVER_INDUSTRY_NAME: dict[str, str] = {}   # code → name (프로세스 캐시)
+
+# Naver 업종명 → 짧은 표시명 (미미 스타일). 없으면 원문 그대로.
+NAVER_INDUSTRY_SHORT = {
+    "반도체와반도체장비": "반도체",
+    "전자장비와기기": "전자장비",
+    "디스플레이장비및부품": "디스플레이",
+    "핸드셋": "핸드셋",
+    "전기제품": "전기제품",
+    "생물공학": "바이오",
+    "제약": "제약",
+    "생명과학도구및서비스": "바이오",
+    "건강관리장비와용품": "의료기기",
+    "건강관리기술": "헬스케어",
+    "소프트웨어": "소프트웨어",
+    "IT서비스": "IT서비스",
+    "게임엔터테인먼트": "게임",
+    "양방향미디어와서비스": "인터넷",
+    "방송과엔터테인먼트": "엔터",
+    "자동차부품": "자동차부품",
+    "자동차": "자동차",
+    "조선": "조선",
+    "우주항공과국방": "방산/우주",
+    "전기장비": "전기장비",
+    "기계": "기계",
+    "건축제품": "건자재",
+    "건설": "건설",
+    "화학": "화학",
+    "철강": "철강",
+    "비철금속": "비철금속",
+    "에너지장비및서비스": "에너지",
+    "석유와가스": "정유/가스",
+    "가스유틸리티": "유틸리티",
+    "전기유틸리티": "유틸리티",
+    "은행": "은행",
+    "증권": "증권",
+    "보험": "보험",
+    "카드": "금융",
+    "창업투자": "금융",
+    "식품": "식품",
+    "음료": "음료",
+    "화장품": "화장품",
+    "섬유,의류,신발,호화품": "의류",
+    "호텔,레스토랑,레저": "레저",
+    "무역회사와판매업체": "상사",
+    "해운사": "해운",
+    "항공사": "항공",
+    "육상운수": "운송",
+    "복합기업": "지주",
+    "상업서비스와공급품": "서비스",
+    "교육서비스": "교육",
+    "통신장비": "통신장비",
+    "무선통신서비스": "통신",
+    "다각화된통신서비스": "통신",
+    "백화점과일반상점": "유통",
+    "인터넷과카탈로그소매": "이커머스",
+    "가정용기기와용품": "가전",
+    "가구": "가구",
+    "종이와목재": "제지",
+    "포장재": "포장재",
+    "부동산": "부동산",
+    "광고": "광고",
+    "출판": "출판",
+    "손해보험": "보험",
+    "생명보험": "보험",
+}
+
+
+def _naver_industry_name(code: str) -> Optional[str]:
+    if not code:
+        return None
+    if code in _NAVER_INDUSTRY_NAME:
+        return _NAVER_INDUSTRY_NAME[code]
+    import requests
+    try:
+        r = requests.get(
+            f"https://m.stock.naver.com/api/stocks/industry/{code}?page=1&pageSize=1",
+            timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+        r.raise_for_status()
+        name = ((r.json() or {}).get("groupInfo") or {}).get("name")
+    except Exception as e:
+        log.debug("[data_source] Naver 업종명 %s 실패: %s", code, e)
+        return None
+    if name:
+        _NAVER_INDUSTRY_NAME[code] = str(name)
+    return _NAVER_INDUSTRY_NAME.get(code)
+
+
+def fetch_naver_industry(ticker: str) -> Optional[str]:
+    """종목 → Naver 업종 짧은 표시명. 실패 시 None (호출자가 기존 sector 유지)."""
+    import requests
+    try:
+        r = requests.get(
+            f"https://m.stock.naver.com/api/stock/{ticker}/integration",
+            timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+        r.raise_for_status()
+        code = (r.json() or {}).get("industryCode")
+    except Exception as e:
+        log.debug("[data_source] Naver integration %s 실패: %s", ticker, e)
+        return None
+    name = _naver_industry_name(str(code)) if code else None
+    if not name:
+        return None
+    return NAVER_INDUSTRY_SHORT.get(name, name)
+
+
+def fetch_naver_industries(tickers: Iterable[str], workers: int = 6) -> dict[str, str]:
+    """여러 종목 병렬 조회 → {ticker: 업종}. 실패 종목은 제외."""
+    from concurrent.futures import ThreadPoolExecutor
+    ts = [t for t in dict.fromkeys(tickers) if t]
+    out: dict[str, str] = {}
+    if not ts:
+        return out
+    # 업종명 캐시를 먼저 채우도록 첫 종목은 순차 (동일 code 동시 조회 낭비 방지)
+    first = fetch_naver_industry(ts[0])
+    if first:
+        out[ts[0]] = first
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+        for t, name in zip(ts[1:], pool.map(fetch_naver_industry, ts[1:])):
+            if name:
+                out[t] = name
+    return out
+
+
 def fetch_ohlcv_by_ticker_via_fdr(
     ticker: str, start_iso: str, end_iso: str
 ) -> list[tuple]:

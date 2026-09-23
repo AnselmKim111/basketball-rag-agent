@@ -92,6 +92,9 @@ report-bot 서비스는 계속 disabled 유지(같은 토큰 양쪽 폴링 시 4
 - 조치: 정규장(15:30) 분봉 기준 오늘 row 교체(저장·검증 동일 경로), Naver 1순위 +
   6-worker 병렬(6분), 🧩 섹션 제거(핵심 3섹션에 시총 표기로 합류), EPS 열 자동 숨김,
   차트 채널 base_date별 dedupe. 정정판 self-test: validated 219 / rejected 0.
+- 2차(같은 날): 사용자 "미미 수준으로 깔끔하게" → 메시지를 미미 포맷으로 전면 교체
+  (업종별 신고가 한 줄 + ★ + 소형주 버킷 + 돌파직전, 나머지 섹션 미표시), 장중고가 기준
+  신고가(`high_52w_hi`) 추가, Naver 업종명 그룹핑(`sector_naver` 캐시). CLAUDE.md §6 참조.
 - 내일(09-24) 16:00 cron이 첫 정식 실행 — 로그 `[validator] 완료 ... rejected=0` 확인.
 - 남은 개선 후보: near_breakout의 `vol_trend ≥ 1.3` 게이트가 소부장 눌림목을 거를 수
   있음(백테스트 없이 손대지 않음). pykrx 부활은 KRX 계정(KRX_ID/KRX_PW) 필요 — 사용자

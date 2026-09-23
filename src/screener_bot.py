@@ -467,6 +467,44 @@ def _chart_caption(ticker: str, item: dict, cats: list[str], rows: list[dict], y
 # max_tickers cap 소모 — 실측 하루 ~94건 낭비. 섹션 추가 시 여기도 함께 갱신할 것.
 DISPLAY_CATEGORIES = ("near_breakout_52w", "high_all", "high_52w", "high_26w",
                       "vcp_breakout", "volume_surge", "rs_leaders")
+# 차트 게시 그룹 (formatter.display_items 키) — 소형주 버킷은 게시 안 함 (채널 flood 방지)
+CHART_DISPLAY_GROUPS = ("new_high", "near_breakout")
+
+
+async def _enrich_sectors_naver(results: dict) -> int:
+    """표시 종목의 업종을 Naver(industryCode→업종명)로 보강 — pykrx 업종지수 사망 대체.
+
+    DB(tickers.sector_naver) 캐시 우선, 미보유만 병렬 조회 후 저장. results의 item
+    "sector"를 제자리에서 갱신. 실패는 기존 sector 유지 (로그만).
+    """
+    from src.screener import data_source, db, formatter
+    disp = formatter.display_items(results)
+    tickers = {it.get("ticker") for items in disp.values() for it in items if it.get("ticker")}
+    if not tickers:
+        return 0
+    loop = asyncio.get_running_loop()
+    cached = await loop.run_in_executor(None, lambda: db.get_sectors_naver(tickers))
+    missing = sorted(tickers - set(cached))
+    fetched: dict[str, str] = {}
+    if missing:
+        try:
+            fetched = await loop.run_in_executor(
+                None, lambda: data_source.fetch_naver_industries(missing))
+            if fetched:
+                await loop.run_in_executor(None, lambda: db.update_sectors_naver(fetched))
+        except Exception:
+            log.exception("[screener] Naver 업종 조회 실패 — 기존 sector 유지")
+    secs = {**cached, **fetched}
+    n = 0
+    for items in results.values():
+        for it in items or []:
+            s = secs.get(it.get("ticker"))
+            if s:
+                it["sector"] = s
+                n += 1
+    log.info("[screener] Naver 업종 보강: 표시 %d종목 중 캐시 %d + 신규 %d",
+             len(tickers), len(cached), len(fetched))
+    return n
 
 
 async def _post_charts_and_meta(results: dict, base_date: str,
@@ -480,16 +518,19 @@ async def _post_charts_and_meta(results: dict, base_date: str,
 
     by_ticker: dict[str, dict] = {}
     badges: dict[str, list] = {}
-    # 표시 종목과 1:1 — 메시지에 안 나오는 종목(중소형 📊💎🔥💪)은 차트도 게시 안 함
-    for cat, items in formatter.display_items(results).items():
-        if cat not in DISPLAY_CATEGORIES:
+    # 표시 종목과 1:1 — 메시지에 안 나오는 종목(6개월·VCP·수급·RS·소형주)은 차트도 게시 안 함
+    for group, items in formatter.display_items(results).items():
+        if group not in CHART_DISPLAY_GROUPS:
             continue
         for it in items:
             t = it.get("ticker")
             if not t:
                 continue
             by_ticker.setdefault(t, it)
-            badges.setdefault(t, []).append(cat)
+            for cat in it.get("cats") or []:
+                if cat in DISPLAY_CATEGORIES and cat not in badges.setdefault(t, []):
+                    badges[t].append(cat)
+            badges.setdefault(t, [])
 
     tickers = list(by_ticker.keys())[:max_tickers]
     # EPS YoY는 pykrx 일괄(2회) — 캐시 우선
@@ -831,6 +872,12 @@ async def _screener_daily_job_locked(bot: Bot, override_chat_id: str | None) -> 
                         f"📈 신호 {len(uniq)}개 발견 — 차트 채널 게시 중 (~{eta}초)")
             except Exception:
                 log.exception("[scheduled] 진행 ping 실패 — 무시하고 진행")
+
+        # 표시 종목 업종 보강 (Naver) — 메시지 그룹핑 품질
+        try:
+            await _enrich_sectors_naver(results)
+        except Exception:
+            log.exception("[scheduled] 업종 보강 실패 — 기존 sector로 진행")
 
         # 종목별 채널 차트 게시 + ytd/eps 메타 (채널 미설정 시 메타만)
         try:

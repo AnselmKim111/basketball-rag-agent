@@ -1,7 +1,7 @@
 """코스닥 중소형 확장 — 표시 정책 + validator 병렬화 회귀 테스트.
 
-2026-09-23 정책: 🧩 중소형 섹션 제거. 중소형(1000억~3000억)은 신고가 계열 핵심
-3섹션(🎯🚀📈)에만 시총 표기로 합류, 나머지(📊💎🔥💪)에선 제외.
+2026-09-23 정책(미미 스타일): 시총 필터(1000억) 이상은 업종별 신고가 한 줄, 미만은
+'(소형주/1,000억↓)' 버킷 한 줄. 6개월·VCP·수급·RS는 메시지 미표시.
 """
 from __future__ import annotations
 
@@ -23,59 +23,25 @@ def _results(**over):
     return base
 
 
-def test_no_smallcap_section_and_core_sections_tag_cap():
-    from src.screener.formatter import format_results
+def test_smallcap_goes_to_bucket_not_main():
+    from src.screener.formatter import format_results, display_items
     results = _results(high_all=[
         {"ticker": "BIG", "name": "대형주", "chg_pct": 3.0, "market_cap": 3.01e11},
-        {"ticker": "SMALL", "name": "네오팜", "chg_pct": 5.0, "market_cap": 2.15e11},
+        {"ticker": "SMALL", "name": "네오팜", "chg_pct": 5.0, "market_cap": 0.8e11},
     ])
     msg = format_results(results, datetime.now())
-    assert "중소형 신호" not in msg              # 🧩 섹션 제거
-    assert "역사적 신고가 (2)" in msg            # 중소형도 핵심 섹션에 합류
-    assert "네오팜(2,150억)" in msg              # 시총 표기로 구분
-    assert "대형주 /" in msg                     # 대형은 표기 없음
+    assert "중소형 신호" not in msg
+    assert "(기타) 대형주★" in msg
+    assert "(소형주/1,000억↓) 네오팜" in msg
+    d = display_items(results)
+    assert [it["ticker"] for it in d["new_high"]] == ["BIG"]
 
 
-def test_smallcap_dropped_from_noise_sections():
-    from src.screener.formatter import format_results, display_items
-    small = {"ticker": "S1", "name": "아이디피", "chg_pct": 8.0, "market_cap": 1.5e11}
-    results = _results(volume_surge=[dict(small)], rs_leaders=[dict(small)],
-                       vcp_breakout=[dict(small)], high_26w=[dict(small)])
-    msg = format_results(results, datetime.now())
-    assert "아이디피" not in msg
-    assert all(len(v) == 0 for v in display_items(results).values())
-
-
-def test_smallcap_in_core_shown_once_with_dedup():
-    from src.screener.formatter import format_results
-    it = {"ticker": "S1", "name": "아이디피", "chg_pct": 8.0, "market_cap": 1.5e11}
-    results = _results(high_all=[dict(it)], high_52w=[dict(it)], volume_surge=[dict(it)])
-    msg = format_results(results, datetime.now())
-    assert msg.count("아이디피") == 1            # 🚀가 먼저 claim, 📈·🔥엔 중복 없음
-
-
-def test_smallcap_cap_none_stays_in_main_sections():
+def test_smallcap_cap_none_stays_in_main():
     from src.screener.formatter import format_results
     results = _results(high_52w=[{"ticker": "X", "name": "미상", "chg_pct": 1.0, "market_cap": None}])
     msg = format_results(results, datetime.now())
-    assert "52주 신고가 (1)" in msg
-    assert "미상 /" in msg
-
-
-def test_eps_column_hidden_when_all_na():
-    from src.screener.formatter import format_results
-    results = _results(high_52w=[{"ticker": "A", "name": "에이", "chg_pct": 1.0, "market_cap": 5e11}])
-    msg = format_results(results, datetime.now(), extra={"A": {"ytd": 12.0, "eps_yoy": None}})
-    assert "(종목 / 당일 / 연초대비)" in msg
-    assert "EPS" not in msg
-    msg2 = format_results(results, datetime.now(), extra={"A": {"ytd": 12.0, "eps_yoy": 30.0}})
-    assert "EPS YoY" in msg2 and "+30.0%" in msg2
-
-
-def test_header_says_1000억():
-    from src.screener.formatter import format_results
-    msg = format_results(_results(), datetime.now(), stats={"processed": 1500})
-    assert "시총 1000억+" in msg
+    assert "(기타) 미상" in msg
 
 
 def test_min_cap_default_lowered():

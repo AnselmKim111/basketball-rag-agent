@@ -116,6 +116,20 @@ def compute_signals_for_ticker(rows: list[dict], base_date: str | None = None) -
                 "chg_pct": chg_pct,
             }
 
+    # 1.2) 52주 신고가 — **장중 고가 기준** (미미의 신고가 채널과 동일 정의, 2026-09-23
+    # 실측: 샘씨엔에스는 종가 미경신·고가 경신인데 미미 리스트에 포함). 표시용 신고가
+    # 섹션 = high_52w ∪ high_all ∪ high_52w_hi. 백테스트 원신호(종가 기준)는 그대로.
+    if len(df) >= 252:
+        past_high_52w = df["high"].iloc[-252:-1].max()
+        if today["high"] > past_high_52w and past_high_52w > 0:
+            out["high_52w_hi"] = {
+                "close": int(today["close"]),
+                "high": int(today["high"]),
+                "prev_high": int(past_high_52w),
+                "pct": float((today["high"] / past_high_52w - 1) * 100),
+                "chg_pct": chg_pct,
+            }
+
     # 1.5) 6개월(126거래일) 신고가 — 종가기준. 장기 하락 후 회복 국면 조기 포착
     # (52주 고점에선 멀지만 6개월 박스권을 뚫는 GS건설류). 52주 신고가와 독립 발화 —
     # 중복 표시는 formatter dedup이 처리, 백테스트는 원신호 그대로 측정.
@@ -319,6 +333,8 @@ def compute_signals_for_ticker(rows: list[dict], base_date: str | None = None) -
 CATEGORIES = [
     "high_all",
     "high_52w",
+    "high_52w_hi",       # 장중 고가 기준 52주 신고가 (표시용, 미미 정의)
+    "high_52w_small",    # 시총 필터 미만(<1000억) 종목의 신고가 — 미미 '동전주' 버킷 대응
     "high_26w",
     "vcp_breakout",
     "volume_breakout",
@@ -357,6 +373,35 @@ def _composite_score(item: dict, max_cap: float) -> float:
     norm_rs = (rs / 100.0) if isinstance(rs, (int, float)) else 0.5
     score = 0.4 * norm_chg + 0.3 * norm_cap + 0.3 * norm_rs
     return -score
+
+
+def new_high_only(rows: list[dict], base_date: str) -> dict | None:
+    """시총 필터 미만 종목용 경량 신고가 판정 (52주 종가 or 장중고가 경신).
+
+    compute_signals_for_ticker 전체를 돌리지 않고 신고가만 — 1200+ 소형주 추가 부담 최소화.
+    반환: entry payload(close/chg_pct/prev_high) 또는 None.
+    """
+    if not rows or len(rows) < 252:
+        return None
+    idx = next((i for i in range(len(rows) - 1, -1, -1) if rows[i]["date"] == base_date), None)
+    if idx is None or idx < 252:
+        return None
+    today = rows[idx]
+    prev = rows[idx - 1]
+    past = rows[idx - 252: idx]
+    past_close_hi = max((r.get("close") or 0) for r in past)
+    past_high_hi = max((r.get("high") or 0) for r in past)
+    close = today.get("close") or 0
+    high = today.get("high") or 0
+    if past_close_hi <= 0 or close <= 0 or (prev.get("close") or 0) <= 0:
+        return None
+    if close > past_close_hi or (past_high_hi > 0 and high > past_high_hi):
+        return {
+            "close": int(close),
+            "prev_high": int(max(past_close_hi, past_high_hi)),
+            "chg_pct": float((close / prev["close"] - 1) * 100),
+        }
+    return None
 
 
 def compute_all(base_date: str | None = None) -> tuple[dict[str, list[dict]], dict]:
@@ -402,11 +447,25 @@ def compute_all(base_date: str | None = None) -> tuple[dict[str, list[dict]], di
     rs_meta: dict[str, dict] = {}  # ticker → 상대강도 원료 (base_date 기준)
     from src.screener.breadth import BreadthAccumulator
     breadth_acc = BreadthAccumulator()
+    small_nh_on = _get_float_env("SCREENER_SMALL_NH", 1) == 1
     for tinfo in tickers:
         ticker = tinfo["ticker"]
         cap = tinfo.get("market_cap")
         if cap is not None and cap < min_cap:
             skipped_cap += 1
+            # 소형주(시총 필터 미만)는 신고가만 경량 판정 → 미미의 '동전주' 버킷처럼 한 줄 표시.
+            if small_nh_on and cap > 0:
+                try:
+                    srows = db.load_ohlcv(ticker, days=300)
+                    nh = new_high_only(srows, base_date)
+                except Exception:
+                    nh = None
+                if nh:
+                    by_cat["high_52w_small"].append({
+                        "ticker": ticker, "name": tinfo.get("name") or ticker,
+                        "market": tinfo.get("market") or "", "market_cap": cap,
+                        "sector": tinfo.get("sector") or "", **nh,
+                    })
             continue
         rows = db.load_ohlcv(ticker, days=1300)
         # 시장 폭 누산 (이중 I/O 없이 — 이미 로드된 rows). <60행도 자체 길이 가드 있음.

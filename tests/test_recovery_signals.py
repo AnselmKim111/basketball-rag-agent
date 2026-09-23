@@ -130,9 +130,8 @@ def test_formatter_new_sections_and_dedup():
         "volume_surge": [{"ticker": "000003", "name": "수급주", "chg_pct": 9.0, "vol_ratio": 4.2}],
     }
     msg = format_results(results, datetime.now())
-    assert "6개월 신고가 (회복 국면) (1)" in msg   # dup은 52주 섹션이 claim → 1개만
-    assert "회복주" in msg
-    assert "수급 유입" in msg and "수급주" in msg
+    # 2026-09-23 미미 스타일: 6개월·수급 섹션은 메시지에서 제외 (계산·저장만)
+    assert "회복주" not in msg and "수급주" not in msg
     assert msg.count("중복52주") == 1
 
 
@@ -140,6 +139,6 @@ def test_display_categories_include_new(fresh):
     import src.screener_bot as kr_bot
     import src.us_screener_bot as us_bot
     for cat in ("high_26w", "volume_surge"):
-        assert cat in kr_bot.DISPLAY_CATEGORIES
         assert cat in us_bot.DISPLAY_CATEGORIES
-    assert kr_bot.DISPLAY_CATEGORIES == us_bot.DISPLAY_CATEGORIES
+    # KR은 미미 스타일(2026-09-23): 차트 게시 그룹 = 신고가 + 돌파직전만
+    assert kr_bot.CHART_DISPLAY_GROUPS == ("new_high", "near_breakout")
