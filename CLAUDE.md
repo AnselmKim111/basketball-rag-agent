@@ -115,9 +115,16 @@
 - `src/screener/universe.py` — KOSPI/KOSDAQ 보통주 + 시총 + 섹터 갱신
 
 ### 데이터 소스 우선순위 (절대 순서 지킬 것)
-1. **Naver Finance siseJson API** — 1순위 (시뮬레이션 환경에서도 정확)
-2. **pykrx** date-batch — 폴백
+1. **Naver Finance siseJson API** — 1순위 (cron `update_today`도 2026-09-23부터 Naver 먼저)
+2. **pykrx** date-batch — 폴백 (2026-09부터 KRX 로그인 필수 → 사실상 사망, 로그에 매일 실패)
 3. **FDR** ticker-batch — 최후 폴백 (cap+timeout 보호)
+
+**정규장 종가 원칙 (2026-09-23 실측·절대 깨지 말 것)**: NXT 통합 이후 Naver 일봉의
+*오늘* row는 16:00~20:00 애프터마켓 가격으로 계속 움직인다 (삼성전자 15:30 종가 276,500
+vs 통합 일봉 277,500). `data_source.apply_regular_session_override`가 fchart **분봉
+09:00~15:30**에서 정규장 OHLCV를 산출해 오늘 row를 교체 — DB 저장·validator 재fetch가
+같은 함수를 타므로 항상 일치. 이게 없으면 매일 신호의 75~85%가 한두 틱 차이로 검증
+탈락한다 (09-17~23 실측: 219→37). 끄는 스위치 `SCREENER_REGULAR_CLOSE=0` (쓰지 말 것).
 
 시총·섹터:
 - 시총: pykrx fetch_market_cap → FDR StockListing Marcap 폴백
@@ -147,8 +154,10 @@
 - `SCREENER_CHAT_ID` — 자동 발송 대상 chat id
 - `SCREENER_TEST_MODE=1` — 부팅 시 self-test 자동 실행
 - `SCREENER_MIN_MARKET_CAP=300_000_000_000` — 시총 필터 (3000억)
-- `SCREENER_RETRY_INTERVAL_S=300`, `SCREENER_RETRY_MAX=6` — today fetch retry (16:00 cron이
-  KRX 미발행 대비 16:30까지 5분 간격 재시도)
+- `SCREENER_RETRY_INTERVAL_S=180`, `SCREENER_RETRY_MAX=4` — today fetch retry (Naver 1순위라
+  보통 1회에 끝남. 이전 5분×6=26분 pykrx 재시도는 KRX 사망으로 낭비였음)
+- `SCREENER_NAVER_WORKERS=6` — Naver ticker-batch 병렬 (1300종목 ≈ 6분)
+- `SCREENER_OVERRIDE_REFETCH=1` — /screen·self-test도 cron처럼 재수집 (정정 발송·검증용, 평소 미설정)
 - `SCREENER_NAVER_CAP=1200`, `SCREENER_NAVER_TIMEOUT_S=600` — Naver fetch 보호
 - `SCREENER_FORCE_REFETCH=1` — cached 무시하고 매번 Naver 재 fetch (정확성 위해 켬)
 - `SCREENER_FORCE_BACKFILL=<토큰>` — 강제 백필 **one-shot**: 같은 토큰은 1회만 소비
@@ -165,10 +174,14 @@
 미수신이면 `ensure_recent_business_day_data`로 직전 영업일 fetch.
 
 ### 메시지 포맷 (미미 스타일)
-- 섹션: 🚀 역사적 신고가 / 📈 52주 신고가 / 💎 VCP 돌파 / 🔥 거래량 돌파 / 🎯 52주 돌파 직전
-- 섹션 안에서 섹터별 그룹핑: `(반도체) 삼성전자(+5.2%), SK하이닉스(+3.1%)`
-- KOSPI 우선 정렬 (각 섹터 내부)
-- 헤더에 base_date + 검증 종목 수 + 이중확인 통과 수 명시
+- 섹션 순서(백테스트 edge 순): 🎯 52주 돌파 직전 / 🚀 역사적 신고가 / 📈 52주 신고가 /
+  📊 6개월 신고가 / 💎 VCP / 🔥 수급 유입 / 💪 RS 리더. 앞 섹션이 종목 선점(dedup).
+- 라인: `종목 / 당일 / 연초대비` (EPS 열은 값 있을 때만 — pykrx 사망 후 전부 N/A라 숨김)
+- **중소형(1000억~3000억) 정책 (2026-09-23 사용자 요청)**: 🧩 중소형 섹션 삭제.
+  🎯🚀📈 핵심 3섹션에만 `이름(1,228억)` 시총 표기로 합류(소부장 코스닥 커버리지),
+  📊💎🔥💪에선 제외. `formatter.display_items()`가 메시지·차트 게시 대상의 단일 계약.
+- 헤더에 base_date + 검증 종목 수 + 시장 폭 한 줄. 검증제외가 0이 아니면 운영노트에 표시
+  — **두 자릿수면 데이터 드리프트 회귀 신호**(정규장 종가 원칙 참조).
 
 ### 알려진 환경 한계
 시뮬레이션 환경에서 외부 KRX/Naver/FDR 데이터에 lag/forward-fill 가능성. 따라서
