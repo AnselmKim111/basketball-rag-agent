@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import logging
 import time
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Iterable, Optional
 
 log = logging.getLogger(__name__)
@@ -81,6 +81,111 @@ def fetch_market_ohlcv_by_date(date_str: str, market: str = "ALL") -> list[tuple
     return []
 
 
+KST = timezone(timedelta(hours=9))
+# 정규장 구간 (KRX 09:00 ~ 15:30 동시호가). NXT 프리/애프터마켓·시간외 단일가 제외.
+REGULAR_OPEN_HHMM = "0900"
+REGULAR_CLOSE_HHMM = "1530"
+
+
+def _today_kst_iso() -> str:
+    return datetime.now(KST).strftime("%Y-%m-%d")
+
+
+def parse_naver_minute_bars(text: str) -> list[tuple[str, int, int]]:
+    """fchart 분봉 XML → [(YYYYMMDDHHMM, close, cum_volume)] (시간 asc).
+
+    item data 형식: 'YYYYMMDDHHMM|open|high|low|close|cumvol' — 분봉은 O/H/L이 null.
+    """
+    import re
+    out: list[tuple[str, int, int]] = []
+    for raw in re.findall(r'data="([^"]+)"', text or ""):
+        parts = raw.split("|")
+        if len(parts) < 6:
+            continue
+        try:
+            ts = parts[0].strip()
+            c = int(float(parts[4]))
+            v = int(float(parts[5]))
+        except (ValueError, TypeError):
+            continue
+        if len(ts) == 12 and c > 0 and v >= 0:
+            out.append((ts, c, v))
+    out.sort(key=lambda x: x[0])
+    return out
+
+
+def regular_session_bar(bars: list[tuple[str, int, int]], date_iso: str) -> tuple | None:
+    """분봉에서 해당 날짜의 **정규장(09:00~15:30) OHLCV**만 추림.
+
+    2025-03 NXT(대체거래소) 개장 이후 Naver 일봉은 프리마켓(08:00~)·애프터마켓(~20:00)
+    까지 통합돼 16:00~20:00 사이엔 종가가 계속 움직인다 (실측 2026-09-23: 삼성전자
+    15:30 종가 276,500 vs 통합 일봉 종가 277,500). 신고가·등락률·이중검증은 KRX 정규장
+    종가(15:30 동시호가) 기준이어야 하므로 분봉에서 직접 산출.
+
+    반환: (open, high, low, close, volume) — high/low는 분봉 종가의 max/min(근사),
+          volume은 15:30 시점 누적 거래량. 정규장 봉이 없으면 None.
+    """
+    ymd = date_iso.replace("-", "")
+    day = [b for b in bars if b[0][:8] == ymd
+           and REGULAR_OPEN_HHMM <= b[0][8:12] <= REGULAR_CLOSE_HHMM]
+    if not day:
+        return None
+    closes = [b[1] for b in day]
+    return (day[0][1], max(closes), min(closes), day[-1][1], day[-1][2])
+
+
+def fetch_regular_session_bar_via_naver(ticker: str, date_iso: str,
+                                        count: int = 700) -> tuple | None:
+    """Naver fchart 분봉으로 date_iso의 정규장 OHLCV. 실패 시 None (호출자가 일봉 유지).
+
+    count=700: 정규장 391봉 + 애프터마켓(~20:00) 최대 ~270봉 커버.
+    """
+    import requests
+    url = (
+        "https://fchart.stock.naver.com/sise.nhn"
+        f"?symbol={ticker}&timeframe=minute&count={int(count)}&requestType=0"
+    )
+    try:
+        resp = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+        resp.raise_for_status()
+    except Exception as e:
+        log.warning("[data_source] Naver 분봉 %s 실패: %s", ticker, e)
+        return None
+    return regular_session_bar(parse_naver_minute_bars(resp.text), date_iso)
+
+
+def _regular_close_enabled() -> bool:
+    import os
+    return (os.getenv("SCREENER_REGULAR_CLOSE", "1") or "1").strip() != "0"
+
+
+def apply_regular_session_override(ticker: str, rows: list[tuple],
+                                   today_iso: str | None = None) -> list[tuple]:
+    """rows 중 **오늘(KST) 날짜 row**를 정규장 분봉 기준 OHLCV로 교체.
+
+    오늘 row만 대상: 과거 row는 이미 확정된 통합 일봉(다음날 재fetch 시 덮어씀)이고,
+    오늘 row는 16:00~20:00 사이 계속 움직여 DB 저장값과 validator 재fetch값이 어긋난다
+    (2026-09-17~23 매일 신호의 75~85%가 이 드리프트로 검증 탈락). 분봉 fetch 실패 시
+    일봉 row 유지 — validator가 보수적으로 판정.
+    """
+    if not rows or not _regular_close_enabled():
+        return rows
+    today_iso = today_iso or _today_kst_iso()
+    idx = next((i for i, r in enumerate(rows) if r[1] == today_iso), None)
+    if idx is None:
+        return rows
+    bar = fetch_regular_session_bar_via_naver(ticker, today_iso)
+    if not bar:
+        log.info("[data_source] %s %s 정규장 분봉 없음 → 일봉 유지", ticker, today_iso)
+        return rows
+    o, h, l, c, v = bar
+    r = rows[idx]
+    # open도 분봉(09:00 첫 봉) 기준 — 통합 일봉 시가는 NXT 프리마켓(08:00~) 값
+    # (실측: 삼성전자 2026-09-23 통합 시가 284,500 vs 정규장 시가 282,500).
+    rows[idx] = (r[0], r[1], o, h, l, c, v, r[7] if len(r) > 7 else None)
+    return rows
+
+
 def fetch_ohlcv_by_ticker_via_naver(
     ticker: str, start_iso: str, end_iso: str
 ) -> list[tuple]:
@@ -136,7 +241,8 @@ def fetch_ohlcv_by_ticker_via_naver(
         if c <= 0 or v < 0:
             continue
         rows.append((str(ticker), iso, o, h, l, c, v, None))
-    return rows
+    # 오늘 row는 정규장(15:30) 기준으로 교체 — 통합 일봉의 장후 드리프트 차단.
+    return apply_regular_session_override(str(ticker), rows)
 
 
 def fetch_ohlcv_by_ticker_via_fdr(

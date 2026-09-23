@@ -60,6 +60,19 @@ def update_today() -> dict:
         log.info("[incremental] %s 주말 — skip", iso)
         return {"date": iso, "rows": 0, "is_business_day": False, "empty": True}
 
+    # 1순위 Naver ticker-batch (정규장 15:30 기준, update_specific_date와 동일 경로 —
+    # 내부에서 pykrx→FDR 폴백). KRX(pykrx)는 2026-09부터 로그인 필수라 사실상 사망.
+    if active_set and _int_env("SCREENER_TODAY_NAVER_FIRST", 1) == 1:
+        res = update_specific_date(iso, force=True)
+        if not res.get("empty"):
+            cutoff = (today - timedelta(days=RETENTION_DAYS)).strftime("%Y-%m-%d")
+            deleted = db.delete_older_than(cutoff)
+            if deleted:
+                log.info("[incremental] %d행 정리 (cutoff=%s)", deleted, cutoff)
+            return {"date": iso, "rows": res.get("rows", 0), "is_business_day": True,
+                    "empty": False}
+        log.info("[incremental] %s Naver 1순위 빈 결과 → pykrx 시도", iso)
+
     rows = data_source.fetch_market_ohlcv_by_date(ymd)
     if active_set:
         rows = [r for r in rows if r[0] in active_set]
@@ -152,27 +165,45 @@ def update_specific_date(target_iso: str, force: bool = False) -> dict:
         t0 = time.monotonic()
         scanned = 0
         first_diag = False
-        for ticker in active_list[:naver_cap]:  # 시총 desc 정렬된 순서대로
-            if time.monotonic() - t0 > naver_timeout:
-                log.warning("[incremental] Naver timeout %ds → %d에서 중단", naver_timeout, scanned)
-                break
+        # 병렬 fetch (validator와 동일 패턴) — 순차 ~11분이 오늘 row 정규장 분봉 추가로
+        # 2배가 되는 걸 상쇄. submit 순서 = 시총 desc, timeout 시 잔여 cancel.
+        workers = _int_env("SCREENER_NAVER_WORKERS", 6)
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        from concurrent.futures import TimeoutError as _FutTimeout
+        targets = active_list[:naver_cap]
+        with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+            futures = {pool.submit(data_source.fetch_ohlcv_by_ticker_via_naver,
+                                   t, nv_start, nv_end): t for t in targets}
             try:
-                tr = data_source.fetch_ohlcv_by_ticker_via_naver(ticker, nv_start, nv_end)
-                if not first_diag and tr:
-                    sample = [(r[1], r[5]) for r in tr]
-                    log.warning("[incremental] DIAG NAVER(%s) range=%s~%s actual=%s",
-                                ticker, nv_start, nv_end, sample)
-                    first_diag = True
-                merged.extend(tr)
-                target_match.extend([r for r in tr if r[1] == target_iso])
-            except Exception as e:
-                log.debug("Naver %s 실패: %s", ticker, e)
-            scanned += 1
-            if scanned % 200 == 0:
-                log.info(
-                    "[incremental] Naver 진행 %d/%d (rows=%d, target_match=%d)",
-                    scanned, naver_cap, len(merged), len(target_match),
-                )
+                for fut in as_completed(futures, timeout=naver_timeout + 30):
+                    if time.monotonic() - t0 > naver_timeout:
+                        log.warning("[incremental] Naver timeout %ds → %d에서 중단",
+                                    naver_timeout, scanned)
+                        for f in futures:
+                            f.cancel()
+                        break
+                    try:
+                        tr = fut.result()
+                    except Exception as e:
+                        log.debug("Naver %s 실패: %s", futures[fut], e)
+                        tr = []
+                    if not first_diag and tr:
+                        sample = [(r[1], r[5]) for r in tr]
+                        log.warning("[incremental] DIAG NAVER(%s) range=%s~%s actual=%s",
+                                    futures[fut], nv_start, nv_end, sample)
+                        first_diag = True
+                    merged.extend(tr)
+                    target_match.extend([r for r in tr if r[1] == target_iso])
+                    scanned += 1
+                    if scanned % 200 == 0:
+                        log.info(
+                            "[incremental] Naver 진행 %d/%d (rows=%d, target_match=%d)",
+                            scanned, len(targets), len(merged), len(target_match),
+                        )
+            except _FutTimeout:
+                log.warning("[incremental] Naver futures timeout → %d에서 중단", scanned)
+                for f in futures:
+                    f.cancel()
         log.info(
             "[incremental] Naver 완료 scanned=%d total_rows=%d target_match=%d",
             scanned, len(merged), len(target_match),

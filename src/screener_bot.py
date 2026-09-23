@@ -476,11 +476,12 @@ async def _post_charts_and_meta(results: dict, base_date: str,
     채널 토큰/ID 미설정이면 게시는 건너뛰고 메타(ytd·eps)만 계산(4열 enrich).
     반환: (links: {ticker: url}, extra: {ticker: {ytd, eps_yoy}}).
     """
-    from src.screener import chart, db, fundamentals
+    from src.screener import chart, db, formatter, fundamentals
 
     by_ticker: dict[str, dict] = {}
     badges: dict[str, list] = {}
-    for cat, items in results.items():
+    # 표시 종목과 1:1 — 메시지에 안 나오는 종목(중소형 📊💎🔥💪)은 차트도 게시 안 함
+    for cat, items in formatter.display_items(results).items():
         if cat not in DISPLAY_CATEGORIES:
             continue
         for it in items:
@@ -517,7 +518,12 @@ async def _post_charts_and_meta(results: dict, base_date: str,
             ytd = fundamentals.ytd_pct(rows)
             eps = eps_map.get(t)
             extra[t] = {"ytd": ytd, "eps_yoy": eps}
-            if chart_bot and rows:
+            # 같은 base_date에 이미 게시한 종목은 링크 재사용 (재실행·정정 발송 시 채널 중복 방지)
+            dedupe_key = f"chart_post:{base_date}:{t}"
+            prior = await loop.run_in_executor(None, lambda k=dedupe_key: db.meta_get(k))
+            if chart_bot and prior:
+                links[t] = prior
+            elif chart_bot and rows:
                 # freshness 가드 — cron 경로에선 절대 stale이 아니어야 정상 (뜨면 조기 경보)
                 data_date = rows[-1]["date"]
                 if data_date != base_date:
@@ -534,6 +540,8 @@ async def _post_charts_and_meta(results: dict, base_date: str,
                         url = _permalink(channel, msg.message_id)
                         if url:
                             links[t] = url
+                            await loop.run_in_executor(
+                                None, lambda k=dedupe_key, u=url: db.meta_set(k, u))
                         posted += 1
                     await asyncio.sleep(3.0)  # 채널 ~20건/분 한도 → 게시 간 간격 (성공/실패 무관 페이싱)
         except Exception:
@@ -706,9 +714,10 @@ async def _screener_daily_job_locked(bot: Bot, override_chat_id: str | None) -> 
             lengths2 = await loop.run_in_executor(None, db.ticker_data_lengths)
             log.info("[scheduled] 백필 후 ticker_data_lengths: %s", lengths2)
 
-        if override_chat_id:
+        if override_chat_id and os.getenv("SCREENER_OVERRIDE_REFETCH", "").strip() != "1":
             # 수동 /screen: 무거운 재수집(Naver 1200종목, ~10분) 생략 → 기존 DB 최신일자로 즉시 계산.
             # validator가 신호 발생 종목을 Naver로 재검증하므로 정확성 유지. DB 비었을 때만 최소 보장.
+            # (SCREENER_OVERRIDE_REFETCH=1이면 cron과 동일하게 재수집 — 정정 발송·검증용)
             latest = await loop.run_in_executor(None, db.latest_date)
             if not latest:
                 log.info("[scheduled] /screen: DB 비어있음 → ensure_recent_business_day_data")
@@ -716,13 +725,17 @@ async def _screener_daily_job_locked(bot: Bot, override_chat_id: str | None) -> 
             else:
                 log.info("[scheduled] /screen override → Naver 재수집 생략, DB 최신=%s 사용", latest)
         else:
-            # 16:00 cron: 오늘 1일치 fetch + KRX 미발행 대비 retry(5분×6=최대 30분) + 폴백
-            retry_interval = int(os.getenv("SCREENER_RETRY_INTERVAL_S", "300"))
-            retry_max = int(os.getenv("SCREENER_RETRY_MAX", "6"))
+            # 16:00 cron: 오늘 1일치 — Naver 정규장(15:30) 기준 1순위.
+            # 이전엔 pykrx(KRX) 먼저 5분×6 재시도 후 Naver 폴백이었는데, 2026-09부터 KRX가
+            # 로그인 필수로 바뀌어 pykrx가 매일 실패 → 26분 낭비 후 16:26 Naver fetch =
+            # 시간외 드리프트 구간. 지금은 Naver가 1순위(update_specific_date 내부에서
+            # pykrx→FDR 폴백 유지)라 15:30 직후 바로 받을 수 있음.
+            retry_interval = int(os.getenv("SCREENER_RETRY_INTERVAL_S", "180"))
+            retry_max = int(os.getenv("SCREENER_RETRY_MAX", "4"))
             inc = await loop.run_in_executor(None, incremental.update_today)
             attempt = 1
             while inc.get("empty") and inc.get("is_business_day") and attempt < retry_max:
-                log.info("[scheduled] today fetch 미발행 → %d초 후 재시도 (%d/%d)",
+                log.info("[scheduled] today fetch 미수신 → %d초 후 재시도 (%d/%d)",
                          retry_interval, attempt, retry_max)
                 await asyncio.sleep(retry_interval)
                 inc = await loop.run_in_executor(None, incremental.update_today)
