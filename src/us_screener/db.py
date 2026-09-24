@@ -319,6 +319,41 @@ def upsert_tickers(rows: Iterable[tuple]) -> int:
     return len(rows)
 
 
+def deactivate_missing(active: set[str]) -> int:
+    """active 집합에 없는 종목을 is_active=0 (상장폐지·합병·시총 기준 이탈). 반환: 비활성화 수."""
+    if not active:
+        return 0
+    ensure_schema()
+    with _conn() as c:
+        cur = c.execute("SELECT ticker FROM tickers WHERE is_active=1")
+        stale = [r[0] for r in cur.fetchall() if r[0] not in active]
+        if stale:
+            c.execute("BEGIN")
+            c.executemany("UPDATE tickers SET is_active=0 WHERE ticker=?", [(t,) for t in stale])
+            c.execute("COMMIT")
+    return len(stale)
+
+
+def ticker_row_stats(tickers: Iterable[str] | None = None) -> dict[str, tuple[int, Optional[str]]]:
+    """{ticker: (row_count, latest_date)} — 활성 종목 기준 (tickers 주면 그 집합만)."""
+    ensure_schema()
+    with _conn() as c:
+        cur = c.execute("SELECT ticker, COUNT(*), MAX(date) FROM ohlcv GROUP BY ticker")
+        out = {r[0]: (int(r[1]), r[2]) for r in cur.fetchall()}
+    if tickers is not None:
+        ts = set(tickers)
+        out = {t: out.get(t, (0, None)) for t in ts}
+    return out
+
+
+def dates_for_ticker(ticker: str, since: str) -> set[str]:
+    """ticker의 since 이후 보유 날짜 집합 — gap 보충 중복 호출 방지용."""
+    ensure_schema()
+    with _conn() as c:
+        cur = c.execute("SELECT date FROM ohlcv WHERE ticker=? AND date>=?", (ticker, since))
+        return {r[0] for r in cur.fetchall()}
+
+
 def update_market_caps(caps: dict[str, int]) -> int:
     """{ticker: market_cap} 일괄 업데이트. 신규 ticker는 무시 (universe 빌드 후 호출)."""
     if not caps:

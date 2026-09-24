@@ -34,6 +34,12 @@ DEFAULT_NEAR_BREAKOUT_UPPER = 0.99
 DEFAULT_MIN_MARKET_CAP = 1_000_000_000
 
 
+def min_market_cap() -> float:
+    """미국 시총 하한 (USD). KR과 env 분리 — 예전엔 KR의 SCREENER_MIN_MARKET_CAP(원)을 같이
+    읽어, KR을 1000억(1e11)으로 설정하면 미국이 $100B 필터가 되는 사고 소지가 있었다."""
+    return _get_float_env("US_SCREENER_MIN_MARKET_CAP", DEFAULT_MIN_MARKET_CAP)
+
+
 def _get_float_env(key: str, default: float) -> float:
     try:
         return float(os.getenv(key, "") or default)
@@ -262,7 +268,7 @@ def compute_all(base_date: str | None = None) -> tuple[dict[str, list[dict]], di
     else:
         log.info("[signals] base_date 명시: %s", base_date)
 
-    min_cap = _get_float_env("SCREENER_MIN_MARKET_CAP", DEFAULT_MIN_MARKET_CAP)
+    min_cap = min_market_cap()
 
     by_cat: dict[str, list[dict]] = {k: [] for k in CATEGORIES}
 

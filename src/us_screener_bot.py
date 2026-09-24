@@ -271,7 +271,7 @@ def _diag_report(query: str) -> str:
         row = db.get_ticker_row(ticker)
 
     base_date = db.latest_date()
-    min_cap = signals._get_float_env("SCREENER_MIN_MARKET_CAP", signals.DEFAULT_MIN_MARKET_CAP)
+    min_cap = signals.min_market_cap()
     out = [f"🩺 진단: {ticker} ({(row or {}).get('name') or '?'})", f"기준일(base_date): {base_date}"]
 
     if not row:
@@ -570,8 +570,8 @@ async def _us_screener_daily_job_locked(bot: Bot, override_chat_id: str | None) 
     ops_notes: list[str] = []
 
     try:
-        # universe 보장 — 미국은 S&P500+Nasdaq100 ~550종목으로 fetch 빠름(~2초).
-        # 매번 refresh_universe (upsert) 호출해 NASDAQ100 신규 종목·섹터 항상 반영.
+        # universe 보장 — Nasdaq screener 1회 요청(~1초)으로 미국 보통주 시총≥$1B 전체(~2,550).
+        # 매번 refresh_universe (upsert + 이탈 종목 비활성화) — 신규 상장·상장폐지 즉시 반영.
         await loop.run_in_executor(None, db.ensure_schema)
         try:
             count = await loop.run_in_executor(None, universe.refresh_universe)
@@ -582,7 +582,7 @@ async def _us_screener_daily_job_locked(bot: Bot, override_chat_id: str | None) 
                 if count is not None and count < BASELINES["us_caps"]:
                     await alert_admin(bot, ("US_SCREENER_ALLOWED_CHAT_IDS", "US_SCREENER_CHAT_ID"),
                                       "⚠ US universe fetch 급감",
-                                      f"평소 ~516종목, 오늘 {count}종목 — FDR StockListing 포맷 변경 의심")
+                                      f"평소 ~2,550종목(Nasdaq 보통주 시총≥$1B), 오늘 {count}종목 — Nasdaq screener/FDR 점검")
             except Exception:
                 log.exception("[scheduled] us 헬스 알림 실패")
         except Exception:
@@ -592,44 +592,30 @@ async def _us_screener_daily_job_locked(bot: Bot, override_chat_id: str | None) 
         lengths = await loop.run_in_executor(None, db.ticker_data_lengths)
         log.info("[scheduled] ticker_data_lengths: %s", lengths)
 
-        # 백필 트리거 조건:
+        # 백필 트리거 (2026-09-25 재설계):
         #   - DB 비었음 (첫 실행)
-        #   - 강제 (US_SCREENER_FORCE_BACKFILL=1)
-        #   - 252일+ 종목이 ohlcv 보유 종목의 30% 미만 (52주 신고가 산출 불가)
-        #   - active universe 대비 ohlcv 60일+ 미보유 종목 10개 초과 (신규 종목 — NASDAQ100
-        #     추가분 등 — 데이터 backfill 필요). backfill_done flag 무관하게 트리거.
-        #   - max_len < 1000 (5년 데이터 미확보 — 역사적 신고가 ATH 계산 불가). flag 무관.
-        # one-shot force — 같은 토큰은 1회만 소비 (Railway env 스냅샷 잔존 대비)
+        #   - 강제 (US_SCREENER_FORCE_BACKFILL=<토큰>, one-shot — 전 종목 재수집)
+        #   - 이력 부족 종목 존재 (backfill.pending_tickers: row<1000 + 30일 내 시도 없음) —
+        #     유니버스 확장·신규 상장·과거 파서 사고로 이력이 잘린 종목(RDDT·FERG 등)을 그 종목만 백필.
         force_token = (os.getenv("US_SCREENER_FORCE_BACKFILL", "") or "").strip()
         consumed = await loop.run_in_executor(
             None, lambda: db.meta_get("force_backfill_consumed"))
         force = bool(force_token) and force_token != "0" and force_token != consumed
         rc = await loop.run_in_executor(None, db.row_count)
-        ge_252 = lengths.get("ge_252", 0)
-        ge_60 = lengths.get("ge_60", 0)
-        total_t = lengths.get("total_tickers", 0) or 1
-        max_len = lengths.get("max_len", 0)
-        total_active = await loop.run_in_executor(None, lambda: len(db.get_active_tickers()))
-        insufficient = (ge_252 / total_t) < 0.30
-        missing = total_active - ge_60  # ohlcv 60일+ 미보유 active 종목 (신규 상장/추가분)
-        backfill_done = await loop.run_in_executor(None, lambda: db.meta_get("naver_backfill_done"))
-        need_backfill = (
-            (rc == 0) or force
-            or (insufficient and not backfill_done)
-            or (missing > 10)
-            or (max_len < 1000)
-        )
+        pending = await loop.run_in_executor(None, backfill.pending_tickers)
+        need_backfill = (rc == 0) or force or bool(pending)
+        missing = len(pending)
+        backfill_targets = None if (rc == 0 or force) else pending
+        if force:
+            backfill_targets = [t["ticker"] for t in await loop.run_in_executor(
+                None, db.get_active_tickers)]
 
         if need_backfill:
-            reason = (
-                "첫 실행" if rc == 0 else ("강제" if force
-                else (f"신규 종목 {missing}개 데이터 부족" if missing > 10
-                      else f"252일+ 종목 부족 ({ge_252}/{total_t})"))
-            )
+            reason = "첫 실행" if rc == 0 else ("강제" if force else f"이력 부족 {missing}종목")
             # 진행 상황은 로그만 — 채팅 스팸 금지 (특이사항은 본 메시지 footer 한 줄로)
-            log.info("[scheduled] 백필 시작 (%s, Naver 기반)", reason)
+            log.info("[scheduled] 백필 시작 (%s)", reason)
             result = await loop.run_in_executor(
-                None, lambda: backfill.run_full_backfill()
+                None, lambda: backfill.run_full_backfill(tickers=backfill_targets)
             )
             log.info("[scheduled] 백필 완료: mode=%s success=%s fail=%s rows=%s",
                      result.get("mode"), result["success"], result["fail"], result["rows"])
@@ -657,11 +643,16 @@ async def _us_screener_daily_job_locked(bot: Bot, override_chat_id: str | None) 
             inc = await loop.run_in_executor(None, incremental.update_today)
             attempt += 1
 
-        # 영업일인데도 끝까지 today 미수신이면 어제 영업일 데이터라도 보장
-        if inc.get("empty"):
+        # 영업일인데도 끝까지 today 미수신이면 어제 영업일 데이터라도 보장.
+        # 휴장일 판정(다른 날 봉은 받았는데 대상일만 전 종목 없음)이면 이미 최근 봉 갱신됨 → skip.
+        if inc.get("empty") and not inc.get("holiday_like"):
             log.info("[scheduled] today 데이터 미수신 → ensure_recent_business_day_data")
             ensured = await loop.run_in_executor(None, incremental.ensure_recent_business_day_data)
             log.info("[scheduled] ensure_recent_business_day 결과: %s", ensured)
+        # 수집 커버리지 — 대상일 봉을 못 받은 활성 종목이 있으면 운영노트로 노출 (조용한 누락 금지)
+        cov = inc.get("coverage") or {}
+        if cov.get("miss"):
+            ops_notes.append(f"수집누락 {cov['miss']}/{cov.get('target', '?')}")
 
         # 진단: 대표 미국 종목 last 7일치 close 출력 (cent 단위 → /100 = $)
         try:
