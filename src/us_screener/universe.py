@@ -55,16 +55,25 @@ def refresh_universe() -> int:
     min_cap = _min_cap()
     members, gics = _index_members()
     nasdaq = data_source.fetch_nasdaq_universe(min_cap, always_include=set(members))
-    raw_n = data_source.nasdaq_screener_raw_count()
-    prev_active = len(db.get_active_tickers())
-    # 정상 판정: 원본 응답 규모(평소 ~7,000행) + 직전 활성 대비 급감 없음.
-    # 필터 후 개수만 보면 시총 기준을 올렸을 때 영구 폴백되거나, 부분 응답으로 수백 종목이
-    # 조용히 비활성화될 수 있다 (리뷰 지적).
-    sane = raw_n >= MIN_SANE_RAW_ROWS and (
-        prev_active < MIN_SANE_UNIVERSE or len(nasdaq) >= prev_active * MAX_DAILY_SHRINK)
+    raw_n = data_source.nasdaq_screener_raw_count()   # 같은 캐시 응답 기준 (재요청 없음)
+    # 정상 판정: 원본 응답 규모(평소 ~7,000행) + '마지막 정상 갱신'(같은 시총 기준) 대비 급감 없음.
+    # 현재 활성 수와 비교하면 폴백 후 활성 수가 굳어 영구 폴백되고, 시총 기준을 올리면 다시는
+    # 통과하지 못한다 (리뷰 지적) → meta에 저장한 마지막 정상 {min_cap, count}와 비교.
+    import json as _json
+    try:
+        last = _json.loads(db.meta_get("us_universe_last_sane") or "{}")
+    except (ValueError, TypeError):
+        last = {}
+    same_basis = last.get("min_cap") == min_cap and last.get("count", 0) >= MIN_SANE_UNIVERSE
+    sane = raw_n >= MIN_SANE_RAW_ROWS and bool(nasdaq) and (
+        not same_basis or len(nasdaq) >= last["count"] * MAX_DAILY_SHRINK)
     if not sane and nasdaq:
-        log.warning("[us_universe] Nasdaq 응답 비정상 (raw=%d, 필터후=%d, 직전 활성=%d) — 폴백",
-                    raw_n, len(nasdaq), prev_active)
+        log.warning("[us_universe] Nasdaq 응답 비정상 (raw=%d, 필터후=%d, 마지막 정상=%s) — 폴백",
+                    raw_n, len(nasdaq), last)
+    if sane and not members:
+        # 지수 멤버 목록(FDR) 실패 시 시총 공란 클래스주(BF.A 등)가 always_include를 잃는다 →
+        # 비활성화는 건너뛰고 upsert만 (리뷰 지적)
+        log.warning("[us_universe] 지수 멤버 목록 실패 — 이번 갱신은 비활성화 생략")
 
     if sane:
         rows: list[tuple] = []
@@ -82,7 +91,8 @@ def refresh_universe() -> int:
         if secs:
             db.update_sectors(secs)
         active = {r[0] for r in rows}
-        deact = db.deactivate_missing(active)
+        deact = db.deactivate_missing(active) if members else 0
+        db.meta_set("us_universe_last_sane", _json.dumps({"min_cap": min_cap, "count": len(rows)}))
         dropped_members = sorted(set(members) - active)
         log.info(
             "[us_universe] %d종목 활성화 (Nasdaq 보통주 시총≥$%.1fB, 지수멤버 %d 포함, 비활성화 %d)",
@@ -106,7 +116,8 @@ def refresh_universe() -> int:
     except Exception:
         log.exception("[us_universe] market_cap fetch 실패 — 시총 없이 진행")
     rows = [(sym, nm or sym, label, 1, today, caps.get(sym)) for sym, nm, label in members.values()]
-    db.upsert_tickers(rows)
+    # 이미 비활성화된 종목(상장폐지 등)은 되살리지 않음 — 신규만 추가, 기존은 시총만 갱신 (리뷰 지적)
+    db.upsert_tickers_keep_active(rows)
     if gics:
         db.update_sectors(gics)
     log.info("[us_universe] %d종목 활성화 (폴백 S&P500+NASDAQ100, 시총 %d, 섹터 %d)",

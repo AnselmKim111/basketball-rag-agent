@@ -205,6 +205,50 @@ vs 통합 일봉 277,500). `data_source.apply_regular_session_override`가 fchar
 
 ---
 
+## 6-US. US ScreenerBot — 미국 기술적 신호 (2026-09-25 커버리지 재설계)
+
+사고: "61종목 계산 · 458종목 base_date 누락"(525 중). Yahoo가 09-22 봉을 ~80% 종목에서 NaN으로
+주자 구 파서가 한 행의 NaN으로 **종목 전체를 조용히 폐기**했고, 대상일을 KST로 잡아 미개장일을
+검색했으며, FDR S&P500 목록엔 시총이 없어 $1B 필터가 무의미했다.
+
+### 원칙 (절대 깨지 말 것)
+- **유니버스 = 미국 보통주 시총 ≥ `US_SCREENER_MIN_MARKET_CAP`(기본 $1B) 전체** (~2,565).
+  Nasdaq screener API(전 종목+시총) → 보통주 필터(`is_common_equity`: 채권·우선주·워런트·유닛·
+  CEF 제외, ADR·클래스주·REIT·MLP 포함) + nasdaqtrader `otherlisted.txt`로 screener 누락 NYSE
+  클래스주 보충(LEN.B·UHAL.B·MOG.A…, 시총: 베이스 상속→Nasdaq summary→SEC 주식수×가격).
+  지수 멤버(S&P500 FDR+NDX100)는 항상 포함. 목록 이탈 종목은 비활성화 — 단 원본 ≥5000행이고
+  마지막 정상 갱신(같은 시총 기준) 대비 15% 넘게 줄지 않았을 때만. 실패 시 폴백은 비활성 종목을
+  되살리지 않음.
+- **대상일 = NYSE 캘린더 기준 마지막 마감 거래일** (`incremental.us_target_date`, 16:30 ET 컷,
+  `market_calendar.py` 규칙 기반 휴장일 + `US_MARKET_EXTRA_HOLIDAYS`). 진행 중 봉 저장 금지.
+- **한 행 결함이 종목을 버리지 않는다**: 행 단위 스킵(`_cents_row`). 빈 봉은 DB에 없는 날짜만
+  Nasdaq historical(1일 lag, 클래스주는 `X%sl%Y`)로, 최신 세션은 Yahoo meta 공식 종가로 보충.
+  과거일을 분봉 종가로 만들지 않음(공식 종가와 어긋남).
+- 체인: Yahoo 직접 → Stooq → Nasdaq. **FDR 제외**(같은 Yahoo, 소켓 timeout 없음).
+- 매일: 대형주 5개 probe(대상일 봉 0 → 전 종목 sweep 생략, 거래일이면 `source_down` 알림) →
+  6-worker 병렬 → 누락분 1회 재시도 → 무거래 종목(마지막 체결일 < 대상일)은 보합·거래량0 봉.
+  이미 받은 종목은 재수집 안 함(같은 날 /screen). base_date = 활성 과반 보유 최신일(≤대상일).
+- 분할: 최근 창 종가가 DB와 일정 비율로 어긋나면(가장 오래된 구간 기준) 창 행을 저장하지 않고
+  전체 이력 원자 교체(`replace_ticker_history`) — 실패 시 다음날 재감지.
+- 백필: 이력 부족(<1000행)·공백(최신일이 대상일-10일 이전) 종목만, 병렬, 성공은 30일/실패는
+  1일 뒤 재시도(`backfill_attempts` meta). `/backfill`(전 종목) · `/backfill pending` · `/backfill AAPL`.
+- validator: 병렬, timeout = max(120s, 0.6s×종목수), 종목 단위 집계.
+- 메시지 헤더: 계산 종목 수 · 신규상장 이력 부족 수 · base_date 누락 수. 운영노트:
+  `수집누락 a/b`(5% 넘으면 관리자 알림), `백필실패`, `분할 재구축`, `데이터소스 장애`.
+
+### 실측 (2026-09-25 스크래치 전체 실행)
+유니버스 2,565 (36s) · 5년 백필 2,565/2,565 (7분) · 일일 수집 2,560+무거래 5 (3분) ·
+계산 2,553 / base_date 누락 0 / 신규상장 12 · 검증 126/126 (27s).
+
+### 환경변수
+`US_SCREENER_MIN_MARKET_CAP`(USD, KR과 분리) · `US_SCREENER_FETCH_WORKERS/TIMEOUT_S/CAP` ·
+`US_SCREENER_BACKFILL_WORKERS/TIMEOUT_S` · `US_SCREENER_VALIDATE_WORKERS/TIMEOUT_S` ·
+`US_SCREENER_SOURCE_DOWN_RETRIES`(3) · `US_SCREENER_RETRY_INTERVAL_S` · `US_SCREENER_CHART_MAX` ·
+`US_SCREENER_PER_CATEGORY_TOP` · `US_MARKET_EXTRA_HOLIDAYS` · `US_SCREENER_FORCE_BACKFILL`(one-shot).
+(`US_SCREENER_RETRY_MAX`는 폐기 — 예전 전 종목 재수집 횟수)
+
+---
+
 ## 7. EarningsBot — 미국 기업 어닝콜 + 비교 PDF (전용 봇)
 
 **전용 텔레그램 봇** (`EARNINGS_BOT_TOKEN`, @AnselmsSlave11bot). orchestrator

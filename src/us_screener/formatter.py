@@ -16,6 +16,20 @@ from datetime import datetime
 DISPLAY_ORDER = ("high_all", "high_52w", "vcp_breakout", "near_breakout_52w")
 
 
+def displayed_items(results: dict[str, list[dict]]) -> list[dict]:
+    """메시지에 실제로 표시되는 종목 (표시 순서). _format_section과 같은 규칙:
+    섹션 순서대로, 앞 섹션에 나온 종목(상한 밖 포함)은 제외, 등락률순 상위 N."""
+    seen: set = set()
+    out: list[dict] = []
+    top_n = _per_category_top()
+    for cat in DISPLAY_ORDER:
+        items = [it for it in (results.get(cat) or []) if it.get("ticker") and it["ticker"] not in seen]
+        ranked = sorted(items, key=lambda it: -(it.get("chg_pct") or 0.0))
+        seen.update(it["ticker"] for it in ranked)
+        out.extend(ranked[:top_n])
+    return out
+
+
 def _per_category_top() -> int:
     try:
         return max(1, int(os.getenv("US_SCREENER_PER_CATEGORY_TOP", "80")))

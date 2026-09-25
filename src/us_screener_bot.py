@@ -12,7 +12,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 from telegram import Bot, Update
 from telegram.constants import ParseMode
@@ -270,7 +270,7 @@ def _diag_report(query: str) -> str:
         ticker = cands[0][0]
         row = db.get_ticker_row(ticker)
 
-    base_date = db.latest_date()
+    base_date = _screen_base_date()   # 스크리닝과 같은 기준일 (전역 MAX(date) 아님)
     min_cap = signals.min_market_cap()
     out = [f"🩺 진단: {ticker} ({(row or {}).get('name') or '?'})", f"기준일(base_date): {base_date}"]
 
@@ -429,6 +429,14 @@ DISPLAY_CATEGORIES = ("near_breakout_52w", "high_all", "high_52w", "high_26w",
                       "vcp_breakout", "volume_surge", "rs_leaders")
 
 
+def _screen_base_date(target_iso: str | None = None) -> str:
+    """스크리닝 기준일 — 활성 종목 과반이 보유한 최신일 (≤ 마지막 마감 거래일). /diag와 공유."""
+    from src.us_screener import db, incremental
+    target_iso = target_iso or incremental.us_target_date().isoformat()
+    return (db.latest_date_with_coverage(0.5, max_date=target_iso) or db.latest_date()
+            or datetime.now(KST).strftime("%Y-%m-%d"))
+
+
 async def _post_charts_and_meta(results: dict, base_date: str | None = None,
                                 max_tickers: int = 120) -> tuple[dict, dict]:
     """신호 티커별 (1) 채널 차트 게시 → permalink, (2) ytd·eps 메타 산출.
@@ -444,11 +452,8 @@ async def _post_charts_and_meta(results: dict, base_date: str | None = None,
     badges: dict[str, list] = {}
     # 메시지 표시 순서·상한과 동일하게 (섹션 순 → 섹션 내 등락률순 → 섹션당 top N, 앞 섹션 우선).
     # 예전엔 results dict 순서로 앞 120개만 처리 → 뒤 섹션(🎯 등) 표시 종목이 링크·YTD 없이 N/A.
-    top_n = _fmt._per_category_top()
-    for cat in _fmt.DISPLAY_ORDER:
-        fresh = [it for it in (results.get(cat) or []) if it.get("ticker") and it["ticker"] not in by_ticker]
-        for it in sorted(fresh, key=lambda it: -(it.get("chg_pct") or 0.0))[:top_n]:
-            by_ticker[it["ticker"]] = it
+    for it in _fmt.displayed_items(results):
+        by_ticker[it["ticker"]] = it
     for cat, items in results.items():
         if cat not in DISPLAY_CATEGORIES:
             continue
@@ -495,9 +500,11 @@ async def _post_charts_and_meta(results: dict, base_date: str | None = None,
                 mcap_n += 1
             # 같은 base_date에 이미 게시한 종목은 링크 재사용 (재실행·정정 발송 시 채널 중복 방지)
             dedupe_key = f"chart_post:{base_date}:{t}"
+            fp = f"{rows[-1]['close'] if rows else ''}|{','.join(sorted(badges.get(t, [])))}"
             prior = await loop.run_in_executor(None, lambda k=dedupe_key: db.meta_get(k))
-            if chart_bot and prior:
-                links[t] = prior
+            prior_url, _, prior_fp = (prior or "").partition(" ")
+            if chart_bot and prior_url and prior_fp == fp:   # 데이터 정정 후엔 재게시
+                links[t] = prior_url
             elif chart_bot and rows and posted < chart_max:
                 # freshness 가드 — cron 경로에선 절대 stale이 아니어야 정상 (뜨면 조기 경보)
                 data_date = rows[-1]["date"]
@@ -517,7 +524,7 @@ async def _post_charts_and_meta(results: dict, base_date: str | None = None,
                         if url:
                             links[t] = url
                             await loop.run_in_executor(
-                                None, lambda k=dedupe_key, u=url: db.meta_set(k, u))
+                                None, lambda k=dedupe_key, u=url, f=fp: db.meta_set(k, f"{u} {f}"))
                         posted += 1
                     await asyncio.sleep(3.0)  # 채널 ~20건/분 한도 → 게시 간 간격 (성공/실패 무관 페이싱)
         except Exception:
@@ -663,16 +670,12 @@ async def _us_screener_daily_job_locked(bot: Bot, override_chat_id: str | None) 
         # 증분 — 마지막 마감 US 거래일(NYSE 캘린더) 1일치. 이미 95%+ 받아둔 날이면(같은 날
         # /screen 재실행 등) 전 종목 sweep 생략.
         target_iso = incremental.us_target_date().isoformat()
-        active_n = len(await loop.run_in_executor(None, db.get_active_tickers)) or 1
-        have_n = await loop.run_in_executor(None, lambda: db.date_row_count(target_iso))
-        if have_n >= active_n * 0.95:
-            log.info("[scheduled] %s 이미 %d/%d종목 보유 — sweep 생략", target_iso, have_n, active_n)
-            inc = {"date": target_iso, "empty": False, "coverage": {}}
-        else:
+        if True:  # (update_today가 이미 받은 종목은 건너뛰고 누락분만 수집)
             # 재시도는 소스 장애(source_down)일 때만 — probe가 싸므로 전 종목 sweep 반복 없음.
             # 휴장일(holiday_like)은 재시도 없이 종료 (예전: 휴장일에 전 종목 6회 반복 → 데드라인 초과)
             retry_interval = int(os.getenv("US_SCREENER_RETRY_INTERVAL_S", "300"))
-            retry_max = int(os.getenv("US_SCREENER_RETRY_MAX", "3"))
+            # 전용 env — 예전 US_SCREENER_RETRY_MAX(=1, 전 종목 재수집 횟수 의미)와 분리 (리뷰 지적)
+            retry_max = int(os.getenv("US_SCREENER_SOURCE_DOWN_RETRIES", "3"))
             inc = await loop.run_in_executor(None, incremental.update_today)
             attempt = 1
             while inc.get("source_down") and attempt < retry_max:
@@ -727,10 +730,27 @@ async def _us_screener_daily_job_locked(bot: Bot, override_chat_id: str | None) 
 
         # 기준일 = 활성 종목 과반이 보유한 가장 최근 날짜 (≤ 마지막 마감 거래일).
         # 전역 MAX(date)는 소수 종목만 가진 날짜(진행 봉·백필 잔여)로 앞당겨질 수 있음 (리뷰 지적).
-        base_date = (await loop.run_in_executor(
-            None, lambda: db.latest_date_with_coverage(0.5, max_date=target_iso))
-            or await loop.run_in_executor(None, db.latest_date)
-            or datetime.now(KST).strftime("%Y-%m-%d"))
+        base_date = await loop.run_in_executor(None, lambda: _screen_base_date(target_iso))
+        # 거래일인데 대상일 커버리지가 과반 미달 → 누락분 1회 재수집, 그래도 미달이면 관리자 알림
+        # (예전: 전일=last_sent → '휴장 판정' 무음 skip으로 그날 신호가 영영 안 나감 — 리뷰 지적)
+        from src.us_screener import market_calendar as _mc
+        if base_date < target_iso and _mc.is_trading_day(date.fromisoformat(target_iso)) \
+                and not inc.get("source_down"):
+            log.warning("[scheduled] %s 커버리지 과반 미달 — 누락분 재수집", target_iso)
+            miss = await loop.run_in_executor(None, lambda: db.active_tickers_missing_date(target_iso))
+            await asyncio.sleep(int(os.getenv("US_SCREENER_RETRY_INTERVAL_S", "300")))
+            await loop.run_in_executor(
+                None, lambda: incremental.update_specific_date(target_iso, only_tickers=miss))
+            base_date = await loop.run_in_executor(None, lambda: _screen_base_date(target_iso))
+            if base_date < target_iso:
+                try:
+                    from src.admin_alerts import alert_admin
+                    await alert_admin(bot, ("US_SCREENER_ALLOWED_CHAT_IDS", "US_SCREENER_CHAT_ID"),
+                                      "⚠ US 대상일 커버리지 부족",
+                                      f"{target_iso} 봉 보유가 활성 종목 과반 미달 — 발송 보류 "
+                                      f"(base={base_date}). /screen 으로 수동 재시도 가능")
+                except Exception:
+                    log.exception("[scheduled] 커버리지 알림 실패")
         log.info("[scheduled] base_date for signals: %s", base_date)
 
         # 데이터 기반 휴장 판정 (cron 경로만) — 새 거래일 데이터가 없어 base_date가

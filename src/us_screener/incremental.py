@@ -73,14 +73,21 @@ def detect_split(fetched: list[tuple], db_closes: dict[str, int]) -> float | Non
     Yahoo 일봉은 조회 시점 기준 분할 조정 — 분할 후 최근 구간만 덮어쓰면 과거 행과 스케일이
     섞여 가짜 신고가가 난다 (리뷰 지적). 겹치는 날짜 2개 이상일 때만 판단.
     """
-    ratios = [r[5] / db_closes[r[1]] for r in fetched
-              if r[1] in db_closes and db_closes[r[1]] > 0 and r[5] > 0]
-    if len(ratios) < 2:
+    pairs = sorted((r[1], r[5] / db_closes[r[1]]) for r in fetched
+                   if r[1] in db_closes and db_closes[r[1]] > 0 and r[5] > 0)
+    if len(pairs) < 2:
         return None
-    lo, hi = min(ratios), max(ratios)
-    if hi / lo > 1.01:
+    # 가장 오래된 날짜부터 같은 비율(서로 1% 이내)로 이어지는 구간 — Yahoo가 조정을 하루 늦게
+    # 반영하면 최신 1~2개 DB 행은 이미 새 스케일(비율≈1)이라 전체 일치를 요구하면 놓친다 (리뷰 지적).
+    run = [pairs[0][1]]
+    for _, r in pairs[1:]:
+        if max(run + [r]) / min(run + [r]) <= 1.01:
+            run.append(r)
+        else:
+            break
+    if len(run) < 2:
         return None
-    mid = (lo + hi) / 2
+    mid = (min(run) + max(run)) / 2
     return mid if abs(mid - 1) > SPLIT_TOLERANCE else None
 
 
@@ -148,12 +155,14 @@ def _fetch_starts(tickers: list[str], target: date) -> dict[str, str]:
         if latest:
             ld = date.fromisoformat(latest)
             if floor <= ld < base_start:
-                start = ld + timedelta(days=1)
+                # 공백을 메우되 DB와 7일 겹치게 — 분할 감지에 겹치는 날짜가 필요 (리뷰 지적)
+                start = ld - timedelta(days=7)
         out[t] = start.isoformat()
     return out
 
 
-def update_specific_date(target_iso: str, force: bool = False) -> dict:
+def update_specific_date(target_iso: str, force: bool = False,
+                         only_tickers: list[str] | None = None) -> dict:
     """지정 날짜 OHLCV fetch + DB 저장.
 
     반환: {"date", "rows", "empty", "coverage", ["holiday_like" | "source_down"], "splits"}.
@@ -163,6 +172,9 @@ def update_specific_date(target_iso: str, force: bool = False) -> dict:
     all_tickers = db.get_active_tickers()
     all_tickers.sort(key=lambda t: -(t.get("market_cap") or 0))   # 대형주 먼저
     active_list = [t["ticker"] for t in all_tickers]
+    if only_tickers is not None:
+        keep = set(only_tickers)
+        active_list = [t for t in active_list if t in keep]
     if not active_list:
         return {"date": target_iso, "rows": 0, "empty": True, "coverage": {}}
 
@@ -178,12 +190,19 @@ def update_specific_date(target_iso: str, force: bool = False) -> dict:
     data_source.reset_source_stats()
     t0 = time.monotonic()
 
-    # probe — 대형주에 대상일 봉이 하나도 없으면 전 종목 sweep 생략
-    probe = [t for t in PROBE_TICKERS if t in set(targets)] or targets[:5]
-    p_rows, p_hit, _, _ = _run_batch(probe, target_iso, starts, target_iso, len(probe), 120)
-    if not p_hit:
-        if p_rows:
-            db.upsert_ohlcv_bulk(p_rows)
+    # probe — 대형주에 대상일 봉이 하나도 없으면 전 종목 sweep 생략.
+    # 부분 재수집(only_tickers)은 이미 다른 종목이 대상일을 가진 상태 → probe 불필요
+    # (남은 종목은 저유동주일 가능성이 커 probe로 쓰면 소스 장애 오판).
+    if only_tickers is not None:
+        probe = []
+    else:
+        probe = [t for t in PROBE_TICKERS if t in set(targets)] or targets[:5]
+    p_rows, p_hit, _, p_splits = (_run_batch(probe, target_iso, starts, target_iso, len(probe), 120)
+                                  if probe else ([], set(), [], []))
+    if probe and not p_hit:
+        keep_rows = [r for r in p_rows if r[0] not in set(p_splits)]
+        if keep_rows:
+            db.upsert_ohlcv_bulk(keep_rows)
         trading = market_calendar.is_trading_day(target)
         log.warning("[incremental] %s probe %d종목 대상일 봉 0 → sweep 생략 (%s)", target_iso,
                     len(probe), "소스 장애 의심" if trading else "휴장일")
@@ -198,6 +217,7 @@ def update_specific_date(target_iso: str, force: bool = False) -> dict:
     rows, hit, missed, splits = _run_batch(rest, target_iso, starts, target_iso, workers, timeout_s)
     rows = p_rows + rows
     hit |= p_hit
+    splits = p_splits + splits
     missed = [t for t in targets if t not in hit]
 
     # 누락 종목 1회 재시도 (일시적 429·네트워크 — 조용히 넘기지 않음)
@@ -215,11 +235,20 @@ def update_specific_date(target_iso: str, force: bool = False) -> dict:
     # 클래스주 실측). 데이터 누락이 아니므로 전일 종가 보합·거래량 0 봉을 기록 — 누락 집계에서
     # 빼고, 신호에도 영향 없음(보합·무거래는 신고가·돌파 불가).
     no_trade: list[str] = []
+    fresh_last: dict[str, tuple] = {}
+    for r in rows:
+        if r[1] < target_iso and (r[0] not in fresh_last or r[1] > fresh_last[r[0]][1]):
+            fresh_last[r[0]] = r
     for t in missed[:200]:
         ltd = data_source.last_trade_date(t)
         if ltd and ltd < target_iso:
-            prev = db.load_ohlcv(t, days=1)
-            prev_close = prev[-1]["close"] if prev and prev[-1]["date"] < target_iso else None
+            # 직전 종가: 이번에 받은 행 우선 (DB가 마지막 체결일을 아직 모를 수 있음 — 리뷰 지적)
+            fr = fresh_last.get(t)
+            if fr and fr[1] == ltd:
+                prev_close = fr[5]
+            else:
+                prev = db.load_ohlcv(t, days=1)
+                prev_close = (prev[-1]["close"] if prev and prev[-1]["date"] == ltd else None)
             if prev_close:
                 rows.append((t, target_iso, prev_close, prev_close, prev_close, prev_close, 0, None))
                 no_trade.append(t)
@@ -237,18 +266,29 @@ def update_specific_date(target_iso: str, force: bool = False) -> dict:
         log.warning("[incremental] %s 대상일 봉 누락 %d종목 (시총순): %s", target_iso, len(missed),
                     ", ".join(missed[:80]))
 
-    inserted = db.upsert_ohlcv_bulk(rows) if rows else 0
+    # 분할 감지 종목은 창 구간 행을 저장하지 않고 전체 이력 재구축을 먼저 시도 — 재구축이
+    # 실패하면 DB가 여전히 옛 스케일이라 다음 실행에서 다시 감지된다 (한 번 놓치면 영구
+    # 혼합 스케일이 되던 문제 — 리뷰 지적).
+    split_set = set(splits)
+    inserted = db.upsert_ohlcv_bulk([r for r in rows if r[0] not in split_set]) if rows else 0
     log.info("[incremental] %s 저장 rows=%d", target_iso, inserted)
-
-    if splits:
+    rebuilt_ok: list[str] = []
+    if split_set:
         try:
             from src.us_screener import backfill
-            rebuilt = backfill.rebuild_history(sorted(set(splits)))
-            log.info("[incremental] 분할 감지 %d종목 이력 재구축: %s", len(set(splits)), rebuilt)
+            rebuilt = backfill.rebuild_history(sorted(split_set))
+            rebuilt_ok = [t for t, n in rebuilt.items() if n]
+            log.info("[incremental] 분할 감지 %d종목 이력 재구축: %s", len(split_set), rebuilt)
         except Exception:
-            log.exception("[incremental] 분할 이력 재구축 실패")
+            log.exception("[incremental] 분할 이력 재구축 실패 — 다음 실행에서 재감지")
+        failed_rebuild = split_set - set(rebuilt_ok)
+        if failed_rebuild:
+            hit -= failed_rebuild
+            coverage["hit"] = len(hit)
+            coverage["miss"] = coverage["target"] - len(hit)
     return {"date": target_iso, "rows": inserted, "empty": not hit, "coverage": coverage,
-            "splits": sorted(set(splits)), "source_stats": stats}
+            "splits": sorted(rebuilt_ok), "split_pending": sorted(split_set - set(rebuilt_ok)),
+            "source_stats": stats}
 
 
 def update_today() -> dict:
@@ -263,7 +303,18 @@ def update_today() -> dict:
 
     target = us_target_date()
     iso = target.isoformat()
-    res = update_specific_date(iso, force=True)
+    # 같은 대상일을 이미 대부분 받았으면(같은 날 /screen 재실행·백필 직후) 없는 종목만 수집.
+    # 예전엔 95%+면 통째로 건너뛰어 재시도·무거래 처리까지 빠졌다 (리뷰 지적).
+    active_n = len(db.get_active_tickers())
+    missing = db.active_tickers_missing_date(iso)
+    if not missing:
+        log.info("[incremental] %s 활성 %d종목 전부 보유 — 수집 생략", iso, active_n)
+        return {"date": iso, "rows": 0, "is_business_day": True, "empty": False,
+                "coverage": {"target": active_n, "hit": active_n, "miss": 0}}
+    subset = missing if len(missing) <= active_n * 0.5 else None
+    if subset is not None:
+        log.info("[incremental] %s 누락 %d/%d종목만 수집", iso, len(subset), active_n)
+    res = update_specific_date(iso, force=True, only_tickers=subset)
     out = {"date": iso, "rows": res.get("rows", 0), "is_business_day": True,
            "empty": bool(res.get("empty")), "coverage": res.get("coverage"),
            "holiday_like": bool(res.get("holiday_like")), "source_down": bool(res.get("source_down")),

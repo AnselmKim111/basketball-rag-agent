@@ -102,6 +102,7 @@ def cross_validate(
     # 검증: 각 신호 종목의 DB close vs truth close 비교
     validated: dict[str, list[dict]] = {k: [] for k in results.keys()}
     rejected = 0
+    rejected_set: set[str] = set()     # 종목 단위 집계 (카테고리 중복 계수로 음수가 나던 문제)
     rejected_tickers: list[str] = []
     for cat, items in results.items():
         for it in items:
@@ -110,21 +111,24 @@ def cross_validate(
             true_close = truth.get(t)
             if true_close is None:
                 # fetch 실패 — 보수적으로 제외 (잘못된 데이터 방지)
-                rejected += 1
-                rejected_tickers.append(f"{t}({it.get('name','?')})NoFetch")
+                if t not in rejected_set:
+                    rejected_set.add(t)
+                    rejected_tickers.append(f"{t}({it.get('name','?')})NoFetch")
                 continue
             if abs(db_close - true_close) <= tolerance:
                 validated[cat].append(it)
             else:
-                rejected += 1
-                rejected_tickers.append(
-                    f"{t}({it.get('name','?')}) DB={db_close} vs Naver={true_close}"
-                )
+                if t not in rejected_set:
+                    rejected_set.add(t)
+                    rejected_tickers.append(
+                        f"{t}({it.get('name','?')}) DB={db_close} vs Naver={true_close}"
+                    )
                 log.warning(
                     "[validator] REJECT %s(%s) DB=%d Naver=%d diff=%d",
                     t, it.get("name", "?"), db_close, true_close, db_close - true_close,
                 )
 
+    rejected = len(rejected_set)
     stats = {
         "validated": len(tickers) - rejected,
         "rejected": rejected,

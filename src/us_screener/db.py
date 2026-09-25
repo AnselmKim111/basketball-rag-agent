@@ -415,6 +415,36 @@ def replace_ticker_history(ticker: str, rows: list[tuple]) -> int:
     return len(rows)
 
 
+def upsert_tickers_keep_active(rows: Iterable[tuple]) -> int:
+    """(ticker, name, market, is_active, updated_at, market_cap) — 신규는 삽입, 기존은 is_active를
+    건드리지 않고 이름·라벨·시총(COALESCE)만 갱신. 유니버스 폴백 전용."""
+    ensure_schema()
+    rows = list(rows)
+    if not rows:
+        return 0
+    with _conn() as c:
+        c.execute("BEGIN")
+        c.executemany(
+            "INSERT INTO tickers (ticker, name, market, is_active, updated_at, market_cap) "
+            "VALUES (?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(ticker) DO UPDATE SET name=excluded.name, market=excluded.market, "
+            "updated_at=excluded.updated_at, "
+            "market_cap=COALESCE(excluded.market_cap, tickers.market_cap)", rows)
+        c.execute("COMMIT")
+    return len(rows)
+
+
+def active_tickers_missing_date(date_str: str) -> list[str]:
+    """활성 종목 중 date_str 봉이 없는 종목 (시총 desc)."""
+    ensure_schema()
+    with _conn() as c:
+        cur = c.execute(
+            "SELECT t.ticker FROM tickers t WHERE t.is_active=1 AND NOT EXISTS "
+            "(SELECT 1 FROM ohlcv o WHERE o.ticker=t.ticker AND o.date=?) "
+            "ORDER BY COALESCE(t.market_cap, 0) DESC", (date_str,))
+        return [r[0] for r in cur.fetchall()]
+
+
 def update_market_caps(caps: dict[str, int]) -> int:
     """{ticker: market_cap} 일괄 업데이트. 신규 ticker는 무시 (universe 빌드 후 호출)."""
     if not caps:

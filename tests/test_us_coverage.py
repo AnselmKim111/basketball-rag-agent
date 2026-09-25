@@ -97,7 +97,7 @@ def test_gap_filled_from_nasdaq_only_for_dates_not_in_db(monkeypatch):
 
     rows = ds.fetch_ohlcv_by_ticker_via_naver("A", "2026-09-15", "2026-09-25")
     assert [r[1] for r in rows] == ["2026-09-21", "2026-09-22", "2026-09-23"]
-    assert calls == [("2026-09-22", "2026-09-22")]
+    assert calls == [("2026-09-12", "2026-09-22")]       # 넓은 창(좁으면 최신 행 누락 실측)
 
     calls.clear()
     rows = ds.fetch_ohlcv_by_ticker_via_naver("A", "2026-09-15", "2026-09-25",
@@ -399,3 +399,97 @@ def test_no_trade_day_recorded_as_flat_bar(usdb, monkeypatch):
     assert res["coverage"]["miss"] == 0 and res["coverage"]["no_trade"] == 1
     bar = usdb.load_ohlcv("SENEB", days=1)[-1]
     assert bar["date"] == "2026-09-24" and bar["close"] == 18742 and bar["volume"] == 0
+
+
+# ------------------------------------------------------------------
+# 2차 리뷰 확정 지적 회귀
+# ------------------------------------------------------------------
+def test_detect_split_with_late_yahoo_adjustment():
+    inc = importlib.import_module("src.us_screener.incremental")
+    # D-3..D-1은 옛 스케일(비율 0.5), 최신 D는 이미 새 스케일(1.0) — 예전엔 None
+    fetched = [("X", f"2026-09-2{i}", 0, 0, 0, 10000, 0, None) for i in range(1, 5)]
+    db_closes = {"2026-09-21": 20000, "2026-09-22": 20000, "2026-09-23": 20000, "2026-09-24": 10000}
+    assert inc.detect_split(fetched, db_closes) == pytest.approx(0.5)
+
+
+def test_session_bar_requires_official_close(monkeypatch):
+    import requests
+    et = 1790256600   # 2026-09-24 13:30 UTC = 09:30 EDT
+    payload = {"chart": {"result": [{"meta": {"exchangeTimezoneName": "America/New_York",
+        "regularMarketTime": et + 6.5 * 3600, "regularMarketPrice": 172.84,
+        "regularMarketDayHigh": 174.77, "regularMarketDayLow": 163.62, "regularMarketVolume": 3028845},
+        "timestamp": [et, et + 1800],
+        "indicators": {"quote": [{"open": [163.95, 165.0], "high": [1, 1], "low": [1, 1],
+                                  "close": [165.0, 166.0], "volume": [1, 1]}]}}]}}
+    monkeypatch.setattr(requests, "get", lambda *a, **k: _Resp(payload))
+    r = ds._yahoo_session_bar("A", "2026-09-24")
+    assert r[2:7] == (16395, 17477, 16362, 17284, 3028845)      # 공식 종가·고저·거래량
+    assert ds._yahoo_session_bar("A", "2026-09-23") is None      # 과거일은 재구성 안 함
+
+
+def test_formatter_displayed_items_matches_section_dedup(monkeypatch):
+    monkeypatch.setenv("US_SCREENER_PER_CATEGORY_TOP", "2")
+    fmt = importlib.import_module("src.us_screener.formatter")
+    mk = lambda t, c: {"ticker": t, "chg_pct": c}   # noqa: E731
+    res = {"high_all": [mk("A", 5), mk("B", 4), mk("C", 3)],       # C는 상한 밖
+           "high_52w": [mk("A", 5), mk("B", 4), mk("C", 3), mk("D", 2)]}
+    shown = [it["ticker"] for it in fmt.displayed_items(res)]
+    assert shown == ["A", "B", "D"]            # C는 앞 섹션 상한 밖이라 어디에도 표시 안 됨
+    msg = fmt.format_results(res, datetime(2026, 9, 25, 7, 0))
+    assert "D" in msg.split("52주 신고가")[1]
+
+
+def test_validator_stats_are_per_ticker(monkeypatch):
+    validator = importlib.import_module("src.us_screener.validator")
+    res = {"high_all": [{"ticker": "X", "close": 100}], "high_52w": [{"ticker": "X", "close": 100},
+           {"ticker": "Y", "close": 200}]}
+    monkeypatch.setattr(ds, "fetch_ohlcv_by_ticker_via_naver",
+                        lambda t, s, e, known_dates=None: [(t, "2026-09-24", 0, 0, 0, 999 if t == "X" else 200, 0, None)])
+    v, st = validator.cross_validate(res, "2026-09-24")
+    assert st["rejected"] == 1 and st["validated"] == 1          # 예전: rejected=2, validated=0
+    assert [it["ticker"] for it in v["high_52w"]] == ["Y"]
+
+
+def test_universe_sanity_uses_last_sane_basis(usdb, monkeypatch):
+    universe = importlib.import_module("src.us_screener.universe")
+    monkeypatch.setattr(ds, "fetch_us_tickers", lambda: [("AAPL", "Apple", "S&P500")])
+    monkeypatch.setattr(ds, "fetch_sectors", lambda: {})
+    monkeypatch.setattr(ds, "nasdaq_screener_raw_count", lambda: 7000)
+    big = lambda n: [{"ticker": f"T{i:04d}", "name": "t", "market_cap": 3e9, "sector": ""}  # noqa: E731
+                     for i in range(n)] + [{"ticker": "AAPL", "name": "Apple", "market_cap": 3e12, "sector": ""}]
+    monkeypatch.setattr(ds, "fetch_nasdaq_universe", lambda c, always_include=(): big(2500))
+    assert universe.refresh_universe() == 2501
+    # 시총 기준 상향 → 목록 급감해도 기준이 바뀌었으므로 정상 처리 (영구 폴백 금지)
+    monkeypatch.setenv("US_SCREENER_MIN_MARKET_CAP", "2e9")
+    monkeypatch.setattr(ds, "fetch_nasdaq_universe", lambda c, always_include=(): big(1800))
+    assert universe.refresh_universe() == 1801
+    assert len(usdb.get_active_tickers()) == 1801
+    # 같은 기준에서 급감(부분 응답) → 폴백, 비활성화 없음, 비활성 종목 부활 없음
+    monkeypatch.setattr(ds, "fetch_nasdaq_universe", lambda c, always_include=(): big(900))
+    monkeypatch.setattr(ds, "fetch_market_caps", lambda: {})
+    usdb.upsert_tickers([("ANSS", "Ansys", "S&P500", 0, "x", None)])
+    monkeypatch.setattr(ds, "fetch_us_tickers", lambda: [("AAPL", "Apple", "S&P500"), ("ANSS", "Ansys", "NASDAQ100")])
+    universe.refresh_universe()
+    act = {t["ticker"] for t in usdb.get_active_tickers()}
+    assert len(act) == 1801 and "ANSS" not in act
+
+
+def test_update_today_fetches_only_missing(usdb, monkeypatch):
+    inc = importlib.import_module("src.us_screener.incremental")
+    usdb.upsert_tickers([("AAPL", "a", "US", 1, "x", 3e12), ("THIN", "t", "US", 1, "x", 1e9)])
+    monkeypatch.setattr(inc, "us_target_date", lambda now_et=None: datetime(2026, 9, 24).date())
+    usdb.upsert_ohlcv_bulk([("AAPL", "2026-09-24", 1, 1, 1, 1, 1, None)])
+    seen = []
+    monkeypatch.setattr(ds, "fetch_ohlcv_by_ticker_via_naver",
+                        lambda t, s, e, known_dates=None: seen.append(t) or [(t, "2026-09-24", 1, 1, 1, 1, 1, None)])
+    monkeypatch.setenv("US_SCREENER_RETRY_PASS_SLEEP_S", "0")
+    out = inc.update_today()
+    assert seen == ["THIN"] and out["coverage"]["miss"] == 0     # probe 없이 누락분만
+    assert inc.update_today()["coverage"]["miss"] == 0            # 전부 보유 → 수집 생략
+
+
+def test_stale_sec_facts_rejected():
+    f = importlib.import_module("src.us_screener.fundamentals")
+    facts = {"facts": {"dei": {"EntityCommonStockSharesOutstanding": {"units": {"shares": [
+        {"val": 941481, "end": "2011-04-29"}]}}}}}
+    assert f._latest_shares(facts) is None

@@ -84,8 +84,20 @@ def _latest_shares(facts: dict) -> float | None:
         vals = [e for e in arr if e.get("val") and e.get("end")]
         if vals:
             vals.sort(key=lambda e: str(e.get("end")))
+            # 1년 넘은 값은 버림 — 다중 클래스 발행사(BRK 등)는 dei 태그가 2011년에 멈춰 있어
+            # 94만 주 같은 옛 값으로 시총·EPS가 틀리게 표시된다 (리뷰 지적)
+            if _is_stale(vals[-1]["end"], 400):
+                continue
             return float(vals[-1]["val"])
     return None
+
+
+def _is_stale(end_iso: str, max_days: int) -> bool:
+    from datetime import date as _d
+    try:
+        return (_d.today() - _d.fromisoformat(str(end_iso)[:10])).days > max_days
+    except ValueError:
+        return True
 
 
 def ticker_fundamentals(ticker: str, use_cache: bool = True) -> dict:
@@ -115,8 +127,9 @@ def ticker_fundamentals(ticker: str, use_cache: bool = True) -> dict:
                     prior = next((p for p in reversed(pts)
                                   if p["fp"] == latest["fp"] and p["fy"] == latest["fy"] - 1), None)
                     if prior and prior["val"] > 1e-6:
-                        eps_val = round((latest["val"] - prior["val"]) / abs(prior["val"]) * 100, 1)
-                        asof = latest["end"]
+                        if not _is_stale(latest["end"], 200):   # 수년 전 EPS를 최신처럼 표시 금지
+                            eps_val = round((latest["val"] - prior["val"]) / abs(prior["val"]) * 100, 1)
+                            asof = latest["end"]
                 shares = _latest_shares(facts)
     except Exception:
         log.warning("[fundamentals] %s 펀더멘털 실패", ticker)

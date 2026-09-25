@@ -87,6 +87,17 @@ def source_stats() -> dict:
         return dict(SOURCE_STATS)
 
 
+def _local_dt(ts: int, meta: dict) -> datetime:
+    """epoch → 거래소 현지 시각. meta.gmtoffset은 '조회 시점' 오프셋이라 DST 경계를 넘는 과거
+    봉에 쓰면 1시간 어긋난다 (리뷰 지적) → exchangeTimezoneName으로 변환."""
+    tzname = (meta or {}).get("exchangeTimezoneName") or "America/New_York"
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.fromtimestamp(int(ts), ZoneInfo(tzname))
+    except Exception:
+        return datetime.fromtimestamp(int(ts) + int((meta or {}).get("gmtoffset") or 0), tz=timezone.utc)
+
+
 def now_et() -> datetime:
     """미국 동부시간 현재 (DST 자동). zoneinfo 없으면 EDT(-4) 근사."""
     try:
@@ -253,7 +264,7 @@ def _yahoo_chart(ticker: str, start_iso: str, end_iso: str) -> tuple[list[tuple]
             return [], []
         ts = res.get("timestamp") or []
         q = ((res.get("indicators") or {}).get("quote") or [{}])[0]
-        gmtoff = int((res.get("meta") or {}).get("gmtoffset") or 0)
+        meta = res.get("meta") or {}
     except Exception:
         return [], []
     opens, highs, lows = q.get("open") or [], q.get("high") or [], q.get("low") or []
@@ -263,7 +274,7 @@ def _yahoo_chart(ticker: str, start_iso: str, end_iso: str) -> tuple[list[tuple]
     now = now_et()
     for i, t in enumerate(ts):
         # 거래소 현지 날짜 (EDT/EST) — UTC로 자르면 날짜가 밀릴 수 있음
-        iso = datetime.fromtimestamp(int(t) + gmtoff, tz=timezone.utc).strftime("%Y-%m-%d")
+        iso = _local_dt(t, meta).strftime("%Y-%m-%d")
         if iso < start_iso or iso > end_iso:
             continue
         if _is_unfinished_session(iso, now):
@@ -285,10 +296,12 @@ def _yahoo_chart(ticker: str, start_iso: str, end_iso: str) -> tuple[list[tuple]
 
 
 def _yahoo_session_bar(ticker: str, date_iso: str) -> Optional[tuple]:
-    """Yahoo 일봉이 비었을 때 그날 정규장 OHLCV를 분봉(30m)으로 재구성.
+    """Yahoo 일봉이 비었을 때 그날 정규장 OHLCV를 분봉(30m)+meta로 재구성.
 
-    실측(2026-09-22): 1d 봉은 None인데 30m 봉은 온전. close/high/low/volume은 meta의
-    regularMarket*(공식 종가·일중 고저·거래량)이 같은 날짜면 그것을 우선.
+    **공식 종가가 있는 날만**: meta.regularMarketTime이 date_iso(=Yahoo의 최신 세션)일 때만
+    regularMarketPrice(종가 경매 포함 공식 종가)·일중 고저·거래량을 쓴다. 과거 날짜를 마지막
+    30분봉 종가로 만들면 공식 종가와 수 센트 어긋나 검증에서 오탈락/오통과한다 (리뷰 실측
+    7/10 종목 1센트 초과 차이) → 그 경우 None (Nasdaq 보충에 맡기거나 공백 유지).
     """
     import requests
     d = datetime.strptime(date_iso, "%Y-%m-%d")
@@ -305,33 +318,25 @@ def _yahoo_session_bar(ticker: str, date_iso: str) -> Optional[tuple]:
         log.debug("[us_data] Yahoo 분봉 %s %s 실패: %s", ticker, date_iso, e)
         return None
     meta = res.get("meta") or {}
-    gmtoff = int(meta.get("gmtoffset") or 0)
-    q = ((res.get("indicators") or {}).get("quote") or [{}])[0]
-    o_s, h_s, l_s, c_s, v_s = (q.get(k) or [] for k in ("open", "high", "low", "close", "volume"))
-    bars = []
-    for i, t in enumerate(res.get("timestamp") or []):
-        local = datetime.fromtimestamp(int(t) + gmtoff, tz=timezone.utc)
-        if local.strftime("%Y-%m-%d") != date_iso:
-            continue
-        if not ((9, 30) <= (local.hour, local.minute) < (16, 0)):
-            continue
-        vals = [arr[i] if i < len(arr) else None for arr in (o_s, h_s, l_s, c_s, v_s)]
-        if _finite(*vals[:4]):
-            bars.append(vals)
-    if not bars:
-        return None
-    o = bars[0][0]
-    h = max(b[1] for b in bars)
-    l = min(b[2] for b in bars)
-    c = bars[-1][3]
-    v = sum((b[4] or 0) for b in bars)
     mt = meta.get("regularMarketTime")
-    if mt and datetime.fromtimestamp(int(mt) + gmtoff, tz=timezone.utc).strftime("%Y-%m-%d") == date_iso:
-        c = meta.get("regularMarketPrice") or c
-        h = meta.get("regularMarketDayHigh") or h
-        l = meta.get("regularMarketDayLow") or l
-        v = meta.get("regularMarketVolume") or v
-    r = _cents_row(ticker, date_iso, o, h, l, c, v)
+    if not mt or _local_dt(mt, meta).strftime("%Y-%m-%d") != date_iso:
+        return None
+    q = ((res.get("indicators") or {}).get("quote") or [{}])[0]
+    o_s = q.get("open") or []
+    first_open = None
+    for i, t in enumerate(res.get("timestamp") or []):
+        local = _local_dt(t, meta)
+        if local.strftime("%Y-%m-%d") != date_iso or not ((9, 30) <= (local.hour, local.minute) < (16, 0)):
+            continue
+        v = o_s[i] if i < len(o_s) else None
+        if _finite(v):
+            first_open = v
+            break
+    if first_open is None:
+        return None
+    r = _cents_row(ticker, date_iso, first_open, meta.get("regularMarketDayHigh"),
+                   meta.get("regularMarketDayLow"), meta.get("regularMarketPrice"),
+                   meta.get("regularMarketVolume"))
     if r:
         _stat("yahoo_session_fill")
     return r
@@ -349,8 +354,7 @@ def last_trade_date(ticker: str) -> Optional[str]:
         mt = meta.get("regularMarketTime")
         if not mt:
             return None
-        return datetime.fromtimestamp(int(mt) + int(meta.get("gmtoffset") or 0),
-                                      tz=timezone.utc).strftime("%Y-%m-%d")
+        return _local_dt(mt, meta).strftime("%Y-%m-%d")
     except Exception:
         return None
 
@@ -428,14 +432,15 @@ def fetch_ohlcv_by_ticker_via_naver(ticker: str, start_iso: str, end_iso: str,
     if rows:
         need = set(gaps) - set(known_dates or ())
         if need:
-            fill = [r for r in fetch_ohlcv_by_ticker_via_nasdaq(ticker, min(need), max(need))
+            wide_from = (datetime.strptime(min(need), "%Y-%m-%d") - timedelta(days=10)).strftime("%Y-%m-%d")
+            fill = [r for r in fetch_ohlcv_by_ticker_via_nasdaq(ticker, wide_from, max(need))
                     if r[1] in need]
             got = {r[1] for r in fill}
             if fill:
                 _stat("nasdaq_fill_rows", len(fill))
             recent_floor = (datetime.strptime(end_iso, "%Y-%m-%d") - timedelta(days=5)).strftime("%Y-%m-%d")
             for iso in sorted(need - got):
-                if iso >= recent_floor:          # Nasdaq이 아직 못 가진 최근일만 (호출 수 제한)
+                if iso >= recent_floor:          # 공식 종가를 줄 수 있는 최신 세션 후보만
                     r = _yahoo_session_bar(ticker, iso)
                     if r:
                         fill.append(r)
@@ -476,9 +481,9 @@ def _fdr_listing(name: str):
 # S&P500과 합집합 → 중복 자동 제거. 대부분 S&P500 포함, 고유 종목(외국계 ADR 등) 보강.
 _NASDAQ100 = [
     "AAPL", "ABNB", "ADBE", "ADI", "ADP", "ADSK", "AEP", "AMAT", "AMD", "AMGN",
-    "AMZN", "ANSS", "APP", "ARM", "ASML", "AVGO", "AZN", "BIIB", "BKNG", "BKR",
+    "AMZN", "APP", "ARM", "ASML", "AVGO", "AZN", "BIIB", "BKNG", "BKR",
     "CCEP", "CDNS", "CDW", "CEG", "CHTR", "CMCSA", "COST", "CPRT", "CRWD", "CSCO",
-    "CSGP", "CSX", "CTAS", "CTSH", "DASH", "DDOG", "DLTR", "DXCM", "EA", "EXC",
+    "CSGP", "CSX", "CTAS", "CTSH", "DASH", "DDOG", "DLTR", "DXCM", "EXC",
     "FANG", "FAST", "FTNT", "GEHC", "GFS", "GILD", "GOOG", "GOOGL", "HON", "IDXX",
     "ILMN", "INTC", "INTU", "ISRG", "KDP", "KHC", "KLAC", "LIN", "LRCX", "LULU",
     "MAR", "MCHP", "MDB", "MDLZ", "MELI", "META", "MNST", "MRVL", "MSFT", "MU",
@@ -561,8 +566,9 @@ def _nasdaq_screener_rows(max_age_s: int = 900) -> list[dict]:
         except Exception as e:
             log.warning("[us_data] Nasdaq screener 실패 attempt=%d: %s", attempt + 1, e)
         time.sleep(2 * (attempt + 1))
-    if rows:
-        _NASDAQ_SCREENER_CACHE.update(at=now, rows=rows)
+    # 실패도 짧게 캐시 — 같은 refresh 안에서 universe·raw_count·caps가 각각 재시도하며
+    # 수 분씩 잡아먹지 않게 (리뷰 지적). 실패 캐시는 max_age_s 대신 5분.
+    _NASDAQ_SCREENER_CACHE.update(at=now if rows else now - max(0, max_age_s - 300), rows=rows)
     return rows
 
 
@@ -714,6 +720,9 @@ def fetch_nasdaq_universe(min_cap: float, always_include: Iterable[str] = ()) ->
     keep_bases = {str(r.get("symbol") or "").strip().upper().split("/")[0] for r in rows
                   if _nasdaq_to_db_symbol(str(r.get("symbol") or "")) in keep}
     out: dict[str, dict] = {}
+    if not rows:
+        return []          # screener 실패 → 보충(summary/SEC 수십 회)도 건너뛰고 폴백으로
+    class_budget = 20
     for r in rows:
         sym = str(r.get("symbol") or "").strip().upper()
         name = str(r.get("name") or "")
@@ -722,6 +731,10 @@ def fetch_nasdaq_universe(min_cap: float, always_include: Iterable[str] = ()) ->
         t = _nasdaq_to_db_symbol(sym)
         cap = caps.get(sym, 0)
         sibling_of_member = "/" in sym and not cap and sym.split("/")[0] in keep_bases
+        if "/" in sym and not cap and not sibling_of_member and class_budget > 0:
+            # 클래스주 시총 공란 + 상속할 베이스 행 없음 (AKO/B·CRD/A 실측) → SEC 주식수×가격
+            class_budget -= 1
+            cap = _sec_cap(t) or _nasdaq_summary_cap(t)
         if cap < min_cap and t not in keep and not sibling_of_member:
             continue
         out[t] = {"ticker": t, "name": clean_company_name(name), "market_cap": cap or None,
@@ -748,6 +761,24 @@ def fetch_nasdaq_universe(min_cap: float, always_include: Iterable[str] = ()) ->
             out[t] = {"ticker": t, "name": clean_company_name(o["name"]), "market_cap": cap or None,
                       "sector": "", "industry": ""}
             added.append(t)
+    # 보충 목록 영속화: otherlisted.txt·cap 조회가 실패한 날 전날 목록으로 대체 — 하루 실패로
+    # LEN.B·PBR.A 같은 대형 클래스주가 비활성화되지 않게 (리뷰 지적)
+    try:
+        import json as _json
+        from src.us_screener import db as _db
+        if added:
+            _db.meta_set("us_class_supplement", _json.dumps(
+                [{k: out[t][k] for k in ("ticker", "name", "market_cap")} for t in added]))
+        elif not _otherlisted_rows():
+            prev = _json.loads(_db.meta_get("us_class_supplement") or "[]")
+            for it in prev:
+                if it.get("ticker") and it["ticker"] not in out:
+                    out[it["ticker"]] = {**it, "sector": "", "industry": ""}
+                    added.append(it["ticker"])
+            if prev:
+                log.warning("[us_data] otherlisted 실패 — 전일 클래스주 보충 %d 재사용", len(prev))
+    except Exception:
+        log.exception("[us_data] 클래스주 보충 영속화 실패")
     if added:
         log.info("[us_data] screener 누락 클래스주 보충 %d: %s", len(added), ", ".join(added[:30]))
     return list(out.values())
