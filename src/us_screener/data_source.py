@@ -18,6 +18,7 @@ incremental/validator/backfill 모듈이 무수정 재사용 가능하게 함. �
 """
 from __future__ import annotations
 
+import json
 import logging
 import math
 import os
@@ -546,19 +547,65 @@ def _nasdaq_to_db_symbol(sym: str) -> str:
     return sym.replace("/", ".")
 
 
+_SCREENER_DISK_FIELDS = ("symbol", "name", "marketCap", "industry", "sector")
+
+
+def _screener_disk_path():
+    from src.state_store import _state_dir
+    return _state_dir() / "us_nasdaq_screener.json"
+
+
+def _screener_disk_save(rows: list[dict]) -> None:
+    try:
+        slim = [{k: r.get(k) for k in _SCREENER_DISK_FIELDS} for r in rows]
+        path = _screener_disk_path()
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"saved_at": time.time(), "rows": slim}))
+        tmp.replace(path)
+    except Exception as e:
+        log.warning("[us_data] Nasdaq screener 디스크 캐시 저장 실패: %s", e)
+
+
+def _screener_disk_load() -> list[dict]:
+    """마지막 정상 응답 (US_SCREENER_ROWS_MAX_AGE_H, 기본 72h 이내만)."""
+    try:
+        max_age_h = float(os.getenv("US_SCREENER_ROWS_MAX_AGE_H", "") or 72)
+        blob = json.loads(_screener_disk_path().read_text())
+        age_h = (time.time() - float(blob.get("saved_at") or 0)) / 3600
+        rows = blob.get("rows") or []
+        if rows and age_h <= max_age_h:
+            log.warning("[us_data] Nasdaq screener 라이브 실패 → 디스크 캐시 사용 (%.1fh 전, %d행)",
+                        age_h, len(rows))
+            return rows
+        log.warning("[us_data] Nasdaq screener 디스크 캐시 만료/없음 (%.1fh 전)", age_h)
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        log.warning("[us_data] Nasdaq screener 디스크 캐시 로드 실패: %s", e)
+    return []
+
+
 def _nasdaq_screener_rows(max_age_s: int = 900) -> list[dict]:
-    """Nasdaq screener 전 종목 (메모 15분). 실패 시 []."""
+    """Nasdaq screener 전 종목 (메모 15분). 라이브 실패 시 마지막 정상 응답(디스크, 72h) → [].
+
+    2026-09-25 Railway 실측: 전체 다운로드가 느린 날 40초+ (read timeout 30초로 3회 연속 실패
+    → 유니버스 폴백). 거래소별 분할은 NYSE 단독 요청이 더 느려 해법 아님 → timeout 90초 +
+    디스크 캐시. 캐시는 전일 정상 응답이라 비활성화 판정도 전일과 동일 (잘못된 이탈 없음).
+    """
     now = time.time()
     if _NASDAQ_SCREENER_CACHE["rows"] is not None and now - _NASDAQ_SCREENER_CACHE["at"] < max_age_s:
         return _NASDAQ_SCREENER_CACHE["rows"]
     import requests
     rows: list[dict] = []
+    read_timeout = float(os.getenv("US_SCREENER_NASDAQ_TIMEOUT_S", "") or 90)
     for attempt in range(3):
         try:
             resp = requests.get(
                 "https://api.nasdaq.com/api/screener/stocks",
                 params={"tableonly": "true", "download": "true"},
-                timeout=30, headers={**_HTTP_UA, "Accept": "application/json"})
+                timeout=(10, read_timeout),
+                headers={**_HTTP_UA, "Accept": "application/json, text/plain, */*",
+                         "Origin": "https://www.nasdaq.com", "Referer": "https://www.nasdaq.com/"})
             resp.raise_for_status()
             rows = ((resp.json().get("data") or {}).get("rows")) or []
             if rows:
@@ -566,6 +613,10 @@ def _nasdaq_screener_rows(max_age_s: int = 900) -> list[dict]:
         except Exception as e:
             log.warning("[us_data] Nasdaq screener 실패 attempt=%d: %s", attempt + 1, e)
         time.sleep(2 * (attempt + 1))
+    if rows:
+        _screener_disk_save(rows)
+    else:
+        rows = _screener_disk_load()
     # 실패도 짧게 캐시 — 같은 refresh 안에서 universe·raw_count·caps가 각각 재시도하며
     # 수 분씩 잡아먹지 않게 (리뷰 지적). 실패 캐시는 max_age_s 대신 5분.
     _NASDAQ_SCREENER_CACHE.update(at=now if rows else now - max(0, max_age_s - 300), rows=rows)

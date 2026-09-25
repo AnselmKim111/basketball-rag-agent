@@ -493,3 +493,45 @@ def test_stale_sec_facts_rejected():
     facts = {"facts": {"dei": {"EntityCommonStockSharesOutstanding": {"units": {"shares": [
         {"val": 941481, "end": "2011-04-29"}]}}}}}
     assert f._latest_shares(facts) is None
+
+
+def test_screener_rows_disk_cache_on_live_failure(monkeypatch, tmp_path):
+    """2026-09-25 Railway 실측: Nasdaq screener 40초+ 응답 → timeout 3연속 → 유니버스 폴백.
+    라이브 성공 시 디스크 저장, 실패 시 72h 이내 마지막 정상 응답 사용, 만료면 []."""
+    import requests
+    from src.us_screener import data_source as ds
+    monkeypatch.setenv("STATE_DIR", str(tmp_path))
+    monkeypatch.delenv("RAILWAY_VOLUME_MOUNT_PATH", raising=False)
+    monkeypatch.setattr(ds.time, "sleep", lambda s: None)
+    live = [{"symbol": "AAPL", "name": "Apple Inc. Common Stock", "marketCap": "3e12",
+             "industry": "Computer Manufacturing", "sector": "Technology", "lastsale": "$1"}]
+
+    class _R:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"data": {"rows": live}}
+    calls = []
+
+    def _ok(url, **kw):
+        calls.append(kw.get("timeout"))
+        return _R()
+    monkeypatch.setattr(requests, "get", _ok)
+    ds._NASDAQ_SCREENER_CACHE.update(at=0, rows=None)
+    assert ds._nasdaq_screener_rows()[0]["symbol"] == "AAPL"
+    assert calls[0][1] >= 90                                  # read timeout 30→90
+    assert (tmp_path / "us_nasdaq_screener.json").exists()
+
+    def _fail(url, **kw):
+        raise requests.exceptions.ReadTimeout("slow")
+    monkeypatch.setattr(requests, "get", _fail)
+    ds._NASDAQ_SCREENER_CACHE.update(at=0, rows=None)
+    rows = ds._nasdaq_screener_rows()
+    assert [r["symbol"] for r in rows] == ["AAPL"] and rows[0]["marketCap"] == "3e12"
+    assert "lastsale" not in rows[0]                          # slim 저장
+
+    monkeypatch.setenv("US_SCREENER_ROWS_MAX_AGE_H", "0")     # 만료 → 캐시 미사용
+    ds._NASDAQ_SCREENER_CACHE.update(at=0, rows=None)
+    assert ds._nasdaq_screener_rows() == []
+    ds._NASDAQ_SCREENER_CACHE.update(at=0, rows=None)
