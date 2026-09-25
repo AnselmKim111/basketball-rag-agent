@@ -346,11 +346,25 @@ async def _cmd_backfill(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await deny_message(update, "US 스크리너봇")
         return
     chat_id = str(update.effective_chat.id)
+    # /backfill            → 전 활성 종목 5년치 재수집 (예전 동작)
+    # /backfill pending    → 이력 부족·공백 종목만
+    # /backfill AAPL MSFT  → 지정 종목만
+    args = [a.strip().upper() for a in (context.args or []) if a.strip()]
+    from src.us_screener import backfill as _bf, db as _db
+    loop = asyncio.get_running_loop()
+    if args and args[0] == "PENDING":
+        targets = await loop.run_in_executor(None, _bf.pending_tickers)
+        scope = f"이력 부족 {len(targets)}종목"
+    elif args:
+        targets = args
+        scope = f"지정 {len(targets)}종목"
+    else:
+        targets = [t["ticker"] for t in await loop.run_in_executor(None, _db.get_active_tickers)]
+        scope = f"전 종목 {len(targets)}"
     try:
-        await update.message.reply_text("📥 1년치 백필 시작 (~10분 소요, 진행률 push)")
+        await update.message.reply_text(f"📥 5년치 백필 시작 — {scope} (진행률 push)")
     except Exception:
         pass
-    loop = asyncio.get_running_loop()
 
     def _progress(done: int, total: int, success: int) -> None:
         # blocking thread → 메인 loop로 안전하게 push
@@ -368,11 +382,13 @@ async def _cmd_backfill(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     try:
         from src.us_screener import backfill
         result = await loop.run_in_executor(
-            None, lambda: backfill.run_full_backfill(progress_cb=_progress)
+            None, lambda: backfill.run_full_backfill(progress_cb=_progress, tickers=targets)
         )
+        failed = result.get("failed") or []
         await send_text_chunked(
             context.bot, chat_id,
-            f"✅ 백필 완료: success={result['success']} fail={result['fail']} rows={result['rows']}",
+            f"✅ 백필 완료 ({scope}): success={result['success']} fail={result['fail']} "
+            f"rows={result['rows']}" + (f"\n실패: {', '.join(failed[:30])}" if failed else ""),
         )
     except Exception:
         log.exception("[backfill] 실패")
@@ -423,17 +439,24 @@ async def _post_charts_and_meta(results: dict, base_date: str | None = None,
     """
     from src.us_screener import chart, db, fundamentals
 
+    from src.us_screener import formatter as _fmt
     by_ticker: dict[str, dict] = {}
     badges: dict[str, list] = {}
+    # 메시지 표시 순서·상한과 동일하게 (섹션 순 → 섹션 내 등락률순 → 섹션당 top N, 앞 섹션 우선).
+    # 예전엔 results dict 순서로 앞 120개만 처리 → 뒤 섹션(🎯 등) 표시 종목이 링크·YTD 없이 N/A.
+    top_n = _fmt._per_category_top()
+    for cat in _fmt.DISPLAY_ORDER:
+        fresh = [it for it in (results.get(cat) or []) if it.get("ticker") and it["ticker"] not in by_ticker]
+        for it in sorted(fresh, key=lambda it: -(it.get("chg_pct") or 0.0))[:top_n]:
+            by_ticker[it["ticker"]] = it
     for cat, items in results.items():
         if cat not in DISPLAY_CATEGORIES:
             continue
         for it in items:
             t = it.get("ticker")
-            if not t:
-                continue
-            by_ticker.setdefault(t, it)
-            badges.setdefault(t, []).append(cat)
+            if t in by_ticker and cat not in badges.setdefault(t, []):
+                badges[t].append(cat)
+    chart_max = int(os.getenv("US_SCREENER_CHART_MAX", str(max_tickers)) or max_tickers)
 
     token = os.getenv("US_SCREENER_CHART_BOT_TOKEN", "").strip()
     channel = os.getenv("US_SCREENER_CHART_CHANNEL_ID", "").strip()
@@ -456,7 +479,7 @@ async def _post_charts_and_meta(results: dict, base_date: str | None = None,
     )
     posted = 0
     mcap_n = 0
-    for t, it in list(by_ticker.items())[:max_tickers]:
+    for t, it in by_ticker.items():   # 메타(ytd·eps)는 표시 종목 전부, 채널 게시만 chart_max 상한
         try:
             rows = await loop.run_in_executor(None, lambda t=t: db.load_ohlcv(t, days=260))
             ytd = fundamentals.ytd_pct(rows)
@@ -470,7 +493,12 @@ async def _post_charts_and_meta(results: dict, base_date: str | None = None,
                 mcap = (rows[-1]["close"] / 100.0) * f["shares"]
             if mcap:
                 mcap_n += 1
-            if chart_bot and rows:
+            # 같은 base_date에 이미 게시한 종목은 링크 재사용 (재실행·정정 발송 시 채널 중복 방지)
+            dedupe_key = f"chart_post:{base_date}:{t}"
+            prior = await loop.run_in_executor(None, lambda k=dedupe_key: db.meta_get(k))
+            if chart_bot and prior:
+                links[t] = prior
+            elif chart_bot and rows and posted < chart_max:
                 # freshness 가드 — cron 경로에선 절대 stale이 아니어야 정상 (뜨면 조기 경보)
                 data_date = rows[-1]["date"]
                 if base_date and data_date != base_date:
@@ -488,6 +516,8 @@ async def _post_charts_and_meta(results: dict, base_date: str | None = None,
                         url = _permalink(channel, msg.message_id)
                         if url:
                             links[t] = url
+                            await loop.run_in_executor(
+                                None, lambda k=dedupe_key, u=url: db.meta_set(k, u))
                         posted += 1
                     await asyncio.sleep(3.0)  # 채널 ~20건/분 한도 → 게시 간 간격 (성공/실패 무관 페이싱)
         except Exception:
@@ -621,6 +651,8 @@ async def _us_screener_daily_job_locked(bot: Bot, override_chat_id: str | None) 
                      result.get("mode"), result["success"], result["fail"], result["rows"])
             if result.get("success"):
                 ops_notes.append(f"백필 {result['success']}종목")
+            if result.get("fail"):
+                ops_notes.append(f"백필실패 {result['fail']}(내일 재시도)")
             if force:
                 await loop.run_in_executor(
                     None, lambda: db.meta_set("force_backfill_consumed", force_token))
@@ -628,31 +660,58 @@ async def _us_screener_daily_job_locked(bot: Bot, override_chat_id: str | None) 
             lengths2 = await loop.run_in_executor(None, db.ticker_data_lengths)
             log.info("[scheduled] 백필 후 ticker_data_lengths: %s", lengths2)
 
-        # 증분 (오늘 1일치) — KRX 16:30 이전 미발행 대비 retry
-        # US_SCREENER_RETRY_INTERVAL_S(기본 300=5분), US_SCREENER_RETRY_MAX(기본 6회 → 최대 30분)
-        retry_interval = int(os.getenv("US_SCREENER_RETRY_INTERVAL_S", "300"))
-        retry_max = int(os.getenv("US_SCREENER_RETRY_MAX", "6"))
-        inc = await loop.run_in_executor(None, incremental.update_today)
-        attempt = 1
-        while inc.get("empty") and inc.get("is_business_day") and attempt < retry_max:
-            log.info(
-                "[scheduled] today fetch 미발행 → %d초 후 재시도 (%d/%d)",
-                retry_interval, attempt, retry_max,
-            )
-            await asyncio.sleep(retry_interval)
+        # 증분 — 마지막 마감 US 거래일(NYSE 캘린더) 1일치. 이미 95%+ 받아둔 날이면(같은 날
+        # /screen 재실행 등) 전 종목 sweep 생략.
+        target_iso = incremental.us_target_date().isoformat()
+        active_n = len(await loop.run_in_executor(None, db.get_active_tickers)) or 1
+        have_n = await loop.run_in_executor(None, lambda: db.date_row_count(target_iso))
+        if have_n >= active_n * 0.95:
+            log.info("[scheduled] %s 이미 %d/%d종목 보유 — sweep 생략", target_iso, have_n, active_n)
+            inc = {"date": target_iso, "empty": False, "coverage": {}}
+        else:
+            # 재시도는 소스 장애(source_down)일 때만 — probe가 싸므로 전 종목 sweep 반복 없음.
+            # 휴장일(holiday_like)은 재시도 없이 종료 (예전: 휴장일에 전 종목 6회 반복 → 데드라인 초과)
+            retry_interval = int(os.getenv("US_SCREENER_RETRY_INTERVAL_S", "300"))
+            retry_max = int(os.getenv("US_SCREENER_RETRY_MAX", "3"))
             inc = await loop.run_in_executor(None, incremental.update_today)
-            attempt += 1
+            attempt = 1
+            while inc.get("source_down") and attempt < retry_max:
+                log.info("[scheduled] 대상일 봉 미수신(소스 장애 의심) → %d초 후 재시도 (%d/%d)",
+                         retry_interval, attempt, retry_max)
+                await asyncio.sleep(retry_interval)
+                inc = await loop.run_in_executor(None, incremental.update_today)
+                attempt += 1
+            if inc.get("source_down"):
+                # 거래일인데 대형주조차 대상일 봉이 없음 = 데이터 소스 장애. 조용한 skip 금지.
+                try:
+                    from src.admin_alerts import alert_admin
+                    await alert_admin(bot, ("US_SCREENER_ALLOWED_CHAT_IDS", "US_SCREENER_CHAT_ID"),
+                                      "⚠ US 데이터 소스 장애",
+                                      f"{inc.get('date')} 거래일인데 대상일 봉 미수신 "
+                                      f"(sources={inc.get('source_stats')}) — 직전 거래일 기준으로 진행")
+                except Exception:
+                    log.exception("[scheduled] 소스 장애 알림 실패")
+                ops_notes.append("데이터소스 장애")
 
-        # 영업일인데도 끝까지 today 미수신이면 어제 영업일 데이터라도 보장.
-        # 휴장일 판정(다른 날 봉은 받았는데 대상일만 전 종목 없음)이면 이미 최근 봉 갱신됨 → skip.
         if inc.get("empty") and not inc.get("holiday_like"):
-            log.info("[scheduled] today 데이터 미수신 → ensure_recent_business_day_data")
+            log.info("[scheduled] 대상일 데이터 미수신 → ensure_recent_business_day_data")
             ensured = await loop.run_in_executor(None, incremental.ensure_recent_business_day_data)
             log.info("[scheduled] ensure_recent_business_day 결과: %s", ensured)
         # 수집 커버리지 — 대상일 봉을 못 받은 활성 종목이 있으면 운영노트로 노출 (조용한 누락 금지)
         cov = inc.get("coverage") or {}
-        if cov.get("miss"):
+        if cov.get("miss") and not cov.get("probe_only"):
             ops_notes.append(f"수집누락 {cov['miss']}/{cov.get('target', '?')}")
+            if cov["miss"] > max(20, cov.get("target", 0) * 0.05):
+                try:
+                    from src.admin_alerts import alert_admin
+                    await alert_admin(bot, ("US_SCREENER_ALLOWED_CHAT_IDS", "US_SCREENER_CHAT_ID"),
+                                      "⚠ US 수집 누락 과다",
+                                      f"{inc.get('date')} 대상일 봉 누락 {cov['miss']}/{cov.get('target')} "
+                                      f"(sources={inc.get('source_stats')})")
+                except Exception:
+                    log.exception("[scheduled] 누락 알림 실패")
+        if inc.get("splits"):
+            ops_notes.append(f"분할 재구축 {len(inc['splits'])}")
 
         # 진단: 대표 미국 종목 last 7일치 close 출력 (cent 단위 → /100 = $)
         try:
@@ -666,8 +725,12 @@ async def _us_screener_daily_job_locked(bot: Bot, override_chat_id: str | None) 
         except Exception:
             log.exception("[scheduled] DIAG load_ohlcv 실패")
 
-        # 기준일 = DB의 가장 최근 OHLCV 날짜 (명시적 결정 → signals에 전달)
-        base_date = await loop.run_in_executor(None, db.latest_date) or datetime.now(KST).strftime("%Y-%m-%d")
+        # 기준일 = 활성 종목 과반이 보유한 가장 최근 날짜 (≤ 마지막 마감 거래일).
+        # 전역 MAX(date)는 소수 종목만 가진 날짜(진행 봉·백필 잔여)로 앞당겨질 수 있음 (리뷰 지적).
+        base_date = (await loop.run_in_executor(
+            None, lambda: db.latest_date_with_coverage(0.5, max_date=target_iso))
+            or await loop.run_in_executor(None, db.latest_date)
+            or datetime.now(KST).strftime("%Y-%m-%d"))
         log.info("[scheduled] base_date for signals: %s", base_date)
 
         # 데이터 기반 휴장 판정 (cron 경로만) — 새 거래일 데이터가 없어 base_date가

@@ -103,7 +103,9 @@ def ticker_fundamentals(ticker: str, use_cache: bool = True) -> dict:
     asof: str | None = None
     try:
         from src.earnings import sec_edgar
-        cik = sec_edgar.ticker_to_cik(ticker)
+        from src.us_screener.data_source import _yahoo_symbol
+        # SEC 표기는 'MOG-A'·'BRK-B' (Yahoo와 동일) — DB 'MOG.A'·'BRKB'로는 CIK 미발견
+        cik = sec_edgar.ticker_to_cik(ticker) or sec_edgar.ticker_to_cik(_yahoo_symbol(ticker))
         if cik:
             facts = _fetch_facts(cik)
             if facts:

@@ -24,7 +24,7 @@ log = logging.getLogger(__name__)
 # 데이터 소스 베이스라인 — 정상 운영 시 최소 기대치. 미만이면 알림.
 # 보수적으로 시작 (거짓 양성 < 거짓 음성), 며칠 관측 후 조정.
 BASELINES = {
-    "us_caps": 100,         # us_screener.fetch_market_caps (FDR S&P500). 평소 ~500.
+    "us_caps": 2000,        # US 유니버스(Nasdaq 보통주 시총≥$1B) 활성 수. 평소 ~2,560 (2026-09-25~).
     "us_sectors": 100,      # us_screener.fetch_sectors. 평소 ~500.
     "kr_caps": 2000,        # screener.fetch_market_caps (pykrx ALL). 평소 ~2700.
     "kr_sectors": 200,      # screener.fetch_sectors. 평소 ~560.

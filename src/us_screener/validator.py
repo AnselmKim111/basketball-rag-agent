@@ -6,11 +6,11 @@
 
 검증 절차:
   1. 신호 발생 종목 리스트 (보통 50-150개) 추출
-  2. 각 종목에 대해 Naver historical API 다시 호출 (병렬화 가능하지만 우선 순차)
+  2. 각 종목 재조회 (US_SCREENER_VALIDATE_WORKERS 병렬, 종목 수 비례 timeout)
   3. 응답의 base_date close vs 우리 DB의 close 비교 — 불일치 시 그 종목 제외
   4. 검증 통과 종목만 결과에 유지
 
-비용: 신호 종목 ~100개 × ~0.3초 = 30초. timeout 60초로 보호.
+비용: 신호 종목 ~200개 × ~0.4초 / 6 workers ≈ 15초. timeout = max(120s, 0.6s×종목수).
 """
 from __future__ import annotations
 
@@ -51,45 +51,53 @@ def cross_validate(
     반환: (validated_results, validation_stats).
     validated_results는 검증 통과 종목만 유지. 불일치 종목은 모든 카테고리에서 제거.
     """
-    timeout_s = _int_env("SCREENER_VALIDATE_TIMEOUT_S", 60)
-    tolerance = _int_env("SCREENER_VALIDATE_TOLERANCE", 1)  # ±1원까지 OK (반올림 오차)
+    tolerance = _int_env("SCREENER_VALIDATE_TOLERANCE", 1)  # ±1 cent (반올림 오차)
 
     tickers = _all_signal_tickers(results)
     if not tickers:
         return results, {"validated": 0, "rejected": 0, "fetch_failed": 0, "skipped_timeout": 0}
+    # 유니버스 ~2,550 → 신호 종목 수백 개 가능. KR과 env 분리 + 종목 수 비례 (리뷰 지적:
+    # 순차 60초로는 알파벳 뒤쪽 신호가 매일 NoFetch로 탈락).
+    timeout_s = _int_env("US_SCREENER_VALIDATE_TIMEOUT_S", max(120, int(len(tickers) * 0.6)))
+    workers = max(1, _int_env("US_SCREENER_VALIDATE_WORKERS", 6))
+    log.info("[validator] %d종목 cross-validate 시작 (base_date=%s, workers=%d, timeout=%ds)",
+             len(tickers), base_date, workers, timeout_s)
 
-    log.info("[validator] %d종목 cross-validate 시작 (base_date=%s, timeout=%ds)",
-             len(tickers), base_date, timeout_s)
+    from datetime import datetime as _dt, timedelta as _td
+    target_dt = _dt.strptime(base_date, "%Y-%m-%d").date()
+    start = (target_dt - _td(days=3)).strftime("%Y-%m-%d")
+    end = (target_dt + _td(days=1)).strftime("%Y-%m-%d")
+    # base_date 외 날짜는 '보유'로 넘겨 불필요한 gap 보충 호출 방지 (base 봉만 필요)
+    known = {(target_dt + _td(days=k)).isoformat() for k in range(-3, 2) if k != 0}
 
-    # ticker → 검증된 close (Naver 응답)
+    def _fetch_one(ticker: str) -> tuple[str, int | None]:
+        rows = data_source.fetch_ohlcv_by_ticker_via_naver(ticker, start, end, known_dates=known)
+        match = [r for r in rows if r[1] == base_date]
+        return ticker, (int(match[0][5]) if match else None)
+
     truth: dict[str, int | None] = {}
     fetch_failed = 0
     skipped_timeout = 0
-
-    t0 = time.monotonic()
-    for ticker in sorted(tickers):
-        if time.monotonic() - t0 > timeout_s:
-            log.warning("[validator] timeout %ds 초과 — %d종목 skip", timeout_s, len(tickers) - len(truth))
-            skipped_timeout = len(tickers) - len(truth)
-            break
-        try:
-            from datetime import datetime as _dt, timedelta as _td
-            target_dt = _dt.strptime(base_date, "%Y-%m-%d").date()
-            start = (target_dt - _td(days=3)).strftime("%Y-%m-%d")
-            end = (target_dt + _td(days=1)).strftime("%Y-%m-%d")
-            rows = data_source.fetch_ohlcv_by_ticker_via_naver(ticker, start, end)
-        except Exception as e:
-            log.debug("[validator] %s fetch 실패: %s", ticker, e)
-            fetch_failed += 1
-            truth[ticker] = None
-            continue
-        # base_date close 추출
-        match = [r for r in rows if r[1] == base_date]
-        if match:
-            truth[ticker] = int(match[0][5])  # close (index 5)
-        else:
-            truth[ticker] = None
-            fetch_failed += 1
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from concurrent.futures import TimeoutError as _FutTimeout
+    pool = ThreadPoolExecutor(max_workers=workers)
+    futures = {pool.submit(_fetch_one, t): t for t in sorted(tickers)}
+    try:
+        for fut in as_completed(futures, timeout=timeout_s):
+            t = futures[fut]
+            try:
+                _, close = fut.result()
+            except Exception as e:
+                log.debug("[validator] %s fetch 실패: %s", t, e)
+                close = None
+            truth[t] = close
+            if close is None:
+                fetch_failed += 1
+    except _FutTimeout:
+        skipped_timeout = len(tickers) - len(truth)
+        log.warning("[validator] timeout %ds — %d종목 미검증", timeout_s, skipped_timeout)
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
 
     # 검증: 각 신호 종목의 DB close vs truth close 비교
     validated: dict[str, list[dict]] = {k: [] for k in results.keys()}

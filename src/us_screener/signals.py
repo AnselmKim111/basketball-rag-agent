@@ -330,6 +330,7 @@ def compute_all(base_date: str | None = None) -> tuple[dict[str, list[dict]], di
         "skipped_no_base": skipped_no_base,
         "skipped_short": skipped_short,
         "total_active": len(tickers),
+        "min_cap": min_cap,
     }
     log.info(
         "[signals] base_date=%s processed=%d skipped_cap=%d skipped_no_base=%d "

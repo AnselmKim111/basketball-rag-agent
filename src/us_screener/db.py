@@ -306,7 +306,7 @@ def upsert_tickers(rows: Iterable[tuple]) -> int:
                     "ON CONFLICT(ticker) DO UPDATE SET "
                     "name=excluded.name, market=excluded.market, "
                     "is_active=excluded.is_active, updated_at=excluded.updated_at, "
-                    "market_cap=excluded.market_cap",
+                    "market_cap=COALESCE(excluded.market_cap, tickers.market_cap)",
                     r,
                 )
             else:
@@ -352,6 +352,67 @@ def dates_for_ticker(ticker: str, since: str) -> set[str]:
     with _conn() as c:
         cur = c.execute("SELECT date FROM ohlcv WHERE ticker=? AND date>=?", (ticker, since))
         return {r[0] for r in cur.fetchall()}
+
+
+def closes_for_ticker(ticker: str, since: str) -> dict[str, int]:
+    """{date: close} (since 이후) — 분할 감지용."""
+    ensure_schema()
+    with _conn() as c:
+        cur = c.execute("SELECT date, close FROM ohlcv WHERE ticker=? AND date>=?", (ticker, since))
+        return {r[0]: int(r[1]) for r in cur.fetchall()}
+
+
+def date_row_count(date_str: str) -> int:
+    ensure_schema()
+    with _conn() as c:
+        return int(c.execute("SELECT COUNT(*) FROM ohlcv WHERE date=?", (date_str,)).fetchone()[0])
+
+
+def latest_date_with_coverage(min_frac: float = 0.5, max_date: Optional[str] = None) -> Optional[str]:
+    """활성 종목의 min_frac 이상이 보유한 가장 최근 날짜 (≤ max_date).
+
+    base_date를 전역 MAX(date)로 잡으면 소수 종목만 가진 날짜(장중 봉·백필 잔여)로 앞당겨져
+    나머지 전 종목이 'base_date 누락'이 된다 — 2026-09-25 리뷰 지적.
+    """
+    ensure_schema()
+    with _conn() as c:
+        active = int(c.execute("SELECT COUNT(*) FROM tickers WHERE is_active=1").fetchone()[0]) or 1
+        q = ("SELECT o.date, COUNT(*) FROM ohlcv o JOIN tickers t ON t.ticker=o.ticker "
+             "WHERE t.is_active=1 AND o.date >= ? ")
+        args: list = []
+        # 최근 30일만 스캔 (전체 GROUP BY는 수백만 행)
+        since = c.execute("SELECT MAX(date) FROM ohlcv").fetchone()[0]
+        if not since:
+            return None
+        from datetime import date as _d, timedelta as _td
+        args.append((_d.fromisoformat(since) - _td(days=30)).isoformat())
+        if max_date:
+            q += "AND o.date <= ? "
+            args.append(max_date)
+        q += "GROUP BY o.date ORDER BY o.date DESC"
+        for d, n in c.execute(q, args).fetchall():
+            if n >= active * min_frac:
+                return d
+    return None
+
+
+def replace_ticker_history(ticker: str, rows: list[tuple]) -> int:
+    """종목 이력 전체 교체 (분할·비율변경 재구축). 삭제+삽입을 한 트랜잭션으로 — 실패 시 원복."""
+    if not rows:
+        return 0
+    ensure_schema()
+    with _conn() as c:
+        c.execute("BEGIN")
+        try:
+            c.execute("DELETE FROM ohlcv WHERE ticker=?", (ticker,))
+            c.executemany(
+                "INSERT OR REPLACE INTO ohlcv (ticker, date, open, high, low, close, volume, value) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)", rows)
+            c.execute("COMMIT")
+        except Exception:
+            c.execute("ROLLBACK")
+            raise
+    return len(rows)
 
 
 def update_market_caps(caps: dict[str, int]) -> int:

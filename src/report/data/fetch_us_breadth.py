@@ -89,8 +89,12 @@ def _caps_changes(sectors: dict, limit: int):
     # Path A: 미장스크리너 db 시총 (Railway cron이 채움)
     try:
         from src.us_screener import db
+        from src.us_screener.data_source import _yahoo_symbol
         rows = db.get_active_tickers()
-        dbcaps = {r["ticker"]: int(r["market_cap"]) for r in rows if r.get("market_cap")}
+        # 2026-09-25~ 미장스크리너 유니버스가 미국 전 종목(시총≥$1B)으로 확장 — 'S&P500 히트맵'
+        # 계약 유지를 위해 지수 멤버만, 심볼은 섹터맵·가격 fetch와 같은 Yahoo 표기로 정규화.
+        dbcaps = {_yahoo_symbol(r["ticker"]): int(r["market_cap"]) for r in rows
+                  if r.get("market_cap") and r.get("market") in ("S&P500", "NASDAQ100")}
         if len(dbcaps) >= 50:
             keep = sorted(dbcaps, key=lambda s: -dbcaps[s])[:limit]
             dfs = fetch_many({s: s for s in keep}, days=10, workers=12)

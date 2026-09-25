@@ -40,35 +40,73 @@ def _int_env(key: str, default: int) -> int:
 ATTEMPTS_META_KEY = "backfill_attempts"
 # row 수가 이 미만이면 이력 부족 (5년 ≈ 1260행; 상장 5년 미만 종목은 시도 기록으로 재시도 억제)
 FULL_HISTORY_ROWS = 1000
-RETRY_AFTER_DAYS = 30
+RETRY_AFTER_DAYS = 30          # 성공(행 있음)했는데도 이력 짧음 = 신규 상장 → 30일 뒤 재확인
+FAIL_RETRY_AFTER_DAYS = 1      # 빈 결과·오류 = 일시 장애일 수 있음 → 다음날 재시도
+STALE_DAYS = 10                # DB 최신일이 대상일보다 이만큼 오래되면 공백 → 재백필
 
 
 def _load_attempts() -> dict[str, str]:
+    """{ticker: 'YYYY-MM-DD' (성공) | 'fail:YYYY-MM-DD' (빈 결과/오류)}."""
     try:
         return json.loads(db.meta_get(ATTEMPTS_META_KEY) or "{}")
     except (ValueError, TypeError):
         return {}
 
 
-def pending_tickers(min_rows: int = FULL_HISTORY_ROWS) -> list[str]:
-    """백필 필요 종목: 활성 + row < min_rows + 최근 RETRY_AFTER_DAYS일 내 시도 기록 없음.
+def _recently_attempted(stamp: Optional[str], today) -> bool:
+    if not stamp:
+        return False
+    failed = stamp.startswith("fail:")
+    day = stamp[5:] if failed else stamp
+    wait = FAIL_RETRY_AFTER_DAYS if failed else RETRY_AFTER_DAYS
+    try:
+        return (today - datetime.fromisoformat(day).date()).days < wait
+    except ValueError:
+        return False
 
-    시총 desc 정렬. 신규 편입(유니버스 확장·신규 상장)은 여기로 잡히고, 이력이 짧은 신규
-    상장은 한 번 시도 후 30일간 재시도 안 함 (매일 백필 재트리거 방지).
+
+def _target_date():
+    from src.us_screener import incremental
+    return incremental.us_target_date()
+
+
+def pending_tickers(min_rows: int = FULL_HISTORY_ROWS) -> list[str]:
+    """백필 필요 종목 (시총 desc):
+      - row < min_rows 이고 최근 시도 기록 없음 (성공 30일 / 실패 1일)
+      - 또는 DB 최신일이 대상일보다 STALE_DAYS 넘게 오래됨 (비활성→재활성 공백·과거 사고 잔여)
     """
     active = db.get_active_tickers()
     stats = db.ticker_row_stats({t["ticker"] for t in active})
     attempts = _load_attempts()
-    cutoff = (datetime.now(KST).date() - timedelta(days=RETRY_AFTER_DAYS)).isoformat()
+    today = datetime.now(KST).date()
+    stale_before = (_target_date() - timedelta(days=STALE_DAYS)).isoformat()
     out = []
     for t in sorted(active, key=lambda x: -(x.get("market_cap") or 0)):
-        n = stats.get(t["ticker"], (0, None))[0]
-        if n >= min_rows:
+        n, latest = stats.get(t["ticker"], (0, None))
+        short = n < min_rows
+        stale = n > 0 and latest is not None and latest < stale_before
+        if not (short or stale):
             continue
-        last = attempts.get(t["ticker"])
-        if last and last >= cutoff:
+        if _recently_attempted(attempts.get(t["ticker"]), today):
             continue
         out.append(t["ticker"])
+    return out
+
+
+def rebuild_history(tickers: list[str], days: int = DEFAULT_DAYS) -> dict:
+    """분할·비율변경 종목의 이력 전체를 새로 받아 원자적으로 교체. 반환: {ticker: rows}."""
+    end_iso = _target_date().isoformat()
+    start_iso = (datetime.fromisoformat(end_iso) - timedelta(days=int(days * 1.5) + 15)).strftime("%Y-%m-%d")
+    out = {}
+    for t in tickers:
+        rows = data_source.fetch_ohlcv_by_ticker_via_naver(t, start_iso, end_iso)
+        # 새 이력이 기존보다 확연히 짧으면(소스 일시 장애) 교체 안 함 — 이력 손실 방지
+        have = db.ticker_row_stats([t]).get(t, (0, None))[0]
+        if rows and len(rows) >= min(have, 250) * 0.8:
+            out[t] = db.replace_ticker_history(t, rows)
+        else:
+            out[t] = 0
+            log.warning("[backfill] %s 재구축 보류 (새 %d행 vs 기존 %d행)", t, len(rows), have)
     return out
 
 
@@ -95,8 +133,10 @@ def run_full_backfill(
     if tickers is None:
         tickers = pending_tickers()
     naver_result = _run_naver_batch_backfill(days=days, progress_cb=progress_cb, tickers=tickers)
-    if naver_result["rows"] > 0 or not tickers:
-        return naver_result
+    # 미국은 date-batch 소스가 없고(fetch_market_ohlcv_by_date=[]), 이하 FDR 순차 폴백은 Yahoo와
+    # 같은 엔드포인트라 이득 없이 timeout 없는 순차 호출만 늘린다 → 종목별 체인 결과로 종료.
+    # (체인 자체가 Yahoo → Stooq → Nasdaq 폴백을 포함)
+    return naver_result
     log.warning("[backfill] Naver 백필 빈 결과 → pykrx date-batch 폴백 시도")
 
     today = datetime.now(KST).date()
@@ -182,8 +222,11 @@ def _run_naver_batch_backfill(
 ) -> dict:
     """종목별 5년치 fetch (병렬). 시총 desc (대형주 우선 — timeout 시 소형주만 누락).
 
-      - US_SCREENER_BACKFILL_WORKERS (기본 6), US_SCREENER_BACKFILL_TIMEOUT_S (기본 1500)
-      - 시도한 종목은 meta backfill_attempts에 날짜 기록 (성공·빈 결과 모두)
+      - 종료일 = 마지막 마감 US 거래일 (KST 날짜를 쓰면 미국 장중 실행 시 진행 봉이 저장돼
+        base_date가 앞당겨짐 — 리뷰 지적)
+      - 워커가 직접 upsert하고 행 수만 반환 (5년치 결과를 메모리에 쌓지 않음)
+      - 시도 기록: 성공은 날짜, 빈 결과·오류는 'fail:날짜' (다음날 재시도)
+      - US_SCREENER_BACKFILL_WORKERS (6), US_SCREENER_BACKFILL_TIMEOUT_S (1500)
     """
     db.ensure_schema()
     timeout_s = _int_env("US_SCREENER_BACKFILL_TIMEOUT_S", 1500)
@@ -194,65 +237,63 @@ def _run_naver_batch_backfill(
         tickers = [t["ticker"] for t in all_tickers]
     if not tickers:
         log.info("[backfill] 대상 종목 없음 — skip")
-        return {"success": 0, "fail": 0, "rows": 0, "skipped_existing": 0, "mode": "noop"}
+        return {"success": 0, "fail": 0, "rows": 0, "skipped_existing": 0, "mode": "noop",
+                "failed": []}
 
-    today = datetime.now(KST).date()
-    start_iso = (today - timedelta(days=int(days * 1.5) + 15)).strftime("%Y-%m-%d")
-    end_iso = today.strftime("%Y-%m-%d")
+    end_d = _target_date()
+    start_iso = (end_d - timedelta(days=int(days * 1.5) + 15)).isoformat()
+    end_iso = end_d.isoformat()
     log.info("[backfill] 시작: %d종목 (%s ~ %s, workers=%d, timeout=%ds)",
              len(tickers), start_iso, end_iso, workers, timeout_s)
 
-    def _one(t: str) -> tuple[str, list[tuple]]:
-        return t, data_source.fetch_ohlcv_by_ticker_via_naver(t, start_iso, end_iso)
+    def _one(t: str) -> int:
+        rows = data_source.fetch_ohlcv_by_ticker_via_naver(t, start_iso, end_iso)
+        return db.upsert_ohlcv_bulk(rows) if rows else 0
 
     success = fail = total_rows = 0
     failed: list[str] = []
     attempts = _load_attempts()
-    stamp = today.isoformat()
+    stamp = datetime.now(KST).date().isoformat()
     t0 = time.monotonic()
+    done = 0
     from concurrent.futures import ThreadPoolExecutor, as_completed
     from concurrent.futures import TimeoutError as _FutTimeout
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {pool.submit(_one, t): t for t in tickers}
-        done = 0
-        try:
-            for fut in as_completed(futures, timeout=timeout_s + 60):
-                t = futures[fut]
-                try:
-                    _, rows = fut.result()
-                except Exception as e:
-                    log.warning("[backfill] %s 예외: %s", t, e)
-                    rows = []
-                if rows:
-                    total_rows += db.upsert_ohlcv_bulk(rows)
-                    success += 1
-                else:
-                    fail += 1
-                    failed.append(t)
+    pool = ThreadPoolExecutor(max_workers=workers)
+    futures = {pool.submit(_one, t): t for t in tickers}
+    try:
+        for fut in as_completed(futures, timeout=timeout_s):
+            t = futures.pop(fut)
+            try:
+                n = fut.result()
+            except Exception as e:
+                log.warning("[backfill] %s 예외: %s", t, e)
+                n = 0
+            if n:
+                total_rows += n
+                success += 1
                 attempts[t] = stamp
-                done += 1
-                if done % 200 == 0 or done == len(tickers):
-                    log.info("[backfill] 진행 %d/%d success=%d fail=%d rows=%d",
-                             done, len(tickers), success, fail, total_rows)
-                    db.meta_set(ATTEMPTS_META_KEY, json.dumps(attempts))
-                    if progress_cb:
-                        try:
-                            progress_cb(done, len(tickers), success)
-                        except Exception:
-                            log.exception("[backfill] progress_cb 실패")
-                if time.monotonic() - t0 > timeout_s:
-                    log.warning("[backfill] timeout %ds → %d/%d에서 중단 (나머지는 다음 실행)",
-                                timeout_s, done, len(tickers))
-                    for f in futures:
-                        f.cancel()
-                    break
-        except _FutTimeout:
-            log.warning("[backfill] futures timeout → %d/%d", done, len(tickers))
-            for f in futures:
-                f.cancel()
+            else:
+                fail += 1
+                failed.append(t)
+                attempts[t] = f"fail:{stamp}"
+            done += 1
+            if done % 200 == 0 or done == len(tickers):
+                log.info("[backfill] 진행 %d/%d success=%d fail=%d rows=%d",
+                         done, len(tickers), success, fail, total_rows)
+                db.meta_set(ATTEMPTS_META_KEY, json.dumps(attempts))
+                if progress_cb:
+                    try:
+                        progress_cb(done, len(tickers), success)
+                    except Exception:
+                        log.exception("[backfill] progress_cb 실패")
+    except _FutTimeout:
+        log.warning("[backfill] timeout %ds → %d/%d에서 중단 (나머지는 다음 실행)",
+                    timeout_s, done, len(tickers))
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
     db.meta_set(ATTEMPTS_META_KEY, json.dumps(attempts))
     if failed:
-        log.warning("[backfill] 빈 결과 %d종목: %s", len(failed), ", ".join(failed[:60]))
+        log.warning("[backfill] 빈 결과 %d종목 (다음날 재시도): %s", len(failed), ", ".join(failed[:60]))
 
     db.meta_set(
         "backfill_summary",
@@ -271,7 +312,8 @@ def _run_naver_batch_backfill(
              success, fail, total_rows, time.monotonic() - t0)
     return {
         "success": success, "fail": fail, "rows": total_rows,
-        "skipped_existing": 0, "mode": "ticker-batch-parallel",
+        "skipped_existing": 0, "mode": "ticker-batch-parallel", "failed": failed,
+        "not_done": len(tickers) - done,
     }
 
 

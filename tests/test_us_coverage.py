@@ -196,6 +196,7 @@ def _screener_rows():
 
 def test_universe_cap_inheritance_and_member_siblings(monkeypatch):
     monkeypatch.setattr(ds, "_nasdaq_screener_rows", lambda max_age_s=900: _screener_rows())
+    monkeypatch.setattr(ds, "_otherlisted_rows", lambda max_age_s=3600: [])
     u = {x["ticker"]: x for x in ds.fetch_nasdaq_universe(1e9, always_include={"BFB"})}
     assert set(u) == {"HEI", "HEI.A", "BFB", "BF.A"}         # TINY(<$1B)·우선주 제외
     assert u["HEI.A"]["market_cap"] == 43404457271            # 클래스주 시총 상속
@@ -229,10 +230,9 @@ def test_pending_tickers_respects_rows_and_attempts(usdb):
     backfill = importlib.import_module("src.us_screener.backfill")
     usdb.upsert_tickers([("FULL", "F", "US", 1, "x", 3e9), ("SHORT", "S", "US", 1, "x", 2e9),
                          ("TRIED", "T", "US", 1, "x", 1e9)])
-    usdb.upsert_ohlcv_bulk([("FULL", f"2020-01-{i:02d}", 1, 1, 1, 1, 1, None) for i in range(1, 2)])
-    # FULL을 1000행 이상으로
-    base = datetime(2019, 1, 1)
-    usdb.upsert_ohlcv_bulk([("FULL", (base + timedelta(days=i)).date().isoformat(), 1, 1, 1, 1, 1, None)
+    # FULL: 1000행 이상 + 최신일이 최근(공백 아님)
+    end = datetime.now().date()
+    usdb.upsert_ohlcv_bulk([("FULL", (end - timedelta(days=i)).isoformat(), 1, 1, 1, 1, 1, None)
                             for i in range(1000)])
     today = datetime.now(timezone(timedelta(hours=9))).date().isoformat()
     usdb.meta_set(backfill.ATTEMPTS_META_KEY, json.dumps({"TRIED": today}))
@@ -245,10 +245,11 @@ def test_refresh_universe_deactivates_only_on_sane_response(usdb, monkeypatch):
     monkeypatch.setattr(ds, "fetch_sectors", lambda: {"AAPL": "Information Technology"})
     usdb.upsert_tickers([("ANSS", "Ansys", "S&P500", 1, "x", None)])
 
-    # 부분 응답(<1500) → 폴백, 비활성화 안 함
+    # 부분 응답(원본 행 부족) → 폴백, 비활성화 안 함
     monkeypatch.setattr(ds, "fetch_nasdaq_universe", lambda c, always_include=(): [
         {"ticker": "AAPL", "name": "Apple Inc", "market_cap": 3e12, "sector": "Technology"}])
     monkeypatch.setattr(ds, "fetch_market_caps", lambda: {"AAPL": 3e12})
+    monkeypatch.setattr(ds, "nasdaq_screener_raw_count", lambda: 120)
     universe.refresh_universe()
     assert {t["ticker"] for t in usdb.get_active_tickers()} == {"AAPL", "ANSS"}
 
@@ -256,6 +257,7 @@ def test_refresh_universe_deactivates_only_on_sane_response(usdb, monkeypatch):
     big = [{"ticker": f"T{i:04d}", "name": f"T{i}", "market_cap": 2e9, "sector": "X"} for i in range(1600)]
     big.append({"ticker": "AAPL", "name": "Apple Inc", "market_cap": 3e12, "sector": "Technology"})
     monkeypatch.setattr(ds, "fetch_nasdaq_universe", lambda c, always_include=(): big)
+    monkeypatch.setattr(ds, "nasdaq_screener_raw_count", lambda: 7000)
     n = universe.refresh_universe()
     act = {t["ticker"]: t for t in usdb.get_active_tickers()}
     assert n == 1601 and "ANSS" not in act
@@ -273,3 +275,109 @@ def test_us_min_cap_env_isolated_from_kr(monkeypatch):
     monkeypatch.setenv("SCREENER_MIN_MARKET_CAP", "100000000000")      # KR 1000억(원)
     monkeypatch.delenv("US_SCREENER_MIN_MARKET_CAP", raising=False)
     assert signals.min_market_cap() == 1_000_000_000                     # 미국은 영향 없음
+
+
+# ------------------------------------------------------------------
+# 리뷰 워크플로 확정 지적 회귀 (2026-09-25)
+# ------------------------------------------------------------------
+def test_nasdaq_symbol_variants_for_class_shares():
+    assert ds._nasdaq_symbol_variants("HEI.A") == ["HEI%25sl%25A", "HEI.A"]
+    assert ds._nasdaq_symbol_variants("BRKB") == ["BRK%25sl%25B", "BRK.B"]
+    assert ds._nasdaq_symbol_variants("AAPL") == ["AAPL"]
+
+
+def test_unfinished_session_bar_is_dropped():
+    et = timezone(timedelta(hours=-4))
+    now = datetime(2026, 9, 25, 10, 30, tzinfo=et)                 # 금 장중
+    assert ds._is_unfinished_session("2026-09-25", now) is True
+    assert ds._is_unfinished_session("2026-09-24", now) is False
+    assert ds._is_unfinished_session("2026-09-25", now.replace(hour=16, minute=45)) is False
+
+
+def test_session_fill_used_when_target_gap_and_nasdaq_lags(monkeypatch):
+    monkeypatch.setattr(ds, "_yahoo_chart", lambda t, s, e: (
+        [("A", "2026-09-23", 1, 1, 1, 16532, 1, None)], ["2026-09-24"]))
+    monkeypatch.setattr(ds, "fetch_ohlcv_by_ticker_via_nasdaq", lambda *a: [])   # 1일 lag
+    monkeypatch.setattr(ds, "_yahoo_session_bar",
+                        lambda t, d: ("A", d, 16395, 17477, 16362, 17284, 3028845, None))
+    rows = ds.fetch_ohlcv_by_ticker_via_naver("A", "2026-09-15", "2026-09-24")
+    assert rows[-1][1] == "2026-09-24" and rows[-1][5] == 17284
+
+
+def test_fdr_not_in_chain(monkeypatch):
+    monkeypatch.setattr(ds, "_yahoo_chart", lambda t, s, e: ([], []))
+    called = []
+    monkeypatch.setattr(ds, "fetch_ohlcv_by_ticker_via_fdr", lambda *a: called.append(1) or [])
+    monkeypatch.setattr(ds, "fetch_ohlcv_by_ticker_via_stooq", lambda *a: [])
+    monkeypatch.setattr(ds, "fetch_ohlcv_by_ticker_via_nasdaq", lambda *a: [])
+    assert ds.fetch_ohlcv_by_ticker_via_naver("A", "2026-09-15", "2026-09-24") == []
+    assert called == []                     # timeout 없는 FDR(같은 Yahoo)로 풀을 붙잡지 않음
+
+
+def test_detect_split():
+    inc = importlib.import_module("src.us_screener.incremental")
+    fetched = [("X", "2026-09-22", 0, 0, 0, 1000, 0, None), ("X", "2026-09-23", 0, 0, 0, 1010, 0, None)]
+    assert inc.detect_split(fetched, {"2026-09-22": 10000, "2026-09-23": 10100}) == pytest.approx(0.1)
+    assert inc.detect_split(fetched, {"2026-09-22": 1000, "2026-09-23": 1010}) is None   # 동일 스케일
+    assert inc.detect_split(fetched[:1], {"2026-09-22": 10000}) is None                   # 근거 1개
+    assert inc.detect_split(fetched, {"2026-09-22": 10000, "2026-09-23": 1010}) is None   # 비일관
+
+
+def test_backfill_failure_retried_next_day_success_waits_30(usdb):
+    import json
+    backfill = importlib.import_module("src.us_screener.backfill")
+    usdb.upsert_tickers([("OK", "O", "US", 1, "x", 3e9), ("BAD", "B", "US", 1, "x", 2e9)])
+    today = datetime.now(timezone(timedelta(hours=9))).date()
+    yday = (today - timedelta(days=1)).isoformat()
+    usdb.meta_set(backfill.ATTEMPTS_META_KEY,
+                  json.dumps({"OK": today.isoformat(), "BAD": f"fail:{yday}"}))
+    assert backfill.pending_tickers() == ["BAD"]      # 실패는 다음날 재시도, 성공은 30일 대기
+
+
+def test_pending_includes_stale_history(usdb):
+    backfill = importlib.import_module("src.us_screener.backfill")
+    usdb.upsert_tickers([("GAP", "G", "US", 1, "x", 3e9)])
+    old_end = datetime.now().date() - timedelta(days=60)          # 재활성화 공백
+    usdb.upsert_ohlcv_bulk([("GAP", (old_end - timedelta(days=i)).isoformat(), 1, 1, 1, 1, 1, None)
+                            for i in range(1100)])
+    assert backfill.pending_tickers() == ["GAP"]
+
+
+def test_latest_date_with_coverage_ignores_thin_dates(usdb):
+    usdb.upsert_tickers([(f"T{i}", "t", "US", 1, "x", 2e9) for i in range(10)])
+    rows = [(f"T{i}", "2026-09-24", 1, 1, 1, 1, 1, None) for i in range(10)]
+    rows += [("T0", "2026-09-25", 1, 1, 1, 1, 1, None)]           # 장중 봉이 1종목에만
+    usdb.upsert_ohlcv_bulk(rows)
+    assert usdb.latest_date() == "2026-09-25"
+    assert usdb.latest_date_with_coverage(0.5) == "2026-09-24"
+    assert usdb.latest_date_with_coverage(0.5, max_date="2026-09-23") is None
+
+
+def test_replace_ticker_history_atomic(usdb):
+    usdb.upsert_ohlcv_bulk([("S", "2026-09-2%d" % i, 1, 1, 1, 10000, 1, None) for i in range(1, 5)])
+    n = usdb.replace_ticker_history("S", [("S", "2026-09-24", 1, 1, 1, 1000, 1, None)])
+    assert n == 1 and usdb.closes_for_ticker("S", "2026-01-01") == {"2026-09-24": 1000}
+
+
+def test_upsert_tickers_keeps_cap_when_null(usdb):
+    usdb.upsert_tickers([("A", "A", "US", 1, "x", 5e10)])
+    usdb.upsert_tickers([("A", "A", "S&P500", 1, "y", None)])   # 폴백 경로
+    assert usdb.get_active_tickers()[0]["market_cap"] == 5e10
+
+
+def test_us_target_date_skips_nyse_holidays():
+    inc = importlib.import_module("src.us_screener.incremental")
+    et = timezone(timedelta(hours=-5))
+    # 추수감사절(11-26) 다음날 07:00 KST = 11-26 17:00 ET → 대상일은 11-25
+    assert inc.us_target_date(datetime(2026, 11, 26, 17, 0, tzinfo=et)).isoformat() == "2026-11-25"
+    # 노동절(09-07) 다음날 화 07:00 KST = 09-07 18:00 ET → 09-04(금)
+    assert inc.us_target_date(datetime(2026, 9, 7, 18, 0, tzinfo=timezone(timedelta(hours=-4)))).isoformat() == "2026-09-04"
+
+
+def test_formatter_header_shows_short_history_and_cap():
+    from src.us_screener.formatter import format_results
+    msg = format_results({}, datetime(2026, 9, 25, 7, 2), base_date="2026-09-24",
+                         stats={"processed": 2540, "skipped_no_base": 0, "skipped_short": 12,
+                                "min_cap": 1e9})
+    assert "2540종목 신호 계산 (미국 보통주 시총 $1B+)" in msg
+    assert "신규상장 12종목 이력 부족" in msg and "base_date 데이터 누락" not in msg

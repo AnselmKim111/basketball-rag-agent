@@ -12,6 +12,10 @@ import os
 from datetime import datetime
 
 
+# 메시지 섹션 순서 (앞 섹션이 종목 선점) — 차트/메타 대상 선정과 공유하는 단일 계약
+DISPLAY_ORDER = ("high_all", "high_52w", "vcp_breakout", "near_breakout_52w")
+
+
 def _per_category_top() -> int:
     try:
         return max(1, int(os.getenv("US_SCREENER_PER_CATEGORY_TOP", "80")))
@@ -136,7 +140,12 @@ def format_results(
     if stats:
         proc = stats.get("processed", 0)
         skipped_no_base = stats.get("skipped_no_base", 0)
-        line = f"✓ {proc}종목 신호 계산 (시총 $1B+)"
+        skipped_short = stats.get("skipped_short", 0)
+        cap_b = (stats.get("min_cap") or 1e9) / 1e9
+        cap_s = f"${cap_b:,.0f}B" if cap_b >= 1 else f"${cap_b * 1000:,.0f}M"
+        line = f"✓ {proc}종목 신호 계산 (미국 보통주 시총 {cap_s}+)"
+        if skipped_short > 0:
+            line += f" · 신규상장 {skipped_short}종목 이력 부족"
         if skipped_no_base > 0:
             line += f" · {skipped_no_base}종목 base_date 데이터 누락"
         parts.append(line)
@@ -150,6 +159,7 @@ def format_results(
 
     # 앞에 나온 종목은 뒷 섹션서 제외 (역사적 신고가 → 52주 신고가 순으로 dedup)
     seen: set = set()
+    # 섹션 순서는 DISPLAY_ORDER와 일치해야 함 (차트/메타 대상 선정 계약)
     parts.append(_format_section(results.get("high_all", []), "🚀", "역사적 신고가", links, extra, seen))
     parts.append(_format_section(results.get("high_52w", []), "📈", "52주 신고가", links, extra, seen))
     parts.append(_format_section(results.get("vcp_breakout", []), "💎", "VCP 돌파 (최근 1주 이내)", links, extra, seen))

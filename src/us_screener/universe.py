@@ -21,8 +21,10 @@ from src.us_screener import data_source, db
 log = logging.getLogger(__name__)
 KST = timezone(timedelta(hours=9))
 
-# Nasdaq 응답이 이보다 작으면 부분 응답으로 보고 폴백 + 비활성화 금지 (평소 ~2,550)
-MIN_SANE_UNIVERSE = 1500
+# Nasdaq 응답 정상성 기준 (미달이면 폴백 + 비활성화 금지)
+MIN_SANE_RAW_ROWS = 5000      # screener 원본 행 수 (평소 ~7,000)
+MIN_SANE_UNIVERSE = 1500      # 직전 활성 수가 이 이상일 때만 급감 비율 검사
+MAX_DAILY_SHRINK = 0.85       # 하루에 활성 종목이 15% 넘게 줄면 부분 응답으로 간주
 
 
 def _min_cap() -> float:
@@ -53,8 +55,18 @@ def refresh_universe() -> int:
     min_cap = _min_cap()
     members, gics = _index_members()
     nasdaq = data_source.fetch_nasdaq_universe(min_cap, always_include=set(members))
+    raw_n = data_source.nasdaq_screener_raw_count()
+    prev_active = len(db.get_active_tickers())
+    # 정상 판정: 원본 응답 규모(평소 ~7,000행) + 직전 활성 대비 급감 없음.
+    # 필터 후 개수만 보면 시총 기준을 올렸을 때 영구 폴백되거나, 부분 응답으로 수백 종목이
+    # 조용히 비활성화될 수 있다 (리뷰 지적).
+    sane = raw_n >= MIN_SANE_RAW_ROWS and (
+        prev_active < MIN_SANE_UNIVERSE or len(nasdaq) >= prev_active * MAX_DAILY_SHRINK)
+    if not sane and nasdaq:
+        log.warning("[us_universe] Nasdaq 응답 비정상 (raw=%d, 필터후=%d, 직전 활성=%d) — 폴백",
+                    raw_n, len(nasdaq), prev_active)
 
-    if len(nasdaq) >= MIN_SANE_UNIVERSE:
+    if sane:
         rows: list[tuple] = []
         secs: dict[str, str] = {}
         for it in nasdaq:
@@ -83,8 +95,8 @@ def refresh_universe() -> int:
         return len(rows)
 
     # ---- 폴백: S&P500 + NASDAQ100 (Nasdaq screener 실패/부분 응답)
-    log.warning("[us_universe] Nasdaq 유니버스 %d종목 (<%d) — S&P500+NASDAQ100 폴백, 비활성화 생략",
-                len(nasdaq), MIN_SANE_UNIVERSE)
+    log.warning("[us_universe] Nasdaq 유니버스 사용 불가(%d종목) — 기존 활성 유지 + S&P500+NASDAQ100 "
+                "보강, 비활성화 생략", len(nasdaq))
     if not members:
         log.error("[us_universe] ticker list 비어있음 — FDR/네트워크 점검")
         return 0
