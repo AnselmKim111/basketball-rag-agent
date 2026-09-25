@@ -437,11 +437,19 @@ def _screen_base_date(target_iso: str | None = None) -> str:
             or datetime.now(KST).strftime("%Y-%m-%d"))
 
 
+def _fallback_chart_url(ticker: str) -> str:
+    """채널 게시 못 한 종목(게시 실패·채널 미설정·상한 초과)의 차트 링크 — Yahoo 차트."""
+    from src.us_screener.data_source import _yahoo_symbol
+    return f"https://finance.yahoo.com/quote/{_yahoo_symbol(ticker)}/chart/"
+
+
 async def _post_charts_and_meta(results: dict, base_date: str | None = None,
-                                max_tickers: int = 120) -> tuple[dict, dict]:
+                                max_tickers: int | None = None) -> tuple[dict, dict]:
     """신호 티커별 (1) 채널 차트 게시 → permalink, (2) ytd·eps 메타 산출.
 
-    채널 토큰/ID 미설정이면 게시는 건너뛰고 메타(ytd·eps)만 계산(4열 포맷 enrich).
+    메시지의 모든 티커는 차트로 연결된다 (2026-09-25 사용자 지시 "기본이잖아"):
+    기본은 표시 종목 전부 채널 게시(상한 없음, US_SCREENER_CHART_MAX로만 제한),
+    게시 못 한 종목은 Yahoo 차트 링크로 폴백 — 링크 없는 티커 0.
     base_date: freshness 가드용 — 차트 데이터 마지막 거래일과 불일치 시 warning + ⚠️.
     반환: (links: {ticker: url}, extra: {ticker: {ytd, eps_yoy}}).
     """
@@ -461,7 +469,10 @@ async def _post_charts_and_meta(results: dict, base_date: str | None = None,
             t = it.get("ticker")
             if t in by_ticker and cat not in badges.setdefault(t, []):
                 badges[t].append(cat)
-    chart_max = int(os.getenv("US_SCREENER_CHART_MAX", str(max_tickers)) or max_tickers)
+    try:
+        chart_max = int(os.getenv("US_SCREENER_CHART_MAX", "") or max_tickers or len(by_ticker))
+    except ValueError:
+        chart_max = max_tickers or len(by_ticker)
 
     token = os.getenv("US_SCREENER_CHART_BOT_TOKEN", "").strip()
     channel = os.getenv("US_SCREENER_CHART_CHANNEL_ID", "").strip()
@@ -484,7 +495,7 @@ async def _post_charts_and_meta(results: dict, base_date: str | None = None,
     )
     posted = 0
     mcap_n = 0
-    for t, it in by_ticker.items():   # 메타(ytd·eps)는 표시 종목 전부, 채널 게시만 chart_max 상한
+    for t, it in by_ticker.items():   # 메타·게시 모두 표시 종목 전부 (chart_max는 env로만 제한)
         try:
             rows = await loop.run_in_executor(None, lambda t=t: db.load_ohlcv(t, days=260))
             ytd = fundamentals.ytd_pct(rows)
@@ -529,8 +540,11 @@ async def _post_charts_and_meta(results: dict, base_date: str | None = None,
                     await asyncio.sleep(3.0)  # 채널 ~20건/분 한도 → 게시 간 간격 (성공/실패 무관 페이싱)
         except Exception:
             log.exception("[us_screener] 티커 처리 실패 %s", t)
-    log.info("[us_screener] 채널 게시 %d건 · 메타 %d종목 (links=%d, 시총확보=%d)",
-             posted, len(extra), len(links), mcap_n)
+    fallback = [t for t in by_ticker if not links.get(t)]
+    for t in fallback:
+        links[t] = _fallback_chart_url(t)
+    log.info("[us_screener] 채널 게시 %d건 · 메타 %d종목 (links=%d/%d, 외부차트 폴백=%d, 시총확보=%d)",
+             posted, len(extra), len(links), len(by_ticker), len(fallback), mcap_n)
     return links, extra
 
 

@@ -140,5 +140,5 @@ def test_display_categories_include_new(fresh):
     import src.us_screener_bot as us_bot
     for cat in ("high_26w", "volume_surge"):
         assert cat in us_bot.DISPLAY_CATEGORIES
-    # KR은 미미 스타일(2026-09-23): 차트 게시 그룹 = 신고가 + 돌파직전만
-    assert kr_bot.CHART_DISPLAY_GROUPS == ("new_high", "near_breakout")
+    # KR 미미 스타일: 메시지에 찍히는 모든 그룹이 차트 게시 대상 (소형주 포함, 2026-09-25)
+    assert kr_bot.CHART_DISPLAY_GROUPS == ("new_high", "near_breakout", "new_high_small")

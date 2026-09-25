@@ -188,14 +188,19 @@ vs 통합 일봉 277,500). `data_source.apply_regular_session_override`가 fchar
   샘씨엔에스처럼 종가 미경신·고가 경신도 포함) ∪ 역사적 신고가(★). 업종별 한 줄, 종목 수
   많은 업종 먼저, `기타` 맨 뒤. 종목명은 차트 채널 게시물 링크.
 - **소형주 버킷**: 시총 필터(1000억) 미만은 `signals.new_high_only`로 신고가만 경량 판정
-  (`high_52w_small`) → 한 줄. 차트 게시 안 함. 끄기 `SCREENER_SMALL_NH=0`.
+  (`high_52w_small`) → 한 줄(최대 15). 끄기 `SCREENER_SMALL_NH=0`.
 - **돌파 직전**: near_breakout_52w에서 신고가 종목 제외, 1000억 이상만.
 - 6개월·VCP·수급·RS·추세전환은 계산·저장(백테스트·버터대디)만, 메시지 미표시.
   숫자 열·통계 헤더·시장폭 줄 없음. 기준일은 당일이 아닐 때만 표기. 운영노트는 맨 끝 1줄.
 - **업종**: `data_source.fetch_naver_industry` (Naver industryCode → 업종명, `NAVER_INDUSTRY_SHORT`
   로 축약) — 표시 종목만 조회, `tickers.sector_naver`에 캐시(`get_active_tickers`가 우선 사용).
   pykrx 업종지수 사망 대체. 미미의 수작업 테마(양자컴퓨팅 등)는 재현 불가.
-- `formatter.display_items()` = 메시지·차트 게시(`CHART_DISPLAY_GROUPS`) 단일 계약.
+- `formatter.display_items()` = 메시지 표시 계약, `formatter.shown_items()` = 실제 이름이 찍히는
+  종목('외 N' 제외) = 차트 게시 대상(`CHART_DISPLAY_GROUPS`, 소형주 포함).
+- **티커 클릭 → 차트는 기본 (2026-09-25 사용자 지시, KR·US 공통·절대 빼지 말 것)**: 메시지에 찍힌
+  모든 이름/티커가 링크. 채널 게시 상한 기본 없음(`SCREENER_CHART_MAX`/`US_SCREENER_CHART_MAX`로만
+  제한 — 검증 때도 설정 금지), 게시 실패·상한 초과·채널 미설정 종목은 외부 차트(KR Naver fchart /
+  US Yahoo chart)로 폴백. 로그 `links=N/N` 불일치면 회귀.
 - 검증제외가 0이 아니면 운영노트에 표시 — **두 자릿수면 데이터 드리프트 회귀 신호**.
 
 ### 알려진 환경 한계

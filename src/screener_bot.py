@@ -467,8 +467,14 @@ def _chart_caption(ticker: str, item: dict, cats: list[str], rows: list[dict], y
 # max_tickers cap 소모 — 실측 하루 ~94건 낭비. 섹션 추가 시 여기도 함께 갱신할 것.
 DISPLAY_CATEGORIES = ("near_breakout_52w", "high_all", "high_52w", "high_26w",
                       "vcp_breakout", "volume_surge", "rs_leaders")
-# 차트 게시 그룹 (formatter.display_items 키) — 소형주 버킷은 게시 안 함 (채널 flood 방지)
-CHART_DISPLAY_GROUPS = ("new_high", "near_breakout")
+# 차트 게시 그룹 (formatter.shown_items 키) — 메시지의 모든 이름이 차트 링크를 가진다
+# (2026-09-25 사용자 지시 "티커 클릭 시 차트 자동 연결은 기본"). 소형주 버킷 포함.
+CHART_DISPLAY_GROUPS = ("new_high", "near_breakout", "new_high_small")
+
+
+def _fallback_chart_url(ticker: str) -> str:
+    """채널 게시 못 한 종목(게시 실패·채널 미설정·상한 초과)의 차트 링크 — Naver 차트."""
+    return f"https://m.stock.naver.com/fchart/domestic/stock/{ticker}"
 
 
 async def _enrich_sectors_naver(results: dict) -> int:
@@ -508,18 +514,19 @@ async def _enrich_sectors_naver(results: dict) -> int:
 
 
 async def _post_charts_and_meta(results: dict, base_date: str,
-                                max_tickers: int = 120) -> tuple[dict, dict]:
+                                max_tickers: int | None = None) -> tuple[dict, dict]:
     """신호 종목별 (1) 채널 차트 게시 → permalink, (2) ytd·eps 메타 산출.
 
-    채널 토큰/ID 미설정이면 게시는 건너뛰고 메타(ytd·eps)만 계산(4열 enrich).
+    메시지에 찍히는 모든 이름이 차트로 연결된다: 기본은 전부 채널 게시(상한 없음,
+    SCREENER_CHART_MAX로만 제한), 게시 못 한 종목은 Naver 차트 링크로 폴백.
     반환: (links: {ticker: url}, extra: {ticker: {ytd, eps_yoy}}).
     """
     from src.screener import chart, db, formatter, fundamentals
 
     by_ticker: dict[str, dict] = {}
     badges: dict[str, list] = {}
-    # 표시 종목과 1:1 — 메시지에 안 나오는 종목(6개월·VCP·수급·RS·소형주)은 차트도 게시 안 함
-    for group, items in formatter.display_items(results).items():
+    # 표시 종목과 1:1 — 메시지에 안 나오는 종목(6개월·VCP·수급·RS·'외 N')은 차트도 게시 안 함
+    for group, items in formatter.shown_items(results).items():
         if group not in CHART_DISPLAY_GROUPS:
             continue
         for it in items:
@@ -532,7 +539,11 @@ async def _post_charts_and_meta(results: dict, base_date: str,
                     badges[t].append(cat)
             badges.setdefault(t, [])
 
-    tickers = list(by_ticker.keys())[:max_tickers]
+    tickers = list(by_ticker.keys())
+    try:
+        chart_max = int(os.getenv("SCREENER_CHART_MAX", "") or max_tickers or len(tickers))
+    except ValueError:
+        chart_max = max_tickers or len(tickers)
     # EPS YoY는 pykrx 일괄(2회) — 캐시 우선
     loop = asyncio.get_event_loop()
     eps_map = await loop.run_in_executor(
@@ -564,7 +575,7 @@ async def _post_charts_and_meta(results: dict, base_date: str,
             prior = await loop.run_in_executor(None, lambda k=dedupe_key: db.meta_get(k))
             if chart_bot and prior:
                 links[t] = prior
-            elif chart_bot and rows:
+            elif chart_bot and rows and posted < chart_max:
                 # freshness 가드 — cron 경로에선 절대 stale이 아니어야 정상 (뜨면 조기 경보)
                 data_date = rows[-1]["date"]
                 if data_date != base_date:
@@ -587,7 +598,11 @@ async def _post_charts_and_meta(results: dict, base_date: str,
                     await asyncio.sleep(3.0)  # 채널 ~20건/분 한도 → 게시 간 간격 (성공/실패 무관 페이싱)
         except Exception:
             log.exception("[screener] 종목 처리 실패 %s", t)
-    log.info("[screener] 채널 게시 %d건 · 메타 %d종목 (links=%d)", posted, len(extra), len(links))
+    fallback = [t for t in tickers if not links.get(t)]
+    for t in fallback:
+        links[t] = _fallback_chart_url(t)
+    log.info("[screener] 채널 게시 %d건 · 메타 %d종목 (links=%d/%d, 외부차트 폴백=%d)",
+             posted, len(extra), len(links), len(tickers), len(fallback))
     return links, extra
 
 

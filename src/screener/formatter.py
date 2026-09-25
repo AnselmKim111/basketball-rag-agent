@@ -132,17 +132,42 @@ def _name_disp(it: dict, links: dict) -> str:
     return f'<a href="{url}">{name}</a>' if url else name
 
 
-def _sector_lines(items: list[dict], links: dict, max_per_line: int = 12) -> list[str]:
-    """업종별 한 줄: '(반도체) 아스플로★, 엑시콘, ...'. 종목 수 많은 업종 먼저, 기타는 맨 뒤."""
-    if not items:
-        return ["해당 없음"]
+SECTOR_LINE_MAX = 12   # 업종 한 줄 최대 종목 수
+SMALL_SHOW_MAX = 15    # 소형주 버킷 최대 종목 수
+
+
+def _sector_groups(items: list[dict]) -> list[tuple[str, list[dict], int]]:
+    """[(업종, 표시 종목, 생략 수)] — 종목 수 많은 업종 먼저, 기타는 맨 뒤."""
     ordered = sorted(items, key=lambda it: -(it.get("chg_pct") or 0.0))
     groups = _group_by_sector(ordered)
     groups.sort(key=lambda g: (g[0] == "기타", -len(g[1])))
+    return [(sec, its[:SECTOR_LINE_MAX], max(0, len(its) - SECTOR_LINE_MAX)) for sec, its in groups]
+
+
+def _small_shown(small: list[dict]) -> list[dict]:
+    return sorted(small, key=lambda it: -(it.get("chg_pct") or 0.0))[:SMALL_SHOW_MAX]
+
+
+def shown_items(results: dict[str, list[dict]]) -> dict[str, list[dict]]:
+    """display_items 중 메시지에 실제 이름이 찍히는 종목만 ('외 N' 생략분 제외).
+
+    차트 게시 대상 = 이것과 1:1 — 메시지의 모든 이름이 차트 링크를 갖는다.
+    """
+    disp = display_items(results)
+    out = {}
+    for key in (DISPLAY_NEW_HIGH, DISPLAY_NEAR):
+        out[key] = [it for _, its, _ in _sector_groups(disp[key]) for it in its]
+    out[DISPLAY_SMALL] = _small_shown(disp[DISPLAY_SMALL])
+    return out
+
+
+def _sector_lines(items: list[dict], links: dict) -> list[str]:
+    """업종별 한 줄: '(반도체) 아스플로★, 엑시콘, ...'. 종목 수 많은 업종 먼저, 기타는 맨 뒤."""
+    if not items:
+        return ["해당 없음"]
     lines = []
-    for sec, its in groups:
-        names = [_name_disp(it, links) for it in its[:max_per_line]]
-        rest = len(its) - len(names)
+    for sec, its, rest in _sector_groups(items):
+        names = [_name_disp(it, links) for it in its]
         tail = f" 외 {rest}" if rest > 0 else ""
         lines.append(f"({sec}) {', '.join(names)}{tail}")
     return lines
@@ -196,8 +221,7 @@ def format_results(
     small = disp[DISPLAY_SMALL]
     if small:
         cap_label = _fmt_cap_short(smallcap_max())
-        names = [_name_disp(it, links)
-                 for it in sorted(small, key=lambda it: -(it.get("chg_pct") or 0.0))[:15]]
+        names = [_name_disp(it, links) for it in _small_shown(small)]
         rest = len(small) - len(names)
         parts.append(f"(소형주/{cap_label}↓) {', '.join(names)}{f' 외 {rest}' if rest > 0 else ''}")
     if any("high_all" in (it.get("cats") or []) for it in disp[DISPLAY_NEW_HIGH] + small):
