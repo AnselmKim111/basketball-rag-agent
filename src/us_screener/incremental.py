@@ -211,8 +211,26 @@ def update_specific_date(target_iso: str, force: bool = False) -> dict:
         log.info("[incremental] 재시도 패스: %d종목 중 %d 회수", len(missed), len(h2))
         missed = [t for t in targets if t not in hit]
 
+    # 무거래일 판정: 마지막 체결일이 대상일 이전 = 그날 거래 없음 (BIO.B·SENEB 같은 저유동
+    # 클래스주 실측). 데이터 누락이 아니므로 전일 종가 보합·거래량 0 봉을 기록 — 누락 집계에서
+    # 빼고, 신호에도 영향 없음(보합·무거래는 신고가·돌파 불가).
+    no_trade: list[str] = []
+    for t in missed[:200]:
+        ltd = data_source.last_trade_date(t)
+        if ltd and ltd < target_iso:
+            prev = db.load_ohlcv(t, days=1)
+            prev_close = prev[-1]["close"] if prev and prev[-1]["date"] < target_iso else None
+            if prev_close:
+                rows.append((t, target_iso, prev_close, prev_close, prev_close, prev_close, 0, None))
+                no_trade.append(t)
+    if no_trade:
+        hit |= set(no_trade)
+        missed = [t for t in missed if t not in set(no_trade)]
+        log.info("[incremental] %s 무거래 %d종목 (보합·거래량0 기록): %s", target_iso,
+                 len(no_trade), ", ".join(no_trade[:30]))
+
     coverage = {"target": len(targets), "hit": len(hit), "miss": len(missed),
-                "elapsed_s": round(time.monotonic() - t0, 1)}
+                "no_trade": len(no_trade), "elapsed_s": round(time.monotonic() - t0, 1)}
     stats = data_source.source_stats()
     log.info("[incremental] %s batch 완료: %s sources=%s", target_iso, coverage, stats)
     if missed:

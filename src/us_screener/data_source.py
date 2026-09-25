@@ -337,6 +337,24 @@ def _yahoo_session_bar(ticker: str, date_iso: str) -> Optional[tuple]:
     return r
 
 
+def last_trade_date(ticker: str) -> Optional[str]:
+    """Yahoo meta의 마지막 체결일 (거래소 현지 날짜). 실패 시 None."""
+    import requests
+    try:
+        resp = requests.get(
+            f"https://query2.finance.yahoo.com/v8/finance/chart/{_yahoo_symbol(ticker)}",
+            params={"range": "5d", "interval": "1d"}, timeout=15, headers=_HTTP_UA)
+        resp.raise_for_status()
+        meta = ((((resp.json().get("chart") or {}).get("result")) or [{}])[0] or {}).get("meta") or {}
+        mt = meta.get("regularMarketTime")
+        if not mt:
+            return None
+        return datetime.fromtimestamp(int(mt) + int(meta.get("gmtoffset") or 0),
+                                      tz=timezone.utc).strftime("%Y-%m-%d")
+    except Exception:
+        return None
+
+
 def fetch_ohlcv_by_ticker_via_yahoo(ticker: str, start_iso: str, end_iso: str) -> list[tuple]:
     return _yahoo_chart(ticker, start_iso, end_iso)[0]
 

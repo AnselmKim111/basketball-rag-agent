@@ -381,3 +381,21 @@ def test_formatter_header_shows_short_history_and_cap():
                                 "min_cap": 1e9})
     assert "2540종목 신호 계산 (미국 보통주 시총 $1B+)" in msg
     assert "신규상장 12종목 이력 부족" in msg and "base_date 데이터 누락" not in msg
+
+
+def test_no_trade_day_recorded_as_flat_bar(usdb, monkeypatch):
+    inc = importlib.import_module("src.us_screener.incremental")
+    usdb.upsert_tickers([("AAPL", "Apple", "S&P500", 1, "x", 3e12), ("SENEB", "Seneca", "US", 1, "x", 1.3e9)])
+    usdb.upsert_ohlcv_bulk([("SENEB", "2026-09-23", 18742, 18742, 18742, 18742, 406, None)])
+
+    def fake_chain(t, s, e, known_dates=None):
+        if t == "AAPL":
+            return [("AAPL", "2026-09-24", 1, 1, 1, 33592, 1, None)]
+        return [("SENEB", "2026-09-23", 18742, 18742, 18742, 18742, 406, None)]
+    monkeypatch.setattr(ds, "fetch_ohlcv_by_ticker_via_naver", fake_chain)
+    monkeypatch.setattr(ds, "last_trade_date", lambda t: "2026-09-23")
+    monkeypatch.setenv("US_SCREENER_RETRY_PASS_SLEEP_S", "0")
+    res = inc.update_specific_date("2026-09-24")
+    assert res["coverage"]["miss"] == 0 and res["coverage"]["no_trade"] == 1
+    bar = usdb.load_ohlcv("SENEB", days=1)[-1]
+    assert bar["date"] == "2026-09-24" and bar["close"] == 18742 and bar["volume"] == 0
