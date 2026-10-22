@@ -940,11 +940,16 @@ async def _run_pipeline(
     context: ContextTypes.DEFAULT_TYPE,
     user_text: str,
     parsed: dict | None = None,
+    *,
+    raise_outage: bool = False,
 ) -> None:
     """전체 어닝콜 분석 파이프라인. graceful — 외부 실패는 메시지로 알리고 계속.
 
     parsed: 이미 파싱된 입력 (watch 폴러가 LLM 가용성 확인 겸 1회 파싱해 구독자 공용으로
     넘김). None이면 여기서 파싱.
+    raise_outage: True(watch 경로)면 0단계 재파싱의 LLM 장애(401·402·429)를 안내 문구로 삼키지
+    않고 raise — _watch_fire_pipeline이 'llm_outage'로 판정해 seen 미마킹(다음 폴링 재시도).
+    기본(대화형)은 기존대로 장애 안내 후 종료.
     """
     bot: Bot = context.bot
     chat_id = str(update.effective_chat.id)
@@ -952,9 +957,17 @@ async def _run_pipeline(
     # Phase 9 — 메시지 1: 시작 알림 (한 줄)
     await _safe_reply(update, "📞 어닝콜 분석 시작 — 약 5-10분 소요 (결과는 한 번에 발송)")
 
-    # 0) 파싱
+    # 0) 파싱 — LLM 장애(401 키 무효·크레딧)를 '입력을 이해하지 못했습니다'로 오인 안내 금지
     if parsed is None:
-        parsed = await _step_parse(user_text)
+        from src import summarizer
+        try:
+            parsed = await _step_parse(user_text, raise_outage=True)
+        except summarizer.OpenRouterCreditExhausted as e:
+            if raise_outage:
+                raise
+            log.warning("[earnings] parse LLM 장애 — 분석 중단 (%s)", type(e).__name__)
+            await _safe_send(bot, chat_id, f"⚠️ {summarizer.llm_outage_label(e)} — 어닝 분석 불가")
+            return
     if parsed is None:
         await _safe_send(
             bot, chat_id,
@@ -2850,13 +2863,16 @@ async def _safe_send(bot: Bot, chat_id: str, text: str) -> None:
 #     미마킹 → 다음 폴링 재시도. 실행 중 중복 발사는 _WATCH_INFLIGHT(프로세스 메모리)로 차단.
 #   - pre-call 합성 실패는 precall 캐시 디렉토리에 실패 stamp — 같은 (ticker, 콜 날짜)는
 #     24h 내 재발사·재메시지 안 함 (이전: 4h 폴링마다 '자동 발사'+'합성 실패' 스팸).
+#     단 LLM 인증(401) 실패는 메모리 stamp만 — 키 교체 재배포 후 다음 폴링에서 즉시 재시도
+#     (볼륨 stamp가 남으면 D-2~D-1 윈도를 통째로 놓칠 수 있음).
 WATCH_OUTAGE_BACKOFF_DEFAULT_S = 6 * 3600
 PRECALL_FAIL_TTL_S = 24 * 3600
 
 _WATCH_INFLIGHT: set[str] = set()          # 풀 분석 진행 중인 seen_key
 _WATCH_TASKS: set[asyncio.Task] = set()    # 백그라운드 task 참조 유지 (GC 방지)
 _watch_outage_at: float | None = None      # 마지막 watch LLM 장애 시각 (재배포 시 초기화)
-# stamp 파일 기록 실패(읽기 전용 볼륨 등) 대비 메모리 사본: (TICKER, year, quarter, call_date) → 시각
+# 메모리 stamp: 파일 기록 실패(읽기 전용 볼륨 등) 대비 사본 + llm_auth 실패의 유일한 기록
+# (재배포 시 초기화). (TICKER, year, quarter, call_date) → 시각
 _PRECALL_FAIL_MEM: dict[tuple[str, int, int, str], float] = {}
 
 
@@ -2925,6 +2941,8 @@ def _precall_fail_recent(ticker: str, year: int, quarter: int, call_date: str = 
         return False
     if (data.get("call_date") or "") != call_date:
         return False  # 콜 일정 변경 — 새 날짜는 별도로 시도
+    if data.get("reason") == "llm_auth":
+        return False  # 인증 장애 stamp는 재배포(키 교체) 후 무효 — 구버전이 남긴 파일 방어
     try:
         return now - float(data.get("failed_at") or 0) < PRECALL_FAIL_TTL_S
     except (TypeError, ValueError):
@@ -2936,6 +2954,10 @@ def _precall_fail_mark(
 ) -> None:
     now = _now()
     _PRECALL_FAIL_MEM[(ticker.upper(), int(year), int(quarter), call_date)] = now
+    if reason == "llm_auth":
+        # 인증 장애는 메모리만 — 같은 프로세스에선 재발사 스팸 방지, 키 교체 재배포 후엔
+        # 즉시 재시도 (볼륨 stamp 금지: breaker·watch backoff와 같은 수명)
+        return
     try:
         _precall_fail_path(ticker, year, quarter).write_text(
             json.dumps(
@@ -3110,7 +3132,8 @@ async def _watch_fire_pre_call(
     """watch_poll에서 D-2~D-1 pre-call 자동 발사. precall 캐시 저장 + 발송 1회.
 
     LLM 장애(breaker/backoff) 중엔 조용히 skip. 합성 실패 시 실패 stamp — 같은
-    (ticker, 콜 날짜)는 24h 내 재발사·재메시지 안 함.
+    (ticker, 콜 날짜)는 24h 내 재발사·재메시지 안 함 (인증 장애는 메모리 stamp만 —
+    재배포 후 재시도).
     """
     from src.earnings import precall
     if precall.exists(ticker, year, quarter):
@@ -3130,8 +3153,9 @@ async def _watch_fire_pre_call(
     if not report:
         auth = _llm_auth_blocked()
         _precall_fail_mark(ticker, year, quarter, call_date, reason="llm_auth" if auth else "empty")
-        why = "LLM 인증 장애" if auth else "데이터 부족 가능"
-        await _safe_send(bot, chat_id, f"⚠️ {ticker} pre-call 합성 실패 — {why} (24시간 내 재시도 안 함)")
+        why = ("LLM 인증 장애 (키 교체·재배포 후 다음 폴링에서 재시도)" if auth
+               else "데이터 부족 가능 (24시간 내 재시도 안 함)")
+        await _safe_send(bot, chat_id, f"⚠️ {ticker} pre-call 합성 실패 — {why}")
         return
     await send_text_chunked(bot, chat_id, report)
     try:
@@ -3161,8 +3185,9 @@ async def _watch_fire_and_mark(
 ) -> None:
     """구독자별 풀 분석(동시) → 종료 후 seen 처리. LLM 장애로 끝났으면 미마킹 (다음 폴링 재시도).
 
-    장애 판정: 파이프라인이 OpenRouterCreditExhausted로 끝났거나 종료 시점 401 breaker 열림
-    (단계별 LLM 실패는 _run_pipeline이 삼키므로 breaker로 판별). 일반 실패는 기존대로 마킹.
+    장애 판정: 파이프라인이 OpenRouterCreditExhausted로 끝났거나(0단계 재파싱 장애 포함 —
+    raise_outage) 종료 시점 401 breaker 열림 (이후 단계별 LLM 실패는 _run_pipeline이 삼키므로
+    breaker로 판별). 일반 실패는 기존대로 마킹.
     """
     from src import state_store
     try:
@@ -3222,7 +3247,10 @@ async def _watch_fire_pipeline(
 
     user_text = f"{ticker} {fiscal_label}"
     try:
-        await _run_pipeline(_FakeUpdate(chat_id, user_text), _FakeContext(), user_text, parsed=parsed)
+        # raise_outage: 폴러 파싱이 None(일반 실패)이라 여기서 재파싱할 때 402/429를 삼키면 'ok'로
+        # 끝나 mark_seen → 그 분기 분석 영구 유실. 장애는 raise 받아 'llm_outage'로 미마킹.
+        await _run_pipeline(_FakeUpdate(chat_id, user_text), _FakeContext(), user_text,
+                            parsed=parsed, raise_outage=True)
     except summarizer.OpenRouterCreditExhausted:
         log.warning("[earnings_watch_poll] 풀 분석 LLM 장애 (%s %s)", ticker, fiscal_label)
         return "llm_outage"

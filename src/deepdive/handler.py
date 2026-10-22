@@ -439,8 +439,8 @@ async def _summarize_and_send(
                 max_tokens=1500,
                 context=f"deepdive {prompt_name}",
             )
-        except summarizer.OpenRouterCreditExhausted:
-            return "(요약 실패: OpenRouter 토큰 부족)"
+        except summarizer.OpenRouterCreditExhausted as e:
+            return summarizer.llm_outage_placeholder(e)  # 401이면 '키 무효' 안내
         except Exception as e:
             log.exception("chat_with_retry 호출 자체 실패")
             return f"(요약 실패: {type(e).__name__}: {str(e)[:200]})"

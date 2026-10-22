@@ -3,7 +3,9 @@
   - category_bots: OpenRouter 인증/크레딧 장애 배치는 placeholder로 발송·seen 처리하지 않음
   - disclosure_watcher: 발송 성공분만 seen, 실패분은 재시도 (상한 넘으면 포기)
   - earnings_bot watch: 파이프라인 종료 후 seen, LLM 장애면 미마킹 + 폴링 skip/backoff,
-    pre-call 합성 실패는 24h stamp로 재발사·스팸 방지
+    pre-call 합성 실패는 24h stamp로 재발사·스팸 방지 (인증 장애는 메모리 stamp만 —
+    키 교체 재배포 후 즉시 재시도). 폴러 파싱 None → _run_pipeline 재파싱 장애(402/429)도
+    'llm_outage'로 미마킹 (raise_outage)
 
 네트워크·실제 state 파일 미사용 (전부 mock / tmp_path).
 """
@@ -11,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import json
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 
@@ -252,7 +255,7 @@ def eb_env(monkeypatch, tmp_path, breaker):
         breaker=breaker, clock=1_000_000.0, store={}, call_offset=0,
         cal_calls=0, tr_calls=0, parse_calls=0, parse_exc=None,
         pipelines=[], pipeline_hook=None, synth_calls=0, synth_result=(None, None),
-        today=today,
+        today=today, pipeline_raise_outage=[], real_pipeline=eb._run_pipeline,
     )
     monkeypatch.setattr(eb, "_now", lambda: st.clock)
 
@@ -270,7 +273,8 @@ def eb_env(monkeypatch, tmp_path, breaker):
             raise st.parse_exc
         return {"mode": "tickers", "tickers": ["AAPL"]}
 
-    async def _pipeline(update, context, user_text, parsed=None):
+    async def _pipeline(update, context, user_text, parsed=None, *, raise_outage=False):
+        st.pipeline_raise_outage.append(raise_outage)
         st.pipelines.append((str(update.effective_chat.id), parsed, set(st.store.get("earnings_watch", []))))
         if st.pipeline_hook:
             st.pipeline_hook()
@@ -363,6 +367,81 @@ def test_watch_credit_exception_from_pipeline_leaves_unmarked(eb_env):
     assert eb_env.store.get("earnings_watch", []) == []
 
 
+def test_watch_fire_passes_raise_outage(eb_env):
+    """watch 경로는 _run_pipeline에 raise_outage=True — 재파싱 장애를 삼키지 않게."""
+    _poll(_FakeBot())
+    assert eb_env.pipeline_raise_outage == [True, True]
+
+
+@pytest.mark.parametrize("kind", ["credit402", "rate429", "auth401"])
+def test_watch_reparse_outage_unmarked_and_backoff(eb_env, monkeypatch, kind):
+    """폴러 파싱이 None(일반 실패) → _run_pipeline 재파싱이 402/429/401 → 'llm_outage'.
+
+    이전: _run_pipeline이 '⚠️ … 크레딧 부족 — 어닝 분석 불가'를 보내고 정상 반환 → 'ok' →
+    (402/429는 breaker 무관) mark_seen → 크레딧 충전 후에도 그 분기 분석 영구 유실.
+    """
+    sm = _sm()
+    exc = {
+        "credit402": lambda: sm.OpenRouterCreditExhausted("Error code: 402 - insufficient credits"),
+        "rate429": lambda: sm.OpenRouterCreditExhausted("Error code: 429 - rate limit"),
+        "auth401": lambda: _auth_error_cls()("401 User not found. (mock)"),
+    }[kind]
+    calls = {"poll": 0, "reparse": 0}
+
+    async def _parse(user_text, *, raise_outage=False):
+        if calls["poll"] == 0:
+            calls["poll"] += 1
+            return None  # 폴러 1회 파싱: 깨진 JSON 등 일반 실패
+        calls["reparse"] += 1
+        assert raise_outage, "_run_pipeline 재파싱도 raise_outage=True"
+        raise exc()
+
+    monkeypatch.setattr(eb, "_step_parse", _parse)
+    monkeypatch.setattr(eb, "_run_pipeline", eb_env.real_pipeline)
+    bot = _FakeBot()
+    _poll(bot)
+
+    assert calls["reparse"] == 2, "구독자 2명 각자 재파싱"
+    assert eb_env.store.get("earnings_watch", []) == [], "장애로 끝난 분기는 미마킹"
+    assert eb._watch_outage_at is not None, "watch 장애 기록 (backoff)"
+    assert eb._WATCH_INFLIGHT == set()
+    texts = [t for _, t in bot.sent]
+    assert not any("어닝 분석 불가" in t for t in texts), texts
+    assert not any("입력을 이해하지 못했습니다" in t for t in texts), texts
+
+    # backoff 중 폴링 skip → 경과·복구 후 재발사·마킹
+    tr_before = eb_env.tr_calls
+    _poll(bot)
+    assert eb_env.tr_calls == tr_before
+    eb_env.clock += eb.WATCH_OUTAGE_BACKOFF_DEFAULT_S + 1
+
+    async def _parse_ok(user_text, *, raise_outage=False):
+        return {"mode": "tickers", "tickers": ["AAPL"]}
+
+    monkeypatch.setattr(eb, "_step_parse", _parse_ok)
+    monkeypatch.setattr(eb, "_run_pipeline", _fake_pipeline_ok)
+    _poll(bot)
+    assert eb_env.store["earnings_watch"] == [eb_env.seen_key], "복구 후 재시도 → 마킹"
+
+
+async def _fake_pipeline_ok(update, context, user_text, parsed=None, *, raise_outage=False):
+    return None
+
+
+def test_watch_reparse_non_outage_failure_still_marks(eb_env, monkeypatch):
+    """재파싱도 일반 실패(None)면 기존대로 입력 안내 후 마킹 (장애 아님 — 무한 재시도 방지)."""
+    async def _parse(user_text, *, raise_outage=False):
+        return None
+
+    monkeypatch.setattr(eb, "_step_parse", _parse)
+    monkeypatch.setattr(eb, "_run_pipeline", eb_env.real_pipeline)
+    bot = _FakeBot()
+    _poll(bot)
+    assert eb_env.store["earnings_watch"] == [eb_env.seen_key]
+    assert eb._watch_outage_at is None
+    assert sum("입력을 이해하지 못했습니다" in t for _, t in bot.sent) == 2
+
+
 def test_watch_non_auth_pipeline_error_still_marks(eb_env):
     def _raise():
         raise ValueError("boom")
@@ -420,6 +499,72 @@ def test_precall_stamp_keyed_by_call_date_and_persisted(eb_env):
     assert eb._precall_fail_recent("AAPL", 2026, 4, "2026-10-24")
     eb_env.clock += eb.PRECALL_FAIL_TTL_S + 1
     assert not eb._precall_fail_recent("AAPL", 2026, 4, "2026-10-24")
+
+
+def test_precall_auth_stamp_memory_only(eb_env):
+    """401 실패 stamp는 볼륨에 남기지 않음 — 같은 프로세스에선 억제, 재배포 후엔 재시도."""
+    eb._precall_fail_mark("AAPL", 2026, 4, "2026-10-24", reason="llm_auth")
+    assert not eb._precall_fail_path("AAPL", 2026, 4).exists(), "llm_auth는 .fail.json 금지"
+    assert eb._precall_fail_recent("AAPL", 2026, 4, "2026-10-24"), "프로세스 내 재발사 억제"
+    eb._PRECALL_FAIL_MEM.clear()  # 키 교체 재배포 (메모리 초기화)
+    assert not eb._precall_fail_recent("AAPL", 2026, 4, "2026-10-24")
+
+
+def test_precall_legacy_auth_file_stamp_ignored(eb_env):
+    """구버전이 볼륨에 남긴 reason=llm_auth 파일 stamp는 무시 (empty는 유지)."""
+    path = eb._precall_fail_path("AAPL", 2026, 4)
+    stamp = {"ticker": "AAPL", "year": 2026, "quarter": 4, "call_date": "2026-10-24",
+             "failed_at": eb_env.clock, "reason": "llm_auth"}
+    path.write_text(json.dumps(stamp), encoding="utf-8")
+    assert not eb._precall_fail_recent("AAPL", 2026, 4, "2026-10-24")
+    path.write_text(json.dumps({**stamp, "reason": "empty"}), encoding="utf-8")
+    assert eb._precall_fail_recent("AAPL", 2026, 4, "2026-10-24")
+
+
+def test_precall_auth_failure_retries_after_redeploy(eb_env, monkeypatch):
+    """D-2 pre-call 중 401 → 메시지는 '재배포 후 재시도', 볼륨 stamp 없음.
+    breaker 쿨다운 후 같은 프로세스 폴링은 재발사 안 함(스팸 방지), 재배포 후 폴링은 재발사."""
+    eb_env.call_offset = 2
+
+    async def _synth_401(ticker, year, quarter, fiscal_label):
+        eb_env.synth_calls += 1
+        eb_env.breaker.open = True  # 합성 중 401 → breaker 열림, 리포트 없음
+        return None, None
+    monkeypatch.setattr(eb, "_step_synthesize_pre_call", _synth_401)
+    bot = _FakeBot()
+    _poll(bot)
+    assert eb_env.synth_calls == 2
+    fails = [t for _, t in bot.sent if "pre-call 합성 실패" in t]
+    assert len(fails) == 2 and all("재배포" in t and "24시간" not in t for t in fails)
+    call_date = eb_env.today + timedelta(days=2)
+    y, q = call_date.year, (call_date.month - 1) // 3 + 1
+    assert not eb._precall_fail_path("AAPL", y, q).exists()
+
+    eb_env.breaker.open = False  # breaker 쿨다운(15분) 만료, 키는 그대로
+    eb_env.clock += 4 * 3600
+    first = list(bot.sent)
+    _poll(bot)
+    assert eb_env.synth_calls == 2 and bot.sent == first, "같은 프로세스 — 4h 폴링 재발사·스팸 금지"
+
+    # 키 교체 재배포: 메모리 상태 전부 초기화
+    eb._PRECALL_FAIL_MEM.clear()
+    monkeypatch.setattr(eb, "_watch_outage_at", None)
+    monkeypatch.setattr(eb, "_step_synthesize_pre_call", _synth_ok(eb_env))
+    sent_texts = []
+
+    async def _chunked(bot_, chat_id, text, **kw):
+        sent_texts.append(text)
+    monkeypatch.setattr(eb, "send_text_chunked", _chunked)
+    eb_env.clock += 4 * 3600
+    _poll(bot)
+    assert eb_env.synth_calls >= 3 and "pre-call 본문" in sent_texts, "재배포 후 다음 폴링에서 재시도"
+
+
+def _synth_ok(st):
+    async def _synth(ticker, year, quarter, fiscal_label):
+        st.synth_calls += 1
+        return "pre-call 본문", None
+    return _synth
 
 
 def test_step_parse_raise_outage_flag(monkeypatch):

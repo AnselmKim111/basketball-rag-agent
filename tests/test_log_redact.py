@@ -10,6 +10,7 @@ import asyncio
 import hashlib
 import io
 import logging
+import re
 import sys
 from pathlib import Path
 
@@ -168,8 +169,140 @@ def test_redact_never_raises(monkeypatch):
     def boom():
         raise RuntimeError("x")
 
+    monkeypatch.setattr(log_redact, "_ENV_FAILURE_REPORTED", False)
     monkeypatch.setattr(log_redact, "_env_pattern", boom)
     assert redact("plain text") == "plain text"
+
+
+# ------------------------------------------------------------------
+# fail-open 회귀 (SEC-2): env 단계 실패가 패턴 단계를 끄면 안 됨 / 패턴 실패는 fail closed
+# ------------------------------------------------------------------
+_LEAKY_LINE = (
+    f"The token `{FAKE_BOT_TOKEN}` was rejected by the server. "
+    "GET https://x.io/q?apikey=FAKEKEY123456&s=1"
+)
+_ENV_FAIL_NOTICE = "[log_redact] env 마스킹 빌드 실패"
+
+
+def _assert_line_masked(out: str) -> None:
+    assert FAKE_BOT_TOKEN.split(":")[1] not in out, out
+    assert "FAKEKEY123456" not in out, out
+    assert "apikey=‹REDACTED›" in out
+
+
+def test_env_stage_failure_keeps_pattern_masking(monkeypatch, capsys):
+    """_env_pattern이 터져도 토큰·apikey 패턴 마스킹은 그대로, stderr 통지는 1회·값 없음."""
+    monkeypatch.setattr(log_redact, "_ENV_FAILURE_REPORTED", False)
+
+    def boom():
+        raise RuntimeError("SHOULD_NOT_PRINT_detail")
+
+    monkeypatch.setattr(log_redact, "_env_pattern", boom)
+    for _ in range(3):
+        out = redact(_LEAKY_LINE)
+        _assert_line_masked(out)
+        assert "7123456789:‹REDACTED›" in out
+    err = capsys.readouterr().err
+    assert err.count(_ENV_FAIL_NOTICE) == 1
+    assert "RuntimeError" in err
+    assert "SHOULD_NOT_PRINT_detail" not in err
+
+
+def test_surrogate_env_value_does_not_disable_masking(fake_env, monkeypatch, capsys):
+    """비-UTF-8 바이트 env 값(surrogateescape 디코드) 1개가 전체 env 마스킹을 끄면 안 됨."""
+    from urllib.parse import quote
+    monkeypatch.setattr(log_redact, "_ENV_FAILURE_REPORTED", False)
+    bad = "abc\udcffdefghij"  # os.environb b"abc\xffdefghij" 와 동일
+    monkeypatch.setenv("SOME_LEGACY_SECRET", bad)
+    with pytest.raises(UnicodeEncodeError):
+        quote(bad, safe="")  # 수정 전 경로 — strict 인코딩은 터진다
+    out = redact(_LEAKY_LINE)
+    _assert_line_masked(out)
+    assert "‹SCREENER_BOT_TOKEN›" in out  # env 단계도 살아 있음
+    # 값 자체 + 원래 바이트 기준 URL 인코딩 형태 둘 다 마스킹
+    assert redact(f"v={bad}") == "v=‹SOME_LEGACY_SECRET›"
+    assert redact("q=abc%FFdefghij") == "q=‹SOME_LEGACY_SECRET›"
+    dart = fake_env["DART_API_KEY"]
+    assert redact(f"k {dart}") == "k ‹DART_API_KEY›"
+    assert _ENV_FAIL_NOTICE not in capsys.readouterr().err
+
+
+def test_surrogate_env_value_logging_end_to_end(fake_env, root_capture, monkeypatch):
+    """원 재현: 깨진 env 값이 있어도 install_redaction 경로 로그에 토큰·apikey 원문 없음."""
+    buf, _ = root_capture
+    monkeypatch.setenv("SOME_LEGACY_SECRET", "abc\udcffdefghij")
+    install_redaction()
+    logging.getLogger("t.sec2").error("%s", _LEAKY_LINE)
+    out = buf.getvalue()
+    _assert_line_masked(out)
+    _assert_no_secret(out, fake_env)
+
+
+def test_env_build_failure_cached_and_reported_once(fake_env, monkeypatch, capsys):
+    """빌드 실패는 같은 env 스냅샷에서 1회만 시도 (매 로그 라인 재빌드 금지), 통지는 1회."""
+    monkeypatch.setattr(log_redact, "_ENV_FAILURE_REPORTED", False)
+    monkeypatch.setattr(log_redact, "_ENV_CACHE", (None, None, {}))
+    calls = []
+
+    def broken_items():
+        calls.append(1)
+        raise ValueError("SHOULD_NOT_PRINT_value")
+
+    monkeypatch.setattr(log_redact, "_secret_env_items", broken_items)
+    for _ in range(5):
+        _assert_line_masked(redact(_LEAKY_LINE))
+    assert len(calls) == 1
+    assert log_redact._env_pattern() == (None, {})
+    assert len(calls) == 1
+    # env가 바뀌면 재시도 (복구 기회), 통지는 여전히 프로세스당 1회
+    monkeypatch.setenv("SEC2_CHANGE_MARKER", "1")
+    _assert_line_masked(redact(_LEAKY_LINE))
+    assert len(calls) == 2
+    err = capsys.readouterr().err
+    assert err.count(_ENV_FAIL_NOTICE) == 1
+    assert "ValueError" in err and "SHOULD_NOT_PRINT_value" not in err
+
+
+def test_value_variant_failure_keeps_raw_value(fake_env, monkeypatch, capsys):
+    """URL 인코딩 변형 생성이 실패한 값도 원문 일치 마스킹은 유지, 다른 값도 영향 없음."""
+    monkeypatch.setattr(log_redact, "_ENV_FAILURE_REPORTED", False)
+    monkeypatch.setattr(log_redact, "_ENV_CACHE", (None, None, {}))
+
+    def bad_quote(*a, **kw):
+        raise TypeError("quote broken")
+
+    monkeypatch.setattr(log_redact, "quote", bad_quote)
+    assert log_redact._value_variants("abcdefghijk") == ("abcdefghijk",)
+    pw = fake_env["WISEREPORT_PW"]
+    out = redact(f"pw={pw} dart={fake_env['DART_API_KEY']}")
+    assert out == "pw=‹WISEREPORT_PW› dart=‹DART_API_KEY›"
+    assert _ENV_FAIL_NOTICE not in capsys.readouterr().err
+
+
+def test_pattern_stage_failure_fails_closed(fake_env, monkeypatch):
+    """패턴 단계 예외 시 원문(비밀값 포함 가능) 대신 placeholder."""
+    def boom(m):
+        raise RuntimeError("pattern bug")
+
+    monkeypatch.setattr(log_redact, "_PATTERNS", [
+        *log_redact._PATTERNS[:1], (re.compile(r"apikey"), boom),
+    ])
+    line = f"{_LEAKY_LINE} pw={fake_env['WISEREPORT_PW']}"
+    assert redact(line) == "‹redaction-error›"
+    # 패턴에 안 걸리는 줄은 정상 처리 (예외 경로 아님)
+    assert redact("plain text") == "plain text"
+    # formatter 경로도 동일 — 원문이 handler로 새지 않음
+    rec = logging.LogRecord("n", logging.ERROR, __file__, 1, "%s", (line,), None)
+    assert RedactingFormatter("%(message)s").format(rec) == "‹redaction-error›"
+
+
+def test_redact_guard_failure_fails_closed():
+    """str 서브클래스의 길이 판정이 터져도 raise·원문 반환 없이 placeholder."""
+    class Weird(str):
+        def __len__(self):
+            raise RuntimeError("len broken")
+
+    assert redact(Weird(FAKE_BOT_TOKEN)) == "‹redaction-error›"
 
 
 def test_env_cache_refreshes_on_change(monkeypatch):
@@ -312,9 +445,8 @@ def test_diag_env_keys_masks_everything_but_allowlist(fake_env):
     assert only_open["OPENROUTER_MANAGEMENT_KEY"] == (
         f"<set len={len(mgmt)} fp={fingerprint(mgmt)}>"
     )
-    # 짧은 값은 fp 생략 (전수 대입 방지)
-    pw = fake_env["WISEREPORT_PW"]
-    assert diag["WISEREPORT_PW"] == f"<set len={len(pw)}>"
+    # 비밀번호류는 길이·fp 모두 생략 (사전 대입 확인 방지)
+    assert diag["WISEREPORT_PW"] == "<set>"
     # allowlist는 원문
     for k, v in PLAIN_VALUES.items():
         assert diag[k] == v

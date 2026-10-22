@@ -36,6 +36,7 @@ from src.summarizer import (
     OpenRouterCreditExhausted,
     chat_with_retry,
     get_client,
+    llm_outage_label,
 )
 
 log = logging.getLogger(__name__)
@@ -290,8 +291,9 @@ async def _collect_web(name: str, ticker: str) -> WebData:
             out.text = text.strip()
         else:
             out.error = "웹 리서치 응답 비어있음"
-    except OpenRouterCreditExhausted:
-        out.error = "OpenRouter 크레딧 부족"
+    except OpenRouterCreditExhausted as e:
+        # 401(키 무효)이면 '키 교체' 안내 — '모든 데이터 축 실패' 메시지로 사용자에게 노출됨
+        out.error = llm_outage_label(e)
     except Exception as e:
         out.error = f"웹 리서치 예외: {type(e).__name__}: {str(e)[:120]}"
         log.exception("deep_research web 실패")

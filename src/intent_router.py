@@ -21,7 +21,12 @@ import re
 from dataclasses import dataclass, field
 from typing import Optional
 
-from src.summarizer import OpenRouterCreditExhausted, chat_with_retry, get_client
+from src.summarizer import (
+    OpenRouterCreditExhausted,
+    chat_with_retry,
+    get_client,
+    llm_outage_label,
+)
 
 log = logging.getLogger(__name__)
 
@@ -148,8 +153,9 @@ async def classify(text: str) -> Intent:
                 validate_schema=_intent_schema(),  # Layer B+C — schema 검증 + JSON 강제
             ),
         )
-    except OpenRouterCreditExhausted:
-        return Intent(intent="unknown", clarification="OpenRouter 크레딧 부족 — 명시 명령 사용")
+    except OpenRouterCreditExhausted as e:
+        # 401(키 무효)은 '크레딧 부족'이 아니라 키 교체 안내
+        return Intent(intent="unknown", clarification=f"{llm_outage_label(e)} — 명시 명령 사용")
     except Exception:
         log.exception("intent_router LLM 호출 실패")
         return Intent(intent="unknown", clarification="라우터 LLM 호출 실패 — 명시 명령 사용")

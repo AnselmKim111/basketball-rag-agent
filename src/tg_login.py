@@ -16,8 +16,13 @@ Claude Code 컨테이너는 TLS 재종단 프록시라 MTProto 접속 불가, �
     `TG_LOGIN_PASSWORD` 삭제(전화번호는 성공 시에만) + 상태파일 삭제. 상태파일의 session은
     로그인 성공 시 그대로 인가되는 auth key라 남기면 안 된다. 예외: 코드를 보내고 기다리는 중.
   - Railway 변경은 이 서비스(`RAILWAY_SERVICE_ID`)에만 — 개인 계정 세션을 다른 서비스로 퍼뜨리지 않음.
-  - Railway API 불가(토큰 폐기 등)면 로그인 흐름 자체를 시작하지 않음 (사용자 폰에 코드 안 보냄)
-    → PC에서 `scripts/make_tg_session.py`(대화형).
+  - Railway API 불가면 로그인 흐름 자체를 시작하지 않음 (사용자 폰에 코드 안 보냄)
+    → PC에서 `scripts/make_tg_session.py`(대화형). "불가" = 토큰·서비스 id 없음 **또는** 토큰
+    인증 probe 'invalid'(`railway_env.probe()` — 폐기된 토큰이 Variables에 남은 경우).
+    probe 'unknown'(네트워크 예외·5xx·429 — 일시 장애)도 시작하지 않지만, 무효로 단정해 env
+    수동 삭제를 시키지 않고 "재배포로 재시도"만 안내 (env·상태파일 그대로 → 다음 부팅에 이어감).
+  - Railway env 삭제가 실패하면(토큰 폐기 등) 종료 메시지에 남은 env 이름을 붙여 수동 삭제
+    안내 (값은 절대 미포함) — 비밀번호가 유출된 저장소에 조용히 남지 않게.
 
 운영 절차 (Claude가 Railway API로 수행, 사용자는 코드 전달만):
   1) `TG_LOGIN_PHONE=+8210…` upsert → 재배포 → 컨테이너가 코드 요청
@@ -54,8 +59,17 @@ CLIENT_DEVICE_KWARGS = {
     "app_version": "IdeaBot channel_relay",
 }
 
-RAILWAY_UNAVAILABLE_MSG = ("⚠ Railway 토큰 없음 — 세션 생성은 PC에서 "
+RAILWAY_UNAVAILABLE_MSG = ("⚠ Railway 토큰 없음/무효 — 세션 생성은 PC에서 "
                            "scripts/make_tg_session.py(대화형)로 하세요")
+# probe 'unknown' (일시 장애) — 수동 삭제 안내 없음 (재배포하면 같은 env로 이어서 진행)
+RAILWAY_TRANSIENT_MSG = "⚠ Railway API 일시 장애 — 로그인 흐름 보류, 재배포로 재시도"
+
+
+def _manual_note(names: list[str] | tuple[str, ...]) -> str:
+    """삭제 못 한 env 수동 삭제 안내 — 이름만 (값 절대 미포함). 없으면 빈 문자열."""
+    if not names:
+        return ""
+    return f" ⚠ Railway Variables에서 직접 삭제 필요: {', '.join(names)}"
 
 
 def _state_path() -> Path:
@@ -109,16 +123,30 @@ def _own_service_ids() -> list[str] | None:
     return [sid] if sid else None
 
 
-def _railway_ready() -> bool:
-    """Railway API 쓰기 가능 + 자기 서비스 id 확인. False면 로그인 흐름을 시작하지 않는다."""
+def _railway_state() -> str:
+    """Railway API 쓰기 가능 여부 — 'ok' | 'invalid' | 'unknown' (railway_env.probe와 같은 값).
+
+    invalid: 자기 서비스 id·토큰 설정 없음(네트워크 호출 없음) 또는 토큰 폐기·다른 프로젝트.
+    unknown: probe 일시 장애(네트워크 예외·5xx·429·JSON 아님) 또는 확인 중 예외.
+    available()은 설정 존재만 보므로 폐기된 토큰도 통과 → probe()로 실제 인증 확인
+    (확정 판정만 프로세스 캐시 — unknown은 다음 호출에서 재확인).
+    """
     if _own_service_ids() is None:
-        return False
+        return "invalid"
     try:
         from src.model_router import railway_env
-        return bool(railway_env.available())
+        if not railway_env.available():
+            return "invalid"
+        state = railway_env.probe()
     except Exception:
         log.exception("[tg_login] railway_env 확인 실패")
-        return False
+        return "unknown"
+    return state if state in ("ok", "invalid", "unknown") else "unknown"
+
+
+def _railway_ready() -> bool:
+    """Railway API 쓰기 가능 + 자기 서비스 id 확인 (probe 'ok'). False면 env 변경을 시도하지 않는다."""
+    return _railway_state() == "ok"
 
 
 def _supports_service_ids(fn) -> bool:
@@ -148,25 +176,30 @@ def _railway_call(fn, *args, allow_fan_out: bool) -> tuple[bool, str]:
 
 
 def _cleanup_env_vars(names: tuple[str, ...]) -> list[str]:
-    """Railway(이 서비스)에서 env 삭제 → 성공한 것만 os.environ에서도 제거. 삭제된 이름 반환."""
+    """Railway(이 서비스)에서 env 삭제 → 성공한 것만 os.environ에서도 제거.
+
+    삭제 *못 한* 이름 반환 (호출부가 _manual_note로 수동 삭제 안내 — 이름만).
+    """
     present = [n for n in names if os.environ.get(n)]
     if not present:
         return []
     if not _railway_ready():
         log.warning("[tg_login] Railway API 불가 — env 수동 삭제 필요: %s", present)
-        return []
+        return present
     from src.model_router import railway_env
-    deleted: list[str] = []
+    failed: list[str] = []
     for n in present:
         try:
             ok, msg = _railway_call(railway_env.delete_variable, n, allow_fan_out=True)
         except Exception as e:
             ok, msg = False, type(e).__name__
-        log.info("[tg_login] env %s 삭제: %s", n, msg)
         if ok:
+            log.info("[tg_login] env %s 삭제: %s", n, msg)
             os.environ.pop(n, None)
-            deleted.append(n)
-    return deleted
+        else:
+            log.warning("[tg_login] env %s 삭제 실패 — Railway에서 수동 삭제 필요: %s", n, msg)
+            failed.append(n)
+    return failed
 
 
 def _upsert_session(session_str: str) -> tuple[bool, str]:
@@ -185,10 +218,11 @@ def _unlink_state(path: Path) -> None:
         log.warning("[tg_login] 상태파일 삭제 실패: %s", path)
 
 
-def _finish(path: Path, names: tuple[str, ...]) -> None:
-    """종료 경로 공통 정리 — 비밀 env 삭제 + 상태파일(auth key) 삭제."""
-    _cleanup_env_vars(names)
+def _finish(path: Path, names: tuple[str, ...]) -> list[str]:
+    """종료 경로 공통 정리 — 비밀 env 삭제 + 상태파일(auth key) 삭제. 삭제 못 한 env 이름 반환."""
+    failed = _cleanup_env_vars(names)
     _unlink_state(path)
+    return failed
 
 
 # ------------------------------------------------------------------
@@ -280,20 +314,41 @@ async def run_boot_login(notify: Notify | None = None) -> str:
     if action == "cleanup":
         leftovers = [n for n in LOGIN_ENVS if os.environ.get(n)]
         _unlink_state(path)
-        if leftovers and not _railway_ready():
+        railway = _railway_state() if leftovers else "ok"
+        if railway == "unknown":
+            # 세션은 이미 있으므로 잔여 env 수동 삭제는 부작용 없음 — 단 "무효"로 단정하지 않음
+            log.warning("[tg_login] Railway API 일시 장애 — 잔여 env 정리 보류: %s", leftovers)
+            await say(f"⚠ Railway API 일시 장애 — 남은 env({', '.join(leftovers)}) 정리 보류, "
+                      "재배포로 재시도 (급하면 Railway Variables에서 직접 삭제)")
+            return action
+        if railway != "ok":
             log.warning("[tg_login] Railway API 불가 — 잔여 env 수동 삭제 필요: %s", leftovers)
-            await say(f"⚠ Railway 토큰 없음 — 남은 env({', '.join(leftovers)})는 "
+            await say(f"⚠ Railway 토큰 없음/무효 — 남은 env({', '.join(leftovers)})는 "
                       "Railway Variables에서 직접 삭제하세요")
             return action
-        _cleanup_env_vars(LOGIN_ENVS)
+        failed = _cleanup_env_vars(LOGIN_ENVS)
+        if failed:
+            await say("🧹 텔레그램 세션은 있으나 잔여 로그인 env의 Railway 삭제 실패."
+                      + _manual_note(failed))
         return action
 
     # 이하(send_code/wait/sign_in)는 결과 세션을 Railway에 넣어야 끝나는 흐름 — API 불가면
     # 시작하지 않는다 (사용자 폰에 쓸모없는 코드 요청 금지).
-    if not _railway_ready():
-        log.warning("[tg_login] Railway API 불가(토큰/서비스 id 없음) — 로그인 흐름 생략 "
+    railway = _railway_state()
+    if railway == "unknown":
+        # 일시 장애 — 토큰이 무효라고 단정하지 않는다: env·상태파일은 그대로 두고(재배포 시 같은
+        # 단계부터 재개) 수동 삭제 안내도 하지 않음.
+        log.warning("[tg_login] Railway API 일시 장애(토큰 확인 불가) — 로그인 흐름 보류 "
                     "(action=%s)", action)
-        await say(RAILWAY_UNAVAILABLE_MSG)
+        await say(RAILWAY_TRANSIENT_MSG)
+        return "railway_unknown"
+    if railway != "ok":
+        log.warning("[tg_login] Railway API 불가(토큰 없음/무효·서비스 id 없음) — 로그인 흐름 생략 "
+                    "(action=%s)", action)
+        # 컨테이너 흐름은 못 끝나므로 남은 TG_LOGIN_*는 사용자가 지워야 한다 (안 지우면 재배포마다
+        # 이 알림 반복, 토큰 복구 시 의도치 않은 코드 발송). 이름만.
+        left = [n for n in LOGIN_ENVS if os.environ.get(n)]
+        await say(RAILWAY_UNAVAILABLE_MSG + _manual_note(left))
         return "railway_unavailable"
     if action == "wait":
         log.info("[tg_login] 코드 대기 중 — TG_LOGIN_CODE upsert 필요")
@@ -308,13 +363,14 @@ async def run_boot_login(notify: Notify | None = None) -> str:
             await _send_code(phone, api_id, api_hash, path)
         except Exception as e:
             log.exception("[tg_login] send_code 실패")
-            _finish(path, SECRET_LOGIN_ENVS)
-            await say(f"❌ 텔레그램 로그인 코드 요청 실패: {type(e).__name__}: {str(e)[:200]}")
+            left = _finish(path, SECRET_LOGIN_ENVS)
+            await say(f"❌ 텔레그램 로그인 코드 요청 실패: {type(e).__name__}: {str(e)[:200]}"
+                      + _manual_note(left))
             return "send_code_failed"
         # 이전 시도의 코드가 env에 남아 있으면 다음 부팅에 새 hash로 오입력됨 → 삭제
-        _cleanup_env_vars(("TG_LOGIN_CODE",))
+        left = _cleanup_env_vars(("TG_LOGIN_CODE",))
         await say("📨 텔레그램 로그인 코드를 보냈습니다. 앱에 온 코드를 Claude에게 전달하세요 "
-                  "(Claude가 TG_LOGIN_CODE로 반영 → 자동 로그인).")
+                  "(Claude가 TG_LOGIN_CODE로 반영 → 자동 로그인)." + _manual_note(left))
         return action
 
     # sign_in
@@ -326,7 +382,7 @@ async def run_boot_login(notify: Notify | None = None) -> str:
         name = type(e).__name__
         log.warning("[tg_login] sign_in 실패: %s: %s", name, str(e)[:200])
         # 어떤 실패든 이번 코드·비밀번호·상태파일(auth key)은 폐기
-        _finish(path, SECRET_LOGIN_ENVS)
+        note = _manual_note(_finish(path, SECRET_LOGIN_ENVS))
         if "Expired" in name:
             # 코드 만료 → 즉시 새 코드 요청 (새 상태파일 = 다음 코드 대기)
             try:
@@ -334,38 +390,39 @@ async def run_boot_login(notify: Notify | None = None) -> str:
             except Exception:
                 log.exception("[tg_login] 재요청 실패")
                 _unlink_state(path)
-                await say("❌ 코드 만료 후 재요청 실패 — TG_LOGIN_PHONE 재설정 필요")
+                await say("❌ 코드 만료 후 재요청 실패 — TG_LOGIN_PHONE 재설정 필요" + note)
                 return "code_expired"
             await say("⌛ 코드 만료 → 새 코드를 다시 보냈습니다. 새 코드를 전달하세요"
-                      " (2단계 비밀번호 계정이면 TG_LOGIN_PASSWORD도 함께).")
+                      " (2단계 비밀번호 계정이면 TG_LOGIN_PASSWORD도 함께)." + note)
             return "code_expired_resent"
         if "PasswordNeeded" in name:
             await say("🔐 2단계 비밀번호가 필요합니다 — TG_LOGIN_PASSWORD 설정 필요 (Claude에게 전달). "
-                      "이번 코드는 폐기됨 → 재배포 시 새 코드 요청.")
+                      "이번 코드는 폐기됨 → 재배포 시 새 코드 요청." + note)
             return "password_needed"
         if "Password" in name:
             # PasswordHashInvalidError 등 — 비밀번호를 줬는데 틀림
             await say("🔐 2단계 비밀번호가 틀렸습니다 — 올바른 TG_LOGIN_PASSWORD로 다시 설정하세요. "
-                      "이번 코드는 폐기됨 → 재배포 시 새 코드 요청.")
+                      "이번 코드는 폐기됨 → 재배포 시 새 코드 요청." + note)
             return "password_wrong"
         await say(f"❌ 코드 로그인 실패({name}) — 이번 코드는 폐기됨 → 재배포 시 새 코드 요청 "
-                  "(TG_LOGIN_PHONE 유지).")
+                  "(TG_LOGIN_PHONE 유지)." + note)
         return "sign_in_failed"
 
     # 삭제(재배포 없음) → upsert(재배포 유발) 순서: 새 컨테이너에는 세션만 남는다.
     # 상태파일의 session은 방금 인가된 auth key와 같으므로 upsert 전에 삭제.
-    _finish(path, LOGIN_ENVS)
+    note = _manual_note(_finish(path, LOGIN_ENVS))
     ok, msg = _upsert_session(session_str)
     if ok:
         log.info("[tg_login] TG_SESSION_STRING upsert: %s", msg)
-        await say("✅ 텔레그램 세션 생성 완료 → Railway 반영됨. 재배포 후 DSInvResearch 릴레이 활성.")
+        await say("✅ 텔레그램 세션 생성 완료 → Railway 반영됨. 재배포 후 DSInvResearch 릴레이 활성."
+                  + note)
         return "signed_in"
     log.error("[tg_login] TG_SESSION_STRING upsert 실패: %s", msg)
     logged_out = await _log_out(session_str, api_id, api_hash)
     await say(f"⚠️ 로그인은 됐지만 Railway 반영 실패: {msg} — "
               + ("세션은 즉시 로그아웃(폐기)했습니다. " if logged_out else
                  "세션 로그아웃 실패 → 텔레그램 설정 → 기기에서 'IdeaBot relay (Railway)' 종료 필요. ")
-              + "TG_LOGIN_PHONE 재설정 후 재시도.")
+              + "TG_LOGIN_PHONE 재설정 후 재시도." + note)
     return "upsert_failed"
 
 

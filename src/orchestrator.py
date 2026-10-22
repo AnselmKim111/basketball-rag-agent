@@ -16,8 +16,10 @@
 스케줄은 KST 기준.
 
 봇 단위 격리 (2026-10-21 유출 사고 후속): 봇 하나가 시작 실패(토큰 거부 등)해도 그 봇만
-빠지고 나머지는 가동, 그 봇의 cron은 첫 가동 봇이 대행. 전부 실패해도 종료 대신 idle —
-exit하면 Railway 재시작 crash loop. 부팅 시 자격증명 점검 1회(src/cred_check.py).
+빠지고 나머지는 가동, 그 봇의 cron은 첫 가동 봇이 대행. 토큰 거부(InvalidToken)만 영구
+실패 — 그 외(TimedOut·NetworkError 등 일시 장애)는 라운드 단위 재시도(기본 5/15/45초).
+전부 실패 시: 전부 토큰 거부면 idle(exit하면 Railway 재시작 crash loop), 일시 장애가 하나라도
+섞이면 exit 1 → Railway ON_FAILURE 재시작이 복구. 부팅 시 자격증명 점검 1회(src/cred_check.py).
 
 Railway는 Dockerfile의 CMD가 이 모듈로 향함.
 """
@@ -418,58 +420,124 @@ async def _safe_shutdown(app: Application, name: str) -> None:
             log.debug("%s 정리 단계 실패 (%s) — 무시", name, type(e).__name__)
 
 
+# 시작 재시도 (2026-10-22 리뷰): 토큰 거부만 영구 — 부팅 순간 텔레그램·DNS·프록시 일시
+# 장애(get_me TimedOut 등, PTB는 initialize에서 재시도 안 함)는 실패 봇만 모아 라운드 재시도.
+# 값 개수 = 재시도 횟수. env BOT_START_RETRY_BACKOFF_S="5,15,45" (off = 재시도 없음).
+_START_BACKOFF_S: tuple[float, ...] = (5.0, 15.0, 45.0)
+_START_BACKOFF_MAX_S = 600.0  # 값 하나당 상한 (오설정으로 부팅이 무한 대기하지 않게)
+
+
+def _start_backoff_s() -> tuple[float, ...]:
+    raw = os.getenv("BOT_START_RETRY_BACKOFF_S", "").strip()
+    if not raw:
+        return _START_BACKOFF_S
+    if raw.lower() in ("off", "none", "-"):
+        return ()
+    try:
+        vals = [float(x) for x in raw.split(",") if x.strip()]
+    except ValueError:
+        logging.getLogger("orchestrator").warning(
+            "BOT_START_RETRY_BACKOFF_S 형식 오류 — 기본값 %s 사용", _START_BACKOFF_S)
+        return _START_BACKOFF_S
+    # 음수·NaN → 0, inf·과대값 → 상한
+    return tuple(min(max(0.0, v), _START_BACKOFF_MAX_S) for v in vals)
+
+
+async def _try_start(app: Application) -> Exception | None:
+    """initialize → start → start_polling. 실패 시 예외를 raise 대신 반환 — 호출부가
+    except 블록 밖에서 정리·로그 (정리 중 예외의 traceback에 원 예외(토큰 포함 메시지)가
+    "During handling of..."로 딸려 나가지 않게)."""
+    try:
+        await app.initialize()
+        await app.start()
+        await app.updater.start_polling(drop_pending_updates=True)
+    except Exception as e:
+        return e
+    return None
+
+
+async def _set_commands(app: Application, name: str, spec: BotSpec | None) -> None:
+    """텔레그램 / 자동완성 명령 등록 — manual lifecycle은 post_init이 자동 호출 안 되므로 직접."""
+    if not (spec and spec.commands):
+        return
+    log = logging.getLogger("orchestrator")
+    try:
+        await app.bot.set_my_commands(
+            [BotCommand(c, d) for c, d in spec.commands]
+        )
+        log.info("%s set_my_commands 등록: %d개", name, len(spec.commands))
+    except Exception:
+        log.exception("%s set_my_commands 실패 (봇은 정상 가동)", name)
+
+
 async def _start_apps(
     apps: list[tuple[str, Application]],
     spec_by_name: dict[str, BotSpec],
-) -> tuple[list[tuple[str, Application]], list[str], dict[str, str]]:
+) -> tuple[list[tuple[str, Application]], list[str], dict[str, str], set[str]]:
     """봇별 initialize/start/start_polling + set_my_commands — 실패한 봇만 건너뜀.
 
-    반환: (가동 중 apps, 실패 봇 이름 list, {실패 봇 이름: 짧은 사유}).
+    1라운드에 전 봇을 1회씩 시도(정상 봇은 즉시 가동) → 일시 장애 봇만 backoff 후 재시도
+    (봇 하나 때문에 나머지 기동이 늦어지지 않게). 토큰 거부(InvalidToken)는 재시도 없음.
+    시도 사이엔 _safe_shutdown — PTB는 shutdown 후 재-initialize 지원.
+
+    반환: (가동 중 apps, 실패 봇 이름 list, {실패 봇 이름: 짧은 사유},
+          영구 실패(토큰 거부) 봇 이름 set). list는 입력(BOT_SPECS) 순서 유지.
     """
     log = logging.getLogger("orchestrator")
     invalid_token = _invalid_token_cls()
+    order = {name: i for i, (name, _) in enumerate(apps)}
+    backoff = _start_backoff_s()
+    total = len(backoff) + 1
     running: list[tuple[str, Application]] = []
-    failed: list[str] = []
     reasons: dict[str, str] = {}
-    for name, app in apps:
-        spec = spec_by_name.get(name)
-        token_env = spec.token_env if spec else "?"
-        err: Exception | None = None
-        try:
-            await app.initialize()
-            await app.start()
-            await app.updater.start_polling(drop_pending_updates=True)
-        except Exception as e:
-            err = e
-        if err is not None:
-            # 정리·로그는 except 블록 밖에서 — 정리 중 예외의 traceback에 원 예외(토큰 포함
-            # 메시지)가 "During handling of..."로 딸려 나가지 않게.
+    permanent: set[str] = set()
+    pending = list(apps)
+    for attempt in range(1, total + 1):
+        if attempt > 1:
+            delay = backoff[attempt - 2]
+            log.warning("봇 시작 재시도 %d/%d: %s — %.0f초 후",
+                        attempt - 1, len(backoff), ", ".join(n for n, _ in pending), delay)
+            await asyncio.sleep(delay)
+        retry: list[tuple[str, Application]] = []
+        for name, app in pending:
+            spec = spec_by_name.get(name)
+            token_env = spec.token_env if spec else "?"
+            err = await _try_start(app)
+            if err is None:
+                reasons.pop(name, None)
+                await _set_commands(app, name, spec)
+                running.append((name, app))
+                if attempt > 1:
+                    log.info("%s 폴링 시작 (시도 %d회째)", name, attempt)
+                else:
+                    log.info("%s 폴링 시작", name)
+                continue
             if invalid_token is not None and isinstance(err, invalid_token):
                 # 예외 메시지에 토큰 원문 포함 → 텍스트·traceback 미출력, fingerprint만
                 log.error("%s 토큰 거부(fp=%s) — %s 봇 건너뜀",
                           token_env, _fingerprint(os.getenv(token_env, "")), name)
                 reasons[name] = "토큰 거부"
+                permanent.add(name)
+            elif attempt < total:
+                # 중간 실패는 타입명만 — traceback은 최종 실패 1회
+                log.warning("%sBot 시작 실패 (%s) — 시도 %d/%d, 재시도 예정",
+                            name, type(err).__name__, attempt, total)
+                reasons[name] = f"시작 실패 ({type(err).__name__})"
+                retry.append((name, app))
             else:
                 # traceback은 마스킹 formatter(install_redaction) 경유
-                log.error("%sBot 시작 실패 — %s 봇 건너뜀", name, name, exc_info=err)
+                log.error("%sBot 시작 실패 — %d회 시도 후 %s 봇 건너뜀",
+                          name, total, name, exc_info=err)
                 reasons[name] = f"시작 실패 ({type(err).__name__})"
             del err
-            failed.append(name)
             await _safe_shutdown(app, name)
-            continue
-        # 텔레그램 / 자동완성 명령 등록 — manual lifecycle은 post_init이 자동
-        # 호출 안 되므로 여기서 직접 호출.
-        if spec and spec.commands:
-            try:
-                await app.bot.set_my_commands(
-                    [BotCommand(c, d) for c, d in spec.commands]
-                )
-                log.info("%s set_my_commands 등록: %d개", name, len(spec.commands))
-            except Exception:
-                log.exception("%s set_my_commands 실패 (봇은 정상 가동)", name)
-        running.append((name, app))
-        log.info("%s 폴링 시작", name)
-    return running, failed, reasons
+        pending = retry
+        if not pending:
+            break
+    # 재시도로 늦게 뜬 봇도 원래 자리 — apps[0](첫 가동 봇)·cron 대행 봇 선택이 순서에 의존
+    running.sort(key=lambda item: order[item[0]])
+    failed = [name for name, _ in apps if name in reasons]
+    return running, failed, reasons, permanent
 
 
 def _schedule_jobs(scheduler, pending_jobs: list[tuple[str, ScheduledJob]],
@@ -550,26 +618,61 @@ async def _send_admin_text(bot: Bot, chat_id: str, text: str) -> bool:
         return False
 
 
+def _clear_auth_alerted() -> None:
+    """401 관리자 알림 미전달 → summarizer 알림 기록 해제 (다음 차단 때 재알림). 실패는 무시."""
+    try:
+        from src import summarizer
+        getattr(summarizer, "clear_auth_alerted", lambda: None)()
+    except Exception:
+        logging.getLogger("orchestrator").debug("[auth_alert] clear_auth_alerted 실패 (무시)")
+
+
 def _make_auth_alert_hook(bot: Bot, loop: asyncio.AbstractEventLoop) -> Callable[[str], None] | None:
-    """폴백 hook — model_router.handler.make_auth_alert_hook이 없을 때만 사용."""
+    """폴백 hook — model_router.handler.make_auth_alert_hook이 없을 때만 사용.
+
+    summarizer는 hook 호출 시점에 알림 시각을 기록해 6h 재알림을 막으므로, 미전달
+    (발송 실패·취소·루프 전달 실패)이면 기록을 해제 — 다음 차단 때 다시 알림.
+    """
     chat_id = _admin_chat_id()
     if not chat_id:
         return None
+    log = logging.getLogger("orchestrator")
+
+    def _on_done(fut) -> None:
+        try:
+            if fut.cancelled():
+                log.warning("[auth_alert] 401 관리자 알림 발송 취소됨")
+                _clear_auth_alerted()
+                return
+            exc = fut.exception()
+            ok = fut.result() if exc is None else False
+        except Exception:
+            return
+        if exc is not None:
+            # 예외 메시지는 URL(토큰 포함 가능)을 담을 수 있어 타입명만
+            log.warning("[auth_alert] 401 관리자 알림 발송 실패 (%s) — 알림 미전달",
+                        type(exc).__name__)
+        if ok is False:  # _send_admin_text가 실패를 삼키고 False 반환 (타입명은 거기서 경고)
+            _clear_auth_alerted()
 
     def _hook(msg: str) -> None:
         # LLM 워커 스레드에서 동기 호출 — 메인 루프로 넘기고 즉시 반환 (결과 대기 금지)
         coro = _send_admin_text(bot, chat_id, msg)
         try:
-            asyncio.run_coroutine_threadsafe(coro, loop)
-        except Exception:
+            fut = asyncio.run_coroutine_threadsafe(coro, loop)
+        except Exception as e:
             coro.close()
-            logging.getLogger("orchestrator").warning("[auth_alert] 이벤트 루프 전달 실패 — 알림 생략")
+            log.warning("[auth_alert] 이벤트 루프 전달 실패 (%s) — 알림 생략", type(e).__name__)
+            _clear_auth_alerted()
+            return
+        fut.add_done_callback(_on_done)
 
     return _hook
 
 
 def _register_auth_alert_hook(bot: Bot, loop: asyncio.AbstractEventLoop) -> bool:
-    """summarizer 401 breaker → 관리자 알림 1건 hook 등록 (첫 가동 봇이 발송). 등록 시 True."""
+    """summarizer 401 breaker → 관리자 알림 1건 hook 등록 (종목봇, 없으면 첫 가동 봇이 발송).
+    등록 시 True."""
     log = logging.getLogger("orchestrator")
     try:
         from src.summarizer import set_auth_alert_hook
@@ -708,7 +811,7 @@ async def _run_forever(stop_event: asyncio.Event | None = None) -> None:
     spec_by_name = {s.name: s for s in BOT_SPECS}
 
     # 모든 봇 시작 (lifecycle 수동 관리) — 봇 단위 격리: 실패한 봇만 빠짐
-    apps, failed_bots, fail_reasons = await _start_apps(apps, spec_by_name)
+    apps, failed_bots, fail_reasons, permanent_fail = await _start_apps(apps, spec_by_name)
     for name in failed_bots:
         bot_objects.pop(name, None)
     if failed_bots:
@@ -716,17 +819,28 @@ async def _run_forever(stop_event: asyncio.Event | None = None) -> None:
                     len(failed_bots), ", ".join(failed_bots))
 
     if not apps:
-        # 전부 실패(토큰 일괄 폐기 등)해도 종료하지 않음 — exit하면 Railway 재시작 crash loop.
-        # 재시도 없음: 토큰 교체 후 재배포가 복구 경로.
-        log.error("모든 봇 시작 실패 (%s) — idle 대기. 토큰 교체 후 재배포 필요.",
-                  ", ".join(failed_bots))
+        transient = [n for n in failed_bots if n not in permanent_fail]
+        if transient:
+            log.error("모든 봇 시작 실패 (%s) — 일시 장애 의심(%s) 재시도 소진 → exit 1, "
+                      "Railway 재시작으로 복구.", ", ".join(failed_bots), ", ".join(transient))
+        else:
+            # 전부 토큰 거부(일괄 폐기 등) — exit하면 같은 토큰이 계속 거부돼 Railway 재시작
+            # crash loop. 토큰 교체 후 재배포가 복구 경로.
+            log.error("모든 봇 시작 실패 (%s) — 전부 토큰 거부, idle 대기. 토큰 교체 후 재배포 필요.",
+                      ", ".join(failed_bots))
         if _cred_check_enabled():
             await _cred_check_and_notify(None, bot_objects, failed_bots, fail_reasons)
+        if transient:
+            # 예전(격리 전)처럼 비정상 종료 — main()이 SystemExit는 그대로 전파 → exit code 1
+            raise SystemExit(1)
         await _idle_forever(stop_event)
         return
 
     first_live_name, _ = apps[0]
     first_live_bot = bot_objects[first_live_name]
+    # 관리자 알림 봇 — 종목봇(TELEGRAM_BOT_TOKEN, model_router cron 소유)이 가동 중이면 종목봇,
+    # 아니면 첫 가동 봇 (관리자가 종목봇과는 대화를 시작했을 가능성이 가장 높음)
+    admin_bot = bot_objects.get("company") or first_live_bot
 
     # APScheduler — KST 기준 cron
     scheduler = AsyncIOScheduler(timezone=KST)
@@ -745,7 +859,7 @@ async def _run_forever(stop_event: asyncio.Event | None = None) -> None:
 
     # OpenRouter 401 breaker(summarizer) → 관리자 알림. LLM 호출은 워커 스레드라 메인 루프로 넘김.
     loop = asyncio.get_running_loop()
-    auth_hook_set = _register_auth_alert_hook(first_live_bot, loop)
+    auth_hook_set = _register_auth_alert_hook(admin_bot, loop)
 
     scheduler.start()
     next_run = {j.id: str(j.next_run_time) for j in scheduler.get_jobs()}

@@ -4,8 +4,11 @@
 → get_me() None → Telethon 기본 콜백이 input()으로 전화번호를 물음 → EOFError →
 20분마다 log.exception. 여기서는 가짜 telethon 모듈로:
   - input() 호출 0회 (start()/async with 미사용)
-  - is_user_authorized False / AuthKeyUnregistered 등 → 프로세스 단위 중단 플래그
-  - admin 알림은 두 사이클에 걸쳐 1회
+  - 인가 확인은 GetStateRequest 직접 호출 — is_user_authorized()는 FloodWait 등 RPCError를
+    False로 삼켜 정상 세션을 영구 중단시키므로 미사용
+  - AuthKeyUnregistered 등(인가 확인·읽기 단계 모두) → 프로세스 단위 중단 플래그
+  - FloodWait·기타 RPC 오류 → 일시 오류 (중단·알림 없음)
+  - admin 알림은 두 사이클에 걸쳐 1회, 새 세션 생성 도구(scripts/make_tg_session.py) 명시
   - 모든 경로에서 disconnect
 """
 from __future__ import annotations
@@ -57,11 +60,29 @@ class AuthKeyNotFound(Exception):
     pass
 
 
+class BadRequestError(RPCError):
+    pass
+
+
+class FloodError(RPCError):
+    pass
+
+
+class FloodWaitError(FloodError):
+    def __init__(self, seconds):
+        super().__init__(f"A wait of {seconds} seconds is required")
+        self.seconds = seconds
+
+
+class GetStateRequest:
+    pass
+
+
 class FakeClient:
     """Telethon TelegramClient 흉내 — start()/__aenter__는 진짜처럼 input()을 부른다."""
 
     instances: list["FakeClient"] = []
-    authorized = True
+    raise_on_auth: BaseException | None = None  # GetStateRequest(인가 확인)에서 발생
     raise_on_get: BaseException | None = None
     messages: list = []
 
@@ -71,13 +92,21 @@ class FakeClient:
         self.connected = False
         self.disconnect_calls = 0
         self.get_calls = 0
+        self.requests: list = []
         FakeClient.instances.append(self)
 
     async def connect(self):
         self.connected = True
 
+    async def __call__(self, request):
+        self.requests.append(request)
+        if isinstance(request, GetStateRequest) and FakeClient.raise_on_auth is not None:
+            raise FakeClient.raise_on_auth
+        return object()
+
     async def is_user_authorized(self):
-        return FakeClient.authorized
+        # 실제 Telethon은 GetStateRequest의 RPCError(FloodWait 포함)를 전부 False로 삼킨다
+        raise AssertionError("is_user_authorized() 사용 금지 — 일시 오류를 세션 무효로 오판")
 
     async def start(self, *a, **kw):
         # 실제 Telethon: phone=lambda: input('Please enter your phone (or bot token): ')
@@ -120,19 +149,24 @@ def relay(monkeypatch):
     tl = types.ModuleType("telethon")
     errors = types.ModuleType("telethon.errors")
     sessions = types.ModuleType("telethon.sessions")
+    functions = types.ModuleType("telethon.functions")
     for cls in (RPCError, UnauthorizedError, AuthKeyUnregisteredError, SessionRevokedError,
-                UserDeactivatedError, AuthKeyError, AuthKeyDuplicatedError, AuthKeyNotFound):
+                UserDeactivatedError, AuthKeyError, AuthKeyDuplicatedError, AuthKeyNotFound,
+                BadRequestError, FloodError, FloodWaitError):
         setattr(errors, cls.__name__, cls)
     sessions.StringSession = FakeStringSession
+    functions.updates = types.SimpleNamespace(GetStateRequest=GetStateRequest)
     tl.TelegramClient = FakeClient
     tl.errors = errors
     tl.sessions = sessions
+    tl.functions = functions
     monkeypatch.setitem(sys.modules, "telethon", tl)
     monkeypatch.setitem(sys.modules, "telethon.errors", errors)
     monkeypatch.setitem(sys.modules, "telethon.sessions", sessions)
+    monkeypatch.setitem(sys.modules, "telethon.functions", functions)
 
     FakeClient.instances = []
-    FakeClient.authorized = True
+    FakeClient.raise_on_auth = None
     FakeClient.raise_on_get = None
     FakeClient.messages = []
 
@@ -162,24 +196,60 @@ def _fetch():
 # fetch_posts_mtproto
 # ------------------------------------------------------------------
 def test_unauthorized_session_disables_without_input(relay):
-    FakeClient.authorized = False
+    """종료/폐기된 세션: 인가 확인(GetState)이 401 계열 → 사유는 정확한 예외 클래스명."""
+    FakeClient.raise_on_auth = AuthKeyUnregisteredError("AUTH_KEY_UNREGISTERED")
     assert _fetch() == []
     assert relay == []  # input() 미호출
-    assert channel_relay.mtproto_disabled_reason() == "is_user_authorized=False"
+    assert channel_relay.mtproto_disabled_reason() == "AuthKeyUnregisteredError"
     (client,) = FakeClient.instances
+    assert [type(r) for r in client.requests] == [GetStateRequest]
     assert client.get_calls == 0
     assert client.disconnect_calls == 1
 
 
+@pytest.mark.parametrize("stage", ["auth", "get"])
 @pytest.mark.parametrize("exc_cls", [
     AuthKeyUnregisteredError, SessionRevokedError, UserDeactivatedError, AuthKeyDuplicatedError,
 ])
-def test_dead_session_errors_disable(relay, exc_cls):
-    FakeClient.raise_on_get = exc_cls("dead")
+def test_dead_session_errors_disable(relay, exc_cls, stage):
+    if stage == "auth":
+        FakeClient.raise_on_auth = exc_cls("dead")
+    else:
+        FakeClient.raise_on_get = exc_cls("dead")
     assert _fetch() == []
     assert relay == []
     assert channel_relay.mtproto_disabled_reason() == exc_cls.__name__
     assert FakeClient.instances[0].disconnect_calls == 1
+
+
+@pytest.mark.parametrize("exc", [FloodWaitError(120), FloodWaitError(3600),
+                                 BadRequestError("SOMETHING_INVALID"), RPCError("RPC_CALL_FAIL")],
+                         ids=["flood120", "flood3600", "bad-request", "rpc"])
+def test_transient_rpc_error_on_auth_check_does_not_disable(relay, exc, caplog):
+    """FloodWait(>60초면 Telethon이 재-raise)·기타 RPC 오류는 세션 정상 — 이번 사이클만 폴백.
+
+    이전: is_user_authorized()가 이를 False로 삼켜 정상 세션을 프로세스 수명 동안 중단 + 거짓 알림.
+    """
+    import logging
+    caplog.set_level(logging.WARNING, logger="src.channel_relay")
+    FakeClient.raise_on_auth = exc
+    assert _fetch() == []
+    assert channel_relay.mtproto_disabled_reason() is None
+    (client,) = FakeClient.instances
+    assert client.get_calls == 0 and client.disconnect_calls == 1
+    # 다음 사이클은 다시 MTProto 시도 → 정상 복귀
+    FakeClient.raise_on_auth = None
+    FakeClient.messages = [types.SimpleNamespace(id=7, message="글", date=None, media=None)]
+    assert [p.post_id for p in _fetch()] == ["DSInvResearch/7"]
+    if isinstance(exc, FloodWaitError):
+        assert f"FloodWait {exc.seconds}초" in caplog.text
+        assert "Traceback" not in caplog.text
+
+
+def test_flood_wait_on_get_messages_does_not_disable(relay):
+    FakeClient.raise_on_get = FloodWaitError(300)
+    assert _fetch() == []
+    assert channel_relay.mtproto_disabled_reason() is None
 
 
 def test_disabled_skips_client_entirely(relay):
@@ -230,6 +300,7 @@ def test_success_reads_posts_with_device_model(relay):
     assert [p.post_id for p in posts] == ["DSInvResearch/1", "DSInvResearch/2"]
     assert posts[0].has_media and not posts[1].has_media
     (client,) = FakeClient.instances
+    assert [type(r) for r in client.requests] == [GetStateRequest]  # 인가 확인 1회
     assert client.kwargs["device_model"] == "IdeaBot relay (Railway)"
     assert client.kwargs == CLIENT_DEVICE_KWARGS
     assert client.disconnect_calls == 1
@@ -260,13 +331,16 @@ def _run_job_twice(monkeypatch):
 
 
 def test_job_alerts_admin_once_across_two_cycles(relay, monkeypatch):
-    FakeClient.authorized = False
+    FakeClient.raise_on_auth = SessionRevokedError("SESSION_REVOKED")
     bot = _run_job_twice(monkeypatch)
     assert relay == []
     assert len(bot.sent) == 1
     chat_id, text = bot.sent[0]
     assert chat_id == "123456789"  # 발송 채널(RELAY_CHAT_ID) 아님 — admin
-    assert "세션 무효" in text and "HANDOFF" in text
+    assert "세션 무효" in text and "SessionRevokedError" in text
+    # Railway 토큰 폐기 중엔 컨테이너 TG_LOGIN_* 흐름이 막히므로 PC 도구를 직접 안내
+    assert "scripts/make_tg_session.py" in text and "TG_SESSION_STRING" in text
+    assert "HANDOFF" not in text
     assert "fake-session-string" not in text
     assert len(FakeClient.instances) == 1  # 두 번째 사이클은 MTProto 시도 안 함
     assert FakeClient.instances[0].disconnect_calls == 1
@@ -285,6 +359,15 @@ def test_job_no_alert_when_session_healthy_but_transient_error(relay, monkeypatc
     bot = _run_job_twice(monkeypatch)
     assert bot.sent == []
     assert channel_relay.mtproto_disabled_reason() is None
+
+
+def test_job_no_alert_on_long_flood_wait(relay, monkeypatch):
+    """60초 넘는 FloodWait은 Telethon이 재-raise — 세션 무효 알림·중단 없이 두 사이클 모두 재시도."""
+    FakeClient.raise_on_auth = FloodWaitError(120)
+    bot = _run_job_twice(monkeypatch)
+    assert bot.sent == []
+    assert channel_relay.mtproto_disabled_reason() is None
+    assert len(FakeClient.instances) == 2
 
 
 def test_alert_falls_back_to_allowed_chat_ids(relay, monkeypatch):

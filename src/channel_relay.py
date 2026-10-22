@@ -15,9 +15,11 @@
 - 폴링 간격: orchestrator cron 20분 → "3시간 이내" 여유 충족.
 - dedup: state_store `relay_<channel>` 키에 post id 영속 (재배포에도 유지).
 - 세션 무효(사용자가 종료/폐기, 2026-10-21 유출 사고 후속): `start()`/`async with` 금지 —
-  Telethon이 input()으로 전화번호를 물어 이벤트 루프를 막는다. connect → is_user_authorized
-  False 또는 AuthKeyUnregistered 등 → 프로세스 재시작(새 세션 배포)까지 MTProto 중단 +
-  admin 알림 1회. 그동안 웹 프리뷰 폴백.
+  Telethon이 input()으로 전화번호를 물어 이벤트 루프를 막는다. connect → GetStateRequest로
+  인가 확인 → AuthKeyUnregistered·SessionRevoked 등 401 계열 → 프로세스 재시작(새 세션 배포)까지
+  MTProto 중단 + admin 알림 1회. 그동안 웹 프리뷰 폴백.
+  `is_user_authorized()`는 쓰지 않는다 — RPCError 전부(60초 넘는 FloodWait 포함)를 False로
+  삼켜 일시 오류를 "세션 무효"로 오판한다. FloodWait 등 기타 RPC 오류는 이번 사이클만 폴백.
 - 첫 가동(dedup 비어있음): 최근 RELAY_FIRST_RUN_WINDOW_H(기본 3시간) 내 글만
   발송하고 나머지는 조용히 seen 처리 — 과거 글 폭격 방지.
 
@@ -186,6 +188,7 @@ async def fetch_posts_mtproto(channel: str, limit: int = 30) -> list[ChannelPost
     try:
         from telethon import TelegramClient
         from telethon import errors as tl_errors
+        from telethon import functions
         from telethon.sessions import StringSession
     except ImportError:
         log.warning("channel_relay: telethon 미설치 — 웹 프리뷰 폴백")
@@ -194,6 +197,7 @@ async def fetch_posts_mtproto(channel: str, limit: int = 30) -> list[ChannelPost
 
     dead_errors = _dead_session_errors(tl_errors)
     key_not_found = getattr(tl_errors, "AuthKeyNotFound", None)
+    flood_error = getattr(tl_errors, "FloodError", None)
     api_id, api_hash, session = creds
     posts: list[ChannelPost] = []
     client = None
@@ -203,9 +207,9 @@ async def fetch_posts_mtproto(channel: str, limit: int = 30) -> list[ChannelPost
         # start()/async with 금지: 세션 무효 시 Telethon 기본 콜백이 input()으로 전화번호를
         # 물어 이벤트 루프 스레드를 막는다 → connect + 인가 확인만.
         await client.connect()
-        if not await client.is_user_authorized():
-            _disable_mtproto("is_user_authorized=False")
-            return []
+        # 인가 확인 — is_user_authorized()는 RPCError 전부(FloodWait 포함)를 False로 삼켜
+        # 일시 오류를 세션 무효로 오판 → 직접 호출해 dead(401 계열)/일시 오류를 예외로 구분.
+        await client(functions.updates.GetStateRequest())
         msgs = await client.get_messages(channel, limit=limit)
         _auth_key_not_found_strikes = 0
         for m in reversed(msgs or []):  # 오래된 것 → 최신 순
@@ -226,6 +230,11 @@ async def fetch_posts_mtproto(channel: str, limit: int = 30) -> list[ChannelPost
                         _auth_key_not_found_strikes, AUTH_KEY_NOT_FOUND_MAX)
             if _auth_key_not_found_strikes >= AUTH_KEY_NOT_FOUND_MAX:
                 _disable_mtproto(f"AuthKeyNotFound {_auth_key_not_found_strikes}회 연속")
+            return []
+        if isinstance(flood_error, type) and isinstance(e, flood_error):
+            # 세션은 정상 — 이번 사이클만 프리뷰 폴백 (traceback 불필요)
+            log.warning("channel_relay: FloodWait %s초 (%s) — 이번 사이클 건너뜀",
+                        getattr(e, "seconds", "?"), type(e).__name__)
             return []
         log.exception("channel_relay: MTProto 읽기 실패 (%s)", channel)
         return []
@@ -260,7 +269,8 @@ async def _alert_session_invalid(bot: Bot) -> None:
         from src.admin_alerts import alert_admin
         await alert_admin(
             bot, _alert_env_keys(), SESSION_ALERT_TITLE,
-            f"새 세션 필요 (HANDOFF 절차) — 사유: {_mtproto_disabled}. "
+            "새 세션 필요 — PC에서 scripts/make_tg_session.py(대화형)로 생성 후 종목봇 서비스 "
+            f"TG_SESSION_STRING만 갱신 — 사유: {_mtproto_disabled}. "
             "재배포 전까지 웹 프리뷰 폴백.",
         )
     except Exception:

@@ -6,7 +6,9 @@
 
 공개 API (다른 모듈이 의존 — 시그니처 변경 금지):
   - is_secret_name(name)  — env 이름이 비밀값인지 (deny 쪽으로 넓게)
-  - redact(text)          — 문자열에서 비밀값 제거. 절대 raise 안 함
+  - redact(text)          — 문자열에서 비밀값 제거. 절대 raise 안 함.
+                            env 단계 실패 → 패턴 단계만 적용, 패턴 단계 실패 →
+                            원문 대신 '‹redaction-error›' (fail closed)
   - RedactingFormatter    — format() 결과에 redact 적용 (exc_text/stack 포함)
   - install_redaction()   — root logger 모든 handler의 formatter를 감쌈 (멱등)
   - fingerprint(value)    — sha256 앞 8자리 (값 노출 없이 "어떤 값이 배포됐나" 비교용)
@@ -95,7 +97,12 @@ _PATTERNS: list[tuple[re.Pattern[str], object]] = [
 # env 정확일치 마스킹 — env 스냅샷이 바뀔 때만 regex 재컴파일
 # ------------------------------------------------------------------
 # (캐시 key, 컴파일된 패턴 or None, 치환 문자열 → env 이름)
+# 빌드 실패도 (key, None, {})로 캐시 — 같은 env 스냅샷에서 매 로그 라인마다 재시도 안 함.
 _ENV_CACHE: tuple[tuple | None, re.Pattern[str] | None, dict[str, str]] = (None, None, {})
+# env 단계 실패 stderr 통지는 프로세스당 1회
+_ENV_FAILURE_REPORTED = False
+# 패턴 단계 실패 시 원문 대신 반환 (fail closed — 원문엔 비밀값이 있을 수 있음)
+_REDACTION_ERROR = "‹redaction-error›"
 
 
 def _env_snapshot_key() -> tuple:
@@ -118,41 +125,94 @@ def _secret_env_items() -> tuple[tuple[str, str], ...]:
     ))
 
 
+def _report_env_failure(exc: BaseException) -> None:
+    """env 단계 실패를 프로세스당 1회 stderr에 알림 — 값·예외 메시지 없이 타입명만.
+
+    logging 경유 금지: RedactingFormatter.format → redact로 재진입한다.
+    (UnicodeEncodeError 메시지엔 값의 문자가 섞이므로 str(exc)도 쓰지 않음)
+    """
+    global _ENV_FAILURE_REPORTED
+    if _ENV_FAILURE_REPORTED:
+        return
+    _ENV_FAILURE_REPORTED = True
+    try:
+        sys.stderr.write(
+            f"[log_redact] env 마스킹 빌드 실패({type(exc).__name__}) — 패턴 마스킹만 적용\n"
+        )
+        sys.stderr.flush()
+    except Exception:
+        pass
+
+
+def _value_variants(value: str) -> tuple[str, ...]:
+    """원문 + URL 인코딩 형태(쿼리스트링·폼 바디) — 특수문자 포함 비번 대비.
+
+    비-UTF-8 바이트가 든 env 값은 surrogateescape로 디코드돼 lone surrogate를 품는다
+    → quote 기본(strict)은 UnicodeEncodeError. 원래 바이트로 되돌려 인코딩하고,
+    그래도 실패하면 원문만 (값 하나가 나머지 env 마스킹을 끄지 않게).
+    """
+    try:
+        return (
+            value,
+            quote(value, safe="", errors="surrogateescape"),
+            quote_plus(value, errors="surrogateescape"),
+        )
+    except Exception:
+        return (value,)
+
+
 def _env_pattern() -> tuple[re.Pattern[str] | None, dict[str, str]]:
     global _ENV_CACHE
     key = _env_snapshot_key()
     cached_key, cached_pat, cached_map = _ENV_CACHE
     if key == cached_key:
         return cached_pat, cached_map
-    lookup: dict[str, str] = {}
-    for name, value in _secret_env_items():
-        # URL 인코딩된 형태(쿼리스트링·폼 바디)도 함께 — 특수문자 포함 비번 대비
-        for variant in (value, quote(value, safe=""), quote_plus(value)):
-            if len(variant) >= MIN_SECRET_VALUE_LEN:
-                lookup.setdefault(variant, name)
-    pat = None
-    if lookup:
-        # 긴 값 먼저 — 다른 값의 부분문자열인 값이 먼저 잘라먹지 않게
-        alts = sorted(lookup, key=len, reverse=True)
-        pat = re.compile("|".join(re.escape(a) for a in alts))
+    try:
+        lookup: dict[str, str] = {}
+        for name, value in _secret_env_items():
+            for variant in _value_variants(value):
+                if len(variant) >= MIN_SECRET_VALUE_LEN:
+                    lookup.setdefault(variant, name)
+        pat = None
+        if lookup:
+            # 긴 값 먼저 — 다른 값의 부분문자열인 값이 먼저 잘라먹지 않게
+            alts = sorted(lookup, key=len, reverse=True)
+            pat = re.compile("|".join(re.escape(a) for a in alts))
+    except Exception as exc:
+        # 실패도 캐시 먼저 (통지 중 재진입·매 라인 재빌드 방지) — env 바뀌면 재시도
+        _ENV_CACHE = (key, None, {})
+        _report_env_failure(exc)
+        return None, {}
     _ENV_CACHE = (key, pat, lookup)
     return pat, lookup
 
 
 def redact(text: str) -> str:
-    """문자열에서 비밀값 제거. 실패 시 원문 반환 (로깅 경로라 절대 raise 금지)."""
+    """문자열에서 비밀값 제거 (로깅 경로라 절대 raise 금지).
+
+    두 단계는 독립: env 정확일치 단계가 실패해도 패턴 단계는 반드시 돈다.
+    패턴 단계가 실패하면 원문 대신 '‹redaction-error›' 반환 (fail closed).
+    """
     try:
-        if not text or not isinstance(text, str):
+        if not isinstance(text, str) or not text:
             return text
-        out = text
+    except Exception:
+        return _REDACTION_ERROR
+    out = text
+    # 1단계: env 값 정확일치 — 실패 시 1회 통지 후 패턴 단계로 진행
+    try:
         pat, lookup = _env_pattern()
         if pat is not None:
             out = pat.sub(lambda m: f"‹{lookup.get(m.group(0), 'SECRET')}›", out)
+    except Exception as exc:
+        _report_env_failure(exc)
+    # 2단계: 패턴 (토큰·apikey=·sk-or 등) — 실패 시 원문 노출 대신 placeholder
+    try:
         for rx, repl in _PATTERNS:
             out = rx.sub(repl, out)
         return out
     except Exception:
-        return text
+        return _REDACTION_ERROR
 
 
 class RedactingFormatter(logging.Formatter):

@@ -27,6 +27,7 @@ from src.summarizer import (
     IndividualSummary,
     OpenRouterCreditExhausted,
     get_client,
+    llm_outage_label,
     summarize_combined,
     summarize_pdf,
     write_report,
@@ -168,6 +169,7 @@ def main() -> int:
     api_client = get_client()
     credit_exhausted = False
     credit_error_msg = ""
+    credit_label = ""  # 사용자 문구 — 401(키 무효)과 크레딧 소진 구분
 
     individual: list[IndividualSummary] = []
     for i, pdf_path in enumerate(saved_paths, start=1):
@@ -176,9 +178,10 @@ def main() -> int:
             summary = summarize_pdf(api_client, pdf_path)
             individual.append(summary)
         except OpenRouterCreditExhausted as e:
-            log.error("OpenRouter 토큰 부족: %s", e)
+            log.error("OpenRouter 장애 (%s): %s", type(e).__name__, e)
             credit_exhausted = True
             credit_error_msg = str(e)
+            credit_label = llm_outage_label(e, "OpenRouter 토큰 부족")
             break
         except Exception:
             log.exception("요약 실패: %s", pdf_path.name)
@@ -187,7 +190,8 @@ def main() -> int:
     # 토큰 부족 시: 요약 건너뛰고 PDF만 텔레그램 발송
     if credit_exhausted:
         log.warning(
-            "토큰 부족으로 요약 단계 중단. PDF 원본만 텔레그램으로 발송합니다."
+            "OpenRouter 장애(%s)로 요약 단계 중단. PDF 원본만 텔레그램으로 발송합니다.",
+            credit_label,
         )
         if args.no_telegram or os.getenv("DISABLE_TELEGRAM", "false").lower() == "true":
             log.info("텔레그램 발송 스킵")
@@ -196,7 +200,7 @@ def main() -> int:
             pdf_paths=saved_paths,
             company_name=args.company,
             note=(
-                f"⚠️ OpenRouter 토큰 부족으로 요약 생략.\n"
+                f"⚠️ {credit_label} — 요약 생략.\n"
                 f"PDF {len(saved_paths)}건 원본만 발송합니다.\n\n"
                 f"오류: {credit_error_msg[:300]}"
             ),
@@ -211,9 +215,9 @@ def main() -> int:
     try:
         combined = summarize_combined(api_client, args.company, individual)
     except OpenRouterCreditExhausted as e:
-        log.error("종합 요약 중 토큰 부족: %s", e)
+        log.error("종합 요약 중 OpenRouter 장애 (%s): %s", type(e).__name__, e)
         combined = (
-            f"(종합 요약 생성 중 OpenRouter 토큰 부족 발생.\n"
+            f"(종합 요약 생략 — {llm_outage_label(e, 'OpenRouter 토큰 부족')}.\n"
             f"개별 요약 {len(individual)}건만 포함됩니다.)"
         )
     except Exception:

@@ -271,6 +271,7 @@ async def _summarize_pdfs_parallel(
     from src.summarizer import (
         OpenRouterCreditExhausted,
         get_client,
+        llm_outage_placeholder,
         summarize_pdf,
         summarize_pdf_short,
     )
@@ -283,9 +284,10 @@ async def _summarize_pdfs_parallel(
             try:
                 s = await asyncio.to_thread(fn, sum_client, p)
                 return s.summary_text
-            except OpenRouterCreditExhausted:
-                log.warning("[%s] %s 요약 — OpenRouter 한도 초과", label, p.name)
-                return "(요약 실패: OpenRouter 토큰 부족)"
+            except OpenRouterCreditExhausted as e:
+                # 401(키 무효)·크레딧 소진 구분 문구 — prefix는 공통이라 장애 dedup 판별 유지
+                log.warning("[%s] %s 요약 — OpenRouter 장애 (%s)", label, p.name, type(e).__name__)
+                return llm_outage_placeholder(e)
             except Exception as e:
                 log.exception("[%s] %s 요약 실패", label, p.name)
                 return f"(요약 실패: {e!r})"
@@ -306,9 +308,14 @@ _DIAG_PLAIN_NAMES = frozenset({
 _DIAG_PLAIN_SUFFIX_RE = re.compile(
     r"(?:^|_)(?:CHAT_IDS?|ALLOWED_CHAT_IDS|CHANNEL_ID|MODELS?)$"
 )
-# 이 길이 미만은 fingerprint도 생략 — 짧은 값(인증코드·전화번호·짧은 비번)은
-# sha256 8자리만으로 전수 대입 복원 가능.
+# fingerprint(무솔트 sha256 8자리)는 이름으로 판단 — 값 길이로 판단하면 사람이 고른
+# 16자+ 비번(WISEREPORT_PW 등)도 fp가 찍혀 로그만으로 사전 대입 확인이 가능해진다.
+# - 무작위 자격증명(KEY/TOKEN/SECRET/SESSION/HASH)이고 16자 이상일 때만 fp ("새 키가 배포됐나" 확인용)
+# - 비밀번호류(PW/PASS/PHONE/OTP/_CODE)·allowlist 밖 *_ID(S)(계정 ID 등): '<set>' — 길이도 생략
+# - 그 외 미분류 이름: '<set len=N>' — fp 없음 (fail-closed)
 _DIAG_FP_MIN_LEN = 16
+_DIAG_FP_NAME_RE = re.compile(r"KEY|TOKEN|SECRET|SESSION|HASH")
+_DIAG_NO_FP_NAME_RE = re.compile(r"PW|PASS|PASSWD|PASSWORD|PHONE|OTP|_CODE|_IDS?$")
 
 
 def _diag_is_plain(name: str) -> bool:
@@ -316,9 +323,12 @@ def _diag_is_plain(name: str) -> bool:
     return upper in _DIAG_PLAIN_NAMES or bool(_DIAG_PLAIN_SUFFIX_RE.search(upper))
 
 
-def _diag_masked(value: str) -> str:
+def _diag_masked(name: str, value: str) -> str:
     from src.log_redact import fingerprint
-    if len(value) < _DIAG_FP_MIN_LEN:
+    upper = name.upper()
+    if _DIAG_NO_FP_NAME_RE.search(upper):
+        return "<set>"  # 사람이 고른 값(비번·계정·인증코드) — 길이·fp 모두 생략
+    if len(value) < _DIAG_FP_MIN_LEN or not _DIAG_FP_NAME_RE.search(upper):
         return f"<set len={len(value)}>"
     return f"<set len={len(value)} fp={fingerprint(value)}>"
 
@@ -326,8 +336,9 @@ def _diag_masked(value: str) -> str:
 def diag_env_keys(prefixes: Iterable[str]) -> dict[str, str]:
     """주어진 prefix가 들어간 env key를 마스킹된 형태로 반환 (로깅 안전).
 
-    allowlist(chat id·모델명·Railway id 등)만 원문(60자), 나머지는
-    `<set len=N fp=XXXXXXXX>` — 값 노출 없이 "새 키가 배포됐나"만 확인 가능.
+    allowlist(chat id·모델명·Railway id 등)만 원문(60자), 나머지는 이름별 마스킹
+    (`_diag_masked`): 무작위 키·토큰은 `<set len=N fp=XXXXXXXX>` — 값 노출 없이
+    "새 키가 배포됐나"만 확인 가능, 비밀번호·계정 ID류는 `<set>`, 미분류는 `<set len=N>`.
     """
     from src.log_redact import redact
     prefixes = tuple(prefixes)
@@ -340,5 +351,5 @@ def diag_env_keys(prefixes: Iterable[str]) -> dict[str, str]:
             # allowlist여도 값에 토큰 형태가 섞였으면(오설정) 패턴 마스킹
             out[k] = redact(v[:60])
         else:
-            out[k] = _diag_masked(v)
+            out[k] = _diag_masked(k, v)
     return out

@@ -63,6 +63,20 @@
   B=pydantic schema (`src/llm_schemas.py` — **프롬프트 실제 출력과 1:1 대조 필수, 추정 금지**) ·
   C=force_json (response_format, 미지원 모델 400 자동 off) ·
   D=auto rollback (시간당 cron, 1h fail_rate >20% 또는 p95 >30s 시 이전 모델 복원).
+  **D 가드 (2026-10-22 사고 후)**: OpenRouter 401 차단기 작동 후 2h는 skip(키 문제를 모델 탓으로
+  롤백 금지) · 실패 모델이 **2개 이상 프로바이더**에 걸치면 'systemic' 보류(단일 프로바이더 장애는
+  종전대로 env별 롤백, systemic 경보는 6h 내 실패 프로바이더가 새로 늘 때만 재발송, 판정은 모델별
+  실패 3건 이상) · Railway 토큰 없음/무효(`railway_env.probe` 실검증)면 upsert 대신 수동 적용 안내 +
+  history 기록, Railway API 일시 장애면 증거 유지·다음 시간 재시도 · 제외 프로바이더(anthropic) 모델이나
+  현재 실패 중인 모델로는 복원 안 함 · 집계 창은 직전 1시간 버킷 포함(현재 버킷이 정상이면 회복으로 보고 보류).
+- **401 차단기** (`summarizer`): 401 = 키 무효 → 재시도·폴백·health 기록 없이 `OpenRouterAuthError`
+  (크레딧 예외의 하위 클래스라 기존 핸들러가 즉시 중단), `OPENROUTER_AUTH_COOLDOWN_S`(900)간 호출 차단,
+  관리자 알림은 차단당 1회(6h 재알림, 알림 발송 실패 시 dedup 해제). cooldown 만료 후 1건만
+  `GET /key` 키 재확인(≈1s, 임대 20s) — 401/403 재차단·2xx 해제·불확정이면 20s간 실제 호출이 판정.
+  사용자 문구는 '키 무효(401)' — '크레딧 부족'과 구분.
+- `/model_approve`: Railway API 일시 장애면 항목 대기 유지. 주간 평가 메시지에 [수동 적용 필요]·
+  [적용 실패]·[적용 보류 — 키/크레딧 장애] 섹션.
+- `/model_eval` `/model_approve` `/model_reject`는 `*` 허용목록 불인정 — 숫자 chat id 필요.
 - 명령: **종목봇**(TELEGRAM_BOT_TOKEN)에서 `/model_eval` `/model_approve` `/model_reject`
   `/model_status` — 버터대디봇 사망(2026-06-23~)으로 이관. cron 2개(주간 재평가 +
   Layer D)도 company spec으로 이동. 알림 대상: REPORT_CHAT_ID → MODEL_ROUTER_CHAT_ID
@@ -95,6 +109,24 @@
 ## 5. 토큰·자격증명
 
 토큰들은 git에 커밋 안 됨 — `CLAUDE.local.md` 참조 (gitignored).
+
+**2026-10-21 Railway env 유출 사고 이후 규칙 (HANDOFF §0)**:
+- 로그·메시지에 시크릿 값 금지 — 모든 엔트리포인트는 `log_redact.install_redaction()` 후 로깅.
+  부팅 diag(`bot_helpers.diag_env_keys`)는 deny-by-default (허용목록: *_CHAT_ID(S)·*_CHANNEL_ID·*_MODEL·
+  ACTIVE_BOTS·RAILWAY_*_ID). 새 시크릿 env를 추가하면 `log_redact.is_secret_name`에 걸리는 이름으로.
+- 키는 URL 쿼리 대신 헤더로(가능한 곳), 예외 로그엔 status·경로만 (httpx/requests 예외 문자열은 URL 포함).
+- `verify=False` 금지 (DART만 `DART_TLS_VERIFY=0` 탈출구).
+- 봇 기동은 봇별 격리: 토큰 거부(InvalidToken)는 그 봇만 skip + cron 재배치, 그 외 오류는
+  `BOT_START_RETRY_BACKOFF_S`(기본 5,15,45초 · off=재시도 없음) 간격 재시도. 가동 봇 0개 + 일시 오류가
+  하나라도 있으면 exit 1(Railway 재시작), 전부 토큰 거부면 idle. 부팅 시 '🔐 자격증명 점검' 관리자
+  메시지(`CRED_SELF_CHECK=0`으로 끔) — 키 교체 후 ✓ 확인용.
+- 런타임에 Railway 토큰을 두지 않는 것을 권장 (있으면 env 유출 = Variables 쓰기 권한까지 유출).
+  tg_login은 Railway 토큰 실검증(`railway_env.token_valid`) 통과 시에만 동작.
+- 개인 텔레그램 세션(`TG_SESSION_STRING`)은 PC에서 `scripts/make_tg_session.py`(대화형)로 생성,
+  종목봇 서비스에만 설정. TG_LOGIN_PASSWORD를 env로 넣는 경로는 쓰지 말 것.
+- 장애 중 dedup: 실패/미발송분을 '발송됨'으로 찍지 말 것 (카테고리·공시 `DISCLOSURE_SEND_MAX_ATTEMPTS`·
+  어닝 watch `EARNINGS_WATCH_OUTAGE_BACKOFF_S`). 인증 장애로 인한 pre-call 실패 기록은 메모리만
+  (디스크에 남기면 키 교체 재배포 후에도 24h 재시도 차단).
 
 ---
 

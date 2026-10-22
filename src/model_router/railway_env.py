@@ -6,9 +6,17 @@
 
 반환 메시지·로그에 변수 값(value)은 절대 넣지 않음 — TG_SESSION_STRING 같은 비밀도 이
 경로로 쓰이고, 메시지는 텔레그램으로 나간다 (2026-10-21 Railway env 유출 사고 후속).
+
+`available()`은 설정 존재 여부만 본다 (호출 없음 — Layer D·handler가 사용, 일시 장애로
+"없음" 처리하면 안 됨). 토큰이 실제로 살아 있는지(폐기 여부)는 `probe()` — 인증 GraphQL 1회,
+프로세스+토큰 단위 캐시, 'ok' | 'invalid'(설정 누락·폐기·다른 프로젝트) | 'unknown'(일시 장애).
+`token_valid()` == (probe() == 'ok'). 폐기된 토큰이 Variables에 남은 채로 쓰이면 안 되는
+경로(tg_login: 사용자 폰에 코드 발송)가 사용 — tg_login은 'unknown'이면 "무효"가 아니라
+"일시 장애·재배포로 재시도"로 안내 (사용자에게 env 수동 삭제를 시키지 않음).
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 
@@ -45,8 +53,97 @@ def _config(quiet: bool = False) -> dict | None:
 
 
 def available() -> bool:
-    """Railway API 쓰기 가능 설정(토큰·ID) 여부. False면 호출부는 수동 적용 안내."""
+    """Railway API 쓰기 가능 설정(토큰·ID) 여부. False면 호출부는 수동 적용 안내.
+
+    설정 존재만 확인 (네트워크 호출 없음) — 폐기된 토큰도 True. 실제 유효성은 token_valid().
+    """
     return _config(quiet=True) is not None
+
+
+# 토큰 자기조회 — 비밀값 미반환 (variables 쿼리는 서비스 env 값 전부를 돌려주므로 금지)
+TOKEN_PROBE_QUERY = "query{projectToken{projectId environmentId}}"
+TOKEN_PROBE_TIMEOUT_S = 10
+# probe 판정 — 'ok'·'invalid'는 확정(캐시), 'unknown'은 일시 장애(캐시 안 함)
+PROBE_OK, PROBE_INVALID, PROBE_UNKNOWN = "ok", "invalid", "unknown"
+# (sha256(토큰)+project_id) → 확정 판정('ok'|'invalid'). 토큰 원문은 캐시 key로도 보관하지 않음.
+_token_valid_cache: dict[str, str] = {}
+
+
+def reset_token_cache() -> None:
+    """probe/token_valid 캐시 초기화 (테스트용)."""
+    _token_valid_cache.clear()
+
+
+def _token_cache_key(cfg: dict) -> str:
+    return hashlib.sha256(f"{cfg['token']}\0{cfg['project_id']}".encode()).hexdigest()
+
+
+def probe(force: bool = False) -> str:
+    """Railway 토큰 인증 상태 — 'ok' | 'invalid' | 'unknown' (인증 GraphQL 1회, 프로세스+토큰 캐시).
+
+    ok: HTTP 200 + errors 없음 + data.projectToken.projectId == RAILWAY_PROJECT_ID.
+    invalid (확정): 설정 누락(네트워크 호출 없음)·HTTP 401/403·HTTP 200인데 GraphQL 에러
+      ("Not Authorized" 등)·projectToken 없음·다른 프로젝트 토큰.
+    unknown (일시 장애): 네트워크 예외·5xx·429·그 밖의 HTTP·JSON 아님(또는 dict 아님).
+    캐시는 확정 판정(ok/invalid)만 — unknown은 다음 호출에서 재확인. force=True면 캐시 무시.
+    토큰 원문은 로그·반환값 어디에도 넣지 않음.
+    """
+    cfg = _config(quiet=True)
+    if not cfg:
+        return PROBE_INVALID
+    key = _token_cache_key(cfg)
+    if not force and key in _token_valid_cache:
+        return _token_valid_cache[key]
+    secrets = (cfg["token"],)
+    try:
+        with httpx.Client(timeout=TOKEN_PROBE_TIMEOUT_S) as c:
+            r = c.post(GRAPHQL_URL,
+                       json={"query": TOKEN_PROBE_QUERY},
+                       headers={"Project-Access-Token": cfg["token"],
+                                "Content-Type": "application/json"})
+    except Exception as e:
+        log.warning("[model_router.railway_env] 토큰 확인 실패(네트워크): %s", type(e).__name__)
+        return PROBE_UNKNOWN
+    status = getattr(r, "status_code", None)
+    try:
+        data = r.json()
+    except Exception:
+        data = None
+    pt = None
+    if isinstance(data, dict) and isinstance(data.get("data"), dict):
+        pt = data["data"].get("projectToken")
+    if status in (401, 403):
+        state = PROBE_INVALID
+    elif status != 200 or not isinstance(data, dict):
+        # 5xx·429·기타 HTTP, 또는 200인데 JSON이 아님(프록시·게이트웨이 HTML 등) → 판정 불가
+        state = PROBE_UNKNOWN
+    elif (not data.get("errors") and isinstance(pt, dict)
+          and pt.get("projectId") == cfg["project_id"]):
+        state = PROBE_OK
+    else:
+        state = PROBE_INVALID
+    if state != PROBE_OK:
+        if isinstance(pt, dict) and pt.get("projectId") and pt.get("projectId") != cfg["project_id"]:
+            why = "다른 프로젝트의 토큰"
+        else:
+            why = _error_summary(r, data, secrets)
+            if status == 200 and not isinstance(data, dict):
+                why += " (JSON 아님)"
+        log.warning("[model_router.railway_env] Railway 토큰 %s — %s",
+                    "무효(폐기?)" if state == PROBE_INVALID else "확인 실패(일시 장애?)",
+                    _scrub(why, secrets))
+    if state != PROBE_UNKNOWN:
+        _token_valid_cache[key] = state
+    return state
+
+
+def token_valid(force: bool = False) -> bool:
+    """Railway 토큰이 실제로 인증되는지 — probe() == 'ok' (캐시 규칙 동일).
+
+    False: invalid(설정 누락·폐기·다른 프로젝트) 또는 unknown(일시 장애 — fail closed, 캐시 안 함).
+    둘을 구분해야 하는 호출부(사용자 안내 문구가 달라지는 tg_login)는 probe()를 직접 사용.
+    """
+    return probe(force) == PROBE_OK
 
 
 def _target_sids(cfg: dict, service_ids: list[str] | None) -> list[str]:
@@ -65,15 +162,19 @@ def _scrub(text: str, secrets: tuple[str | None, ...]) -> str:
     return out
 
 
-def _error_summary(r, data) -> str:
-    """GraphQL 응답 → 에러 요약 (message 필드만, 응답 원문 dump 금지)."""
+def _error_summary(r, data, secrets: tuple[str | None, ...] = ()) -> str:
+    """GraphQL 응답 → 에러 요약 (message 필드만, 응답 원문 dump 금지).
+
+    secrets는 자르기 *전에* 제거 — 160자로 먼저 자르면 echo된 값의 앞부분 조각이 정확일치
+    치환을 빠져나간다 (TG_SESSION_STRING ~353자).
+    """
     msgs: list[str] = []
     errs = data.get("errors") if isinstance(data, dict) else None
     if isinstance(errs, list):
         for e in errs[:3]:
             m = e.get("message") if isinstance(e, dict) else None
             if m:
-                msgs.append(str(m)[:160])
+                msgs.append(_scrub(str(m), secrets)[:160])
     status = getattr(r, "status_code", "?")
     return f"HTTP {status}" + (f" {'; '.join(msgs)}" if msgs else "")
 
@@ -93,9 +194,11 @@ def _post(cfg: dict, payload: dict, field: str, sid: str,
             data = {}
         if r.status_code == 200 and (data.get("data") or {}).get(field):
             return None
-        return _scrub(f"sid={sid[:8]}: {_error_summary(r, data)}", secrets)
+        return _scrub(f"sid={sid[:8]}: {_error_summary(r, data, secrets)}", secrets)
     except Exception as e:
-        return _scrub(f"sid={sid[:8]}: {type(e).__name__}: {str(e)[:160]}", secrets)
+        # scrub 후 자르기 (자른 뒤 scrub하면 값 조각이 남음)
+        return _scrub(f"sid={sid[:8]}: {type(e).__name__}: {_scrub(str(e), secrets)[:160]}",
+                      secrets)
 
 
 def upsert_variable(name: str, value: str,

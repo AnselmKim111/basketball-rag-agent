@@ -46,8 +46,10 @@ from src.industry_catalog import (
 from src.pipeline_lock import PIPELINE_LOCK
 from src.state_store import mark_seen, mark_seen_with_titles, normalize_title, seen, seen_titles
 from src.summarizer import (
+    OpenRouterAuthError,
     OpenRouterCreditExhausted,
     get_client,
+    is_llm_outage_placeholder,
     summarize_pdf,
     summarize_pdf_short,
 )
@@ -68,8 +70,8 @@ _send_pdf = _bh_send_pdf
 from src.bot_helpers import _summarize_pdfs_parallel  # noqa: E402
 
 # _summarize_pdfs_parallel이 OpenRouterCreditExhausted(401 OpenRouterAuthError 포함)를
-# 삼키고 자리에 넣는 placeholder의 prefix — LLM 장애(키 폐기·크레딧 소진) 판별용.
-_LLM_OUTAGE_SUMMARY_PREFIX = "(요약 실패: OpenRouter"
+# 삼키고 자리에 넣는 placeholder — LLM 장애(키 폐기·크레딧 소진) 판별은
+# summarizer.is_llm_outage_placeholder로만 (리터럴 prefix 중복 금지 — 문구 변경 시 dedup 무력화).
 
 
 def _llm_auth_blocked() -> bool:
@@ -88,9 +90,7 @@ def _is_llm_outage(summaries: list[str]) -> bool:
     """
     if _llm_auth_blocked():
         return True
-    return any(
-        isinstance(s, str) and s.startswith(_LLM_OUTAGE_SUMMARY_PREFIX) for s in summaries
-    )
+    return any(is_llm_outage_placeholder(s) for s in summaries)
 
 
 def _llm_outage_note(label: str) -> str:
@@ -494,6 +494,12 @@ async def industry_on_demand(
     loop = asyncio.get_running_loop()
     try:
         result = await loop.run_in_executor(None, resolve_industry, industry_name)
+    except OpenRouterAuthError:
+        # 401 — 충전이 아니라 키 교체가 조치 (OpenRouterCreditExhausted보다 먼저 catch)
+        await update.message.reply_text(
+            "❌ OpenRouter 키 무효(401) — 산업명 해석 불가. 관리자 키 교체 후 재시도."
+        )
+        return
     except OpenRouterCreditExhausted:
         await update.message.reply_text(
             "❌ OpenRouter 한도 초과 — 산업명 해석 불가. 키 충전 후 재시도."

@@ -78,12 +78,29 @@ def _cron_notify_chat_id() -> str | None:
     return None
 
 
+def _clear_auth_alerted() -> None:
+    """401 관리자 알림 미전달 → summarizer 알림 기록 해제 (다음 차단 때 재알림). 실패는 무시.
+
+    summarizer는 호출 시점에 조회 (테스트가 sys.modules에서 재import하는 경우 포함)."""
+    try:
+        from src import summarizer
+        getattr(summarizer, "clear_auth_alerted", lambda: None)()
+    except Exception:
+        log.debug("[auth_alert] clear_auth_alerted 실패 (무시)")
+
+
 def make_auth_alert_hook(bot: Bot, loop) -> Callable[[str], None] | None:
     """summarizer.set_auth_alert_hook용 hook 생성 — OpenRouter 401 차단 시 관리자 알림.
 
     hook은 LLM 호출 스레드(executor)에서 동기 호출되므로 발송은 봇 이벤트 루프로
     넘기고 즉시 반환 (결과 대기 안 함 → 루프 스레드에서 불려도 deadlock 없음).
     알림 대상은 cron과 동일 (_cron_notify_chat_id). 대상 없으면 None.
+
+    발송 실패는 done-callback이 예외 타입명만 WARNING. 예외 메시지는 URL(토큰 포함 가능)을
+    담을 수 있어 미출력. summarizer는 hook 호출 시점에 알림 시각을 기록해 AUTH_REALERT_S(6h)
+    동안 재알림을 막으므로, 미전달(발송 실패·취소·코루틴 생성/루프 전달 실패)이면
+    summarizer.clear_auth_alerted()로 기록을 해제 — 다음 차단 때 다시 알림 (텔레그램 일시
+    오류 1번에 관리자가 6시간 키 장애를 모르던 문제, 2026-10-22 sim_alert_fail).
     """
     import asyncio
     chat_id = _cron_notify_chat_id()
@@ -91,18 +108,48 @@ def make_auth_alert_hook(bot: Bot, loop) -> Callable[[str], None] | None:
         log.warning("[auth_alert] 알림 대상 chat 미설정 — 401 알림 hook 미등록")
         return None
 
+    def _on_done(fut) -> None:
+        try:
+            if fut.cancelled():
+                log.warning("[auth_alert] 401 관리자 알림 발송 취소됨")
+                _clear_auth_alerted()
+                return
+            exc = fut.exception()
+        except Exception:
+            return
+        if exc is not None:
+            log.warning("[auth_alert] 401 관리자 알림 발송 실패 (%s) — 알림 미전달",
+                        type(exc).__name__)
+            _clear_auth_alerted()
+
     def _hook(msg: str) -> None:
         try:
-            asyncio.run_coroutine_threadsafe(bot.send_message(chat_id, msg), loop)
-        except Exception:
-            log.exception("[auth_alert] 401 알림 예약 실패")
+            coro = bot.send_message(chat_id, msg)
+        except Exception as e:
+            log.warning("[auth_alert] 401 알림 생성 실패 (%s)", type(e).__name__)
+            _clear_auth_alerted()
+            return
+        try:
+            fut = asyncio.run_coroutine_threadsafe(coro, loop)
+        except Exception as e:
+            # 루프 종료 등으로 넘기지 못한 코루틴은 닫아 "never awaited" 경고 방지
+            close = getattr(coro, "close", None)
+            if callable(close):
+                close()
+            log.warning("[auth_alert] 이벤트 루프 전달 실패 (%s) — 401 알림 생략",
+                        type(e).__name__)
+            _clear_auth_alerted()
+            return
+        fut.add_done_callback(_on_done)
 
     return _hook
 
 
 def _format_eval_message(recs: list[dict], pending: list[dict],
                         auto_applied: list[dict],
-                        manual_needed: list[dict] | None = None) -> str:
+                        manual_needed: list[dict] | None = None,
+                        apply_failed: list[dict] | None = None,
+                        key_failed: list[dict] | None = None) -> str:
     parts = ["🤖 *주간 모델 가성비 재평가*", ""]
 
     if auto_applied:
@@ -113,10 +160,26 @@ def _format_eval_message(recs: list[dict], pending: list[dict],
         parts.append("")
 
     if manual_needed:
-        parts.append("*[수동 적용 필요 — Railway API 토큰 미설정]*")
+        parts.append("*[수동 적용 필요 — Railway API 토큰 미설정/무효]*")
         for r in manual_needed:
             parts.append(f"📝 `{r['env_name']}`: {r['old_model']} → *{r['new_model']}*")
             parts.append("   대시보드 Variables에서 수정 후 재배포")
+        parts.append("")
+
+    if apply_failed:
+        # automatic인데 Railway 반영 실패(일시 장애 포함) — pending이 없어 빠뜨리면 '변경 권고 없음'으로 오안내
+        parts.append("*[적용 실패 — Railway 반영 안 됨]*")
+        for r in apply_failed:
+            parts.append(f"⚠ `{r['env_name']}`: {r['old_model']} → *{r['new_model']}*")
+            parts.append("   `/model_eval`로 재시도 또는 대시보드 Variables에서 수정 후 재배포")
+        parts.append("")
+
+    if key_failed:
+        # canary가 OpenRouter 키/크레딧 장애로 실패 — 모델 문제 아님. 빠뜨리면 '변경 권고 없음'으로 오안내
+        parts.append("*[적용 보류 — OpenRouter 키/크레딧 장애]*")
+        for r in key_failed:
+            parts.append(f"🔑 `{r['env_name']}`: {r['old_model']} → *{r['new_model']}*")
+        parts.append("   키 교체·충전 후 `/model_eval` 재시도")
         parts.append("")
 
     if pending:
@@ -129,7 +192,7 @@ def _format_eval_message(recs: list[dict], pending: list[dict],
         parts.append("")
         parts.append("승인: `/model_approve <id|all>`")
         parts.append("거부: `/model_reject <id|all>`")
-    elif not auto_applied and not manual_needed:
+    elif not auto_applied and not manual_needed and not apply_failed and not key_failed:
         parts.append("✨ 변경 권고 없음 — 아래 현황 참조")
 
     if LAST_EVAL_STATUS:
@@ -152,10 +215,14 @@ async def _apply_change(env_name: str, new_model: str) -> tuple[str, str]:
 
     status:
       - applied        — upsert 성공 (일부 서비스 성공 포함)
-      - manual         — canary 통과, Railway 토큰 미설정 → 대시보드 수동 수정 안내 (실패 아님)
+      - manual         — canary 통과, Railway 토큰 미설정 또는 무효(probe 'invalid' — 폐기된
+                         토큰이 Variables에 남은 사고 상태 포함) → 대시보드 수동 수정 안내
+                         (실패 아님 — 호출부가 history에 'approved'로 남겨 Layer D 롤백 대상 유지)
       - key_failed     — OpenRouter 키 무효(401)/크레딧 부족 → 모델 품질과 무관
       - canary_failed  — 모델 품질 미달로 정상 차단
-      - railway_failed — 토큰은 있으나 upsert 실패 (폐기된 토큰 등) → 수동 안내 병기
+      - railway_failed — 토큰 유효 확인 후에도 upsert 실패, 또는 토큰 probe가 Railway API
+                         일시 장애('unknown' — 네트워크·5xx·429)로 판정 불가 → 수동 안내 병기.
+                         실패라 /model_approve 항목은 pending 유지 (재시도 가능)
 
     canary(LLM 호출 수십 초)·railway upsert(httpx) 모두 blocking — to_thread로
     이벤트 루프 보호 (안 그러면 모든 봇 polling이 canary 동안 멈춤).
@@ -175,9 +242,18 @@ async def _apply_change(env_name: str, new_model: str) -> tuple[str, str]:
                                   "충전 후 재승인")
         log.warning("[apply_change] %s canary 실패 — 변경 거부: %s", env_name, fail_summary)
         return "canary_failed", f"❌ Canary 실패 ({result['sentinels']}건, {len(result['failures'])} fail): {fail_summary}"
-    if not railway_env.available():
-        # 토큰 미설정(유출 후 미발급 포함) — 실패할 API 호출 대신 수동 적용 안내
-        log.info("[apply_change] %s Railway 토큰 미설정 — 수동 적용 안내", env_name)
+    # 토큰 미설정(유출 후 미발급) 또는 무효(폐기됐는데 Variables에 남음 — available()은
+    # 존재만 봄) — 실패할 upsert 대신 수동 적용 안내. probe는 GraphQL 1회(확정 판정 캐시)라 to_thread.
+    # 'unknown'(Railway API 일시 장애)은 무효가 아님 — 'manual'로 처리하면 승인 항목이 소비되고
+    # history에 'approved'가 남아 재시도 불가 → railway_failed로 pending 유지.
+    state = (await asyncio.to_thread(railway_env.probe) if railway_env.available()
+             else railway_env.PROBE_INVALID)
+    if state == railway_env.PROBE_UNKNOWN:
+        log.warning("[apply_change] %s Railway API 일시 장애 — 적용 보류 (재시도 또는 수동)", env_name)
+        return "railway_failed", ("⚠ Railway API 일시 장애 — 재시도 또는 수동 적용\n"
+                                  f"{_manual_apply_msg(env_name, new_model)}")
+    if state != railway_env.PROBE_OK:
+        log.info("[apply_change] %s Railway 토큰 미설정/무효 — 수동 적용 안내", env_name)
         return "manual", _manual_apply_msg(env_name, new_model)
     ok, msg = await asyncio.to_thread(railway_env.upsert_variable, env_name, new_model)
     if ok:
@@ -227,6 +303,8 @@ async def model_eval_job(bot: Bot, override_chat_id: str | None = None) -> None:
     # 3. automatic 즉시 적용
     auto_applied = []
     manual_needed = []
+    apply_failed = []  # railway_failed (upsert 실패·Railway API 일시 장애) — history 미기록
+    key_failed = []    # canary가 OpenRouter 키 무효/크레딧 부족으로 실패 — history 미기록
     for r in recs:
         if r["classification"] != "automatic":
             continue
@@ -239,12 +317,20 @@ async def model_eval_job(bot: Bot, override_chat_id: str | None = None) -> None:
                                            "resolved_at": int(datetime.now().timestamp())})
         elif status == "manual":
             manual_needed.append(r)
+            # /model_approve 수동 경로와 동일 — canary 통과·적용만 수동. history에 남겨
+            # 사용자가 대시보드에서 반영한 뒤에도 Layer D 롤백 대상 유지
+            approval_store.append_history({**r, "status": "approved", "note": msg,
+                                           "resolved_at": int(datetime.now().timestamp())})
+        elif status == "railway_failed":
+            apply_failed.append(r)
+        elif status == "key_failed":
+            key_failed.append(r)
 
     # 4. suggest는 pending에 저장
     pending = approval_store.stage_recommendations(recs, ttl_hours=_ttl_hours())
 
     # 5. 텔레그램 알림
-    msg = _format_eval_message(recs, pending, auto_applied, manual_needed)
+    msg = _format_eval_message(recs, pending, auto_applied, manual_needed, apply_failed, key_failed)
     try:
         await bot.send_message(chat_id, msg, parse_mode=ParseMode.MARKDOWN)
         log.info("[model_router.cron] 알림 발송 (auto=%d pending=%d)", len(auto_applied), len(pending))
@@ -325,7 +411,8 @@ async def model_approve_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         if "key_failed" in statuses:
             hints.append("· OpenRouter 키 무효/크레딧 부족 → 모델 문제 아님. 키 교체(또는 충전)·재배포 후 재승인")
         if "railway_failed" in statuses:
-            hints.append("· Railway 반영 실패 → 위 안내대로 대시보드 Variables에서 수동 수정")
+            hints.append("· Railway 반영 실패/일시 장애 → 잠시 후 재승인(항목 대기 유지) 또는 "
+                         "위 안내대로 대시보드 Variables에서 수동 수정")
         if "canary_failed" in statuses:
             hints.append("· Canary 실패 → 모델 품질 미달로 정상 차단 (조치 불필요)")
         await update.message.reply_text(

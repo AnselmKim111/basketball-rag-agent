@@ -261,8 +261,10 @@ async def _cmd_curate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     except Exception as e:
         from src import summarizer as _sm
         if isinstance(e, _sm.OpenRouterCreditExhausted):
+            # 401(키 무효)은 충전이 아니라 키 교체가 조치 — 충전 안내는 크레딧/한도 장애에만
+            tail = "" if isinstance(e, _sm.OpenRouterAuthError) else " 키 충전 후 재시도."
             await update.message.reply_text(
-                "❌ OpenRouter 한도 초과 — 섹터 해석 불가. 키 충전 후 재시도."
+                f"❌ {_sm.llm_outage_label(e, 'OpenRouter 한도 초과')} — 섹터 해석 불가.{tail}"
             )
             return
         log.exception("curate resolve_industry 예외")
@@ -452,8 +454,9 @@ async def _launch_curate_pipeline(
     except Exception as e:
         from src import summarizer as _sm
         if isinstance(e, _sm.OpenRouterCreditExhausted):
-            await send_text_chunked(
-                bot, chat_id, "❌ OpenRouter 한도 초과 — thesis 생성 불가."
+            await send_text_chunked(  # 401이면 '키 무효' 안내 (llm_outage_label)
+                bot, chat_id,
+                f"❌ {_sm.llm_outage_label(e, 'OpenRouter 한도 초과')} — thesis 생성 불가.",
             )
             return
         log.exception("curate thesis 생성 예외")
@@ -1395,8 +1398,20 @@ async def _run_pipeline(
         )
     except Exception as e:
         # OpenRouter 키 한도 초과는 사용자가 즉시 조치 가능 → 명확한 안내.
+        # 401(키 무효)은 OpenRouterCreditExhausted 하위 클래스라 먼저 분기 — 충전·한도 상향은
+        # 잘못된 조치 (2026-10-21 키 disable 사고). 로그 문구는 self-test 종료 신호라 공통 유지.
         from src import summarizer as _sm
-        if isinstance(e, _sm.OpenRouterCreditExhausted):
+        if isinstance(e, _sm.OpenRouterAuthError):
+            log.error("OpenRouter 한도 초과로 파이프라인 중단 (%s — 401 키 무효)", type(e).__name__)
+            try:
+                await send_text_chunked(
+                    bot, chat_id,
+                    "❌ OpenRouter 키 무효(401) — 관리자가 새 키를 OPENROUTER_API_KEY에 넣고 "
+                    "재배포한 뒤 다시 시도",
+                )
+            except Exception:
+                pass
+        elif isinstance(e, _sm.OpenRouterCreditExhausted):
             log.error("OpenRouter 한도 초과로 파이프라인 중단")
             try:
                 await send_text_chunked(

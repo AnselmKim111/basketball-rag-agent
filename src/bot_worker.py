@@ -274,7 +274,12 @@ async def _legacy_text_handler(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def _answer_question(update: Update, question: str) -> None:
     """일반 질문 답변 — claude-sonnet 호출. 한국 주식·시장 맥락 우선."""
-    from src.summarizer import OpenRouterCreditExhausted, chat_with_retry, get_client
+    from src.summarizer import (
+        OpenRouterCreditExhausted,
+        chat_with_retry,
+        get_client,
+        llm_outage_label,
+    )
     try:
         client = get_client()
     except Exception:
@@ -300,8 +305,8 @@ async def _answer_question(update: Update, question: str) -> None:
                 context=f"question ({question[:30]})",
             ),
         )
-    except OpenRouterCreditExhausted:
-        await update.message.reply_text("⚠️ OpenRouter 크레딧 부족")
+    except OpenRouterCreditExhausted as e:
+        await update.message.reply_text(f"⚠️ {llm_outage_label(e)}")
         return
     except Exception:
         logging.exception("question 답변 실패")
@@ -895,7 +900,7 @@ def main() -> None:
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not token:
         # 진단: 컨테이너에 어떤 환경변수가 inject 되었는지 출력.
-        # 값은 diag_env_keys allowlist(chat id·모델명)만 원문, 나머지는 set/len/fp만.
+        # 값은 diag_env_keys allowlist(chat id·모델명)만 원문, 나머지는 이름별 마스킹(<set>/len/fp).
         all_keys = sorted(os.environ.keys())
         relevant = diag_env_keys(("TELEGRAM", "WISE", "OPEN", "ALLOWED", "CHAT"))
         print("=" * 60, flush=True)
