@@ -41,9 +41,11 @@ def fetch_ipo_calendar(days_back: int = 14, days_fwd: int = 14) -> list[dict]:
     today = date.today()
     start = (today - timedelta(days=days_back)).isoformat()
     end = (today + timedelta(days=days_fwd)).isoformat()
-    url = f"{_BASE}/calendar/ipo?from={start}&to={end}&token={key}"
+    # 키는 X-Finnhub-Token 헤더로 (쿼리 token= 은 URL째 예외·로그에 남음)
+    url = f"{_BASE}/calendar/ipo?from={start}&to={end}"
     try:
-        r = httpx.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
+        r = httpx.get(url, timeout=20,
+                      headers={"User-Agent": "Mozilla/5.0", "X-Finnhub-Token": key})
         if r.status_code in (401, 403):
             log.info("[ipo] %s — 권한 없음 (무료 티어 제외 가능)", r.status_code)
             return []

@@ -33,6 +33,7 @@ import json
 import logging
 import os
 import re
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -938,8 +939,13 @@ async def _run_pipeline(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
     user_text: str,
+    parsed: dict | None = None,
 ) -> None:
-    """전체 어닝콜 분석 파이프라인. graceful — 외부 실패는 메시지로 알리고 계속."""
+    """전체 어닝콜 분석 파이프라인. graceful — 외부 실패는 메시지로 알리고 계속.
+
+    parsed: 이미 파싱된 입력 (watch 폴러가 LLM 가용성 확인 겸 1회 파싱해 구독자 공용으로
+    넘김). None이면 여기서 파싱.
+    """
     bot: Bot = context.bot
     chat_id = str(update.effective_chat.id)
 
@@ -947,7 +953,8 @@ async def _run_pipeline(
     await _safe_reply(update, "📞 어닝콜 분석 시작 — 약 5-10분 소요 (결과는 한 번에 발송)")
 
     # 0) 파싱
-    parsed = await _step_parse(user_text)
+    if parsed is None:
+        parsed = await _step_parse(user_text)
     if parsed is None:
         await _safe_send(
             bot, chat_id,
@@ -1294,8 +1301,12 @@ async def _run_pipeline(
 # ------------------------------------------------------------------
 # 단계별 헬퍼
 # ------------------------------------------------------------------
-async def _step_parse(user_text: str) -> dict | None:
-    """0단계: 사용자 입력 → 모드/티커/분기/커스텀 질문 JSON."""
+async def _step_parse(user_text: str, *, raise_outage: bool = False) -> dict | None:
+    """0단계: 사용자 입력 → 모드/티커/분기/커스텀 질문 JSON.
+
+    raise_outage=True면 OpenRouterCreditExhausted(401 OpenRouterAuthError 포함)를 삼키지
+    않고 raise — watch 폴러가 LLM 장애와 일반 파싱 실패를 구분하는 용도. 기본은 기존대로 None.
+    """
     from src import summarizer
     from src.idea_bot import _parse_json
 
@@ -1318,6 +1329,11 @@ async def _step_parse(user_text: str) -> dict | None:
 
     try:
         content = await loop.run_in_executor(None, _call)
+    except summarizer.OpenRouterCreditExhausted:
+        if raise_outage:
+            raise
+        log.exception("parse LLM 호출 실패")
+        return None
     except Exception:
         log.exception("parse LLM 호출 실패")
         return None
@@ -2827,6 +2843,112 @@ async def _safe_send(bot: Bot, chat_id: str, text: str) -> None:
 # ------------------------------------------------------------------
 # Pre-emptive watch poller (cron job)
 # ------------------------------------------------------------------
+# LLM 장애 대응 (2026-10-21 OpenRouter 키 disable 사고 후속):
+#   - 401 breaker 열림 / watch가 최근 LLM 장애를 겪음(backoff) → 폴링 전체 skip.
+#     Yahoo·transcript(AV 25/day) 호출 0, pre-call 발사 0, 메시지 0.
+#   - (ticker, Q, year) seen 처리는 파이프라인 종료 후. LLM 장애(인증/크레딧)로 끝났으면
+#     미마킹 → 다음 폴링 재시도. 실행 중 중복 발사는 _WATCH_INFLIGHT(프로세스 메모리)로 차단.
+#   - pre-call 합성 실패는 precall 캐시 디렉토리에 실패 stamp — 같은 (ticker, 콜 날짜)는
+#     24h 내 재발사·재메시지 안 함 (이전: 4h 폴링마다 '자동 발사'+'합성 실패' 스팸).
+WATCH_OUTAGE_BACKOFF_DEFAULT_S = 6 * 3600
+PRECALL_FAIL_TTL_S = 24 * 3600
+
+_WATCH_INFLIGHT: set[str] = set()          # 풀 분석 진행 중인 seen_key
+_WATCH_TASKS: set[asyncio.Task] = set()    # 백그라운드 task 참조 유지 (GC 방지)
+_watch_outage_at: float | None = None      # 마지막 watch LLM 장애 시각 (재배포 시 초기화)
+# stamp 파일 기록 실패(읽기 전용 볼륨 등) 대비 메모리 사본: (TICKER, year, quarter, call_date) → 시각
+_PRECALL_FAIL_MEM: dict[tuple[str, int, int, str], float] = {}
+
+
+def _now() -> float:
+    """wall clock (테스트에서 monkeypatch로 시간 이동)."""
+    return time.time()
+
+
+def _llm_auth_blocked() -> bool:
+    """summarizer 401 breaker 열림 여부. API 부재(구버전)·예외 시 False."""
+    from src import summarizer
+    try:
+        return bool(getattr(summarizer, "auth_breaker_open", lambda: False)())
+    except Exception:
+        return False
+
+
+def _watch_outage_backoff_s() -> float:
+    try:
+        return max(0.0, float(os.getenv(
+            "EARNINGS_WATCH_OUTAGE_BACKOFF_S", str(WATCH_OUTAGE_BACKOFF_DEFAULT_S))))
+    except ValueError:
+        return float(WATCH_OUTAGE_BACKOFF_DEFAULT_S)
+
+
+def _note_watch_outage() -> None:
+    global _watch_outage_at
+    _watch_outage_at = _now()
+
+
+def _watch_llm_blocked() -> str | None:
+    """watch 폴링·pre-call 발사를 막을 LLM 장애 사유. 정상이면 None."""
+    if _llm_auth_blocked():
+        return "OpenRouter 인증 breaker 열림"
+    if _watch_outage_at is not None and _now() - _watch_outage_at < _watch_outage_backoff_s():
+        return "최근 LLM 장애 backoff"
+    return None
+
+
+def _spawn(coro) -> asyncio.Task:
+    task = asyncio.create_task(coro)
+    _WATCH_TASKS.add(task)
+    task.add_done_callback(_WATCH_TASKS.discard)
+    return task
+
+
+def _precall_fail_path(ticker: str, year: int, quarter: int) -> Path:
+    """pre-call 캐시 파일 옆 실패 stamp (`Q{q}_{y}.fail.json`) — precall.exists와 무관한 이름."""
+    from src.earnings import precall
+    p = precall._path(ticker, year, quarter)
+    return p.with_name(f"{p.stem}.fail.json")
+
+
+def _precall_fail_recent(ticker: str, year: int, quarter: int, call_date: str = "") -> bool:
+    """같은 (ticker, 분기, 콜 날짜)의 pre-call 합성 실패가 24h 이내면 True."""
+    now = _now()
+    ts = _PRECALL_FAIL_MEM.get((ticker.upper(), int(year), int(quarter), call_date))
+    if ts is not None and now - ts < PRECALL_FAIL_TTL_S:
+        return True
+    try:
+        data = json.loads(_precall_fail_path(ticker, year, quarter).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return False
+    except Exception:
+        log.debug("[watch] pre-call 실패 stamp 읽기 실패 (무시): %s", ticker)
+        return False
+    if (data.get("call_date") or "") != call_date:
+        return False  # 콜 일정 변경 — 새 날짜는 별도로 시도
+    try:
+        return now - float(data.get("failed_at") or 0) < PRECALL_FAIL_TTL_S
+    except (TypeError, ValueError):
+        return False
+
+
+def _precall_fail_mark(
+    ticker: str, year: int, quarter: int, call_date: str = "", reason: str = "",
+) -> None:
+    now = _now()
+    _PRECALL_FAIL_MEM[(ticker.upper(), int(year), int(quarter), call_date)] = now
+    try:
+        _precall_fail_path(ticker, year, quarter).write_text(
+            json.dumps(
+                {"ticker": ticker.upper(), "year": int(year), "quarter": int(quarter),
+                 "call_date": call_date, "failed_at": now, "reason": reason},
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+    except Exception:
+        log.exception("[watch] pre-call 실패 stamp 저장 실패 (메모리만 유지): %s", ticker)
+
+
 async def earnings_watch_poll_job(bot: Bot) -> None:
     """orchestrator APScheduler가 호출. watch된 종목의 새 콜 자동 감지·발송.
 
@@ -2836,14 +2958,21 @@ async def earnings_watch_poll_job(bot: Bot) -> None:
          (예정일 미상이면 안전하게 항상 시도; AV 25/day는 state_store dedup이 보호.)
       3) state_store dedup 키 `earnings_watch:{TICKER}:Q{q}_{year}` — 이미 발송이면 skip.
       4) `transcript_source.fetch_full_transcript` 시도 → grounded + 비어 있지 않으면 새 콜.
-      5) fan-out: `subscribers_of(ticker)` 각 chat_id로 풀 분석 파이프라인 1회씩 실행.
-      6) 성공 시 state_store에 mark_seen.
+      5) 입력 파싱 1회 (LLM 가용성 확인 겸, 구독자 공용) → 장애면 미발사·미마킹, 남은 ticker skip.
+      6) fan-out: `subscribers_of(ticker)` 각 chat_id로 풀 분석 파이프라인 1회씩 실행.
+      7) 파이프라인 종료 후 state_store에 mark_seen — LLM 장애로 끝났으면 미마킹 (재시도).
+    LLM 장애(401 breaker 열림 / 최근 장애 backoff) 중엔 폴링 전체 skip — AV 25/day 보호.
     """
     from datetime import datetime as _dt
     from src import state_store, summarizer
     from src.earnings import earnings_watchlist as wl
     from src.earnings import consensus
     from src.earnings import transcript_source as ts
+
+    blocked = _watch_llm_blocked()
+    if blocked:
+        log.warning("[earnings_watch_poll] %s — 이번 폴링 전체 skip (transcript quota·pre-call 보호)", blocked)
+        return
 
     log.info("[earnings_watch_poll] 시작")
     tickers = sorted(wl.all_tickers())
@@ -2865,6 +2994,11 @@ async def earnings_watch_poll_job(bot: Bot) -> None:
     skipped: list[str] = []
 
     for ticker, raw_date in zip(tickers, cal_dates):
+        # 폴링 도중 breaker가 열리면(예: transcript perplexity 폴백 401) 남은 ticker 중단
+        blocked = _watch_llm_blocked()
+        if blocked:
+            log.warning("[earnings_watch_poll] %s — %s부터 남은 ticker skip", blocked, ticker)
+            break
         # 2) calendar gating
         delta = None
         edate = None
@@ -2881,15 +3015,17 @@ async def earnings_watch_poll_job(bot: Bot) -> None:
             y_pre = ref_date.year
             q_pre = (ref_date.month - 1) // 3 + 1
             from src.earnings import precall as _precall
-            if not _precall.exists(ticker, y_pre, q_pre):
+            call_date = edate.isoformat()
+            if not _precall.exists(ticker, y_pre, q_pre) and not _precall_fail_recent(
+                    ticker, y_pre, q_pre, call_date):
                 fiscal_label_pre = f"Q{q_pre} {y_pre}"
                 subs = wl.subscribers_of(ticker)
                 if subs:
                     log.info("[earnings_watch_poll] %s pre-call window 발사 (delta=%s)", ticker, delta)
                     for cid in subs:
-                        asyncio.create_task(
-                            _watch_fire_pre_call(bot, cid, ticker, y_pre, q_pre, fiscal_label_pre)
-                        )
+                        _spawn(_watch_fire_pre_call(
+                            bot, cid, ticker, y_pre, q_pre, fiscal_label_pre, call_date=call_date,
+                        ))
 
         # 2-2) actual transcript 윈도 (D-1 ~ D+4)만 transcript 시도
         in_window = True
@@ -2914,6 +3050,9 @@ async def earnings_watch_poll_job(bot: Bot) -> None:
         if seen_key in state_store.seen("earnings_watch"):
             skipped.append(f"{ticker}(이미 발송 Q{q} {y})")
             continue
+        if seen_key in _WATCH_INFLIGHT:
+            skipped.append(f"{ticker}(Q{q} {y} 분석 진행 중)")
+            continue
 
         # 5) transcript 가용성 체크
         try:
@@ -2932,20 +3071,28 @@ async def earnings_watch_poll_job(bot: Bot) -> None:
             continue
         fiscal_label = f"Q{q} {y}"
 
-        # 즉시 mark_seen — 한 번 fire하면 race 시에도 두 번 안 보내게
+        # 6-1) LLM 가용성 확인 겸 입력 파싱 1회 (구독자 공용). 인증/크레딧 장애면 메시지 없이
+        #    미마킹 — 다음 폴링 재시도. 남은 ticker도 같은 장애라 transcript quota 아끼려 중단.
+        user_text = f"{ticker} {fiscal_label}"
         try:
-            state_store.mark_seen("earnings_watch", [seen_key])
-        except Exception:
-            log.exception("[earnings_watch_poll] mark_seen 실패")
+            parsed = await _step_parse(user_text, raise_outage=True)
+        except summarizer.OpenRouterCreditExhausted:
+            _note_watch_outage()
+            log.warning(
+                "[earnings_watch_poll] %s %s — LLM 장애(OpenRouter 인증/한도) — 미발사·미마킹, 남은 ticker skip",
+                ticker, fiscal_label,
+            )
+            break
 
+        # seen 처리는 파이프라인 종료 후 (_watch_fire_and_mark). 진행 중 중복 발사는 in-flight로 차단.
+        _WATCH_INFLIGHT.add(seen_key)
         await _safe_send(
             bot, subs[0],
             f"🔔 watch 감지 — {ticker} {fiscal_label} transcript 확보 ({len(doc.full_text):,}자). 자동 풀 분석 시작 …",
         )
 
         # 구독자별로 풀 파이프라인 실행 (각자에게 보고서 fan-out)
-        for cid in subs:
-            asyncio.create_task(_watch_fire_pipeline(bot, cid, ticker, fiscal_label, y, q))
+        _spawn(_watch_fire_and_mark(bot, list(subs), ticker, fiscal_label, y, q, seen_key, parsed))
         fired += 1
 
     log.info(
@@ -2958,10 +3105,22 @@ async def earnings_watch_poll_job(bot: Bot) -> None:
 
 async def _watch_fire_pre_call(
     bot: Bot, chat_id: str, ticker: str, year: int, quarter: int, fiscal_label: str,
+    call_date: str = "",
 ) -> None:
-    """watch_poll에서 D-2~D-1 pre-call 자동 발사. precall 캐시 저장 + 발송 1회."""
+    """watch_poll에서 D-2~D-1 pre-call 자동 발사. precall 캐시 저장 + 발송 1회.
+
+    LLM 장애(breaker/backoff) 중엔 조용히 skip. 합성 실패 시 실패 stamp — 같은
+    (ticker, 콜 날짜)는 24h 내 재발사·재메시지 안 함.
+    """
     from src.earnings import precall
     if precall.exists(ticker, year, quarter):
+        return
+    blocked = _watch_llm_blocked()
+    if blocked:
+        log.info("[watch] %s pre-call skip — %s", ticker, blocked)
+        return
+    if _precall_fail_recent(ticker, year, quarter, call_date):
+        log.info("[watch] %s pre-call skip — 24h 내 합성 실패 이력 (call_date=%s)", ticker, call_date or "?")
         return
     await _safe_send(
         bot, chat_id,
@@ -2969,7 +3128,10 @@ async def _watch_fire_pre_call(
     )
     report, snap = await _step_synthesize_pre_call(ticker, year, quarter, fiscal_label)
     if not report:
-        await _safe_send(bot, chat_id, f"⚠️ {ticker} pre-call 합성 실패 — 데이터 부족 가능")
+        auth = _llm_auth_blocked()
+        _precall_fail_mark(ticker, year, quarter, call_date, reason="llm_auth" if auth else "empty")
+        why = "LLM 인증 장애" if auth else "데이터 부족 가능"
+        await _safe_send(bot, chat_id, f"⚠️ {ticker} pre-call 합성 실패 — {why} (24시간 내 재시도 안 함)")
         return
     await send_text_chunked(bot, chat_id, report)
     try:
@@ -2993,8 +3155,46 @@ def _to_date(fiscal_label: str, year: int, quarter: int):
     return _d(year, max(1, min(12, quarter * 3 - 1)), 15)
 
 
-async def _watch_fire_pipeline(bot: Bot, chat_id: str, ticker: str, fiscal_label: str, year: int, quarter: int) -> None:
-    """단일 (ticker, chat_id, period) 풀 분석 — _run_pipeline 재사용 (FakeUpdate)."""
+async def _watch_fire_and_mark(
+    bot: Bot, subs: list[str], ticker: str, fiscal_label: str, year: int, quarter: int,
+    seen_key: str, parsed: dict | None = None,
+) -> None:
+    """구독자별 풀 분석(동시) → 종료 후 seen 처리. LLM 장애로 끝났으면 미마킹 (다음 폴링 재시도).
+
+    장애 판정: 파이프라인이 OpenRouterCreditExhausted로 끝났거나 종료 시점 401 breaker 열림
+    (단계별 LLM 실패는 _run_pipeline이 삼키므로 breaker로 판별). 일반 실패는 기존대로 마킹.
+    """
+    from src import state_store
+    try:
+        statuses = await asyncio.gather(*[
+            _watch_fire_pipeline(bot, cid, ticker, fiscal_label, year, quarter, parsed=parsed)
+            for cid in subs
+        ])
+        if "llm_outage" in statuses or _llm_auth_blocked():
+            _note_watch_outage()
+            log.warning(
+                "[earnings_watch_poll] %s %s — 분석 중 LLM 장애 — seen 미마킹 (다음 폴링 재시도)",
+                ticker, fiscal_label,
+            )
+            return
+        try:
+            state_store.mark_seen("earnings_watch", [seen_key])
+        except Exception:
+            log.exception("[earnings_watch_poll] mark_seen 실패")
+    finally:
+        _WATCH_INFLIGHT.discard(seen_key)
+
+
+async def _watch_fire_pipeline(
+    bot: Bot, chat_id: str, ticker: str, fiscal_label: str, year: int, quarter: int,
+    parsed: dict | None = None,
+) -> str:
+    """단일 (ticker, chat_id, period) 풀 분석 — _run_pipeline 재사용 (FakeUpdate).
+
+    반환: "ok" | "error"(일반 예외) | "llm_outage"(OpenRouter 인증/크레딧 예외).
+    """
+    from src import summarizer
+
     class _FakeChat:
         def __init__(self, cid: str): self.id = int(cid)
 
@@ -3022,9 +3222,14 @@ async def _watch_fire_pipeline(bot: Bot, chat_id: str, ticker: str, fiscal_label
 
     user_text = f"{ticker} {fiscal_label}"
     try:
-        await _run_pipeline(_FakeUpdate(chat_id, user_text), _FakeContext(), user_text)
+        await _run_pipeline(_FakeUpdate(chat_id, user_text), _FakeContext(), user_text, parsed=parsed)
+    except summarizer.OpenRouterCreditExhausted:
+        log.warning("[earnings_watch_poll] 풀 분석 LLM 장애 (%s %s)", ticker, fiscal_label)
+        return "llm_outage"
     except Exception:
         log.exception("[earnings_watch_poll] 풀 분석 실패 (%s %s)", ticker, fiscal_label)
+        return "error"
+    return "ok"
 
 
 async def _self_test(app: Application) -> None:

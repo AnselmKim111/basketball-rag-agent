@@ -18,6 +18,18 @@ log = logging.getLogger(__name__)
 _BASE = "https://financialmodelingprep.com/stable"
 
 
+def _err_brief(e: BaseException | None) -> str:
+    """예외 → 로그용 요약 (타입명 + 상태코드만).
+
+    httpx/requests 예외 문자열엔 요청 URL(apikey 쿼리 포함)이 그대로 박힌다
+    (2026-10-21 Railway 유출 사고 후속) — str(e)·log.exception 금지.
+    """
+    if e is None:
+        return "?"
+    status = getattr(getattr(e, "response", None), "status_code", None)
+    return f"{type(e).__name__} status={status}" if status is not None else type(e).__name__
+
+
 def _calendar_window(start: str, end: str, key: str) -> list[dict]:
     """단일 ≤14일 구간 fetch (FMP 무료 플랜은 범위 캡이 있어 더 넓으면 빈 응답)."""
     import httpx
@@ -33,7 +45,8 @@ def _calendar_window(start: str, end: str, key: str) -> list[dict]:
             return []
         except Exception as e:
             last_err = e
-    log.info("[report.earnings] 캘린더 fetch 실패(%s~%s): %s", start, end, last_err)
+    log.info("[report.earnings] 캘린더 fetch 실패(%s~%s) /earnings-calendar: %s",
+             start, end, _err_brief(last_err))
     return []
 
 
@@ -104,11 +117,11 @@ def fetch_earnings_momentum(days_back: int = 21, days_fwd: int = 12,
         fh_key = os.getenv("FINNHUB_API_KEY")
         if fh_key:
             fh_url = "https://finnhub.io/api/v1/calendar/earnings"
+            # 키는 헤더로 (쿼리 token= 은 URL째 예외·프록시 로그에 남음)
             r = requests.get(fh_url, params={
                 "from": today.isoformat(),
                 "to": (today + timedelta(days=days_fwd)).isoformat(),
-                "token": fh_key,
-            }, timeout=15)
+            }, headers={"X-Finnhub-Token": fh_key}, timeout=15)
             if r.status_code == 200:
                 items = (r.json() or {}).get("earningsCalendar") or []
                 for it in items:

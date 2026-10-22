@@ -43,6 +43,9 @@ def setup_logging(verbose: bool) -> None:
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         datefmt="%H:%M:%S",
     )
+    # 로그·traceback의 키/토큰 마스킹 (stdout tail이 텔레그램으로 회신되므로 필수)
+    from src.log_redact import install_redaction
+    install_redaction()
     logging.getLogger("playwright").setLevel(logging.WARNING)
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("openai").setLevel(logging.WARNING)

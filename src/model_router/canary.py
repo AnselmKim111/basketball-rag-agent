@@ -9,7 +9,13 @@ import logging
 import os
 import time
 
-from src.summarizer import chat_with_retry, get_client
+from src.summarizer import (
+    OpenRouterAuthError,
+    OpenRouterCreditExhausted,
+    auth_breaker_open,
+    chat_with_retry,
+    get_client,
+)
 
 from .candidates import tier_of_env
 
@@ -132,6 +138,8 @@ def run_canary(env_name: str, new_model: str) -> dict:
     """티어 추정 후 sentinel 실행. {passed, failures, latency_ms, sentinels} 반환.
 
     env_name 으로 tier 결정 → sentinel list → 각 호출 (model swap) → validator → 집계.
+    키 무효(401)·크레딧 부족이면 모델 품질과 무관 — `auth_error`/`credit_error` True로
+    표시해 handler가 '모델 품질 미달' 대신 키 문제로 안내.
     """
     if os.getenv("MODEL_ROUTER_SKIP_CANARY", "0") == "1":
         log.info("[canary] MODEL_ROUTER_SKIP_CANARY=1 — skip")
@@ -149,8 +157,22 @@ def run_canary(env_name: str, new_model: str) -> dict:
     failures = []
     latencies = []
     passed_count = 0
+    auth_error = credit_error = False
 
-    client = get_client()
+    def _key_failure(reason: str) -> dict:
+        return {"passed": False, "failures": [reason], "latency_ms": 0,
+                "sentinels": len(sentinels), "tier": tier,
+                "auth_error": True, "credit_error": False}
+
+    # 401 breaker 차단 중 — 네트워크 호출 없이 키 문제로 판정
+    if auth_breaker_open():
+        log.warning("[canary] %s → %s: OpenRouter 401 breaker 차단 중 — canary skip", env_name, new_model)
+        return _key_failure("OpenRouter 인증 실패(401) — API 키 무효 (차단 중)")
+    try:
+        client = get_client()
+    except Exception as e:
+        log.warning("[canary] OpenRouter client 초기화 실패: %s", e)
+        return _key_failure("OPENROUTER_API_KEY 미설정 — client 초기화 실패")
     for i, s in enumerate(sentinels):
         t0 = time.time()
         try:
@@ -166,6 +188,14 @@ def run_canary(env_name: str, new_model: str) -> dict:
                 max_attempts=2,  # canary는 빠르게 — fallback 안 거침
                 context=f"canary:{tier}:{i}",
             )
+        except OpenRouterAuthError:
+            auth_error = True
+            failures.append(f"[{i}] OpenRouter 인증 실패(401) — API 키 무효")
+            break  # 키 문제 — 나머지 sentinel도 같은 결과
+        except OpenRouterCreditExhausted:
+            credit_error = True
+            failures.append(f"[{i}] OpenRouter 크레딧/한도 부족")
+            break
         except Exception as e:
             failures.append(f"[{i}] exception: {e}")
             continue
@@ -185,7 +215,7 @@ def run_canary(env_name: str, new_model: str) -> dict:
         passed_count += 1
 
     ratio = passed_count / max(1, len(sentinels))
-    passed = ratio >= PASS_RATIO
+    passed = ratio >= PASS_RATIO and not (auth_error or credit_error)
     log.info("[canary] %s → %s: %d/%d pass (ratio=%.2f) latency_p50=%dms",
              env_name, new_model, passed_count, len(sentinels), ratio,
              sorted(latencies)[len(latencies) // 2] if latencies else 0)
@@ -195,4 +225,6 @@ def run_canary(env_name: str, new_model: str) -> dict:
         "latency_ms": max(latencies) if latencies else 0,
         "sentinels": len(sentinels),
         "tier": tier,
+        "auth_error": auth_error,
+        "credit_error": credit_error,
     }

@@ -15,6 +15,10 @@
 각 봇 토큰이 있는 봇만 활성화. 모두 같은 asyncio 이벤트 루프에서 polling.
 스케줄은 KST 기준.
 
+봇 단위 격리 (2026-10-21 유출 사고 후속): 봇 하나가 시작 실패(토큰 거부 등)해도 그 봇만
+빠지고 나머지는 가동, 그 봇의 cron은 첫 가동 봇이 대행. 전부 실패해도 종료 대신 idle —
+exit하면 Railway 재시작 crash loop. 부팅 시 자격증명 점검 1회(src/cred_check.py).
+
 Railway는 Dockerfile의 CMD가 이 모듈로 향함.
 """
 
@@ -24,6 +28,7 @@ import asyncio
 import logging
 import os
 import signal
+import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Awaitable, Callable
@@ -56,6 +61,11 @@ from src.recap_bot import RECAP_COMMANDS, build_recap_app, recap_weekly_job
 from src.screener_bot import SCREENER_COMMANDS, build_screener_app, screener_daily_job
 from src.us_screener_bot import US_SCREENER_COMMANDS, build_us_screener_app, us_screener_daily_job
 from src.report_bot import REPORT_COMMANDS, build_report_app, report_daily_job
+
+try:
+    from src import log_redact as _log_redact
+except ImportError:  # 병행 작업 중 모듈 부재 — orchestrator 자체는 계속 import 가능해야 함
+    _log_redact = None
 
 KST = timezone(timedelta(hours=9))
 
@@ -344,7 +354,8 @@ def _diag_env() -> None:
     print(f"[orch] relevant env vars = {relevant}", flush=True)
 
 
-async def _run_forever() -> None:
+def _configure_logging() -> None:
+    """로깅 설정 (멱등) — _run_forever 시작 + main()의 치명적 오류 경로 공용."""
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -358,6 +369,274 @@ async def _run_forever() -> None:
     # exception 전파를 끄면 stderr noise 사라짐. Python 권장: 앱 시작 시 1회.
     logging.raiseExceptions = False
     logging.getLogger("pykrx").setLevel(logging.CRITICAL)
+    # 2026-10-21 Railway env 유출 후속 — 모든 로그 라인(예외 traceback 포함)에서
+    # 토큰·키 값 마스킹. 로그는 호스트에 평문 보관되므로 basicConfig 직후 1회.
+    if _log_redact is not None:
+        _log_redact.install_redaction()
+
+
+# ------------------------------------------------------------------
+# 봇 단위 격리 (2026-10-21 유출 사고 후속)
+# ------------------------------------------------------------------
+# 사고: 토큰 폐기 후 app.initialize()(→ get_me)의 InvalidToken이 asyncio.run 밖으로
+# 새어 프로세스 종료 → Railway 재시작(최대 10회) crash loop로 멀쩡한 봇까지 전부 다운 +
+# traceback에 "The token `<토큰>` was rejected" 원문 출력. 이제 봇 하나 실패 = 그 봇만 스킵.
+def _fingerprint(value: str) -> str:
+    if _log_redact is None:
+        return "?"
+    try:
+        return _log_redact.fingerprint(value)
+    except Exception:
+        return "?"
+
+
+def _invalid_token_cls() -> type | None:
+    """telegram.error.InvalidToken — 테스트 stub엔 telegram.error가 없을 수 있음."""
+    try:
+        from telegram.error import InvalidToken
+    except ImportError:
+        return None
+    if isinstance(InvalidToken, type) and issubclass(InvalidToken, BaseException):
+        return InvalidToken
+    return None
+
+
+async def _safe_shutdown(app: Application, name: str) -> None:
+    """부분 기동된 app 정리 (best-effort). 예외 텍스트는 토큰을 담을 수 있어 타입명만."""
+    log = logging.getLogger("orchestrator")
+    updater = getattr(app, "updater", None)
+    steps = []
+    if updater is not None and getattr(updater, "running", False) is True:
+        steps.append(updater.stop)
+    if getattr(app, "running", False) is True:
+        steps.append(app.stop)
+    steps.append(app.shutdown)
+    for step in steps:
+        try:
+            await step()
+        except Exception as e:
+            log.debug("%s 정리 단계 실패 (%s) — 무시", name, type(e).__name__)
+
+
+async def _start_apps(
+    apps: list[tuple[str, Application]],
+    spec_by_name: dict[str, BotSpec],
+) -> tuple[list[tuple[str, Application]], list[str], dict[str, str]]:
+    """봇별 initialize/start/start_polling + set_my_commands — 실패한 봇만 건너뜀.
+
+    반환: (가동 중 apps, 실패 봇 이름 list, {실패 봇 이름: 짧은 사유}).
+    """
+    log = logging.getLogger("orchestrator")
+    invalid_token = _invalid_token_cls()
+    running: list[tuple[str, Application]] = []
+    failed: list[str] = []
+    reasons: dict[str, str] = {}
+    for name, app in apps:
+        spec = spec_by_name.get(name)
+        token_env = spec.token_env if spec else "?"
+        err: Exception | None = None
+        try:
+            await app.initialize()
+            await app.start()
+            await app.updater.start_polling(drop_pending_updates=True)
+        except Exception as e:
+            err = e
+        if err is not None:
+            # 정리·로그는 except 블록 밖에서 — 정리 중 예외의 traceback에 원 예외(토큰 포함
+            # 메시지)가 "During handling of..."로 딸려 나가지 않게.
+            if invalid_token is not None and isinstance(err, invalid_token):
+                # 예외 메시지에 토큰 원문 포함 → 텍스트·traceback 미출력, fingerprint만
+                log.error("%s 토큰 거부(fp=%s) — %s 봇 건너뜀",
+                          token_env, _fingerprint(os.getenv(token_env, "")), name)
+                reasons[name] = "토큰 거부"
+            else:
+                # traceback은 마스킹 formatter(install_redaction) 경유
+                log.error("%sBot 시작 실패 — %s 봇 건너뜀", name, name, exc_info=err)
+                reasons[name] = f"시작 실패 ({type(err).__name__})"
+            del err
+            failed.append(name)
+            await _safe_shutdown(app, name)
+            continue
+        # 텔레그램 / 자동완성 명령 등록 — manual lifecycle은 post_init이 자동
+        # 호출 안 되므로 여기서 직접 호출.
+        if spec and spec.commands:
+            try:
+                await app.bot.set_my_commands(
+                    [BotCommand(c, d) for c, d in spec.commands]
+                )
+                log.info("%s set_my_commands 등록: %d개", name, len(spec.commands))
+            except Exception:
+                log.exception("%s set_my_commands 실패 (봇은 정상 가동)", name)
+        running.append((name, app))
+        log.info("%s 폴링 시작", name)
+    return running, failed, reasons
+
+
+def _schedule_jobs(scheduler, pending_jobs: list[tuple[str, ScheduledJob]],
+                   bot_objects: dict[str, Bot], failed_bots: list[str]) -> None:
+    """크론 등록. 소유 봇이 시작 실패면 첫 번째 가동 봇으로 대행 (발송 대상 chat은 job이
+    env로 정하므로 그대로 — 바뀌는 건 보내는 봇 객체뿐). 가동 봇이 없으면 경고 후 스킵."""
+    log = logging.getLogger("orchestrator")
+    fallback_name = next(iter(bot_objects), None)
+    for bot_name, job in pending_jobs:
+        bot = bot_objects.get(bot_name)
+        if bot is None:
+            if bot_name not in failed_bots:
+                continue
+            if fallback_name is None:
+                log.warning("스케줄 스킵: %s — 소유 봇 %s 시작 실패 + 대행할 가동 봇 없음",
+                            job.job_id, bot_name)
+                continue
+            bot = bot_objects[fallback_name]
+            log.warning("스케줄 대행: %s — 소유 봇 %s 시작 실패 → %s 봇이 발송 (대상 chat 동일)",
+                        job.job_id, bot_name, fallback_name)
+        scheduler.add_job(
+            _instrumented_job,
+            CronTrigger(timezone=KST, **job.cron),
+            args=[job.func, bot, job.job_id, job.deadline_sec, job.alert_env_keys],
+            id=job.job_id,
+            misfire_grace_time=3600,
+            coalesce=True,
+            max_instances=1,
+        )
+        log.info("스케줄: %s (deadline %ds)", job.description or job.job_id, job.deadline_sec)
+
+
+def _warn_idle_secrets() -> None:
+    """idle 서비스(ACTIVE_BOTS=_disabled_ 등)가 쓰지도 않는 시크릿을 보유 → 유출 노출면.
+    env 이름만 출력 (값 절대 금지)."""
+    if _log_redact is None:
+        return
+    names = sorted(k for k in os.environ if _log_redact.is_secret_name(k))
+    if names:
+        logging.getLogger("orchestrator").warning(
+            "idle 서비스가 시크릿 %d개 보유: %s — 삭제 권장 (안 쓰는 값은 유출 시 노출면만 늘림)",
+            len(names), ", ".join(names))
+
+
+async def _idle_forever(stop_event: asyncio.Event | None = None) -> None:
+    """종료하지 않고 대기 — Railway는 exit 시 즉시 재시작 → crash loop 방지."""
+    try:
+        if stop_event is not None:
+            await stop_event.wait()
+            return
+        while True:
+            await asyncio.sleep(3600)
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        return
+
+
+# ------------------------------------------------------------------
+# 관리자 알림 — 대상 chat은 model_router cron 알림과 동일한 해석 순서 재사용
+# ------------------------------------------------------------------
+def _admin_chat_id() -> str | None:
+    """REPORT_CHAT_ID → MODEL_ROUTER_CHAT_ID → ALLOWED_CHAT_IDS 첫 숫자 id."""
+    try:
+        from src.model_router.handler import _cron_notify_chat_id
+        return _cron_notify_chat_id()
+    except Exception:
+        logging.getLogger("orchestrator").exception("관리자 chat 해석 실패")
+        return None
+
+
+async def _send_admin_text(bot: Bot, chat_id: str, text: str) -> bool:
+    """plain text 발송(parse_mode 없음 — 파싱 위험 0). 실패는 타입명만 경고."""
+    try:
+        await bot.send_message(chat_id=chat_id, text=text)
+        return True
+    except Exception as e:
+        logging.getLogger("orchestrator").warning(
+            "관리자 알림 발송 실패 (%s)", type(e).__name__)
+        return False
+
+
+def _make_auth_alert_hook(bot: Bot, loop: asyncio.AbstractEventLoop) -> Callable[[str], None] | None:
+    """폴백 hook — model_router.handler.make_auth_alert_hook이 없을 때만 사용."""
+    chat_id = _admin_chat_id()
+    if not chat_id:
+        return None
+
+    def _hook(msg: str) -> None:
+        # LLM 워커 스레드에서 동기 호출 — 메인 루프로 넘기고 즉시 반환 (결과 대기 금지)
+        coro = _send_admin_text(bot, chat_id, msg)
+        try:
+            asyncio.run_coroutine_threadsafe(coro, loop)
+        except Exception:
+            coro.close()
+            logging.getLogger("orchestrator").warning("[auth_alert] 이벤트 루프 전달 실패 — 알림 생략")
+
+    return _hook
+
+
+def _register_auth_alert_hook(bot: Bot, loop: asyncio.AbstractEventLoop) -> bool:
+    """summarizer 401 breaker → 관리자 알림 1건 hook 등록 (첫 가동 봇이 발송). 등록 시 True."""
+    log = logging.getLogger("orchestrator")
+    try:
+        from src.summarizer import set_auth_alert_hook
+    except ImportError:
+        log.warning("summarizer.set_auth_alert_hook 없음 — OpenRouter 401 관리자 알림 미등록")
+        return False
+    try:
+        try:
+            from src.model_router.handler import make_auth_alert_hook
+        except ImportError:
+            make_auth_alert_hook = None
+        if make_auth_alert_hook is not None:
+            hook = make_auth_alert_hook(bot, loop)
+        else:
+            hook = _make_auth_alert_hook(bot, loop)
+        if hook is None:
+            log.warning("OpenRouter 401 관리자 알림 hook 미등록 (알림 대상 chat 미설정)")
+            return False
+        set_auth_alert_hook(hook)
+    except Exception:
+        log.exception("OpenRouter 401 관리자 알림 hook 등록 실패 (봇 가동엔 영향 없음)")
+        return False
+    log.info("OpenRouter 401 관리자 알림 hook 등록")
+    return True
+
+
+def _unregister_auth_alert_hook() -> None:
+    try:
+        from src.summarizer import set_auth_alert_hook
+        set_auth_alert_hook(None)
+    except Exception:
+        pass
+
+
+def _cred_check_enabled() -> bool:
+    return os.getenv("CRED_SELF_CHECK", "1").strip() != "0"
+
+
+async def _cred_check_and_notify(bot: Bot | None, bot_objects: dict[str, Bot],
+                                 failed_bots: list[str], fail_reasons: dict[str, str]) -> None:
+    """부팅 1회 자격증명 점검 (src/cred_check.py) → 관리자 chat 1건. bot None이면 로그만.
+    메시지엔 env 이름·fingerprint·✓/✗만 — 값 없음."""
+    log = logging.getLogger("orchestrator")
+    try:
+        from src.cred_check import run_credential_check
+        text = await run_credential_check(
+            bot_objects, failed_bots,
+            bot_token_envs={s.name: s.token_env for s in BOT_SPECS},
+            fail_reasons=fail_reasons,
+        )
+    except Exception:
+        log.exception("자격증명 점검 실패 (봇 가동엔 영향 없음)")
+        return
+    log.info("자격증명 점검 결과:\n%s", text)
+    if bot is None:
+        return
+    chat_id = _admin_chat_id()
+    if not chat_id:
+        log.warning("자격증명 점검: 알림 대상 chat 미설정 "
+                    "(REPORT_CHAT_ID/MODEL_ROUTER_CHAT_ID/ALLOWED_CHAT_IDS) — 로그만 기록")
+        return
+    await _send_admin_text(bot, chat_id, text)
+
+
+async def _run_forever(stop_event: asyncio.Event | None = None) -> None:
+    """stop_event: 테스트용 — 주면 시그널 핸들러 대신 이 이벤트로 종료."""
+    _configure_logging()
 
     log = logging.getLogger("orchestrator")
     _diag_env()
@@ -421,76 +700,81 @@ async def _run_forever() -> None:
         log.warning("활성화된 봇이 하나도 없음 — idle 모드로 대기 "
                     "(ACTIVE_BOTS 환경변수로 봇이 전부 필터되었거나 토큰 미설정).")
         log.warning("복원: ACTIVE_BOTS env 삭제 또는 정상값 설정 후 재배포.")
-        try:
-            while True:
-                await asyncio.sleep(3600)
-        except (KeyboardInterrupt, asyncio.CancelledError):
-            return
+        _warn_idle_secrets()
+        await _idle_forever(stop_event)
+        return
 
     # spec → commands 매핑 (initialize 후 set_my_commands 직접 호출용)
     spec_by_name = {s.name: s for s in BOT_SPECS}
 
-    # 모든 봇 시작 (lifecycle 수동 관리)
-    for name, app in apps:
-        await app.initialize()
-        await app.start()
-        await app.updater.start_polling(drop_pending_updates=True)
-        # 텔레그램 / 자동완성 명령 등록 — manual lifecycle은 post_init이 자동
-        # 호출 안 되므로 여기서 직접 호출.
-        spec = spec_by_name.get(name)
-        if spec and spec.commands:
-            try:
-                await app.bot.set_my_commands(
-                    [BotCommand(c, d) for c, d in spec.commands]
-                )
-                log.info("%s set_my_commands 등록: %d개", name, len(spec.commands))
-            except Exception:
-                log.exception("%s set_my_commands 실패 (봇은 정상 가동)", name)
-        log.info("%s 폴링 시작", name)
+    # 모든 봇 시작 (lifecycle 수동 관리) — 봇 단위 격리: 실패한 봇만 빠짐
+    apps, failed_bots, fail_reasons = await _start_apps(apps, spec_by_name)
+    for name in failed_bots:
+        bot_objects.pop(name, None)
+    if failed_bots:
+        log.warning("시작 실패 봇 %d개: %s — 나머지 봇은 정상 가동",
+                    len(failed_bots), ", ".join(failed_bots))
+
+    if not apps:
+        # 전부 실패(토큰 일괄 폐기 등)해도 종료하지 않음 — exit하면 Railway 재시작 crash loop.
+        # 재시도 없음: 토큰 교체 후 재배포가 복구 경로.
+        log.error("모든 봇 시작 실패 (%s) — idle 대기. 토큰 교체 후 재배포 필요.",
+                  ", ".join(failed_bots))
+        if _cred_check_enabled():
+            await _cred_check_and_notify(None, bot_objects, failed_bots, fail_reasons)
+        await _idle_forever(stop_event)
+        return
+
+    first_live_name, _ = apps[0]
+    first_live_bot = bot_objects[first_live_name]
 
     # APScheduler — KST 기준 cron
     scheduler = AsyncIOScheduler(timezone=KST)
-    for bot_name, job in pending_jobs:
-        bot = bot_objects.get(bot_name)
-        if bot is None:
-            continue
-        scheduler.add_job(
-            _instrumented_job,
-            CronTrigger(timezone=KST, **job.cron),
-            args=[job.func, bot, job.job_id, job.deadline_sec, job.alert_env_keys],
-            id=job.job_id,
-            misfire_grace_time=3600,
-            coalesce=True,
-            max_instances=1,
-        )
-        log.info("스케줄: %s (deadline %ds)", job.description or job.job_id, job.deadline_sec)
+    _schedule_jobs(scheduler, pending_jobs, bot_objects, failed_bots)
 
     # Telethon 세션 생성 (env 주도, 1회성) — TG_LOGIN_PHONE/CODE 있을 때만 동작.
+    # 알림은 종목봇 — 종목봇이 시작 실패한 경우에만 첫 가동 봇이 대행 (미설정 서비스는 기존대로).
     tg_login_task = None
     try:
         from src import tg_login
-        tg_login_task = tg_login.schedule_boot_login(bot_objects.get("company"))
+        tg_login_task = tg_login.schedule_boot_login(
+            bot_objects.get("company")
+            or (first_live_bot if "company" in failed_bots else None))
     except Exception:
         log.exception("tg_login 스케줄 실패 (orchestrator 계속 진행)")
+
+    # OpenRouter 401 breaker(summarizer) → 관리자 알림. LLM 호출은 워커 스레드라 메인 루프로 넘김.
+    loop = asyncio.get_running_loop()
+    auth_hook_set = _register_auth_alert_hook(first_live_bot, loop)
 
     scheduler.start()
     next_run = {j.id: str(j.next_run_time) for j in scheduler.get_jobs()}
     log.info("스케줄러 시작. 다음 실행 시각: %s", next_run)
+
+    # 부팅 1회 자격증명 점검 → 관리자 chat (CRED_SELF_CHECK=0이면 끔)
+    cred_task = None
+    if _cred_check_enabled():
+        cred_task = asyncio.create_task(
+            _cred_check_and_notify(first_live_bot, bot_objects, failed_bots, fail_reasons))
     log.info("==== 모든 봇 가동 중. SIGINT/SIGTERM 까지 대기 ====")
 
     # 종료 시그널 대기
-    stop_event = asyncio.Event()
-    loop = asyncio.get_running_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        try:
-            loop.add_signal_handler(sig, stop_event.set)
-        except NotImplementedError:
-            pass
+    if stop_event is None:
+        stop_event = asyncio.Event()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                loop.add_signal_handler(sig, stop_event.set)
+            except NotImplementedError:
+                pass
     await stop_event.wait()
 
     log.info("종료 시그널 수신 → 정리")
     if tg_login_task and not tg_login_task.done():
         tg_login_task.cancel()
+    if cred_task and not cred_task.done():
+        cred_task.cancel()
+    if auth_hook_set:
+        _unregister_auth_alert_hook()
     scheduler.shutdown(wait=False)
     for name, app in apps:
         try:
@@ -502,7 +786,20 @@ async def _run_forever() -> None:
 
 
 def main() -> None:
-    asyncio.run(_run_forever())
+    try:
+        asyncio.run(_run_forever())
+    except BaseException as e:
+        if isinstance(e, (KeyboardInterrupt, SystemExit)):
+            raise
+        # 기본 excepthook(stderr 직출력)으로 가면 토큰 담긴 예외 메시지가 그대로 남음 →
+        # 마스킹 logger로 critical 1회 기록 후 비정상 종료 코드
+        try:
+            _configure_logging()
+            logging.getLogger("orchestrator").critical(
+                "orchestrator 치명적 오류로 종료 (%s)", type(e).__name__, exc_info=e)
+        except Exception:
+            pass
+        sys.exit(1)
 
 
 if __name__ == "__main__":

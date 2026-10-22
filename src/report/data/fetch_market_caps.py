@@ -32,6 +32,16 @@ _US_CACHE_TTL = 1800
 _FMP_BASE = "https://financialmodelingprep.com/stable"
 
 
+def _err_brief(e: BaseException) -> str:
+    """예외 → 로그용 요약 (타입명 + 상태코드만).
+
+    requests ConnectionError 등은 문자열에 요청 URL(apikey 쿼리 포함)을 그대로 담는다
+    (2026-10-21 Railway 유출 사고 후속) — str(e)·log.exception 금지.
+    """
+    status = getattr(getattr(e, "response", None), "status_code", None)
+    return f"{type(e).__name__} status={status}" if status is not None else type(e).__name__
+
+
 def fetch_kr_market_caps() -> dict[str, int]:
     """6자리 ticker → 시총(원). screener_adapter 우선 → FDR 폴백."""
     global _KR_CACHE, _KR_CACHE_TS
@@ -140,14 +150,16 @@ def fetch_us_market_caps(tickers: list[str]) -> dict[str, int]:
                         if cap:
                             cap_int = int(cap)
                             fmp_hits += 1
-            except Exception:
-                log.exception("[market_caps.us] FMP %s fetch 실패", sym)
+            except Exception as e:
+                log.warning("[market_caps.us] FMP /quote %s fetch 실패: %s", sym, _err_brief(e))
         # FMP miss → Finnhub 폴백
         if not cap_int and fh_key:
             try:
+                # 키는 X-Finnhub-Token 헤더로 (쿼리 token= 은 URL째 예외·로그에 남음)
                 r = requests.get(
                     "https://finnhub.io/api/v1/stock/profile2",
-                    params={"symbol": sym, "token": fh_key},
+                    params={"symbol": sym},
+                    headers={"X-Finnhub-Token": fh_key},
                     timeout=10,
                 )
                 if r.status_code == 200:

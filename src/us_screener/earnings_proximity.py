@@ -33,8 +33,9 @@ def fetch_upcoming_earnings(tickers: set[str], days_fwd: int = 7) -> dict[str, s
     today = date.today()
     try:
         rows = _calendar(today, today + timedelta(days=days_fwd), key)
-    except Exception:
-        log.exception("[earnings_proximity] _calendar 호출 실패")
+    except Exception as e:
+        # 타입명만 — 예외 문자열·traceback에 FMP URL(apikey 쿼리)이 섞일 수 있음
+        log.warning("[earnings_proximity] _calendar 호출 실패: %s", type(e).__name__)
         return {}
 
     out: dict[str, str] = {}

@@ -23,6 +23,7 @@ import logging
 import os
 import re
 import sys
+from collections.abc import Mapping
 from pathlib import Path
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -39,6 +40,7 @@ from telegram.ext import (
 from src.bot_helpers import (
     allowed_chat_ids,
     deny_message,
+    diag_env_keys,
     is_authorized as _bh_is_authorized,
 )
 from src.industry_catalog import (
@@ -46,6 +48,7 @@ from src.industry_catalog import (
     lookup_by_name as industry_lookup_by_name,
     resolve_industry,
 )
+from src.log_redact import install_redaction, redact
 from src.pipeline_lock import PIPELINE_LOCK
 
 
@@ -454,6 +457,59 @@ async def _enqueue(
     task.add_done_callback(_log_task_exception)
 
 
+# ------------------------------------------------------------------
+# src.main subprocess env — allowlist (2026-10-21 Railway env 유출 후속)
+# os.environ.copy()는 TG_SESSION_STRING·Railway 토큰·모든 봇 토큰까지 자식에 넘겨
+# 자식 crash 출력(→ 텔레그램 회신)으로 새어나갈 표면을 넓혔다. src.main이 실제로
+# 읽는 것 + 런타임 공통만 넘긴다. 갱신: src/main.py와 그 import 체인(summarizer·
+# telegram_sender·wisereport·model_router.health)의 getenv를 grep해 추가
+# (tests/test_log_redact.py가 AST로 대조 — 누락 시 실패).
+# ------------------------------------------------------------------
+_PIPELINE_ENV_NAMES = frozenset({
+    # src.main
+    "WISEREPORT_ID", "WISEREPORT_PW", "TOP_N", "SORT_BY", "DOWNLOAD_DIR",
+    "SUMMARY_DIR", "HEADLESS", "IGNORE_HTTPS_ERRORS", "STORAGE_STATE",
+    "DISABLE_TELEGRAM",
+    # src.telegram_sender (src.main 전용 봇 토큰은 TELEGRAM_BOT_TOKEN 하나)
+    "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "TELEGRAM_USERNAME",
+    # 영구 볼륨·상태 경로
+    "STATE_DIR", "RAILWAY_VOLUME_MOUNT_PATH",
+    # 런타임 공통 (프로세스·로케일·Chromium·TLS·프록시)
+    "PATH", "HOME", "LANG", "LANGUAGE", "TZ", "USER", "LOGNAME", "SHELL", "TERM",
+    "TMPDIR", "TEMP", "TMP", "LD_LIBRARY_PATH", "VIRTUAL_ENV", "DISPLAY",
+    "MPLCONFIGDIR", "SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE",
+    "CURL_CA_BUNDLE", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY",
+    "http_proxy", "https_proxy", "no_proxy", "all_proxy",
+})
+# OPENROUTER_* = summarizer (API_KEY·MODEL·FALLBACK_MODEL), *_MODEL = model_router 티어
+_PIPELINE_ENV_PREFIXES = ("LC_", "PYTHON", "PLAYWRIGHT_", "XDG_", "OPENROUTER_")
+_PIPELINE_ENV_SUFFIXES = ("_MODEL", "_MODELS")
+# 명시 제외 — 위 규칙보다 우선 (관리키는 OpenRouter 계정 전체 권한)
+_PIPELINE_ENV_DENY = frozenset({"OPENROUTER_MANAGEMENT_KEY"})
+_PIPELINE_BOT_TOKEN = "TELEGRAM_BOT_TOKEN"
+
+
+def _pipeline_env_allowed(name: str) -> bool:
+    upper = name.upper()
+    if upper in _PIPELINE_ENV_DENY or upper.startswith("TG_"):
+        return False
+    if upper.startswith("RAILWAY_") and "TOKEN" in upper:
+        return False
+    if upper.endswith("_BOT_TOKEN") and name != _PIPELINE_BOT_TOKEN:
+        return False
+    return (
+        name in _PIPELINE_ENV_NAMES
+        or upper.startswith(_PIPELINE_ENV_PREFIXES)
+        or upper.endswith(_PIPELINE_ENV_SUFFIXES)
+    )
+
+
+def _pipeline_child_env(environ: Mapping[str, str] | None = None) -> dict[str, str]:
+    """`python -m src.main` 자식 프로세스용 env (allowlist 필터)."""
+    source = os.environ if environ is None else environ
+    return {k: v for k, v in source.items() if _pipeline_env_allowed(k)}
+
+
 async def _run_pipeline(
     update: Update, name: str, ticker: str, top: int
 ) -> None:
@@ -487,7 +543,7 @@ async def _run_pipeline(
                 cwd=str(REPO_ROOT),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
-                env=os.environ.copy(),
+                env=_pipeline_child_env(),
             )
             timeout_s = int(os.environ.get("REPORT_SUBPROCESS_TIMEOUT_S", "1200"))  # 20분
             try:
@@ -518,7 +574,8 @@ async def _run_pipeline(
                 )
             else:
                 tail = output.splitlines()[-25:]
-                err_block = "\n".join(tail)[-3500:]
+                # 채팅 회신 전 마스킹 — 자르기 전에 해야 잘린 토큰 조각이 안 남음
+                err_block = redact("\n".join(tail))[-3500:]
                 await ack.reply_text(
                     f"❌ *{name}* ({ticker}) 실패 (exit {proc.returncode})\n\n"
                     f"```\n{err_block}\n```",
@@ -831,29 +888,16 @@ def main() -> None:
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         datefmt="%H:%M:%S",
     )
+    install_redaction()
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("telegram").setLevel(logging.WARNING)
 
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not token:
-        # 진단: 컨테이너에 어떤 환경변수가 inject 되었는지 출력
+        # 진단: 컨테이너에 어떤 환경변수가 inject 되었는지 출력.
+        # 값은 diag_env_keys allowlist(chat id·모델명)만 원문, 나머지는 set/len/fp만.
         all_keys = sorted(os.environ.keys())
-        relevant = {
-            k: (
-                f"<set, len={len(os.environ[k])}>"
-                if k in (
-                    "TELEGRAM_BOT_TOKEN",
-                    "WISEREPORT_PW",
-                    "OPENROUTER_API_KEY",
-                )
-                else os.environ[k][:50]
-            )
-            for k in all_keys
-            if any(
-                kw in k.upper()
-                for kw in ("TELEGRAM", "WISE", "OPEN", "ALLOWED", "CHAT")
-            )
-        }
+        relevant = diag_env_keys(("TELEGRAM", "WISE", "OPEN", "ALLOWED", "CHAT"))
         print("=" * 60, flush=True)
         print("DIAG: TELEGRAM_BOT_TOKEN 못 찾음", flush=True)
         print(f"DIAG: 전체 env key 개수 = {len(all_keys)}", flush=True)

@@ -12,9 +12,11 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 from openai import APIStatusError, OpenAI
 from pypdf import PdfReader
@@ -36,6 +38,14 @@ MAX_SUMMARY_CHARS_SHORT = 1_000  # 카테고리(산업/시황/글로벌) 봇용 
 
 class OpenRouterCreditExhausted(RuntimeError):
     """OpenRouter 토큰이 부족하거나 결제 거부된 경우."""
+
+
+class OpenRouterAuthError(OpenRouterCreditExhausted):
+    """OpenRouter 401 — API 키 비활성/폐기/미존재 ('User not found.').
+
+    OpenRouterCreditExhausted 하위 클래스: 기존 핸들러(~25곳)가 그대로 단락한다
+    (재시도·폴백 없이 사용자 안내). 2026-10-21 Railway env 유출 → 키 disable 사고 후속.
+    """
 
 INDIVIDUAL_SYSTEM_PROMPT = """당신은 한국 기업 분석 리포트를 정밀하게 요약하는 시니어 애널리스트입니다.
 
@@ -172,18 +182,158 @@ def _extract_pdf_text(pdf_path: Path, max_chars: int = MAX_PDF_TEXT_CHARS) -> st
 def _is_credit_error(exc: Exception) -> bool:
     """OpenRouter 결제·잔액·키 한도 오류 판별.
 
-    - 402/429: payment / quota 관련 메시지
+    - 402: Payment Required — 메시지 무관 항상 (잔액 0 등)
+    - 429: payment / quota 관련 메시지 (단순 rate limit은 재시도 대상이라 제외)
     - 403: 'Key limit exceeded' (사용자 키의 spending limit 초과)
+    401(키 무효)은 `_is_auth_error` — 별도 breaker로 처리.
     """
     if isinstance(exc, APIStatusError):
+        status = getattr(exc, "status_code", None)
         msg = (str(exc) + " " + str(getattr(exc, "body", ""))).lower()
-        if exc.status_code in (402, 429):
+        if status == 402:
+            return True
+        if status == 429:
             if any(k in msg for k in ("credit", "balance", "payment", "insufficient", "quota")):
                 return True
-        if exc.status_code == 403:
+        if status == 403:
             if any(k in msg for k in ("key limit exceeded", "spending limit", "limit exceeded")):
                 return True
     return False
+
+
+def _is_auth_error(exc: Exception) -> bool:
+    """OpenRouter 401 — 키 비활성/폐기 ('User not found.'). 403(한도)은 해당 없음."""
+    return isinstance(exc, APIStatusError) and getattr(exc, "status_code", None) == 401
+
+
+# ------------------------------------------------------------------
+# 401 인증 breaker — 키가 죽으면 모든 LLM 호출을 cooldown 동안 네트워크 없이 차단
+# ------------------------------------------------------------------
+# 2026-10-21 사고: 키 disable(401)인데 chat_with_retry가 3회(2s/4s backoff, 3차는 같은
+# 키로 fallback 모델) 재시도 → 401마다 모델 health 실패로 집계 → Layer D가 멀쩡한 모델을
+# 롤백 시도. 401은 모델이 아니라 키 문제라 재시도·폴백·health 기록 모두 무의미.
+# 상태는 프로세스 단위 (봇 전부 한 프로세스 — orchestrator). cooldown 만료 후 다음 호출이
+# 네트워크로 재확인(half-open) — 또 401이면 재차단, 성공하면 즉시 해제.
+AUTH_COOLDOWN_DEFAULT_S = 900
+# 같은 장애가 이어지는 동안 관리자 알림 재발송 간격 (cooldown마다 재차단돼도 스팸 방지)
+AUTH_REALERT_S = 6 * 3600
+
+_AUTH_LOCK = threading.Lock()
+_auth_open_until: float = 0.0          # _clock() 기준. 0 = 닫힘
+_auth_last_trip: float | None = None   # 마지막 차단 시각 (Layer D 가드용)
+_auth_alerted_at: float | None = None  # 마지막 관리자 알림 시각 (성공 호출 시 None)
+_auth_alert_hook: Callable[[str], None] | None = None
+
+
+def _clock() -> float:
+    """breaker 시계 (monotonic). 테스트에서 monkeypatch로 시간 이동."""
+    return time.monotonic()
+
+
+def _auth_cooldown_s() -> float:
+    try:
+        return max(1.0, float(os.getenv("OPENROUTER_AUTH_COOLDOWN_S", str(AUTH_COOLDOWN_DEFAULT_S))))
+    except ValueError:
+        return float(AUTH_COOLDOWN_DEFAULT_S)
+
+
+def set_auth_alert_hook(fn: Callable[[str], None] | None) -> None:
+    """401 차단 시 관리자 알림 hook 등록 (None이면 해제).
+
+    차단 1회당 1번만 호출 (호출마다 아님). 같은 장애가 이어지면 AUTH_REALERT_S마다 재알림.
+    LLM 호출 스레드(executor)에서 동기 호출되므로 fn은 빨리 반환해야 함 — 텔레그램 발송은
+    asyncio.run_coroutine_threadsafe 등으로 넘길 것. fn 예외는 삼킴.
+    """
+    global _auth_alert_hook
+    with _AUTH_LOCK:
+        _auth_alert_hook = fn
+
+
+def trip_auth_breaker(exc: Exception | None = None) -> None:
+    """401 감지 → breaker 열기 (cooldown). 관리자 hook은 장애당 1회."""
+    global _auth_open_until, _auth_last_trip, _auth_alerted_at
+    cooldown = _auth_cooldown_s()
+    hook = None
+    with _AUTH_LOCK:
+        now = _clock()
+        was_open = _auth_open_until > now
+        _auth_open_until = now + cooldown
+        _auth_last_trip = now
+        if _auth_alert_hook is not None and (
+                _auth_alerted_at is None or now - _auth_alerted_at >= AUTH_REALERT_S):
+            _auth_alerted_at = now
+            hook = _auth_alert_hook
+    if not was_open:
+        # 서버 메시지는 로그에만 (사용자·텔레그램 메시지엔 고정 문구) — 키 값은 포함 안 됨
+        detail = str(exc)[:160] if exc is not None else ""
+        log.error("[auth_breaker] OpenRouter 401 — LLM 호출 %d초 차단 (%s)", int(cooldown), detail)
+    if hook is not None:
+        mins = max(1, round(cooldown / 60))
+        msg = (
+            "🔑 OpenRouter 인증 실패(401) — API 키 비활성/폐기 의심. "
+            f"LLM 호출을 {mins}분간 중단합니다. "
+            "새 키를 OPENROUTER_API_KEY에 넣고 재배포하세요."
+        )
+        try:
+            hook(msg)
+        except Exception:
+            log.exception("[auth_breaker] 관리자 알림 hook 실패 (무시)")
+
+
+def auth_breaker_open() -> bool:
+    """breaker 열림(cooldown 중) 여부. 만료되면 False → 다음 호출이 네트워크 재확인."""
+    with _AUTH_LOCK:
+        return _auth_open_until > _clock()
+
+
+def auth_breaker_tripped_within(seconds: float) -> bool:
+    """최근 seconds 안에 401 차단이 있었는지 (Layer D 롤백 가드용)."""
+    with _AUTH_LOCK:
+        return _auth_last_trip is not None and _clock() - _auth_last_trip <= seconds
+
+
+def reset_auth_breaker() -> None:
+    """breaker 상태 초기화 (테스트용). hook 등록은 유지."""
+    global _auth_open_until, _auth_last_trip, _auth_alerted_at
+    with _AUTH_LOCK:
+        _auth_open_until = 0.0
+        _auth_last_trip = None
+        _auth_alerted_at = None
+
+
+def _auth_breaker_on_success() -> None:
+    """정상 응답 수신 → 키 살아있음: breaker 즉시 닫고 알림 상태 해제 (다음 장애는 새로 알림)."""
+    global _auth_open_until, _auth_alerted_at
+    if not _auth_open_until and _auth_alerted_at is None:
+        return  # fast path — 평상시 lock 생략
+    with _AUTH_LOCK:
+        _auth_open_until = 0.0
+        _auth_alerted_at = None
+
+
+def _auth_error_message() -> str:
+    return ("OpenRouter 인증 실패(401) — API 키 비활성/폐기 의심. "
+            "새 키를 OPENROUTER_API_KEY에 넣고 재배포하세요.")
+
+
+def raise_if_auth_breaker_open(context: str = "") -> None:
+    """breaker 열려 있으면 네트워크 없이 OpenRouterAuthError. 직접 client를 쓰는 호출부용."""
+    if auth_breaker_open():
+        log.info("[auth_breaker] 차단 중 — LLM 호출 skip [%s]", context)
+        raise OpenRouterAuthError(_auth_error_message() + " (차단 중)")
+
+
+def raise_for_openrouter_error(exc: Exception) -> None:
+    """직접 client.chat.completions.create를 쓰는 호출부의 except 블록용.
+
+    401 → breaker 열고 OpenRouterAuthError, 결제/한도 → OpenRouterCreditExhausted,
+    그 외 no-op (호출부 기존 처리 계속).
+    """
+    if _is_auth_error(exc):
+        trip_auth_breaker(exc)
+        raise OpenRouterAuthError(_auth_error_message()) from exc
+    if _is_credit_error(exc):
+        raise OpenRouterCreditExhausted(str(exc)) from exc
 
 
 def _trim_to_chars(text: str, max_chars: int = MAX_SUMMARY_CHARS) -> str:
@@ -238,6 +388,8 @@ def chat_with_retry(
       - 1차/2차 시도: model로 호출. 빈 content 혹은 transient 에러면 backoff 후 재시도.
       - 3차 시도(마지막): fallback_model이 있으면 그걸로, 없으면 동일 model 재호출.
       - 결제 부족(`OpenRouterCreditExhausted`)은 즉시 raise (재시도 의미 없음).
+      - 401(키 무효)은 breaker 열고 `OpenRouterAuthError` 즉시 raise — 재시도·폴백·health
+        기록 없음. breaker 열려 있으면 네트워크 호출 없이 바로 raise.
 
     반환:
       - 성공 시 strip()된 content.
@@ -252,6 +404,7 @@ def chat_with_retry(
         실패 시 다음 시도 prompt에 schema 재주입. validate_schema 있으면 force_json
         자동 default True.
     """
+    raise_if_auth_breaker_open(context)
     primary = model or DEFAULT_MODEL
     fallback = fallback_model or os.getenv("OPENROUTER_FALLBACK_MODEL") or None
     last_reason = "unknown"
@@ -276,6 +429,10 @@ def chat_with_retry(
         try:
             resp = client.chat.completions.create(**kwargs)
         except APIStatusError as e:
+            if _is_auth_error(e):
+                # 키 문제 — 재시도·fallback 모델(같은 키)·health 기록(모델 탓 아님) 모두 생략
+                trip_auth_breaker(e)
+                raise OpenRouterAuthError(_auth_error_message()) from e
             if _is_credit_error(e):
                 raise OpenRouterCreditExhausted(str(e)) from e
             status_code = getattr(e, "status_code", None) or 0
@@ -332,6 +489,7 @@ def chat_with_retry(
                         context, cur_model, len(content),
                     )
                 _record_health(cur_model, True, time.time() - _t0)
+                _auth_breaker_on_success()
                 return content
             last_reason = "empty content (stream idle timeout 가능성)"
             log.warning(
@@ -403,7 +561,8 @@ def chat_with_chain(
 
     사용자가 env로 모델 변경 시 그 모델이 빈 응답을 보내면 자동으로 다음 모델로
     fallback. OpenRouterCreditExhausted는 즉시 raise (credit 부족은 다음 모델도
-    동일).
+    동일). OpenRouterAuthError(401, 하위 클래스)도 동일 — breaker 열려 있으면
+    네트워크 없이 바로 raise.
 
     Args:
         models: 시도할 모델 list. 첫 모델부터 순차. 각 모델당
@@ -413,6 +572,7 @@ def chat_with_chain(
     Returns:
         (content, used_model). 모두 빈 응답이면 ("", "").
     """
+    raise_if_auth_breaker_open(context)
     if not models:
         log.error("[chain] 빈 모델 list (%s)", context)
         return "", ""

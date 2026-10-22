@@ -82,6 +82,45 @@ def _api_key() -> str | None:
     return os.getenv("DART_API_KEY")
 
 
+_TLS_OFF_WARNED = False
+
+
+def _tls_verify() -> bool:
+    """OpenDART TLS 인증서 검증 여부. 기본 ON.
+
+    2026-04-25 근거 없이 verify=False로 들어갔던 것을 되돌림 — crtfc_key가 쿼리로 나가므로
+    검증 없이는 MITM 시 키가 그대로 노출된다. 인증서 체인 문제로 막히는 환경만
+    `DART_TLS_VERIFY=0` 비상 스위치 (꺼질 때 1회 경고).
+    """
+    global _TLS_OFF_WARNED
+    verify = os.getenv("DART_TLS_VERIFY", "1").strip() != "0"
+    if not verify and not _TLS_OFF_WARNED:
+        _TLS_OFF_WARNED = True
+        log.warning("DART_TLS_VERIFY=0 — OpenDART TLS 인증서 검증 비활성 (비상 스위치, 키 노출 위험)")
+    return verify
+
+
+def _http_err(e: BaseException) -> str:
+    """httpx 예외 → 로그용 요약 (타입명 + 상태코드만).
+
+    httpx 예외 문자열·traceback엔 요청 URL(crtfc_key 쿼리 포함)이 그대로 박힌다
+    (2026-10-21 Railway 유출 사고 후속) — str(e)·log.exception 금지.
+    """
+    status = getattr(getattr(e, "response", None), "status_code", None)
+    return f"{type(e).__name__} status={status}" if status is not None else type(e).__name__
+
+
+def _dart_xml_error(content: bytes) -> str:
+    """document.xml 에러 응답(<result><status>..<message>..) → 'status=020 message=...'.
+
+    원문 body 대신 status/message만 추려 로그 (응답 원문은 로그에 남기지 않음).
+    """
+    head = content[:500].decode("utf-8", "replace")
+    st = re.search(r"<status>\s*([^<]{0,10})\s*</status>", head)
+    msg = re.search(r"<message>\s*([^<]{0,120})\s*</message>", head)
+    return f"status={st.group(1) if st else '?'} message={msg.group(1) if msg else '?'}"
+
+
 def _get(path: str, params: dict[str, Any], timeout: httpx.Timeout = DEFAULT_TIMEOUT) -> dict | None:
     """OpenDART JSON API 호출. 실패 시 None."""
     key = _api_key()
@@ -90,7 +129,7 @@ def _get(path: str, params: dict[str, Any], timeout: httpx.Timeout = DEFAULT_TIM
         return None
     params = {"crtfc_key": key, **params}
     try:
-        with httpx.Client(timeout=timeout, verify=False) as cli:
+        with httpx.Client(timeout=timeout, verify=_tls_verify()) as cli:
             r = cli.get(f"{DART_BASE}/{path}", params=params)
             r.raise_for_status()
             data = r.json()
@@ -101,7 +140,7 @@ def _get(path: str, params: dict[str, Any], timeout: httpx.Timeout = DEFAULT_TIM
                 return None if status != "013" else data
             return data
     except httpx.HTTPError as e:
-        log.warning("DART API HTTP 에러 (%s): %s", path, e)
+        log.warning("DART API HTTP 에러 (%s): %s", path, _http_err(e))
         return None
     except Exception:
         log.exception("DART API 예상치 못한 에러 (%s)", path)
@@ -132,7 +171,7 @@ def _load_corp_map() -> dict[str, str]:
 
     log.info("DART 회사목록 다운로드 시작 (CORPCODE.xml)")
     try:
-        with httpx.Client(timeout=httpx.Timeout(60.0, connect=15.0), verify=False) as cli:
+        with httpx.Client(timeout=httpx.Timeout(60.0, connect=15.0), verify=_tls_verify()) as cli:
             r = cli.get(f"{DART_BASE}/corpCode.xml", params={"crtfc_key": key})
             r.raise_for_status()
             if len(r.content) > MAX_DOWNLOAD_BYTES:
@@ -167,6 +206,9 @@ def _load_corp_map() -> dict[str, str]:
         log.info("DART 회사목록 파싱 완료: %d개 (이름역색인 %d개)", len(m), len(_NAME_TO_TICKER_CACHE))
         _CORP_MAP_CACHE = m
         return m
+    except httpx.HTTPError as e:
+        log.warning("DART 회사목록 다운로드 실패 (corpCode.xml): %s", _http_err(e))
+        return {}
     except Exception:
         log.exception("DART 회사목록 다운로드 실패")
         return {}
@@ -478,7 +520,7 @@ def download_report_archive(
     target_dir.mkdir(parents=True, exist_ok=True)
 
     try:
-        with httpx.Client(timeout=httpx.Timeout(60.0, connect=15.0), verify=False) as cli:
+        with httpx.Client(timeout=httpx.Timeout(60.0, connect=15.0), verify=_tls_verify()) as cli:
             r = cli.get(f"{DART_BASE}/document.xml", params={"crtfc_key": key, "rcept_no": rcept_no})
             r.raise_for_status()
             if len(r.content) > MAX_DOWNLOAD_BYTES:
@@ -486,7 +528,7 @@ def download_report_archive(
                 return None
             content_type = r.headers.get("content-type", "").lower()
             if "xml" in content_type and b"<status>" in r.content[:200]:
-                log.warning("document.xml 에러 응답 (rcept_no=%s): %s", rcept_no, r.content[:300])
+                log.warning("document.xml 에러 응답 (rcept_no=%s): %s", rcept_no, _dart_xml_error(r.content))
                 return None
             zf = zipfile.ZipFile(io.BytesIO(r.content))
             members = zf.infolist()
@@ -512,6 +554,9 @@ def download_report_archive(
             out_path.write_bytes(zf.read(picked))
             log.info("DART 문서 저장: %s (%d bytes)", out_path, out_path.stat().st_size)
             return out_path
+    except httpx.HTTPError as e:
+        log.warning("DART 문서 다운로드 실패 (document.xml) rcept_no=%s: %s", rcept_no, _http_err(e))
+        return None
     except Exception:
         log.exception("DART 문서 다운로드 실패 rcept_no=%s", rcept_no)
         return None

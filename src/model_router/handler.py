@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 import os
 from datetime import datetime
+from typing import Callable
 
 from telegram import Bot, Update
 from telegram.constants import ParseMode
@@ -30,17 +31,36 @@ def _ttl_hours() -> int:
         return 12
 
 
-def _is_admin(chat_id: int, allowed_env: str = "REPORT_ALLOWED_CHAT_IDS") -> bool:
+def _is_numeric_chat_id(tok: str) -> bool:
+    return bool(tok) and tok.lstrip("-").isdigit()
+
+
+def _is_admin(chat_id: int, allowed_env: str = "REPORT_ALLOWED_CHAT_IDS",
+              control_plane: bool = False) -> bool:
     """admin 판정 — report 봇 env 우선, 없으면 종목봇(ALLOWED_CHAT_IDS) 폴백.
 
     2026-09: 버터대디봇 사망으로 model_* 명령을 종목봇에도 등록 — 종목봇
-    사용자 allowlist가 곧 admin (개인 운영 전제)."""
-    allowed = (os.getenv(allowed_env, "") or os.getenv("REPORT_CHAT_ID", "")
-               or os.getenv("ALLOWED_CHAT_IDS", ""))
+    사용자 allowlist가 곧 admin (개인 운영 전제).
+
+    control_plane=True (env를 바꿀 수 있는 /model_approve·/model_reject·/model_eval):
+    `*`(전체 공개)는 admin으로 인정하지 않음 — 숫자 chat id 명시 필요. 앞 env에
+    명시 id가 없으면(`*`뿐) 다음 env의 명시 id로 판정 (2026-10-21 유출 사고 후속)."""
+    sources = (os.getenv(allowed_env, ""), os.getenv("REPORT_CHAT_ID", ""),
+               os.getenv("ALLOWED_CHAT_IDS", ""))
+    if control_plane:
+        for raw in sources:
+            ids = {x.strip() for x in raw.split(",") if _is_numeric_chat_id(x.strip())}
+            if ids:
+                return str(chat_id) in ids
+        return False
+    allowed = next((s for s in sources if s), "")
     if allowed == "*":
         return True
     ids = {x.strip() for x in allowed.split(",") if x.strip()}
     return str(chat_id) in ids
+
+
+_CONTROL_PLANE_DENY = "권한 없음 (제어 명령은 숫자 chat id 명시 필요 — `*` 불인정)"
 
 
 def _cron_notify_chat_id() -> str | None:
@@ -58,8 +78,31 @@ def _cron_notify_chat_id() -> str | None:
     return None
 
 
+def make_auth_alert_hook(bot: Bot, loop) -> Callable[[str], None] | None:
+    """summarizer.set_auth_alert_hook용 hook 생성 — OpenRouter 401 차단 시 관리자 알림.
+
+    hook은 LLM 호출 스레드(executor)에서 동기 호출되므로 발송은 봇 이벤트 루프로
+    넘기고 즉시 반환 (결과 대기 안 함 → 루프 스레드에서 불려도 deadlock 없음).
+    알림 대상은 cron과 동일 (_cron_notify_chat_id). 대상 없으면 None.
+    """
+    import asyncio
+    chat_id = _cron_notify_chat_id()
+    if not chat_id:
+        log.warning("[auth_alert] 알림 대상 chat 미설정 — 401 알림 hook 미등록")
+        return None
+
+    def _hook(msg: str) -> None:
+        try:
+            asyncio.run_coroutine_threadsafe(bot.send_message(chat_id, msg), loop)
+        except Exception:
+            log.exception("[auth_alert] 401 알림 예약 실패")
+
+    return _hook
+
+
 def _format_eval_message(recs: list[dict], pending: list[dict],
-                        auto_applied: list[dict]) -> str:
+                        auto_applied: list[dict],
+                        manual_needed: list[dict] | None = None) -> str:
     parts = ["🤖 *주간 모델 가성비 재평가*", ""]
 
     if auto_applied:
@@ -67,6 +110,13 @@ def _format_eval_message(recs: list[dict], pending: list[dict],
         for r in auto_applied:
             parts.append(f"✓ `{r['env_name']}`: {r['old_model']} → *{r['new_model']}*")
             parts.append(f"   {r['reason']}")
+        parts.append("")
+
+    if manual_needed:
+        parts.append("*[수동 적용 필요 — Railway API 토큰 미설정]*")
+        for r in manual_needed:
+            parts.append(f"📝 `{r['env_name']}`: {r['old_model']} → *{r['new_model']}*")
+            parts.append("   대시보드 Variables에서 수정 후 재배포")
         parts.append("")
 
     if pending:
@@ -79,7 +129,7 @@ def _format_eval_message(recs: list[dict], pending: list[dict],
         parts.append("")
         parts.append("승인: `/model_approve <id|all>`")
         parts.append("거부: `/model_reject <id|all>`")
-    elif not auto_applied:
+    elif not auto_applied and not manual_needed:
         parts.append("✨ 변경 권고 없음 — 아래 현황 참조")
 
     if LAST_EVAL_STATUS:
@@ -92,8 +142,20 @@ def _format_eval_message(recs: list[dict], pending: list[dict],
     return "\n".join(parts)
 
 
-async def _apply_change(env_name: str, new_model: str) -> tuple[bool, str]:
-    """Railway env upsert wrapper. Layer A canary 게이트로 보호.
+def _manual_apply_msg(env_name: str, new_model: str) -> str:
+    return (f"📝 수동 적용 필요 — Railway 대시보드 Variables에서 수정: "
+            f"`{env_name}` = `{new_model}` (수정 후 재배포)")
+
+
+async def _apply_change(env_name: str, new_model: str) -> tuple[str, str]:
+    """Railway env upsert wrapper. Layer A canary 게이트로 보호. (status, message) 반환.
+
+    status:
+      - applied        — upsert 성공 (일부 서비스 성공 포함)
+      - manual         — canary 통과, Railway 토큰 미설정 → 대시보드 수동 수정 안내 (실패 아님)
+      - key_failed     — OpenRouter 키 무효(401)/크레딧 부족 → 모델 품질과 무관
+      - canary_failed  — 모델 품질 미달로 정상 차단
+      - railway_failed — 토큰은 있으나 upsert 실패 (폐기된 토큰 등) → 수동 안내 병기
 
     canary(LLM 호출 수십 초)·railway upsert(httpx) 모두 blocking — to_thread로
     이벤트 루프 보호 (안 그러면 모든 봇 polling이 canary 동안 멈춤).
@@ -103,9 +165,24 @@ async def _apply_change(env_name: str, new_model: str) -> tuple[bool, str]:
     result = await asyncio.to_thread(canary.run_canary, env_name, new_model)
     if not result.get("skipped") and not result["passed"]:
         fail_summary = "; ".join(result["failures"][:3])
+        if result.get("auth_error"):
+            log.warning("[apply_change] %s canary 중단 — OpenRouter 키 무효: %s", env_name, fail_summary)
+            return "key_failed", ("🔑 OpenRouter 인증 실패(401) — API 키 무효 (모델 문제 아님). "
+                                  "새 키를 OPENROUTER_API_KEY에 넣고 재배포 후 재승인")
+        if result.get("credit_error"):
+            log.warning("[apply_change] %s canary 중단 — OpenRouter 크레딧 부족: %s", env_name, fail_summary)
+            return "key_failed", ("💳 OpenRouter 크레딧/한도 부족 (모델 문제 아님). "
+                                  "충전 후 재승인")
         log.warning("[apply_change] %s canary 실패 — 변경 거부: %s", env_name, fail_summary)
-        return False, f"❌ Canary 실패 ({result['sentinels']}건, {len(result['failures'])} fail): {fail_summary}"
-    return await asyncio.to_thread(railway_env.upsert_variable, env_name, new_model)
+        return "canary_failed", f"❌ Canary 실패 ({result['sentinels']}건, {len(result['failures'])} fail): {fail_summary}"
+    if not railway_env.available():
+        # 토큰 미설정(유출 후 미발급 포함) — 실패할 API 호출 대신 수동 적용 안내
+        log.info("[apply_change] %s Railway 토큰 미설정 — 수동 적용 안내", env_name)
+        return "manual", _manual_apply_msg(env_name, new_model)
+    ok, msg = await asyncio.to_thread(railway_env.upsert_variable, env_name, new_model)
+    if ok:
+        return "applied", msg
+    return "railway_failed", f"{msg}\n{_manual_apply_msg(env_name, new_model)}"
 
 
 async def model_health_job(bot: Bot, override_chat_id: str | None = None) -> None:
@@ -149,21 +226,25 @@ async def model_eval_job(bot: Bot, override_chat_id: str | None = None) -> None:
 
     # 3. automatic 즉시 적용
     auto_applied = []
+    manual_needed = []
     for r in recs:
         if r["classification"] != "automatic":
             continue
-        ok, msg = await _apply_change(r["env_name"], r["new_model"])
+        status, msg = await _apply_change(r["env_name"], r["new_model"])
         r["apply_result"] = msg
-        if ok:
+        r["apply_status"] = status
+        if status == "applied":
             auto_applied.append(r)
             approval_store.append_history({**r, "status": "auto_applied",
                                            "resolved_at": int(datetime.now().timestamp())})
+        elif status == "manual":
+            manual_needed.append(r)
 
     # 4. suggest는 pending에 저장
     pending = approval_store.stage_recommendations(recs, ttl_hours=_ttl_hours())
 
     # 5. 텔레그램 알림
-    msg = _format_eval_message(recs, pending, auto_applied)
+    msg = _format_eval_message(recs, pending, auto_applied, manual_needed)
     try:
         await bot.send_message(chat_id, msg, parse_mode=ParseMode.MARKDOWN)
         log.info("[model_router.cron] 알림 발송 (auto=%d pending=%d)", len(auto_applied), len(pending))
@@ -173,8 +254,9 @@ async def model_eval_job(bot: Bot, override_chat_id: str | None = None) -> None:
 
 async def model_eval_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
-    if not _is_admin(chat_id):
-        await update.message.reply_text("권한 없음")
+    # automatic 분류는 즉시 env 적용 → 제어 명령 취급
+    if not _is_admin(chat_id, control_plane=True):
+        await update.message.reply_text(_CONTROL_PLANE_DENY)
         return
     await update.message.reply_text("⏳ 재평가 중 (10-15초)...")
     await model_eval_job(context.bot, override_chat_id=str(chat_id))
@@ -182,8 +264,8 @@ async def model_eval_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 async def model_approve_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
-    if not _is_admin(chat_id):
-        await update.message.reply_text("권한 없음")
+    if not _is_admin(chat_id, control_plane=True):
+        await update.message.reply_text(_CONTROL_PLANE_DENY)
         return
     args = context.args or []
     items = approval_store.load_pending()
@@ -218,37 +300,51 @@ async def model_approve_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     await update.message.reply_text(
         f"⏳ {len(targets)}건 canary 검증 시작 (항목당 30-60초) — 결과 실시간 표시",
     )
-    ok_n = 0
+    ok_n = manual_n = 0
+    statuses: set[str] = set()
     for p in targets:
-        ok, msg = await _apply_change(p["env_name"], p["new_model"])
-        if ok:
+        status, msg = await _apply_change(p["env_name"], p["new_model"])
+        statuses.add(status)
+        if status == "applied":
             ok_n += 1
             approval_store.mark_status(p["id"], "approved", note=msg)
             line = f"✅ {p['id']} `{p['env_name']}` → *{p['new_model']}* — {msg}"
+        elif status == "manual":
+            # 승인·canary 통과 — 적용만 수동. history에 남겨 수동 반영 후 Layer D 롤백 대상 유지
+            manual_n += 1
+            approval_store.mark_status(p["id"], "approved", note=msg)
+            line = f"📝 {p['id']} canary 통과 — {msg}"
         else:
             line = f"❌ {p['id']} `{p['env_name']}` 실패 — {msg}"
         try:
             await update.message.reply_text(line, parse_mode=ParseMode.MARKDOWN)
         except Exception:
             await update.message.reply_text(line)
-    if ok_n == 0:
+    if ok_n == 0 and manual_n == 0:
+        hints = []
+        if "key_failed" in statuses:
+            hints.append("· OpenRouter 키 무효/크레딧 부족 → 모델 문제 아님. 키 교체(또는 충전)·재배포 후 재승인")
+        if "railway_failed" in statuses:
+            hints.append("· Railway 반영 실패 → 위 안내대로 대시보드 Variables에서 수동 수정")
+        if "canary_failed" in statuses:
+            hints.append("· Canary 실패 → 모델 품질 미달로 정상 차단 (조치 불필요)")
         await update.message.reply_text(
-            f"🏁 0/{len(targets)} 적용 — 전부 실패. 위 사유 참조.\n"
-            "· Railway 설정 누락 → RAILWAY_PROJECT_ACCESS_TOKEN 추가 후 재배포 → "
-            "/model_eval → 재승인\n"
-            "· Canary 실패 → 모델 품질 미달로 정상 차단 (조치 불필요)",
+            f"🏁 0/{len(targets)} 적용 — 전부 실패. 위 사유 참조.\n" + "\n".join(hints),
         )
     else:
-        await update.message.reply_text(
-            f"🏁 완료: {ok_n}/{len(targets)} 적용. Railway env 반영됨 — 재배포 후 유효. "
-            f"1주간 Layer D가 실패율 감시.",
-        )
+        parts = [f"🏁 완료: {ok_n}/{len(targets)} 적용."]
+        if ok_n:
+            parts.append("Railway env 반영됨 — 재배포 후 유효.")
+        if manual_n:
+            parts.append(f"📝 {manual_n}건은 대시보드 Variables에서 수동 수정 필요 (위 안내).")
+        parts.append("1주간 Layer D가 실패율 감시.")
+        await update.message.reply_text(" ".join(parts))
 
 
 async def model_reject_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
-    if not _is_admin(chat_id):
-        await update.message.reply_text("권한 없음")
+    if not _is_admin(chat_id, control_plane=True):
+        await update.message.reply_text(_CONTROL_PLANE_DENY)
         return
     args = context.args or []
     if not args:

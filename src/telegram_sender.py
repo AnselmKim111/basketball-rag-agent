@@ -22,6 +22,26 @@ log = logging.getLogger(__name__)
 TELEGRAM_API = "https://api.telegram.org"
 
 
+def _tg_err(e: BaseException, token: str = "") -> str:
+    """텔레그램 API 예외 → 로그용 요약 (상태코드 + Telegram description만).
+
+    httpx 예외 문자열·traceback엔 요청 URL(api.telegram.org/bot<TOKEN>/...)이 그대로
+    박힌다 (2026-10-21 Railway 유출 사고 후속) — str(e)·log.exception 금지.
+    """
+    resp = getattr(e, "response", None)
+    status = getattr(resp, "status_code", None)
+    if status is None:
+        return type(e).__name__
+    desc = ""
+    try:
+        desc = str((resp.json() or {}).get("description") or "")
+    except Exception:
+        pass
+    if token and token in desc:
+        desc = desc.replace(token, "‹token›")
+    return f"status={status} {desc[:200]}".strip()
+
+
 def resolve_chat_id(token: str, username: str) -> str | None:
     """getUpdates에서 username과 일치하는 chat_id를 찾기.
 
@@ -32,12 +52,11 @@ def resolve_chat_id(token: str, username: str) -> str | None:
         r = httpx.get(
             f"{TELEGRAM_API}/bot{token}/getUpdates",
             timeout=15.0,
-            verify=False,
         )
         r.raise_for_status()
         updates = r.json().get("result", [])
     except Exception as e:
-        log.warning("getUpdates 실패: %s", e)
+        log.warning("getUpdates 실패: %s", _tg_err(e, token))
         return None
 
     for upd in reversed(updates):
@@ -72,11 +91,10 @@ def send_message(token: str, chat_id: str, text: str) -> bool:
                 f"{TELEGRAM_API}/bot{token}/sendMessage",
                 json={"chat_id": chat_id, "text": chunk},
                 timeout=30.0,
-                verify=False,
             )
             r.raise_for_status()
-        except Exception:
-            log.exception("텔레그램 텍스트 발송 실패")
+        except Exception as e:
+            log.error("텔레그램 텍스트 발송 실패: %s", _tg_err(e, token))
             return False
     return True
 
@@ -94,12 +112,11 @@ def send_document(token: str, chat_id: str, path: Path, caption: str = "") -> bo
                 data={"chat_id": chat_id, "caption": caption[:1024]},
                 files={"document": (path.name, f, "application/pdf")},
                 timeout=120.0,
-                verify=False,
             )
             r.raise_for_status()
         return True
-    except Exception:
-        log.exception("텔레그램 파일 발송 실패: %s", path.name)
+    except Exception as e:
+        log.error("텔레그램 파일 발송 실패: %s — %s", path.name, _tg_err(e, token))
         return False
 
 

@@ -36,6 +36,16 @@ MAX_TRANSCRIPT_CHARS = 60_000
 MIN_GROUNDED_CHARS = 3_000
 
 
+def _err_brief(e: BaseException) -> str:
+    """예외 → 로그용 요약 (타입명 + 상태코드만).
+
+    AlphaVantage·FMP는 키가 쿼리(apikey=)로 나가 httpx 예외 문자열·traceback에 URL째
+    박힌다 (2026-10-21 Railway 유출 사고 후속) — str(e)·log.exception 금지.
+    """
+    status = getattr(getattr(e, "response", None), "status_code", None)
+    return f"{type(e).__name__} status={status}" if status is not None else type(e).__name__
+
+
 @dataclass
 class TranscriptDoc:
     ticker: str
@@ -121,8 +131,8 @@ def _alpha_vantage(ticker: str, year: int | None, quarter: int | None) -> Transc
         )
         r.raise_for_status()
         data = r.json()
-    except Exception:
-        log.exception("Alpha Vantage transcript fetch 실패 (%s)", ticker)
+    except Exception as e:
+        log.warning("Alpha Vantage transcript fetch 실패 (%s) /query: %s", ticker, _err_brief(e))
         return None
 
     if not isinstance(data, dict):
@@ -130,8 +140,12 @@ def _alpha_vantage(ticker: str, year: int | None, quarter: int | None) -> Transc
     segs = data.get("transcript")
     if not isinstance(segs, list) or not segs:
         # rate limit / premium 안내 메시지
-        if any(k in data for k in ("Information", "Note", "Error Message")):
-            log.warning("Alpha Vantage 제한/오류 (%s): %s", ticker, str(data)[:200])
+        for k in ("Information", "Note", "Error Message"):
+            if k in data:
+                # 안내문만 (키가 섞여 돌아와도 지움) — 응답 원문 dict는 로그에 안 남김
+                msg = str(data.get(k) or "").replace(key, "‹key›")[:200]
+                log.warning("Alpha Vantage 제한/오류 (%s) %s: %s", ticker, k, msg)
+                break
         return None
 
     parts: list[str] = []
@@ -183,8 +197,9 @@ def _fmp(ticker: str, year: int | None, quarter: int | None) -> TranscriptDoc | 
             return None
         r.raise_for_status()
         data = r.json()
-    except Exception:
-        log.exception("FMP transcript fetch 실패 (%s)", ticker)
+    except Exception as e:
+        log.warning("FMP transcript fetch 실패 (%s) /api/v3/earning_call_transcript: %s",
+                    ticker, _err_brief(e))
         return None
 
     if not isinstance(data, list) or not data:

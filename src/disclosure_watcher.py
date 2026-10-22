@@ -9,6 +9,11 @@ dedup:
   - state_store의 `seen()` / `mark_seen_with_titles()` 그대로 재사용.
   - 카테고리 키: `"disc_{chat_id}"` — chat마다 독립 dedup state.
   - 공시는 rcept_no가 unique → 그걸로만 dedup (title 정규화는 안 씀).
+  - 발송 성공한 rcept_no만 seen 처리 — 실패분은 다음 폴링에 재시도 (2026-10-21 텔레그램
+    토큰 교체·장애 시 공시 유실 방지). 같은 (chat, rcept_no)가 `DISCLOSURE_SEND_MAX_ATTEMPTS`
+    (기본 12회 ≈ 거래시간 1시간)번 연속 실패하면 포기하고 seen 처리 — 봇 차단·chat 삭제 같은
+    영구 실패가 매 폴링 무한 재시도되지 않게. 실패 횟수는 프로세스 메모리 (재배포 시 0부터).
+    DART 조회 창이 1일이라 그보다 오래된 미발송 공시는 어차피 다시 안 잡힘.
 
 알림 메시지:
   공시명 + 발생 시각 + 카테고리(critical/normal) 표시.
@@ -24,6 +29,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from datetime import datetime, time, timedelta, timezone
 from typing import Any
 
@@ -45,6 +51,29 @@ CATEGORY_EMOJI = {
     "critical": "🚨",
     "normal": "📄",
 }
+
+# 발송 실패 재시도 상한 (chat·rcept_no 단위). 넘으면 포기 + seen 처리.
+SEND_MAX_ATTEMPTS_DEFAULT = 12
+# (chat_id, rcept_no) → 연속 발송 실패 횟수. 성공·포기 시 삭제 → 크기는 미발송분으로 bounded.
+_SEND_FAILS: dict[tuple[str, str], int] = {}
+
+
+def _send_max_attempts() -> int:
+    try:
+        return max(1, int(os.getenv("DISCLOSURE_SEND_MAX_ATTEMPTS", str(SEND_MAX_ATTEMPTS_DEFAULT))))
+    except ValueError:
+        return SEND_MAX_ATTEMPTS_DEFAULT
+
+
+def _note_send_failure(chat_id: str | int, rcept_no: str) -> bool:
+    """발송 실패 1회 기록. 상한 도달(포기 → seen 처리 대상)이면 True."""
+    key = (str(chat_id), rcept_no)
+    n = _SEND_FAILS.get(key, 0) + 1
+    if n >= _send_max_attempts():
+        _SEND_FAILS.pop(key, None)
+        return True
+    _SEND_FAILS[key] = n
+    return False
 
 
 def is_market_hours() -> bool:
@@ -143,7 +172,8 @@ async def poll_and_dispatch(bot: Bot) -> None:
                 if not fresh:
                     continue
 
-                # 발송 (오래된 것부터)
+                # 발송 (오래된 것부터). seen 처리는 발송 성공분 + 재시도 포기분만.
+                done: list[str] = []
                 for r in reversed(fresh):
                     category = dart_client.classify_disclosure(r.report_nm)
                     text = _format_alert(ticker, name, r, category)
@@ -153,7 +183,15 @@ async def poll_and_dispatch(bot: Bot) -> None:
                     except Exception:
                         log.exception("공시 알림 발송 실패: chat=%s ticker=%s", chat_id, ticker)
                         error_count += 1
+                        if _note_send_failure(chat_id, r.rcept_no):
+                            log.warning(
+                                "공시 알림 발송 %d회 연속 실패 — 포기(seen 처리): chat=%s rcept_no=%s",
+                                _send_max_attempts(), chat_id, r.rcept_no,
+                            )
+                            done.append(r.rcept_no)
                         continue
+                    done.append(r.rcept_no)
+                    _SEND_FAILS.pop((str(chat_id), r.rcept_no), None)
                     # 회고 학습 루프용 영속화 (RecapBot §3). 실패해도 알림 흐름엔 무영향.
                     try:
                         await loop.run_in_executor(
@@ -163,13 +201,11 @@ async def poll_and_dispatch(bot: Bot) -> None:
                     except Exception:
                         log.exception("disclosure_log 영속화 실패: %s", r.rcept_no)
 
-                # dedup state 갱신 (한 chat 단위)
+                # dedup state 갱신 (한 chat 단위) — 실패분은 남겨 다음 폴링에 재시도
+                if not done:
+                    continue
                 try:
-                    state_store.mark_seen(
-                        dedup_key,
-                        [r.rcept_no for r in fresh],
-                        cap=2000,
-                    )
+                    state_store.mark_seen(dedup_key, done, cap=2000)
                 except Exception:
                     log.exception("dedup state 갱신 실패: chat=%s", chat_id)
 

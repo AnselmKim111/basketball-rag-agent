@@ -36,9 +36,11 @@ def _get_json(path: str, params: dict, key: str) -> dict | list | None:
         return None
     import httpx
     q = "&".join(f"{k}={v}" for k, v in params.items())
-    url = f"{_BASE}{path}?{q}&token={key}"
+    # 키는 X-Finnhub-Token 헤더로 (쿼리 token= 은 URL째 예외·로그에 남음)
+    url = f"{_BASE}{path}?{q}"
     try:
-        r = httpx.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
+        r = httpx.get(url, timeout=20,
+                      headers={"User-Agent": "Mozilla/5.0", "X-Finnhub-Token": key})
         if r.status_code in (401, 403):
             if path not in _FORBIDDEN_PATHS:
                 log.info("[estimate_revisions] %s %s — 권한 없음 (이 endpoint 이후 호출 skip)",

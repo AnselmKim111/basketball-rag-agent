@@ -5,6 +5,7 @@ hourly bucket으로 누적 → recent_stats로 실패율·p95 계산 → should_
 """
 from __future__ import annotations
 
+import calendar
 import json
 import logging
 import os
@@ -113,7 +114,8 @@ def recent_stats(model: str, hours: int = 1) -> dict:
     lats = []
     for bucket, b in data.items():
         try:
-            t = time.mktime(time.strptime(bucket, "%Y%m%d-%H"))
+            # bucket은 UTC(gmtime) — mktime(로컬)로 읽으면 비-UTC TZ에서 창 밖으로 밀림
+            t = calendar.timegm(time.strptime(bucket, "%Y%m%d-%H"))
         except Exception:
             continue
         if t < cutoff:
@@ -140,6 +142,19 @@ def should_rollback(model: str, env_name: str | None = None) -> tuple[bool, str]
     if st["p95_latency_ms"] / 1000 > limit:
         return True, f"p95 latency {st['p95_latency_ms']}ms > {limit}s ({env_name or 'default'})"
     return False, "healthy"
+
+
+def failing_models(models: list[str], hours: int = 1) -> list[str]:
+    """실패율 임계 초과 모델 (샘플 ≥ ROLLBACK_MIN_SAMPLES, 중복 제거·입력 순서 유지).
+
+    서로 다른 모델 2개 이상이 같은 창에서 동시에 초과하면 모델 문제가 아니라
+    플랫폼/키 장애 — rollback.check_and_rollback의 systemic 가드가 사용."""
+    out: list[str] = []
+    for m in dict.fromkeys(x for x in models if x):
+        st = recent_stats(m, hours=hours)
+        if st["samples"] >= ROLLBACK_MIN_SAMPLES and st["fail_rate"] > ROLLBACK_FAIL_RATE:
+            out.append(m)
+    return out
 
 
 def reset(model: str) -> None:

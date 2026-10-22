@@ -24,9 +24,11 @@ _BASE = "https://finnhub.io/api/v1"
 
 def _calendar_call(start_iso: str, end_iso: str, key: str) -> list[dict]:
     import httpx
-    url = f"{_BASE}/calendar/earnings?from={start_iso}&to={end_iso}&token={key}"
+    # 키는 X-Finnhub-Token 헤더로 (쿼리 token= 은 URL째 예외·로그에 남음)
+    url = f"{_BASE}/calendar/earnings?from={start_iso}&to={end_iso}"
     try:
-        r = httpx.get(url, timeout=30, headers={"User-Agent": "Mozilla/5.0"})
+        r = httpx.get(url, timeout=30,
+                      headers={"User-Agent": "Mozilla/5.0", "X-Finnhub-Token": key})
         r.raise_for_status()
         data = r.json() or {}
         items = data.get("earningsCalendar")

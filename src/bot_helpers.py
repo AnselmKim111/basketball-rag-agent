@@ -293,15 +293,52 @@ async def _summarize_pdfs_parallel(
     return await asyncio.gather(*[_one(p) for p in paths])
 
 
+# diag에 원문 출력 허용하는 env (공개 정보만). 나머지는 전부 마스킹 — deny-by-default.
+# 2026-10-21 사고: 이름 키워드 블랙리스트(TOKEN/PW/API_KEY/SECRET)가 OPENROUTER_MANAGEMENT_KEY를
+# 놓쳐 부팅마다 원문 출력 → Railway 로그 유출. 새 비밀 env가 생겨도 안전하도록 allowlist로 전환.
+_DIAG_PLAIN_NAMES = frozenset({
+    "ACTIVE_BOTS",
+    "RAILWAY_PROJECT_ID",
+    "RAILWAY_ENVIRONMENT_ID",
+    "RAILWAY_SERVICE_ID",
+    "RAILWAY_SERVICE_IDS",
+})
+_DIAG_PLAIN_SUFFIX_RE = re.compile(
+    r"(?:^|_)(?:CHAT_IDS?|ALLOWED_CHAT_IDS|CHANNEL_ID|MODELS?)$"
+)
+# 이 길이 미만은 fingerprint도 생략 — 짧은 값(인증코드·전화번호·짧은 비번)은
+# sha256 8자리만으로 전수 대입 복원 가능.
+_DIAG_FP_MIN_LEN = 16
+
+
+def _diag_is_plain(name: str) -> bool:
+    upper = name.upper()
+    return upper in _DIAG_PLAIN_NAMES or bool(_DIAG_PLAIN_SUFFIX_RE.search(upper))
+
+
+def _diag_masked(value: str) -> str:
+    from src.log_redact import fingerprint
+    if len(value) < _DIAG_FP_MIN_LEN:
+        return f"<set len={len(value)}>"
+    return f"<set len={len(value)} fp={fingerprint(value)}>"
+
+
 def diag_env_keys(prefixes: Iterable[str]) -> dict[str, str]:
-    """주어진 prefix가 들어간 env key를 마스킹된 형태로 반환 (로깅 안전)."""
+    """주어진 prefix가 들어간 env key를 마스킹된 형태로 반환 (로깅 안전).
+
+    allowlist(chat id·모델명·Railway id 등)만 원문(60자), 나머지는
+    `<set len=N fp=XXXXXXXX>` — 값 노출 없이 "새 키가 배포됐나"만 확인 가능.
+    """
+    from src.log_redact import redact
+    prefixes = tuple(prefixes)
     out: dict[str, str] = {}
     for k in sorted(os.environ.keys()):
         if not any(p in k.upper() for p in prefixes):
             continue
         v = os.environ[k]
-        if any(s in k.upper() for s in ("TOKEN", "PW", "API_KEY", "SECRET")):
-            out[k] = f"<set, len={len(v)}>"
+        if _diag_is_plain(k):
+            # allowlist여도 값에 토큰 형태가 섞였으면(오설정) 패턴 마스킹
+            out[k] = redact(v[:60])
         else:
-            out[k] = v[:60]
+            out[k] = _diag_masked(v)
     return out

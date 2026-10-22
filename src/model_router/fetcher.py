@@ -19,20 +19,15 @@ def _mgmt_key() -> str | None:
     return os.getenv("OPENROUTER_MANAGEMENT_KEY")
 
 
-def _inf_key() -> str | None:
-    return os.getenv("OPENROUTER_API_KEY")
-
-
 def fetch_models() -> dict[str, dict]:
     """모든 활성 모델 → {model_id: {in_price, out_price, ctx_length, created_at, name}}.
 
-    인증 불요. 실패 시 빈 dict.
+    인증 불요 (공개 엔드포인트) — 키를 실어 보내지 않음 (노출면 축소, 키 무효여도 동작).
+    실패 시 빈 dict.
     """
-    key = _mgmt_key() or _inf_key()
-    headers = {"Authorization": f"Bearer {key}"} if key else {}
     try:
         with httpx.Client(timeout=20) as c:
-            r = c.get(f"{BASE_URL}/models", headers=headers)
+            r = c.get(f"{BASE_URL}/models")
             r.raise_for_status()
             data = r.json().get("data", [])
     except Exception:

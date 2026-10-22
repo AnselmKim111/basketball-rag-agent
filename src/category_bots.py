@@ -67,6 +67,38 @@ _send_pdf = _bh_send_pdf
 # 도 같은 헬퍼 공유). 호출부 변경 없도록 alias로 노출.
 from src.bot_helpers import _summarize_pdfs_parallel  # noqa: E402
 
+# _summarize_pdfs_parallel이 OpenRouterCreditExhausted(401 OpenRouterAuthError 포함)를
+# 삼키고 자리에 넣는 placeholder의 prefix — LLM 장애(키 폐기·크레딧 소진) 판별용.
+_LLM_OUTAGE_SUMMARY_PREFIX = "(요약 실패: OpenRouter"
+
+
+def _llm_auth_blocked() -> bool:
+    """summarizer 401 breaker 열림 여부. API 부재(구버전)·예외 시 False."""
+    from src import summarizer
+    try:
+        return bool(getattr(summarizer, "auth_breaker_open", lambda: False)())
+    except Exception:
+        return False
+
+
+def _is_llm_outage(summaries: list[str]) -> bool:
+    """배치 요약 중 OpenRouter 인증/크레딧 장애가 있었는지.
+
+    일반 실패(빈 응답 3회·파싱 오류 등)는 False — 그 경우는 기존대로 발송·seen 처리.
+    """
+    if _llm_auth_blocked():
+        return True
+    return any(
+        isinstance(s, str) and s.startswith(_LLM_OUTAGE_SUMMARY_PREFIX) for s in summaries
+    )
+
+
+def _llm_outage_note(label: str) -> str:
+    return (
+        f"⚠️ {label}: LLM 요약 불가 (OpenRouter 인증/한도 장애) — 이번 회차 미발송, "
+        "복구 후 다음 자동 실행 또는 /trigger 로 재발송"
+    )
+
 
 # ------------------------------------------------------------------
 # 공통: 카테고리 → 다운로드 + 짧은 요약 + 발송
@@ -96,8 +128,18 @@ async def _process_and_send_category(
     LLM 요약은 `_summarize_pdfs_parallel`로 동시 호출 (semaphore 상한). 5-10개
     PDF가 한 번에 요약되어 사용자 체감 응답 속도가 5-8배 빨라진다.
 
+    LLM 장애 (dedup 회차만): OpenRouter 401 breaker 열림 / 인증·크레딧 오류가 배치에서
+    나면 placeholder 요약으로 발송하지 않고 짧은 안내 1건만 보낸 뒤 seen 처리도 생략 —
+    복구 후 다음 회차에 정상 요약으로 재발송. (2026-10-21 키 disable 사고: placeholder
+    요약 리포트가 영구 seen 처리돼 유실.) on-demand(dedup 없음)는 기존대로 PDF+placeholder.
+
     반환: 발송한 리포트 개수.
     """
+    if dedup_key and _llm_auth_blocked():
+        log.warning("[%s] OpenRouter 인증 breaker 열림 — 다운로드·발송 생략 (seen 미갱신)", label)
+        await _send_text(bot, chat_id, _llm_outage_note(label))
+        return 0
+
     if PIPELINE_LOCK.locked():
         await _send_text(
             bot,
@@ -181,6 +223,13 @@ async def _process_and_send_category(
     summaries = await _summarize_pdfs_parallel(
         saved_paths, short_summary=short_summary, label=label
     )
+    if dedup_key and _is_llm_outage(summaries):
+        log.warning(
+            "[%s] LLM 장애(OpenRouter 인증/한도) — %d건 미발송, seen 미갱신 (복구 후 재발송)",
+            label, len(saved_paths),
+        )
+        await _send_text(bot, chat_id, _llm_outage_note(label))
+        return 0
 
     # ─── STEP C: 텔레그램 발송 (순서 보존 위해 sequential) ───
     today = datetime.now(KST).strftime("%Y-%m-%d %H:%M")
